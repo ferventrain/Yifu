@@ -9,7 +9,8 @@ from tqdm import tqdm
 def read_tiff_stack(path):
     if os.path.isdir(path):
         images = [np.array(Image.open(os.path.join(path, p))) for p in sorted(os.listdir(path))]
-        return np.array(images)
+        images = np.array(images)
+        return images
     else:
         img = Image.open(path)
         images = []
@@ -29,6 +30,9 @@ def heatmap(save_img_path, edge_path, save_path, alpha):
     '''
     img = read_tiff_stack(save_img_path)
     edge = read_tiff_stack(edge_path)
+    print(img.shape)
+    print(edge.shape)
+
     # 新建热力图
     heatimg = np.zeros(img.shape)
     heatimg = np.array([heatimg, heatimg, heatimg]).transpose((1, 2, 3, 0))
@@ -59,7 +63,7 @@ def heatmap(save_img_path, edge_path, save_path, alpha):
     heatimg[..., 2][img_out_heat <= 255] = img_out_heat[img_out_heat <= 255]
 
     # 如果是为冠状面叠加脑区轮廓
-    heatimg = np.array(heatimg).transpose(1, 0, 2, 3)
+    # heatimg = np.array(heatimg).transpose(1, 0, 2, 3)
     # 叠加脑区轮廓
     heatimg[edge != 0] = edge[edge != 0]
 
@@ -72,14 +76,16 @@ def heatmap(save_img_path, edge_path, save_path, alpha):
 
 # executing
 # ------------------------------------one image------------------------------------
-img_path = r"C:\Users\Peiqi\Desktop\visual\processing\reg\new_version\P0_P28_final\collected_symmetry\heatmap\avg\horizon\image\P7_soma_avg_image.tiff"
-edge_path = r"C:\Users\Peiqi\Desktop\visual\brainatlas_v4\P7\P7_edge.tiff"
-save_path = r"C:\Users\Peiqi\Desktop\visual\processing\reg\new_version\P0_P28_final\collected_symmetry\heatmap\avg\horizon\image\P7_soma_avg_image_heatmap.tiff"
+img_path = r"S:\tianzhenjun\nao_2\ch2_warped_mask"
+edge_path = r"S:\Yifu\Allen_brainatlas\edge.tiff"
+save_path = r"S:\tianzhenjun\nao_2\ch2_heatmap.tiff"
 
 alpha = 1
 if 'axon' in img_path:
     alpha = 0.02
 elif 'soma' in img_path:
     alpha = 0.05
+else:
+    alpha = 0.1
 
 heatmap(img_path, edge_path, save_path, alpha)

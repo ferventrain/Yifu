@@ -172,7 +172,7 @@ class ImageDownsampler:
                 output_file = output_path / f"downsampled_{i:04d}.tiff"
                 tifffile.imwrite(output_file, slice_img.astype(dtype))
             
-            # 分块保存为NIfTI
+            # 保存为NIfTI
             nifti_path = output_path / "volume.nii.gz"
             self._save_as_nifti(all_downsampled_slices, nifti_path)
             print(f"Saved as NIfTI: {nifti_path}")
