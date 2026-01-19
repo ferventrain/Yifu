@@ -1,13 +1,14 @@
 import os
 import json
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple, Union, Dict
 import numpy as np
 import ants
-import SimpleITK as sitk
 import tifffile
 from scipy import ndimage
 from tqdm import tqdm
+from analyze_density import BrainDensityAnalyzer
 
 
 class BidirectionalRegistration:
@@ -21,386 +22,353 @@ class BidirectionalRegistration:
     }
     
     def __init__(self, 
+                 sample_dir: str,
+                 target_channel: str,
                  atlas_image_path: str, 
                  atlas_label_path: str,
-                 target_image_path: str,
                  register_channel: str,
-                 original_shape: Tuple[int, int, int]):
-        """
-        Args:
-            atlas_image_path: Allen脑图谱原始图像路径
-            atlas_label_path: Allen脑图谱标签图像路径
-            target_image_path: 目标图像路径（downsample后的图像）
-            register_channel: 要配准的通道名（例如 'ch0'）
-            original_shape: 目标图像原始形状（用于上采样）
-        """
+                 original_shape: Tuple[int, int, int],
+                 density_cfg_path: Optional[str] = None):
+        
+        self.sample_dir = Path(sample_dir)
+        self.target_channel = target_channel
+        self.register_channel = register_channel
+        self.original_shape = original_shape
+        
+        # Load Atlas
         self.atlas_image = ants.image_read(atlas_image_path)
         self.atlas_label = ants.image_read(atlas_label_path)
-        resolution_config_path = Path(r'S:\Yifu\registration\resolution.json')
+        
+        # Load Config
+        current_dir = Path(__file__).parent
+        resolution_config_path = current_dir / 'resolution.json'
         with open(resolution_config_path, 'r') as f:
             self.config = json.load(f)
-        self.source_resolution = self.config['source_resolution']  # [x, y, z] in mm
-        self.atlas_resolution = self.config['target_resolution']  # Allen atlas resolution
-        self.target_image = self.prepare_target_image(target_image_path)
-        self.target_path = Path(target_image_path)
-        self.target_channel = self.target_path.stem.split('_')[0]
-        self.register_channel = register_channel
-        self.register_image = ants.image_read(str(self.target_path.parent / f"ch{self.register_channel}_downsample/volume.nii.gz"))
-        self.original_shape = original_shape
-        self.sample_dir = self.target_path.parent  # 包含ch0，mask，配准结果等文件夹的文件夹
-    
-    def prepare_target_image(self, target_path: Union[str, Path]) -> ants.ANTsImage:
-        """准备目标图像"""
-        target_path = Path(target_path)
+        self.source_resolution = self.config['source_resolution']
+        self.atlas_resolution = self.config['target_resolution']
+        
+        # Load Target Image (used for image2atlas warping)
+        self.target_image = self._find_and_load_target_image()
+        if self.target_image is None:
+            print("No target image or mask found!")
+            return
+
+        # Load Register Image (downsampled sample)
+        reg_img_path = self.sample_dir / f"ch{self.register_channel}_downsample/volume.nii.gz"
+        self.register_image = ants.image_read(str(reg_img_path))
+        
+        # Density Config
+        self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'add_id_ytw.json')
+
+    def _find_and_load_target_image(self) -> Optional[ants.ANTsImage]:
+        """查找并加载目标图像"""
+        # 优先级：downsample folder -> downsample_mask folder
+        possible_dirs = [
+            self.sample_dir / f"ch{self.target_channel}_downsample",
+            self.sample_dir / f"ch{self.target_channel}_downsample_mask"
+        ]
+        
+        for p in possible_dirs:
+            if p.exists():
+                return self.prepare_target_image(p)
+        return None
+
+    def prepare_target_image(self, target_path: Path) -> ants.ANTsImage:
+        """准备目标图像：优先读取 NIfTI，否则从 TIFF 转换"""
+        nifti_files = ["volume.nii.gz", "mask.nii.gz"]
         
         if target_path.is_dir():
-            if (target_path / "volume.nii.gz").exists():
-                # 如果NIfTI文件已存在，直接读取
-                target_image = ants.image_read(str(target_path / "volume.nii.gz"))
-            else:
-                # 如果NIfTI文件不存在，转换TIFF栈为NIfTI
-                print("Converting TIFF stack to NIfTI...")
-                volume = self._load_tiff_stack(target_path)
-                temp_nifti = target_path / "volume.nii.gz"
-                volume = sitk.GetImageFromArray(volume)
-                volume.SetSpacing(self.atlas_resolution)  # 设置为Allen atlas分辨率，默认是下采样过的图像
-                volume.SetOrigin([0, 0, 0])
-                volume.SetDirection(np.eye(3).flatten())
-                sitk.WriteImage(volume, str(temp_nifti))
-                target_image = ants.image_read(str(temp_nifti))
+            # Check for existing NIfTI
+            for f in nifti_files:
+                if (target_path / f).exists():
+                    return ants.image_read(str(target_path / f))
+            
+            # Convert TIFF stack
+            print(f"Converting TIFF stack in {target_path} to NIfTI...")
+            volume = self._load_tiff_stack(target_path)
+            temp_nifti = target_path / "volume.nii.gz"
+            
+            # Convert to ANTsImage
+            # volume is (z, y, x), ANTs expects (x, y, z) for from_numpy
+            volume_ants = np.transpose(volume, (2, 1, 0))
+            
+            ants_vol = ants.from_numpy(
+                volume_ants,
+                origin=[0, 0, 0],
+                spacing=self.atlas_resolution,
+                direction=np.eye(3)
+            )
+            
+            ants.image_write(ants_vol, str(temp_nifti))
+            
+            return ants_vol
         else:
-            # 直接读取NIfTI文件
-            target_image = ants.image_read(str(target_path))
-
-        return target_image
+            return ants.image_read(str(target_path))
     
     def _load_tiff_stack(self, folder_path: Path) -> np.ndarray:
         """加载TIFF栈"""
         tiff_files = sorted(folder_path.glob('*.tif*'))
-        stack = []
-        for tiff_file in tiff_files:
-            img = tifffile.imread(tiff_file)
-            stack.append(img)
+        stack = [tifffile.imread(f) for f in tiff_files]
         return np.stack(stack, axis=0)
-    
-    def register(self,
-                mode: str = 'atlas2image',
-                registration_type: str = 'SyN',
-                **kwargs) -> Dict:
-        """
-        执行配准
-        
-        Args:
-            mode: 'atlas2image' 或 'image2atlas'
-            registration_type: 配准类型
-            
-        Returns:
-            包含配准结果的字典
-        """
-        if mode == 'atlas2image':
-            return self._register_atlas_to_image(registration_type, **kwargs)
-        elif mode == 'image2atlas':
-            return self._register_image_to_atlas(registration_type, **kwargs)
-        else:
-            raise ValueError(f"Invalid mode: {mode}. Choose 'atlas2image' or 'image2atlas'")
-    
-    def _register_atlas_to_image(self, 
-                                registration_type: str,
-                                **kwargs) -> Dict:
-        """将Atlas配准到图像空间"""
-        print(f"Performing {registration_type} registration: Atlas → Image...")
-        
-        # 执行配准
-        registration = ants.registration(
-            fixed=self.register_image,
-            moving=self.atlas_image,
-            type_of_transform=registration_type,
-            **kwargs
-        )
-        print(f"Registration completed.")
 
-        # 应用变换到脑图谱标签
-        warped_label = ants.apply_transforms(
-            fixed=self.register_image,
-            moving=self.atlas_label,
-            transformlist=registration['fwdtransforms'],
-            interpolator='nearestNeighbor'
-        )
+    def _save_volume_as_tiff(self, data: Union[ants.ANTsImage, np.ndarray], output_dir: Path, prefix: str = "image"):
+        """通用保存 TIFF 栈方法"""
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        return {
-            'warped_image': registration['warpedmovout'],
-            'warped_label': warped_label,
-            'transforms': registration,
-            'mode': 'atlas2image'
-        }
-    
-    def _register_image_to_atlas(self,
-                                registration_type: str,
-                                **kwargs) -> Dict:
-        """将图像配准到Atlas空间,一般用于制作热图"""
-        print(f"Performing {registration_type} registration: Image → Atlas...")
-        print("--- METADATA VERIFICATION ---")
-        print(f"Atlas Image  | Spacing: {self.atlas_image.spacing}, Origin: {self.atlas_image.origin}, Direction: \n{self.atlas_image.direction}")
-        print(f"Target Image | Spacing: {self.target_image.spacing}, Origin: {self.target_image.origin}, Direction: \n{self.target_image.direction}")
-        self.target_image = ants.histogram_match_image(self.target_image, self.atlas_image)
-        # 执行配准
-        registration = ants.registration(
-            fixed=self.atlas_image,
-            moving=self.register_image,
-            type_of_transform=registration_type,
-            grad_step=0.1,aff_random_sampling_rate=0.5,
-            **kwargs
-        )
-        print(f"Registration completed.")
-        
-        # 如果有下采样后目标图像的标签，也进行变换，用于后续制作热图
-        target_label = None
-        target_label_path = self.sample_dir / (f"{self.target_channel}_downsample_mask/mask.nii.gz")
-        if target_label_path.exists():
-            target_label = ants.image_read(str(target_label_path))
-            target_label.set_spacing(self.atlas_resolution)
-            target_label = ants.apply_transforms(
-                fixed=self.atlas_image,
-                moving=target_label,
-                transformlist=registration['fwdtransforms'],
-                interpolator='nearestNeighbor'
+        if isinstance(data, ants.ANTsImage):
+            arr = data.numpy()
+            # ANTs numpy is (x, y, z), transpose to (y, x, z) for TIFF
+            arr = np.transpose(arr, (1, 0, 2))
+        else:
+            arr = data
+            
+        # Ensure 3D (y, x, z)
+        if arr.ndim != 3:
+            raise ValueError(f"Expected 3D array, got shape {arr.shape}")
+            
+        print(f"Saving {prefix} TIFFs to {output_dir} (shape: {arr.shape})...")
+        for i in range(arr.shape[2]):
+            tifffile.imwrite(
+                str(output_dir / f"{prefix}_{i:04d}.tiff"),
+                arr[:, :, i].astype(np.uint16),
+                compression='lzw'
             )
 
-        return {
-            'warped_image': registration['warpedmovout'],
-            'warped_label': target_label,  # 这里是图像的标签变换到atlas空间，用于制作热图
-            'atlas_label': self.atlas_label,  # 原始atlas标签
-            'transforms': registration,
-            'mode': 'image2atlas'
-        }
-    
-    def upsample_label_chunked(self,
-                               label_image: ants.ANTsImage,
-                               output_dir: str,
-                               method: str = 'nearest',
-                               chunk_size: int = 50) -> None:
-        """
-        分块上采样标签图像，直接保存每个块避免内存问题
+    def _perform_registration(self, fixed: ants.ANTsImage, moving: ants.ANTsImage, 
+                            reg_type: str, **kwargs) -> Dict:
+        """通用配准核心逻辑"""
+        print(f"Performing {reg_type} registration...")
+        print("--- METADATA VERIFICATION ---")
+        print(f"Fixed Image  | Spacing: {fixed.spacing}, Origin: {fixed.origin}")
+        print(f"Moving Image | Spacing: {moving.spacing}, Origin: {moving.origin}")
         
-        Args:
-            label_image: ANTs标签图像
-            original_shape: 原始图像形状 [z, y, x]
-            output_dir: 输出目录
-            method: 上采样方法
-            chunk_size: 每个块的切片数量
-        """
+        # 始终将 Sample (register_image) 的直方图匹配到 Atlas
+        # 注意：需要判断哪个是 sample。根据初始化逻辑，self.register_image 是 sample。
+        # 如果 fixed 是 register_image，则它匹配 atlas (moving)。
+        # 如果 moving 是 register_image，则它匹配 atlas (fixed)。
+        
+        # 在原代码中，无论方向如何，都执行了:
+        # self.register_image = ants.histogram_match_image(self.register_image, self.atlas_image)
+        # 这一步应该在调用此函数前或者在此函数内完成，但需要引用 self.register_image
+        
+        # 为了保持原逻辑，我们在外部做 histogram match。
+        
+        return ants.registration(
+            fixed=fixed,
+            moving=moving,
+            type_of_transform=reg_type,
+            grad_step=0.1,
+            aff_random_sampling_rate=0.5,
+            **kwargs
+        )
+
+    def register(self, mode: str = 'atlas2image', registration_type: str = 'SyN', **kwargs) -> Dict:
+        """执行配准"""
+        if mode not in ['atlas2image', 'image2atlas']:
+            raise ValueError(f"Invalid mode: {mode}")
+
+        # Histogram matching (Sample matches Atlas)
+        print("Performing histogram matching (Sample -> Atlas)...")
+        self.register_image = ants.histogram_match_image(self.register_image, self.atlas_image)
+
+        if mode == 'atlas2image':
+            print("Mode: Atlas -> Image")
+            reg_result = self._perform_registration(
+                fixed=self.register_image, 
+                moving=self.atlas_image, 
+                reg_type=registration_type, 
+                **kwargs
+            )
+            
+            # Apply transform to Atlas Label
+            warped_label = ants.apply_transforms(
+                fixed=self.register_image,
+                moving=self.atlas_label,
+                transformlist=reg_result['fwdtransforms'],
+                interpolator='nearestNeighbor'
+            )
+            
+            return {
+                'warped_image': reg_result['warpedmovout'],
+                'warped_label': warped_label,
+                'transforms': reg_result,
+                'mode': mode
+            }
+            
+        else: # image2atlas
+            print("Mode: Image -> Atlas")
+            reg_result = self._perform_registration(
+                fixed=self.atlas_image, 
+                moving=self.register_image, 
+                reg_type=registration_type, 
+                **kwargs
+            )
+            
+            # Apply transform to Target Image (Sample)
+            warped_target = ants.apply_transforms(
+                fixed=self.atlas_image,
+                moving=self.target_image,
+                transformlist=reg_result['fwdtransforms'],
+                interpolator='nearestNeighbor'
+            )
+            
+            return {
+                'warped_image': reg_result['warpedmovout'],
+                'warped_label': warped_target, # Here label is the warped target image/mask
+                'atlas_label': self.atlas_label,
+                'transforms': reg_result,
+                'mode': mode
+            }
+
+    def upsample_label_chunked(self, label_image: ants.ANTsImage, output_dir: str, 
+                             method: str = 'nearest', chunk_size: int = 50) -> None:
+        """分块上采样标签图像"""
         output_path = Path(output_dir)
         tiff_output = output_path / f"{self.target_channel}_upsampled_label"
         tiff_output.mkdir(parents=True, exist_ok=True)
         
-        # 获取标签数组
         label_array = label_image.numpy()
         current_shape = label_array.shape
-        
         print(f"Upsampling from {current_shape} to {self.original_shape}...")
         
-        # 计算缩放因子
-        zoom_factors = [
-            target / current 
-            for target, current in zip(self.original_shape, current_shape)
-        ]
-        
-        # 确定插值阶数
+        zoom_factors = [t / c for t, c in zip(self.original_shape, current_shape)]
         order = self.UPSAMPLING_METHODS.get(method, 0)
         
-        # 计算每个块在原始空间中的切片数
-        slices_per_chunk_original = int(chunk_size * zoom_factors[0])
-        
-        # 跟踪输出切片索引
         output_slice_idx = 0
-        
-        # 分块处理
         num_chunks = (current_shape[0] + chunk_size - 1) // chunk_size
         
-        for chunk_idx in tqdm(range(num_chunks), desc="Upsampling and saving chunks"):
+        for chunk_idx in tqdm(range(num_chunks), desc="Upsampling chunks"):
             start_idx = chunk_idx * chunk_size
             end_idx = min(start_idx + chunk_size, current_shape[0])
             
-            # 获取当前块
             chunk = label_array[start_idx:end_idx]
-            
-            # 上采样当前块
             upsampled_chunk = ndimage.zoom(chunk, zoom_factors, order=order)
             
-            # 确保标签值保持整数
             if method == 'nearest':
                 upsampled_chunk = np.round(upsampled_chunk).astype(np.uint16)
             else:
                 upsampled_chunk = upsampled_chunk.astype(np.uint16)
             
-            # 直接保存当前块的每个切片
-            for slice_idx in range(upsampled_chunk.shape[0]):
+            # Save slices
+            for i in range(upsampled_chunk.shape[0]):
                 tifffile.imwrite(
                     str(tiff_output / f"label_{output_slice_idx:06d}.tiff"),
-                    upsampled_chunk[slice_idx],
-                    compression='lzw'  # 使用压缩
+                    upsampled_chunk[i],
+                    compression='lzw'
                 )
                 output_slice_idx += 1
             
-            # 立即释放内存
-            del chunk
-            del upsampled_chunk
-        
-        print(f"Saved {output_slice_idx} upsampled slices to {tiff_output}")
-    
-    def save_registration_results(self,
-                                 results: Dict,
-                                 save_transforms: bool = False) -> None:
+            del chunk, upsampled_chunk
+            
+        print(f"Saved {output_slice_idx} slices to {tiff_output}")
+
+    def save_registration_results(self, results: Dict, save_transforms: bool = False, 
+                                save_registered_image: bool = False) -> None:
         """保存配准结果"""
-        
         mode = results['mode']
         
-        # 保存配准后的标签为TIFF栈
-        # atlas2image mode下，label是atlas空间的标签，需要上采样到原始空间
-        # image2atlas mode下，label是原始空间的标签，直接保存即可，后续用于制作热图
-        if results['warped_label'] is not None:
-            label_array = results['warped_label'].numpy()
+        # 1. Save Warped Label / Mask
+        if results.get('warped_label') is not None:
             if mode == 'atlas2image':
-                # 上采样atlas标签到原始空间
-                print(f"Upsampling atlas label to original shape {self.original_shape}...")
+                # Upsample atlas label to original space
                 label_dir = self.sample_dir / f"{self.target_channel}_atlas_label_upsampled"
-                self.upsample_label_chunked(
-                    label_image=results['warped_label'],
-                    output_dir=str(label_dir)
-                )
+                self.upsample_label_chunked(results['warped_label'], str(label_dir))
             else:
-                # 保存下采样+变换后atlas空间的mask
-                print(f"Saving warped mask to {self.target_channel}_warped_mask...")
-                mask_dir = self.sample_dir / f"{self.target_channel}_warped_mask"
-                label_array = np.transpose(label_array, (1, 0, 2))
-                print(f"label array shape: {label_array.shape}")
-                mask_dir.mkdir(exist_ok=True)
-                for i in range(label_array.shape[2]):
-                    tifffile.imwrite(
-                        str(mask_dir / f"mask_{i:04d}.tiff"),
-                        label_array[:,:,i],
-                        compression='lzw'
-                    )
+                # Save warped mask (already in atlas space)
+                mask_dir = self.sample_dir / f"ch{self.target_channel}_warped_mask"
+                # For image2atlas, warped_label is actually the warped sample mask
+                # We need to be careful about dimensions. 
+                # warped_label is an ANTsImage. _save_volume_as_tiff handles it.
+                self._save_volume_as_tiff(results['warped_label'], mask_dir, prefix="mask")
 
-        print(f"Saving warped image to {self.target_channel}_warped_image...")
-        image_dir = self.sample_dir / f"{self.target_channel}_warped_image"
-        image_dir.mkdir(exist_ok=True)
-        warped_image = results['warped_image'].numpy()
-        for i in range(warped_image.shape[2]):
-            tifffile.imwrite(
-                str(image_dir / f"image_{i:04d}.tiff"),
-                warped_image[:,:,i],
-                compression='lzw'
-            )
-        # 保存配准后的图像为NIfTI文件
-        nii_image = sitk.GetImageFromArray(warped_image)
-        nii_image.SetSpacing(results['warped_image'].spacing)
-        sitk.WriteImage(nii_image, str(image_dir / f"{self.target_channel}_warped_image.nii.gz"))
-        
-        # 保存变换参数（如果需要）
+        # 2. Save Warped Image
+        if save_registered_image:
+            image_dir = self.sample_dir / f"ch{self.register_channel}_warped_image"
+            self._save_volume_as_tiff(results['warped_image'], image_dir, prefix="image")
+            
+            # Also save NIfTI
+            nii_path = image_dir / f"{self.register_channel}_warped_image.nii.gz"
+            warped_img = results['warped_image']
+            ants.image_write(warped_img, str(nii_path)) # Use ants.image_write directly
+
+        # 3. Save Transforms
         if save_transforms and 'transforms' in results:
             transforms_dir = self.sample_dir / "transforms"
             transforms_dir.mkdir(exist_ok=True)
-            # 复制变换文件
             for i, transform in enumerate(results['transforms']['fwdtransforms']):
                 if os.path.exists(transform):
-                    import shutil
                     shutil.copy(transform, transforms_dir / f"fwd_{i}_{os.path.basename(transform)}")
-    
-    def run_full_pipeline(self,
-                         mode: str = 'atlas2image',
-                         registration_type: str = 'SyN',
-                         upsample_method: str = 'nearest',
-                         chunk_size: int = 50,
-                         save_transforms: bool = False) -> None:
-        """
-        运行完整的配准流程
+
+    def check_and_run_density_analysis(self, results: Dict):
+        """检查并运行密度分析"""
+        mask_folder = self.sample_dir / f"ch{self.target_channel}_downsample_mask"
         
-        Args:
-            mode: 'atlas2image' 或 'image2atlas'
-            registration_type: 配准类型
-            upsample_method: 上采样方法
-            chunk_size: 分块大小
-            save_transforms: 是否保存变换文件
-        """
-        # 执行配准
+        if mask_folder.exists() and results.get('warped_label') is not None:
+            print(f"\nFound mask folder: {mask_folder}. Starting density analysis...")
+            
+            # Save downsampled atlas label (registered)
+            downsampled_label_dir = self.sample_dir / f"ch{self.target_channel}_atlas_label_downsampled"
+            self._save_volume_as_tiff(results['warped_label'], downsampled_label_dir, prefix="label")
+            
+            try:
+                analyzer = BrainDensityAnalyzer(self.density_cfg_path)
+                analysis_results = analyzer.analyze(str(mask_folder), str(downsampled_label_dir))
+                
+                output_excel = self.sample_dir / f"density_analysis_ch{self.target_channel}.xlsx"
+                analyzer.write_to_excel(analysis_results, str(output_excel))
+                print(f"Density analysis completed. Saved to {output_excel}")
+            except Exception as e:
+                print(f"Error during density analysis: {e}")
+                import traceback
+                traceback.print_exc()
+        elif not mask_folder.exists():
+            print(f"Density analysis skipped. Mask folder {mask_folder} not found.")
+
+    def run_full_pipeline(self, mode: str = 'atlas2image', registration_type: str = 'SyN',
+                         save_registered_image: bool = True, save_transforms: bool = False) -> None:
+        """运行完整流程"""
         results = self.register(mode, registration_type)
-        # 保存配准结果
-        self.save_registration_results(results, save_transforms)
-        # 清理临时文件
-        self._cleanup_temp_files(results['transforms'])
-    
-    def _cleanup_temp_files(self, transforms: dict) -> None:
-        """清理临时文件"""
-        # 清理变换文件
-        for transform in transforms.get('fwdtransforms', []):
-            if os.path.exists(transform):
-                os.remove(transform)
-        for transform in transforms.get('invtransforms', []):
-            if os.path.exists(transform):
-                os.remove(transform)
+        self.save_registration_results(results, save_transforms, save_registered_image)
         
-        # 清理临时NIfTI文件
-        if self.target_path.is_dir():
-            temp_nifti = self.target_path / "temp_volume.nii.gz"
-            if temp_nifti.exists():
-                temp_nifti.unlink()
+        if mode == 'atlas2image':
+            self.check_and_run_density_analysis(results)
 
 
 def main():
     import argparse
-    import json
     
     parser = argparse.ArgumentParser(description="Bidirectional registration between Allen atlas and LSFM images")
-    parser.add_argument('--target', required=True, 
-                       help='Target image path (folder with TIFFs or .nii.gz file)')
-    parser.add_argument('--atlas_image', required=True,
-                       help='Allen atlas image path')
-    parser.add_argument('--atlas_label', required=True,
-                       help='Allen atlas label path')
-    parser.add_argument('--register_channel', required=True,
-                       help='Channel used for registration')
-    parser.add_argument('--mode', default='atlas2image',
-                       choices=['atlas2image', 'image2atlas'],
-                       help='Registration direction')
-    parser.add_argument('--registration_type', default='SyN',
-                       choices=['Rigid', 'Affine', 'SyN', 'SyNRA'],
-                       help='Registration type')
-    parser.add_argument('--upsample_method', default='nearest',
-                       choices=['nearest', 'linear', 'cubic', 'quintic'],
-                       help='Upsampling interpolation method')
-    parser.add_argument('--chunk_size', type=int, default=50,
-                       help='Number of slices per chunk for upsampling')
-    parser.add_argument('--save_transforms', action='store_true',
-                       help='Save transformation files')
+    parser.add_argument('--target_channel', required=True, help='Target channel')
+    parser.add_argument('--sample_dir', required=True, help='Sample root directory')
+    parser.add_argument('--atlas_image', required=True, help='Allen atlas image path')
+    parser.add_argument('--atlas_label', required=True, help='Allen atlas label path')
+    parser.add_argument('--register_channel', required=True, help='Registration channel')
+    parser.add_argument('--save_registered_image', action='store_true', help='Save registered image')
+    parser.add_argument('--mode', default='atlas2image', choices=['atlas2image', 'image2atlas'], help='Direction')
+    parser.add_argument('--registration_type', default='SyN', choices=['Rigid', 'Affine', 'SyN', 'SyNRA'])
+    parser.add_argument('--upsample_method', default='nearest', choices=['nearest', 'linear', 'cubic', 'quintic'])
+    parser.add_argument('--chunk_size', type=int, default=50, help='Chunk size for upsampling')
+    parser.add_argument('--save_transforms', action='store_true', help='Save transforms')
+    parser.add_argument('--density_cfg', help='Density analysis config path')
     
     args = parser.parse_args()
     
-    # 读取原始形状信息（如果提供）
+    # Load original shape if exists
     original_shape = None
-    origin_shape_path = Path(args.target).parent / 'original_shape.json'
+    origin_shape_path = Path(args.sample_dir) / 'original_shape.json'
     if origin_shape_path.exists():
         with open(origin_shape_path, 'r') as f:
-            config = json.load(f)
-            original_shape = tuple(config['original_shape'])  # [z, y, x]
+            original_shape = tuple(json.load(f)['original_shape'])
     else:
-        print(f'Warning: {origin_shape_path} not found. Skipping original shape upsampling.')
+        print(f'Warning: {origin_shape_path} not found. Skipping upsampling.')
     
-    # 创建配准器并运行
     registrator = BidirectionalRegistration(
-        args.atlas_image, 
-        args.atlas_label,
-        args.target,
-        args.register_channel,
-        original_shape
+        args.sample_dir, args.target_channel, args.atlas_image, args.atlas_label,
+        args.register_channel, original_shape, args.density_cfg
     )
     
     registrator.run_full_pipeline(
-        args.mode,
-        args.registration_type,
-        args.upsample_method,
-        args.chunk_size,
-        args.save_transforms
+        args.mode, args.registration_type, args.save_registered_image, args.save_transforms
     )
 
 
