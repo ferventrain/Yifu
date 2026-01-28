@@ -1,0 +1,23 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.idea/
+.vscode/
+.git/
+.gitignore
+.trae/
+dask-scratch-space/
+dask_worker_logs*/
+*.log
+# Exclude large data files, assuming they should be mounted
+Allen_brainatlas/
+*.nii.gz
+*.tiff

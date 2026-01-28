@@ -90,7 +90,7 @@ def main():
     parser.add_argument('--input_zarr', required=True, help='Path to input .zarr directory')
     parser.add_argument('--output_zarr', required=True, help='Path for output .zarr directory')
     parser.add_argument('--output_tiff', help='Optional path to export results as TIFF stack')
-    parser.add_argument('--model', default='cyto3', help='Cellpose model type')
+    parser.add_argument('--pretrained_model', default='cyto3', help='Cellpose pretrained model')
     parser.add_argument('--diameter', type=float, default=30.0, help='Cell diameter')
     parser.add_argument('--block_size', type=str, default="128,256,256", help='Block size z,y,x')
     parser.add_argument('--workers', type=int, default=4, help='Number of dask workers')
@@ -109,7 +109,7 @@ def main():
     run_distributed_segmentation(
         args.input_zarr,
         args.output_zarr,
-        pretrained_model=args.model,
+        pretrained_model=args.pretrained_model,
         diameter=int(args.diameter), # Cast to int to avoid float slice indices error in distributed_segmentation
         block_size=block_size,
         n_workers=args.workers,
