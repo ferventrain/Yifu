@@ -45,10 +45,41 @@ class CellposeSegmentor(BaseSegmentor):
         binary_masks = [(m > 0).astype(np.uint8) for m in masks]
         return binary_masks
 
+    def run_test(self, test_size=(64, 64, 64)):
+        """
+        Run a quick test segmentation on a dummy volume to verify model loading and GPU usage.
+        """
+        print(f"\n--- Running Cellpose Test (Size: {test_size}) ---")
+        
+        # Create random noise image (simulate cell-like blobs?)
+        # Just random noise is enough to test if model runs
+        test_img = np.random.randint(0, 255, test_size, dtype=np.uint8)
+        
+        print(f"Test Image Shape: {test_img.shape}")
+        
+        try:
+            # Run inference
+            print("Running inference...")
+            masks, flows, styles = self.model.eval(
+                test_img,
+                diameter=self.diameter,
+                do_3D=True,
+                z_axis=0,
+                progress=True
+            )
+            
+            print(f"Inference successful. Mask shape: {masks.shape}, Max label: {masks.max()}")
+            print("--- Test Complete ---\n")
+            return True
+        except Exception as e:
+            print(f"Test failed: {e}")
+            return False
+
 def main():
     parser = argparse.ArgumentParser(description="3D Segmentation with Sliding Window")
-    parser.add_argument('--sample_dir', required=True, help='Root directory of the sample')
-    parser.add_argument('--channel', required=True, help='Channel name (e.g., "0" for ch0)')
+    parser.add_argument('--test', action='store_true', help='Run a quick test on dummy data and exit')
+    parser.add_argument('--sample_dir', help='Root directory of the sample')
+    parser.add_argument('--channel', help='Channel name (e.g., "0" for ch0)')
     parser.add_argument('--patch_size', type=str, default="128,256,256", help='Patch size in Z,Y,X (comma separated)')
     parser.add_argument('--overlap', type=float, default=0.2, help='Overlap fraction (0-1)')
     
@@ -61,8 +92,24 @@ def main():
     parser.add_argument('--diameter', type=float, default=30.0, help='Cell diameter (Cellpose)')
     parser.add_argument('--pretrained_model', type=str, default='cyto3', help='Pretrained model name (Cellpose)')  
     
-    args = parser.parse_args()
+    # Allow partial args if testing
+    args, unknown = parser.parse_known_args()
     
+    # Initialize Segmentor (needed for test too)
+    # We need to handle defaults if args are missing during test
+    if args.model_provider == 'cellpose':
+        segmentor = CellposeSegmentor(
+            pretrained_model=args.pretrained_model,
+            diameter=args.diameter
+        )
+    
+    if args.test:
+        segmentor.run_test()
+        return
+
+    if not args.sample_dir or not args.channel:
+        parser.error("--sample_dir and --channel are required unless --test is set")
+        
     sample_dir = Path(args.sample_dir)
     channel = args.channel
     

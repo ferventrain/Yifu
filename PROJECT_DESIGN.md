@@ -49,6 +49,7 @@
 
 ### 3.2 分割模块 (`/segmentation`)
 *   **输入**: Zarr 数组 (或 TIFF 栈)。
+*   **输出**: 分割结果 Mask (Zarr 格式)。
 *   **功能**:
     *   在 3D 空间中检测并分割细胞/细胞核。
     *   **可插拔架构**: 支持通过 Config 切换不同的分割核心 (如 Cellpose, Spotiflow, StarDist)。
