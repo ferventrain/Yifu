@@ -27,14 +27,24 @@ class BidirectionalRegistration:
                  atlas_image_path: str, 
                  atlas_label_path: str,
                  register_channel: str,
-                 original_shape: Tuple[int, int, int],
+                 original_shape: Optional[Tuple[int, int, int]] = None,
                  density_cfg_path: Optional[str] = None):
         
         self.sample_dir = Path(sample_dir)
         self.target_channel = target_channel
         self.register_channel = register_channel
-        self.original_shape = original_shape
         
+        # Try to infer original shape if not provided
+        if original_shape is None:
+            self.original_shape = self._infer_original_shape()
+        else:
+            self.original_shape = original_shape
+            
+        if self.original_shape is None:
+            print("Warning: Could not determine original shape. Upsampling will be skipped/fail.")
+        else:
+            print(f"Original shape determined: {self.original_shape}")
+
         # Load Atlas
         self.atlas_image = ants.image_read(atlas_image_path)
         self.atlas_label = ants.image_read(atlas_label_path)
@@ -59,6 +69,31 @@ class BidirectionalRegistration:
         
         # Density Config
         self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'add_id_ytw.json')
+
+    def _infer_original_shape(self) -> Optional[Tuple[int, int, int]]:
+        """Try to infer original shape from raw TIFF files"""
+        print("Attempting to infer original shape from raw data...")
+        
+        # Try target channel folder first, then register channel folder
+        possible_folders = [
+            self.sample_dir / f"ch{self.target_channel}",
+            self.sample_dir / f"ch{self.register_channel}"
+        ]
+        
+        for folder in possible_folders:
+            if folder.exists() and folder.is_dir():
+                tiff_files = sorted(list(folder.glob("*.tif*")))
+                if tiff_files:
+                    try:
+                        first_img = tifffile.imread(str(tiff_files[0]))
+                        # Shape is (Z, Y, X)
+                        shape = (len(tiff_files),) + first_img.shape
+                        print(f"Found raw data in {folder}. Inferred shape: {shape}")
+                        return shape
+                    except Exception as e:
+                        print(f"Error reading {folder}: {e}")
+        
+        return None
 
     def _find_and_load_target_image(self) -> Optional[ants.ANTsImage]:
         """查找并加载目标图像"""
@@ -224,8 +259,8 @@ class BidirectionalRegistration:
                              method: str = 'nearest', chunk_size: int = 50) -> None:
         """分块上采样标签图像"""
         output_path = Path(output_dir)
-        tiff_output = output_path / f"{self.target_channel}_upsampled_label"
-        tiff_output.mkdir(parents=True, exist_ok=True)
+        # Ensure we are saving directly to output_dir, not a subdir
+        output_path.mkdir(parents=True, exist_ok=True)
         
         label_array = label_image.numpy()
         current_shape = label_array.shape
@@ -252,7 +287,7 @@ class BidirectionalRegistration:
             # Save slices
             for i in range(upsampled_chunk.shape[0]):
                 tifffile.imwrite(
-                    str(tiff_output / f"label_{output_slice_idx:06d}.tiff"),
+                    str(output_path / f"label_{output_slice_idx:06d}.tiff"),
                     upsampled_chunk[i],
                     compression='lzw'
                 )
@@ -260,7 +295,7 @@ class BidirectionalRegistration:
             
             del chunk, upsampled_chunk
             
-        print(f"Saved {output_slice_idx} slices to {tiff_output}")
+        print(f"Saved {output_slice_idx} slices to {output_path}")
 
     def save_registration_results(self, results: Dict, save_transforms: bool = False, 
                                 save_registered_image: bool = False) -> None:
@@ -271,7 +306,8 @@ class BidirectionalRegistration:
         if results.get('warped_label') is not None:
             if mode == 'atlas2image':
                 # Upsample atlas label to original space
-                label_dir = self.sample_dir / f"{self.target_channel}_atlas_label_upsampled"
+                # Save directly to sample_dir/chX_upsampled_label
+                label_dir = self.sample_dir / f"ch{self.target_channel}_upsampled_label"
                 self.upsample_label_chunked(results['warped_label'], str(label_dir))
             else:
                 # Save warped mask (already in atlas space)
@@ -330,8 +366,9 @@ class BidirectionalRegistration:
         results = self.register(mode, registration_type)
         self.save_registration_results(results, save_transforms, save_registered_image)
         
-        if mode == 'atlas2image':
-            self.check_and_run_density_analysis(results)
+        # Density analysis is now handled by main.py
+        # if mode == 'atlas2image':
+        #     self.check_and_run_density_analysis(results)
 
 
 def main():

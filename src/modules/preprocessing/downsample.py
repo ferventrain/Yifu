@@ -6,7 +6,7 @@ from typing import Tuple, List, Optional
 import numpy as np
 from tqdm import tqdm
 import tifffile
-import SimpleITK as sitk
+import nibabel as nib
 from scipy import ndimage
 
 
@@ -200,10 +200,29 @@ class ImageDownsampler:
 
     def _save_as_nifti(self, volume: np.ndarray, output_path: Path) -> None:
         """Save numpy array as NIfTI with correct spacing."""
-        sitk_image = sitk.GetImageFromArray(volume)
-        # SITK expects spacing in (x, y, z)
-        sitk_image.SetSpacing(tuple(self.target_resolution))
-        sitk.WriteImage(sitk_image, str(output_path), useCompression=True)
+        # Nibabel expects (x, y, z) for NIfTI usually, but numpy is (z, y, x).
+        # We need to transpose to (x, y, z) for nibabel to match standard orientation
+        # Or we set the affine correctly. 
+        # Standard: array index (k, j, i) -> (z, y, x). 
+        # NIfTI affine usually maps (i, j, k) -> (x, y, z).
+        # So we transpose volume from (z, y, x) to (x, y, z)
+        
+        volume_xyz = np.transpose(volume, (2, 1, 0))
+        
+        # Create affine matrix
+        # Scaling factors on diagonal
+        # spacing is (x, y, z)
+        spacing = self.target_resolution
+        affine = np.eye(4)
+        affine[0, 0] = spacing[0]
+        affine[1, 1] = spacing[1]
+        affine[2, 2] = spacing[2]
+        
+        # Create image
+        nifti_img = nib.Nifti1Image(volume_xyz, affine)
+        
+        # Save
+        nib.save(nifti_img, output_path)
 
 
 def main():

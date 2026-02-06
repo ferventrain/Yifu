@@ -7,16 +7,29 @@ import zarr
 import dask.array as da
 import tifffile
 from tqdm import tqdm
+import warnings
+
+# Silence specific warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.auth")
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.oauth2")
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.api_core")
+
 from cellpose.contrib.distributed_segmentation import distributed_eval, myLocalCluster
 
 def run_distributed_segmentation(input_zarr_path, output_zarr_path, 
                                pretrained_model='cyto3', diameter=30, 
                                block_size=(128, 256, 256),
-                               n_workers=4, gpu=True):
+                               n_workers=4, gpu=True, memory_limit='128GB'):
     
     print(f"Opening Input Zarr: {input_zarr_path}")
     input_zarr = zarr.open(input_zarr_path, mode='r')
-    print(f"Shape: {input_zarr.shape}")
+    
+    # Handle OME-Zarr (Group with '0' dataset)
+    if isinstance(input_zarr, zarr.Group):
+        if '0' in input_zarr:
+            input_zarr = input_zarr['0']
+    
+    print(f"Input Shape: {input_zarr.shape}")
     
     # Setup Dask Cluster
     # Note: ncpus is physical cores per worker. 
@@ -36,7 +49,7 @@ def run_distributed_segmentation(input_zarr_path, output_zarr_path,
         'n_workers': n_workers,
         'ncpus': ncpus_per_worker,
         'threads_per_worker': 1,
-        'memory_limit': '128GB', # Adjust based on your RAM
+        'memory_limit': memory_limit, # Adjust based on your RAM    
     }
     
     # Cellpose Arguments
