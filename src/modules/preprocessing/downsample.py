@@ -16,7 +16,7 @@ class ImageDownsampler:
     def __init__(self, resolution_config_path: Optional[str] = None, manual_factors: Optional[Tuple[float, float, float]] = None):
         """
         Args:
-            resolution_config_path: Path to JSON config containing resolution info
+            resolution_config_path: Path to JSON config (config.json) containing resolution info
             manual_factors: Tuple of (z, y, x) downsample factors. If provided, overrides config.
         """
         self.manual_factors = manual_factors
@@ -36,12 +36,21 @@ class ImageDownsampler:
             with open(self.config_path, 'r') as f:
                 self.config = json.load(f)
                 
-            # Validate config
-            if 'source_resolution' not in self.config or 'target_resolution' not in self.config:
-                raise ValueError("Config must contain 'source_resolution' and 'target_resolution'")
+            # Parse resolution from main config structure (config.json) or legacy resolution.json
+            if 'input' in self.config and 'resolution_xyz' in self.config['input']:
+                self.source_resolution = self.config['input']['resolution_xyz']
+            elif 'source_resolution' in self.config:
+                self.source_resolution = self.config['source_resolution']
+            else:
+                 raise ValueError("Config must contain 'source_resolution' or 'input.resolution_xyz'")
+
+            if 'preprocessing' in self.config and 'downsample' in self.config['preprocessing'] and 'target_resolution_xyz' in self.config['preprocessing']['downsample']:
+                self.target_resolution = self.config['preprocessing']['downsample']['target_resolution_xyz']
+            elif 'target_resolution' in self.config:
+                self.target_resolution = self.config['target_resolution']
+            else:
+                raise ValueError("Config must contain 'target_resolution' or 'preprocessing.downsample.target_resolution_xyz'")
                 
-            self.source_resolution = self.config['source_resolution']  # [x, y, z]
-            self.target_resolution = self.config['target_resolution']  # [x, y, z]
             self.downsample_factors = self._calculate_downsample_factors()
             
             print(f"Loaded config: {self.config}")

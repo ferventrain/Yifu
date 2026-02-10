@@ -16,6 +16,7 @@ import json
 import copy
 from pathlib import Path
 from tqdm import tqdm
+import tifffile
 
 from openpyxl.cell import MergedCell
 from openpyxl.styles import Alignment, Border, Side, Font

@@ -23,15 +23,16 @@ class BidirectionalRegistration:
     
     def __init__(self, 
                  sample_dir: str,
-                 target_channel: str,
+                 signal_channel: str,
                  atlas_image_path: str, 
                  atlas_label_path: str,
                  register_channel: str,
                  original_shape: Optional[Tuple[int, int, int]] = None,
-                 density_cfg_path: Optional[str] = None):
+                 density_cfg_path: Optional[str] = None,
+                 config_path: Optional[str] = None):
         
         self.sample_dir = Path(sample_dir)
-        self.target_channel = target_channel
+        self.signal_channel = signal_channel
         self.register_channel = register_channel
         
         # Try to infer original shape if not provided
@@ -50,21 +51,42 @@ class BidirectionalRegistration:
         self.atlas_label = ants.image_read(atlas_label_path)
         
         # Load Config
-        current_dir = Path(__file__).parent
-        resolution_config_path = current_dir / 'resolution.json'
-        with open(resolution_config_path, 'r') as f:
-            self.config = json.load(f)
-        self.source_resolution = self.config['source_resolution']
-        self.atlas_resolution = self.config['target_resolution']
+        if config_path and os.path.exists(config_path):
+             with open(config_path, 'r') as f:
+                full_config = json.load(f)
+                # Parse resolution from main config structure
+                # Input resolution (Source)
+                self.source_resolution = full_config['input']['resolution_xyz']
+                # Target resolution (Downsample target)
+                self.atlas_resolution = full_config['preprocessing']['downsample']['target_resolution_xyz']
+        else:
+            # Fallback to old behavior if config_path not provided (though we should enforce it)
+            print("Warning: Config path not provided or not found. Falling back to resolution.json (Deprecated).")
+            current_dir = Path(__file__).parent
+            resolution_config_path = current_dir / 'resolution.json'
+            if resolution_config_path.exists():
+                with open(resolution_config_path, 'r') as f:
+                    self.config = json.load(f)
+                self.source_resolution = self.config['source_resolution']
+                self.atlas_resolution = self.config['target_resolution']
+            else:
+                # Absolute fallback default
+                print("Error: No resolution config found. Using defaults.")
+                self.source_resolution = [1.8, 1.8, 2.0]
+                self.atlas_resolution = [25.0, 25.0, 25.0]
+
+        print(f"Source Resolution: {self.source_resolution}")
+        print(f"Target Resolution: {self.atlas_resolution}")
         
         # Load Target Image (used for image2atlas warping)
-        self.target_image = self._find_and_load_target_image()
-        if self.target_image is None:
-            print("No target image or mask found!")
-            return
-
+        # Simplified: We don't load signal channel image by default to reduce dependencies
+        self.target_image = None
+        
         # Load Register Image (downsampled sample)
         reg_img_path = self.sample_dir / f"ch{self.register_channel}_downsample/volume.nii.gz"
+        if not reg_img_path.exists():
+            raise FileNotFoundError(f"Registration image not found at {reg_img_path}. Please run downsampling first.")
+        
         self.register_image = ants.image_read(str(reg_img_path))
         
         # Density Config
@@ -76,7 +98,7 @@ class BidirectionalRegistration:
         
         # Try target channel folder first, then register channel folder
         possible_folders = [
-            self.sample_dir / f"ch{self.target_channel}",
+            self.sample_dir / f"ch{self.signal_channel}",
             self.sample_dir / f"ch{self.register_channel}"
         ]
         
@@ -94,51 +116,6 @@ class BidirectionalRegistration:
                         print(f"Error reading {folder}: {e}")
         
         return None
-
-    def _find_and_load_target_image(self) -> Optional[ants.ANTsImage]:
-        """查找并加载目标图像"""
-        # 优先级：downsample folder -> downsample_mask folder
-        possible_dirs = [
-            self.sample_dir / f"ch{self.target_channel}_downsample",
-            self.sample_dir / f"ch{self.target_channel}_downsample_mask"
-        ]
-        
-        for p in possible_dirs:
-            if p.exists():
-                return self.prepare_target_image(p)
-        return None
-
-    def prepare_target_image(self, target_path: Path) -> ants.ANTsImage:
-        """准备目标图像：优先读取 NIfTI，否则从 TIFF 转换"""
-        nifti_files = ["volume.nii.gz", "mask.nii.gz"]
-        
-        if target_path.is_dir():
-            # Check for existing NIfTI
-            for f in nifti_files:
-                if (target_path / f).exists():
-                    return ants.image_read(str(target_path / f))
-            
-            # Convert TIFF stack
-            print(f"Converting TIFF stack in {target_path} to NIfTI...")
-            volume = self._load_tiff_stack(target_path)
-            temp_nifti = target_path / "volume.nii.gz"
-            
-            # Convert to ANTsImage
-            # volume is (z, y, x), ANTs expects (x, y, z) for from_numpy
-            volume_ants = np.transpose(volume, (2, 1, 0))
-            
-            ants_vol = ants.from_numpy(
-                volume_ants,
-                origin=[0, 0, 0],
-                spacing=self.atlas_resolution,
-                direction=np.eye(3)
-            )
-            
-            ants.image_write(ants_vol, str(temp_nifti))
-            
-            return ants_vol
-        else:
-            return ants.image_read(str(target_path))
     
     def _load_tiff_stack(self, folder_path: Path) -> np.ndarray:
         """加载TIFF栈"""
@@ -239,17 +216,12 @@ class BidirectionalRegistration:
                 **kwargs
             )
             
-            # Apply transform to Target Image (Sample)
-            warped_target = ants.apply_transforms(
-                fixed=self.atlas_image,
-                moving=self.target_image,
-                transformlist=reg_result['fwdtransforms'],
-                interpolator='nearestNeighbor'
-            )
+            # Simplified: Target image warping logic moved to analysis/heatmap program
+            print("Note: Target image warping logic has been moved to the analysis program.")
             
             return {
                 'warped_image': reg_result['warpedmovout'],
-                'warped_label': warped_target, # Here label is the warped target image/mask
+                'warped_label': None,
                 'atlas_label': self.atlas_label,
                 'transforms': reg_result,
                 'mode': mode
@@ -307,11 +279,11 @@ class BidirectionalRegistration:
             if mode == 'atlas2image':
                 # Upsample atlas label to original space
                 # Save directly to sample_dir/chX_upsampled_label
-                label_dir = self.sample_dir / f"ch{self.target_channel}_upsampled_label"
+                label_dir = self.sample_dir / f"ch{self.signal_channel}_upsampled_label"
                 self.upsample_label_chunked(results['warped_label'], str(label_dir))
             else:
                 # Save warped mask (already in atlas space)
-                mask_dir = self.sample_dir / f"ch{self.target_channel}_warped_mask"
+                mask_dir = self.sample_dir / f"ch{self.signal_channel}_warped_mask"
                 # For image2atlas, warped_label is actually the warped sample mask
                 # We need to be careful about dimensions. 
                 # warped_label is an ANTsImage. _save_volume_as_tiff handles it.
@@ -331,26 +303,35 @@ class BidirectionalRegistration:
         if save_transforms and 'transforms' in results:
             transforms_dir = self.sample_dir / "transforms"
             transforms_dir.mkdir(exist_ok=True)
-            for i, transform in enumerate(results['transforms']['fwdtransforms']):
-                if os.path.exists(transform):
-                    shutil.copy(transform, transforms_dir / f"fwd_{i}_{os.path.basename(transform)}")
+            
+            # Save Forward Transforms
+            if 'fwdtransforms' in results['transforms']:
+                for i, transform in enumerate(results['transforms']['fwdtransforms']):
+                    if os.path.exists(transform):
+                        shutil.copy(transform, transforms_dir / f"fwd_{i}_{os.path.basename(transform)}")
+            
+            # Save Inverse Transforms (Crucial for Heatmap/Image2Atlas later)
+            if 'invtransforms' in results['transforms']:
+                for i, transform in enumerate(results['transforms']['invtransforms']):
+                    if os.path.exists(transform):
+                        shutil.copy(transform, transforms_dir / f"inv_{i}_{os.path.basename(transform)}")
 
     def check_and_run_density_analysis(self, results: Dict):
         """检查并运行密度分析"""
-        mask_folder = self.sample_dir / f"ch{self.target_channel}_downsample_mask"
+        mask_folder = self.sample_dir / f"ch{self.signal_channel}_downsample_mask"
         
         if mask_folder.exists() and results.get('warped_label') is not None:
             print(f"\nFound mask folder: {mask_folder}. Starting density analysis...")
             
             # Save downsampled atlas label (registered)
-            downsampled_label_dir = self.sample_dir / f"ch{self.target_channel}_atlas_label_downsampled"
+            downsampled_label_dir = self.sample_dir / f"ch{self.signal_channel}_atlas_label_downsampled"
             self._save_volume_as_tiff(results['warped_label'], downsampled_label_dir, prefix="label")
             
             try:
                 analyzer = BrainDensityAnalyzer(self.density_cfg_path)
                 analysis_results = analyzer.analyze(str(mask_folder), str(downsampled_label_dir))
                 
-                output_excel = self.sample_dir / f"density_analysis_ch{self.target_channel}.xlsx"
+                output_excel = self.sample_dir / f"density_analysis_ch{self.signal_channel}.xlsx"
                 analyzer.write_to_excel(analysis_results, str(output_excel))
                 print(f"Density analysis completed. Saved to {output_excel}")
             except Exception as e:
@@ -375,7 +356,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Bidirectional registration between Allen atlas and LSFM images")
-    parser.add_argument('--target_channel', required=True, help='Target channel')
+    parser.add_argument('--signal_channel', required=True, help='Signal channel (e.g. 0)')
     parser.add_argument('--sample_dir', required=True, help='Sample root directory')
     parser.add_argument('--atlas_image', required=True, help='Allen atlas image path')
     parser.add_argument('--atlas_label', required=True, help='Allen atlas label path')
@@ -387,6 +368,7 @@ def main():
     parser.add_argument('--chunk_size', type=int, default=50, help='Chunk size for upsampling')
     parser.add_argument('--save_transforms', action='store_true', help='Save transforms')
     parser.add_argument('--density_cfg', help='Density analysis config path')
+    parser.add_argument('--config', help='Path to main config.json')
     
     args = parser.parse_args()
     
@@ -400,8 +382,8 @@ def main():
         print(f'Warning: {origin_shape_path} not found. Skipping upsampling.')
     
     registrator = BidirectionalRegistration(
-        args.sample_dir, args.target_channel, args.atlas_image, args.atlas_label,
-        args.register_channel, original_shape, args.density_cfg
+        args.sample_dir, args.signal_channel, args.atlas_image, args.atlas_label,
+        args.register_channel, original_shape, args.density_cfg, args.config
     )
     
     registrator.run_full_pipeline(

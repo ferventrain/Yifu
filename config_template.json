@@ -1,0 +1,54 @@
+{
+    "project_name": "Template",
+    
+    "input": {
+        "description": "Configuration for input data structure",
+        "resolution_xyz": [1.8, 1.8, 2.0],
+        "channels": {
+            "signal": "0",
+            "registration": "1"
+        }
+    },
+    
+    "preprocessing": {
+        "downsample": {
+            "target_resolution_xyz": [25.0, 25.0, 25.0],
+            "chunk_size": 100  
+        },
+        "zarr": {
+            "chunk_size": [128, 256, 256],
+            "compressor": "default"
+        }
+    },
+    
+    "registration": {
+        "method": "ants",
+        "mode": "atlas2image",
+        "atlas_path": "s:/Yifu/Allen_brainatlas/atlas.tiff",
+        "annotation_path": "s:/Yifu/Allen_brainatlas/atlas_label.tiff",
+        "transform_type": "SyN"
+    },
+    
+    "segmentation": {
+        "method": "thresholds", 
+        
+        "cellpose": {
+            "model": "cyto3",
+            "diameter": 30.0,
+            "use_gpu": true,
+            "workers": 4,
+            "block_size": [128, 256, 256]
+        },
+        
+        "threshold": {
+            "value": "1000",
+            "sigma": 0,
+            "min_object_size": 10
+        }
+    },
+    
+    "analysis": {
+        "density_config": "src/modules/registration/add_id_ytw.json",
+        "output_format": "xlsx"
+    }
+}
