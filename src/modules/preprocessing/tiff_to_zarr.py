@@ -7,8 +7,8 @@ import tifffile
 import numpy as np
 from numcodecs import Blosc
 from tqdm import tqdm
-import dask.array as da
-import dask
+# import dask.array as da
+# import dask
 
 def convert_tiff_to_zarr(input_dir, output_zarr, chunk_size=(128, 256, 256), compressor='default'):
     """

@@ -17,15 +17,22 @@ MAX_WORKERS = 32
 
 
 def get_ims_files(path):
-    """Find IMS files in the given path (file or directory)."""
+    """Find IMS files in the given path (file or directory). Supports UNC/NAS paths."""
+    # Normalize path to handle slashes correctly for the OS
+    path = os.path.normpath(path)
+    
     if os.path.isfile(path):
         if path.lower().endswith('.ims'):
             return [path]
         else:
             return []
     elif os.path.isdir(path):
-        files = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith('.ims')]
-        return files
+        try:
+            files = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith('.ims')]
+            return sorted(files)
+        except Exception as e:
+            print(f"Error accessing directory {path}: {e}")
+            return []
     return []
 
 
@@ -188,13 +195,16 @@ def main():
     
     # 1. Input IMS address
     while True:
+        print("\n提示：支持输入本地路径 (如 D:\\Data) 或 NAS 路径 (如 \\\\192.168.110.31\\Yifu\\...)")
         ims_input = input("请输入ims存放地址 (Enter IMS file path or directory): ").strip()
         if ims_input:
+            # Strip quotes if user copied as path with quotes
+            if (ims_input.startswith('"') and ims_input.endswith('"')) or (ims_input.startswith("'") and ims_input.endswith("'")):
+                ims_input = ims_input[1:-1]
+            # Normalize path for Windows/NAS
+            ims_input = os.path.normpath(ims_input)
             break
             
-    if (ims_input.startswith('"') and ims_input.endswith('"')) or (ims_input.startswith("'") and ims_input.endswith("'")):
-        ims_input = ims_input[1:-1]
-        
     ims_files = get_ims_files(ims_input)
     
     if not ims_files:
@@ -206,12 +216,12 @@ def main():
 
     # 2. Input Output address
     while True:
-        output_dir = input("请输入tif想要存放的目标地址 (Enter output directory for TIFFs): ").strip()
+        output_dir = input("请输入tif想要存放的目标地址 (Enter LOCAL output directory): ").strip()
         if output_dir:
+            if (output_dir.startswith('"') and output_dir.endswith('"')) or (output_dir.startswith("'") and output_dir.endswith("'")):
+                output_dir = output_dir[1:-1]
+            output_dir = os.path.normpath(output_dir)
             break
-            
-    if (output_dir.startswith('"') and output_dir.endswith('"')) or (output_dir.startswith("'") and output_dir.endswith("'")):
-        output_dir = output_dir[1:-1]
 
     if not os.path.exists(output_dir):
         try:
@@ -221,29 +231,46 @@ def main():
             print(f"创建目录失败 (Error creating output directory): {e}")
             return
 
-    # 3. Input Channel
+    # 3. Input Channels
+    available_channel_indices = []
     try:
         with h5py.File(ims_files[0], "r") as f:
              if "DataSet" in f and "ResolutionLevel 0" in f["DataSet"] and "TimePoint 0" in f["DataSet"]["ResolutionLevel 0"]:
                  tp0 = f["DataSet"]["ResolutionLevel 0"]["TimePoint 0"]
                  channels = [k for k in tp0.keys() if k.startswith("Channel")]
                  channels.sort(key=lambda x: int(x.split(" ")[1]) if len(x.split(" ")) > 1 else 0)
-                 print(f"第一个文件中可用通道 (Available channels in first file): {channels}")
+                 available_channel_indices = [int(k.split(" ")[1]) for k in channels if len(k.split(" ")) > 1]
+                 print(f"第一个文件中可用通道 (Available channels in first file): {available_channel_indices}")
     except:
         pass
 
+    target_channel_indices = []
     while True:
-        channel_str = input("请输入你想要输出的channel序号 (Enter channel number to export, e.g., 0): ").strip()
-        try:
-            channel_idx = int(channel_str)
+        channel_input = input("请输入想要输出的channel序号 (可输入 'all' 或多个序号如 '0,1,2'): ").strip().lower()
+        if not channel_input:
+            continue
+            
+        if channel_input == 'all':
+            if not available_channel_indices:
+                print("错误: 无法自动获取可用通道。请输入具体序号。")
+                continue
+            target_channel_indices = available_channel_indices
             break
-        except ValueError:
-            print("无效的序号 (Invalid number).")
+        else:
+            try:
+                # Support comma or space separated numbers
+                parts = re.split(r'[,\s]+', channel_input)
+                target_channel_indices = [int(p) for p in parts if p.strip()]
+                if target_channel_indices:
+                    break
+            except ValueError:
+                print("无效的输入。请输入数字序号，如 '0' 或 '0,1,2'。")
 
     # Process
-    print("\n开始转换 (Starting conversion)...")
+    print(f"\n开始转换通道 (Starting conversion for channels: {target_channel_indices})...")
     for ims_file in ims_files:
-        process_ims(ims_file, output_dir, channel_idx)
+        for channel_idx in target_channel_indices:
+            process_ims(ims_file, output_dir, channel_idx)
         
     print("\n所有转换完成! (All done!)")
     # input("按回车键退出 (Press Enter to exit)...") # Commented out for automated run compatibility if needed

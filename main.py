@@ -189,18 +189,25 @@ def main():
         atlas_lbl = reg_cfg['annotation_path']
         # mode = reg_cfg['mode'] # Already loaded above
         
-        cmd = f"python src/modules/registration/ANTs_registration.py \
-            --sample_dir \"{sample_dir}\" \
-            --signal_channel {signal_ch} \
-            --register_channel {reg_ch} \
-            --atlas_image \"{atlas_img}\" \
-            --atlas_label \"{atlas_lbl}\" \
-            --mode {mode} \
-            --save_registered_image \
-            --save_transforms \
-            --config \"{args.config}\""
-            
-        run_command(cmd, "Step 3: ANTs Registration (Atlas -> Image)")
+        # Check if output already exists to avoid re-running
+        # atlas2image produces: ch{signal_ch}_upsampled_label
+        warped_label_dir_check = sample_dir / f"ch{signal_ch}_upsampled_label"
+        
+        if warped_label_dir_check.exists() and any(warped_label_dir_check.iterdir()):
+             print(f"Registration output exists at {warped_label_dir_check}. Skipping Step 3.")
+        else:
+            cmd = f"python src/modules/registration/ANTs_registration.py \
+                --sample_dir \"{sample_dir}\" \
+                --signal_channel {signal_ch} \
+                --register_channel {reg_ch} \
+                --atlas_image \"{atlas_img}\" \
+                --atlas_label \"{atlas_lbl}\" \
+                --mode {mode} \
+                --save_registered_image \
+                --save_transforms \
+                --config \"{args.config}\""
+                
+            run_command(cmd, "Step 3: ANTs Registration (Atlas -> Image)")
 
     # 4. Density Analysis
     if not args.skip_analysis:
