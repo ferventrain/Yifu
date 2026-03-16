@@ -43,177 +43,92 @@ class BrainDensityAnalyzer:
         with open(self.cfg_path, 'r') as f:
             return json.load(f)
     
-    def load_tiff_stack(self, folder_path, file_pattern="*.tif*"):
+    def process_streaming(self, mask_folder, label_folder):
         """
-        Load all TIFF files from a folder and stack them into a 3D array
-        
-        Args:
-            folder_path: Path to folder containing TIFF files
-            file_pattern: Pattern to match TIFF files
-            
-        Returns:
-            3D numpy array (z, y, x)
-        """
-        folder = Path(folder_path)
-        if not folder.exists():
-            raise FileNotFoundError(f"Folder not found: {folder_path}")
-        
-        # Get all TIFF files and sort them
-        tiff_files = sorted(folder.glob(file_pattern))
-        
-        if not tiff_files:
-            raise ValueError(f"No TIFF files found in {folder_path}")
-        
-        print(f"Found {len(tiff_files)} TIFF files in {folder_path}")
-        
-        # Load all images
-        images = []
-        for tiff_file in tqdm(tiff_files, desc="Loading TIFF files"):
-            arr = tifffile.imread(str(tiff_file))
-            images.append(arr)
-        
-        # Stack into 3D array
-        stack = np.array(images)
-        
-        # Handle different dimensions
-        if stack.ndim == 3:
-            return stack
-        elif stack.ndim == 4:
-            # If images are already 3D, reshape
-            return stack.squeeze()
-        else:
-            raise ValueError(f"Unexpected array dimensions: {stack.shape}")
-    
-    def validate_shapes(self, mask_array, label_array):
-        """
-        Validate that mask and label arrays have the same shape
-        
-        Args:
-            mask_array: 3D mask array
-            label_array: 3D label array
-            
-        Returns:
-            True if shapes match
-        """
-        if mask_array.shape != label_array.shape:
-            raise ValueError(f"Shape mismatch! Mask: {mask_array.shape}, Label: {label_array.shape}")
-        
-        print(f"✓ Shape validation passed: {mask_array.shape}")
-        return True
-    
-    def calculate_distribution(self, img):
-        """
-        Calculate pixel value distribution excluding background (0)
-        
-        Args:
-            img: Input image array
-            
-        Returns:
-            Counter object with pixel value counts
-        """
-        res = collections.Counter(img.flatten())
-        if 0 in res:
-            del res[0]
-        return res
-    
-    def update_total_voxels_recur(self, cfg, distribution):
-        """Recursively update total voxels in configuration tree"""
-        if 'total_voxels' not in cfg:
-            cfg['total_voxels'] = 0
-
-        if len(cfg['children']):
-            for child in cfg['children']:
-                cfg['total_voxels'] += self.update_total_voxels_recur(child, distribution)
-        
-        if cfg['id_ytw'] in distribution:
-            cfg['total_voxels'] += distribution[cfg['id_ytw']]
-
-        return cfg['total_voxels']
-    
-    def update_seg_voxels_recur(self, cfg, distribution):
-        """Recursively update segmentation voxels in configuration tree"""
-        if 'seg_voxels' not in cfg:
-            cfg['seg_voxels'] = 0
-
-        if len(cfg['children']):
-            for child in cfg['children']:
-                cfg['seg_voxels'] += self.update_seg_voxels_recur(child, distribution)
-
-        if cfg['id_ytw'] in distribution:
-            cfg['seg_voxels'] += distribution[cfg['id_ytw']]
-
-        return cfg['seg_voxels']
-    
-    def analyse_statistics(self, cfg, res=None):
-        """Analyze statistics for all brain regions"""
-        if res is None:
-            keys = ['Brain regions', 'Acronym', 'Count', 'Total voxels', 'Density']
-            deep_copied_dict = {key: [] for key in keys}
-            res = {key: copy.deepcopy(deep_copied_dict) for key in range(12)}
-
-        level = cfg['st_level']
-        res[level]['Brain regions'].append(cfg['name'])
-        res[level]['Acronym'].append(cfg['acronym'])
-        res[level]['Count'].append(cfg['seg_voxels'])
-        res[level]['Total voxels'].append(cfg['total_voxels'])
-        
-        if cfg['total_voxels'] > 0:
-            res[level]['Density'].append(cfg['seg_voxels'] / cfg['total_voxels'])
-        else:
-            res[level]['Density'].append(0)
-
-        if len(cfg['children']):
-            for child in cfg['children']:
-                self.analyse_statistics(child, res)
-        
-        return res
-    
-    def analyze(self, mask_folder, label_folder):
-        """
-        Main analysis function
+        Stream process mask and label folders slice by slice to save memory.
+        Calculates distributions without loading full volume.
         
         Args:
             mask_folder: Path to mask folder
             label_folder: Path to label folder
             
         Returns:
-            Dictionary with analysis results
+            Tuple(label_distribution, seg_distribution)
+        """
+        mask_path = Path(mask_folder)
+        label_path = Path(label_folder)
+        
+        # Get file lists
+        mask_files = sorted(list(mask_path.glob("*.tif*")))
+        label_files = sorted(list(label_path.glob("*.tif*")))
+        
+        n_mask = len(mask_files)
+        n_label = len(label_files)
+        
+        if n_mask != n_label:
+            print(f"⚠️ Warning: File count mismatch! Mask: {n_mask}, Label: {n_label}")
+            # Determine the common range
+            n_common = min(n_mask, n_label)
+            print(f"⚠️ Truncating/Limiting analysis to the first {n_common} slices.")
+            
+            # Slice the lists to match the minimum length
+            mask_files = mask_files[:n_common]
+            label_files = label_files[:n_common]
+            
+        print(f"Streaming processing {len(mask_files)} slices...")
+        
+        label_dist_total = collections.Counter()
+        seg_dist_total = collections.Counter()
+        
+        for mf, lf in tqdm(zip(mask_files, label_files), total=len(mask_files), desc="Processing Slices"):
+            # Load single slice
+            mask_slice = tifffile.imread(str(mf))
+            label_slice = tifffile.imread(str(lf))
+            
+            # Validate shape (slice level)
+            if mask_slice.shape != label_slice.shape:
+                raise ValueError(f"Slice shape mismatch: {mf.name} {mask_slice.shape} vs {lf.name} {label_slice.shape}")
+                
+            # 1. Update Label Distribution (Total Voxels per Region)
+            # Filter out background (0) if needed, usually label 0 is background
+            lbl_counts = collections.Counter(label_slice.flatten())
+            if 0 in lbl_counts:
+                del lbl_counts[0]
+            label_dist_total.update(lbl_counts)
+            
+            # 2. Update Segmentation Distribution (Signal Voxels per Region)
+            # Mask binary: >0 is signal
+            mask_binary = mask_slice > 0
+            
+            # Get labels where mask is True
+            # This extracts label values only at signal positions
+            signal_labels = label_slice[mask_binary]
+            
+            seg_counts = collections.Counter(signal_labels)
+            if 0 in seg_counts:
+                del seg_counts[0]
+            seg_dist_total.update(seg_counts)
+            
+        return label_dist_total, seg_dist_total
+
+    def analyze(self, mask_folder, label_folder):
+        """
+        Main analysis function
         """
         print("\n" + "="*50)
-        print("Starting Brain Density Analysis")
+        print("Starting Brain Density Analysis (Streaming Mode)")
         print("="*50)
         
-        # **Load mask and label stacks**
-        print("\n📁 Loading mask files...")
-        mask_array = self.load_tiff_stack(mask_folder)
+        # **Stream Process**
+        print("\n🔄 Processing files stream...")
+        label_distribution, seg_distribution = self.process_streaming(mask_folder, label_folder)
         
-        print("\n📁 Loading label files...")
-        label_array = self.load_tiff_stack(label_folder)
-        
-        # **Validate shapes**
-        print("\n🔍 Validating array shapes...")
-        self.validate_shapes(mask_array, label_array)
-        
-        # **Calculate label distribution：每个不同脑区的体积**
-        print("\n📊 Calculating label distribution...")
-        label_distribution = self.calculate_distribution(label_array)
-        print(f"Found {len(label_distribution)} unique brain regions")
+        print(f"\n📊 Found {len(label_distribution)} unique brain regions in atlas")
+        print(f"🧮 Found signal in {len(seg_distribution)} regions")
         
         # **Update total voxels in config**
         cfg_copy = copy.deepcopy(self.cfg)
         self.update_total_voxels_recur(cfg_copy, label_distribution)
-        
-        # **Process mask and calculate segmentation distribution**
-        print("\n🧮 Processing mask and calculating densities...")
-        
-        # Binarize mask (any non-zero value becomes 1)
-        mask_binary = (mask_array != 0).astype(np.uint8)
-        
-        # Apply mask to labels
-        masked_labels = label_array * mask_binary
-        
-        # Calculate segmentation distribution
-        seg_distribution = self.calculate_distribution(masked_labels)
         
         # **Update segmentation voxels in config**
         self.update_seg_voxels_recur(cfg_copy, seg_distribution)

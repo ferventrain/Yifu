@@ -6,7 +6,6 @@ from typing import Optional, Tuple, Union, Dict
 import numpy as np
 import ants
 import tifffile
-from scipy import ndimage
 from tqdm import tqdm
 from analyze_density import BrainDensityAnalyzer
 
@@ -229,45 +228,64 @@ class BidirectionalRegistration:
 
     def upsample_label_chunked(self, label_image: ants.ANTsImage, output_dir: str, 
                              method: str = 'nearest', chunk_size: int = 50) -> None:
-        """分块上采样标签图像"""
+        """分块上采样标签图像 - 强制对齐到原始尺寸"""
         output_path = Path(output_dir)
-        # Ensure we are saving directly to output_dir, not a subdir
         output_path.mkdir(parents=True, exist_ok=True)
         
-        label_array = label_image.numpy()
-        current_shape = label_array.shape
-        print(f"Upsampling from {current_shape} to {self.original_shape}...")
+        label_array = label_image.numpy() # (Z, Y, X) from ANTs numpy (if we transposed earlier? Wait, ants.numpy is (X,Y,Z))
+        # Let's check how we handle ANTs image.
+        # In this class, we often use ants.image_read.
+        # ants.ANTsImage.numpy() returns (X, Y, Z) usually, but let's verify context.
+        # In _save_volume_as_tiff: arr = np.transpose(arr, (1, 0, 2)) -> (Y, X, Z)
         
-        zoom_factors = [t / c for t, c in zip(self.original_shape, current_shape)]
-        order = self.UPSAMPLING_METHODS.get(method, 0)
+        # Here we get label_image directly from ants.apply_transforms
+        # It is an ANTsImage.
+        arr = label_image.numpy()
+        # Transpose to (Z, Y, X) for easier slicing if needed, OR (Z, X, Y)
+        # Standard python convention for 3D volume is (Z, Y, X).
+        # ANTs is (X, Y, Z).
+        # Let's transpose to (Z, Y, X)
+        source_volume = np.transpose(arr, (2, 1, 0)) 
         
-        output_slice_idx = 0
-        num_chunks = (current_shape[0] + chunk_size - 1) // chunk_size
+        source_shape = source_volume.shape
+        target_shape = self.original_shape # (Z, Y, X)
         
-        for chunk_idx in tqdm(range(num_chunks), desc="Upsampling chunks"):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, current_shape[0])
+        print(f"Upsampling from {source_shape} to {target_shape}...")
+        
+        import cv2
+        
+        # Z-axis mapping: For each target slice i, which source slice does it correspond to?
+        # Nearest neighbor mapping
+        # map: target_z -> source_z
+        z_indices = np.round(np.linspace(0, source_shape[0] - 1, target_shape[0])).astype(int)
+        
+        # Process slice by slice (target z)
+        # This is extremely memory efficient and precise
+        for i, source_z in tqdm(enumerate(z_indices), total=len(z_indices), desc="Upsampling slices"):
             
-            chunk = label_array[start_idx:end_idx]
-            upsampled_chunk = ndimage.zoom(chunk, zoom_factors, order=order)
+            # Get the source slice
+            source_slice = source_volume[source_z] # (Y, X)
             
-            if method == 'nearest':
-                upsampled_chunk = np.round(upsampled_chunk).astype(np.uint16)
-            else:
-                upsampled_chunk = upsampled_chunk.astype(np.uint16)
+            # Resize in XY plane to target XY
+            # cv2.resize expects (width, height) -> (target_X, target_Y)
+            # source_slice is (Y, X)
+            target_xy = (target_shape[2], target_shape[1]) # (X, Y)
             
-            # Save slices
-            for i in range(upsampled_chunk.shape[0]):
-                tifffile.imwrite(
-                    str(output_path / f"label_{output_slice_idx:06d}.tiff"),
-                    upsampled_chunk[i],
-                    compression='lzw'
-                )
-                output_slice_idx += 1
+            # Use nearest neighbor for labels
+            resized_slice = cv2.resize(
+                source_slice.astype(np.uint16), 
+                target_xy, 
+                interpolation=cv2.INTER_NEAREST
+            )
             
-            del chunk, upsampled_chunk
+            # Save
+            tifffile.imwrite(
+                str(output_path / f"label_{i:06d}.tiff"),
+                resized_slice,
+                compression='lzw'
+            )
             
-        print(f"Saved {output_slice_idx} slices to {output_path}")
+        print(f"Saved {len(z_indices)} slices to {output_path}")
 
     def save_registration_results(self, results: Dict, save_transforms: bool = False, 
                                 save_registered_image: bool = False) -> None:
