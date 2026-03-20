@@ -5,6 +5,8 @@ import numpy as np
 import tifffile
 from pathlib import Path
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 def parse_filename(filename):
     """
@@ -17,17 +19,41 @@ def parse_filename(filename):
         return match.group(1), match.group(2)
     return None, None
 
-def process_channel_subtraction(root_path):
+def subtract_worker(cx_file, c0_file, output_path, compression='lzw'):
+    """
+    Worker function to perform subtraction for a single image pair.
+    """
+    try:
+        # Load images
+        img_cx = tifffile.imread(str(cx_file))
+        img_c0 = tifffile.imread(str(c0_file))
+        
+        # Ensure same shape
+        if img_cx.shape != img_c0.shape:
+            return f"Error: Shape mismatch for {cx_file.name}"
+        
+        # Perform subtraction: Cx - C0
+        dtype = img_cx.dtype
+        max_val = np.iinfo(dtype).max
+        
+        # Subtract and clip using vectorized numpy operations
+        subtracted = np.clip(img_cx.astype(np.int32) - img_c0.astype(np.int32), 0, max_val).astype(dtype)
+        
+        # Save result
+        tifffile.imwrite(str(output_path), subtracted, compression=compression)
+        return "success"
+    except Exception as e:
+        return f"Error processing {cx_file.name}: {str(e)}"
+
+def process_channel_subtraction(root_path, max_workers=None, compression='lzw'):
     root = Path(root_path)
     if not root.is_dir():
         print(f"Error: {root_path} is not a valid directory.")
         return
 
     # Find the ch0 folder
-    # Looking for a folder that exactly matches "ch0" or starts with "ch0"
     ch0_folders = [f for f in root.iterdir() if f.is_dir() and (f.name == "ch0" or f.name.startswith("ch0_"))]
     if not ch0_folders:
-        # Try any folder with "ch0" in it if the above fails
         ch0_folders = list(root.glob("*ch0*"))
     
     if not ch0_folders:
@@ -50,13 +76,21 @@ def process_channel_subtraction(root_path):
     
     print(f"Found {len(ch0_files)} reference files in {ch0_dir.name}.")
 
+    if max_workers is None:
+        max_workers = max(1, multiprocessing.cpu_count() // 2)
+    
+    # Windows has a limit of 61 for ProcessPoolExecutor's max_workers
+    if os.name == 'nt' and max_workers > 61:
+        print(f"Note: Capping max_workers to 61 due to Windows limitations (original: {max_workers})")
+        max_workers = 61
+    
+    print(f"Using {max_workers} workers for parallel processing.")
+
     # Traverse other folders (excluding ch0 and output folders)
     for folder in root.iterdir():
         if not folder.is_dir() or folder == ch0_dir or folder.name.endswith("_subtracted"):
             continue
         
-        # Determine the target channel folder name
-        # If folder name is "ch1", output is "ch1_subtracted"
         target_subtracted_dir = root / f"{folder.name}_subtracted"
         target_subtracted_dir.mkdir(parents=True, exist_ok=True)
         
@@ -68,48 +102,37 @@ def process_channel_subtraction(root_path):
             print(f"No TIFF files found in {folder.name}, skipping.")
             continue
             
-        for cx_file in tqdm(cx_files, desc=f"Subtracting {folder.name}"):
+        # Prepare tasks
+        tasks = []
+        for cx_file in cx_files:
             _, z_idx = parse_filename(cx_file.name)
-            
             if z_idx in ch0_files:
-                c0_file = ch0_files[z_idx]
-                
-                try:
-                    # Load images
-                    img_cx = tifffile.imread(str(cx_file))
-                    img_c0 = tifffile.imread(str(c0_file))
-                    
-                    # Ensure same shape
-                    if img_cx.shape != img_c0.shape:
-                        print(f"Warning: Shape mismatch for Z{z_idx}: {img_cx.shape} vs {img_c0.shape}. Skipping.")
-                        continue
-                    
-                    # Perform subtraction: Cx - C0
-                    # Use int32 to avoid overflow/underflow, then clip to 0 and original dtype max
-                    # Most TIFFs are uint16 (0-65535) or uint8 (0-255)
-                    dtype = img_cx.dtype
-                    max_val = np.iinfo(dtype).max
-                    
-                    # Subtract and clip
-                    subtracted = np.clip(img_cx.astype(np.int32) - img_c0.astype(np.int32), 0, max_val).astype(dtype)
-                    
-                    # Save result (filename remains the same)
-                    output_path = target_subtracted_dir / cx_file.name
-                    tifffile.imwrite(str(output_path), subtracted, compression='lzw')
-                    
-                except Exception as e:
-                    print(f"Error processing {cx_file.name}: {e}")
-            else:
-                # No matching Z index in ch0
-                # Optionally copy the file or skip
-                # The user says "对每一个Cx-C0对应的图像", so we skip if C0 is missing.
-                pass
+                output_path = target_subtracted_dir / cx_file.name
+                if not output_path.exists(): # Basic resume support
+                    tasks.append((cx_file, ch0_files[z_idx], output_path, compression))
+        
+        # Execute tasks in parallel
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit tasks
+            future_to_file = {executor.submit(subtract_worker, *task): task[0].name for task in tasks}
+            
+            # Use tqdm to monitor progress
+            for future in tqdm(as_completed(future_to_file), total=len(tasks), desc=f"Subtracting {folder.name}"):
+                result = future.result()
+                if result != "success":
+                    print(f"\n{result}")
 
     print("All processing complete.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Subtract ch0 image from other channel images based on Z-index.")
-    parser.add_argument("path", type=str, help="Root path containing channel folders (ch0, ch1, etc.)")
+    parser = argparse.ArgumentParser(description="Parallel subtract ch0 image from other channel images.")
+    parser.add_argument("path", type=str, help="Root path containing channel folders")
+    parser.add_argument("--workers", type=int, default=None, help="Number of parallel processes (default: CPU_COUNT - 1)")
+    parser.add_argument("--compression", type=str, default="lzw", choices=["lzw", "none", "zlib"], help="TIFF compression (default: lzw)")
     
     args = parser.parse_args()
-    process_channel_subtraction(args.path)
+    
+    # Map 'none' to None for tifffile
+    comp = None if args.compression == 'none' else args.compression
+    
+    process_channel_subtraction(args.path, max_workers=args.workers, compression=comp)
