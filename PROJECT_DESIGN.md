@@ -74,6 +74,7 @@
 ### 3.4 工具模块 (`/utils`)
 *   **关键脚本**:
     *   `channel_organizer.py`: 通道组织工具，用于将多通道图像转换为单通道图像。
+    *   `background_subtraction.py`: 背景扣除工具，专门用于**自发荧光通道**，去除散射光背景以辅助配准。
     *   `convert_niigz.py`: 格式转换工具。
     *   `count_mask_pixel.py` / `volume_calculator.py`: 像素统计与体积计算。
     *   `zero_roi_pixels.py`: ROI 区域处理。

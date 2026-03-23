@@ -5,24 +5,12 @@
         "description": "Configuration for input data structure",
         "resolution_xyz": [1.8, 1.8, 2.0],
         "channels": {
-            "signal": "0",
-            "registration": "1"
+            "signal": "1",
+            "registration": "0"
         }
     },
     
     "preprocessing": {
-        "homomorphic_filter": {
-            "apply": false,
-            "rl": 0.5,
-            "rh": 2.0,
-            "c": 1.0,
-            "d0": null
-        },
-        "clahe": {
-            "apply": false,
-            "clip_limit": 2.0,
-            "tile_grid_size": 8
-        },
         "downsample": {
             "target_resolution_xyz": [25.0, 25.0, 25.0],
             "chunk_size": 100  
@@ -55,7 +43,7 @@
         "threshold": {
             "value": "1000",
             "sigma": 0,
-            "min_object_size": 10
+            "min_object_size": 0
         }
     },
     

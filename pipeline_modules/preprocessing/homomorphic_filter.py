@@ -64,7 +64,7 @@ def estimate_d0_adaptive(img, energy_threshold=0.98):
     d0_clamped = np.clip(d0_estimated, lower_bound, upper_bound)
     return d0_clamped
 
-def homomorphic_filter(img, d0=None, rl=0.5, rh=2.0, c=1.0, return_uint8=False):
+def homomorphic_filter(img, d0=None, rl=0.5, rh=2.0, c=1.0, return_uint8=False, verbose=False):
     """
     Apply Homomorphic Filtering to an image.
     
@@ -75,6 +75,7 @@ def homomorphic_filter(img, d0=None, rl=0.5, rh=2.0, c=1.0, return_uint8=False):
     - rh: High frequency gain (gamma_H), usually > 1.
     - c: Sharpness constant.
     - return_uint8: If True, output is clipped to 0-255 uint8.
+    - verbose: If True, print estimated d0 (default: False).
     
     Returns:
     - filtered_img: The enhanced image.
@@ -82,7 +83,8 @@ def homomorphic_filter(img, d0=None, rl=0.5, rh=2.0, c=1.0, return_uint8=False):
     # Auto-estimate d0 if not provided
     if d0 is None:
         d0 = estimate_d0_adaptive(img)
-        print(f"d0: {d0}")
+        if verbose:
+            print(f"d0: {d0}")
     
     # Get original range if it's uint
     orig_dtype = img.dtype

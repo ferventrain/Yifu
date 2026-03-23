@@ -80,6 +80,27 @@ python main.py --config config.json --sample_dir "S:\path\to\sample_folder"
     ├── ch0_downsampled_mask/
     ```
 
+* zero_roi_pixels.py: 将指定 ROI 区域的像素值置零
+    ```
+    python utils/zero_roi_pixels.py --input-folder FOLDER --output-folder OUTPUT --x-min 0 --x-max 100 --y-min 0 --y-max 100
+    ```
+
+* background_subtraction.py: 背景扣除工具
+    * **用途**：专门用于**自发荧光通道**的处理。
+    * **功能**：通过形态学开运算估计并去除散射光背景，从而提升图像对比度，**辅助配准**步骤。
+    * **用法**：
+    ```bash
+    python src/utils/background_subtraction.py "input.tif" "output.tif" --radius 100 --sigma 3.0
+    ```
+
+* homomorphic_filter.py: 同态滤波增强
+    * **功能**：平衡光照不均，增强低对比度区域的信号。
+    * **用法**：由 `main.py` 通过配置文件自动调用。
+
+* clahe_3d.py: 3D 自适应直方图均衡化 (CLAHE)
+    * **功能**：增强图像局部对比度。
+    * **用法**：由 `main.py` 通过配置文件自动调用。
+
 ## 配准 (Registration)
 
 * ANTs_registration.py

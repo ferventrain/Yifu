@@ -15,3 +15,12 @@ Thumbs.db
 # Project specific
 *.log
 *.tmp
+results/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask_vis.png
+results/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask.tiff
+results/spotiflow_results/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410.csv
+SOTA_test/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask_vis.png
+yifu_env.tar.gz
+SOTA_test/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask.tiff
+SOTA_test/spotiflow_results/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410.csv
+results/spotiflow_results/output_mask.tiff
+SOTA_test/spotiflow_results/output_mask.tiff

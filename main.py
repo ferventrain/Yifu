@@ -77,6 +77,8 @@ def main():
     # Preprocessing
     ds_cfg = cfg['preprocessing']['downsample']
     zarr_cfg = cfg['preprocessing']['zarr']
+    homo_cfg = cfg['preprocessing'].get('homomorphic_filter', {'apply': False})
+    clahe_cfg = cfg['preprocessing'].get('clahe', {'apply': False})
     
     # Registration
     reg_cfg = cfg['registration']
@@ -104,13 +106,48 @@ def main():
     mask_zarr_path = sample_dir / f"ch{signal_ch}_mask.zarr"
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask" 
     
-    # 1. Preprocessing (TIFF -> Zarr & Downsampling)
+    # 1. Preprocessing (Enhancement, TIFF -> Zarr & Downsampling)
     if not args.skip_preprocessing:
+        # 1.0 Image Enhancement (Homomorphic Filter / CLAHE)
+        current_signal_tiff_dir = raw_tiff_dir
+        
+        if homo_cfg.get('apply', False):
+            enhanced_dir = sample_dir / f"ch{signal_ch}_homo"
+            if not enhanced_dir.exists():
+                rl = homo_cfg.get('rl', 0.5)
+                rh = homo_cfg.get('rh', 2.0)
+                c = homo_cfg.get('c', 1.0)
+                d0_str = f"--d0 {homo_cfg['d0']}" if homo_cfg.get('d0') else ""
+                
+                cmd = f"python src/modules/preprocessing/homomorphic_filter.py \
+                    --input \"{current_signal_tiff_dir}\" \
+                    --output \"{enhanced_dir}\" \
+                    --rl {rl} --rh {rh} --c {c} {d0_str}"
+                run_command(cmd, "Step 1.0.1: Homomorphic Filtering")
+            else:
+                print(f"Homomorphic enhanced folder exists: {enhanced_dir}")
+            current_signal_tiff_dir = enhanced_dir
+            
+        if clahe_cfg.get('apply', False):
+            clahe_dir = sample_dir / f"ch{signal_ch}_clahe"
+            if not clahe_dir.exists():
+                clip = clahe_cfg.get('clip_limit', 2.0)
+                grid = clahe_cfg.get('tile_grid_size', 8)
+                
+                cmd = f"python src/modules/preprocessing/clahe_3d.py \
+                    --input \"{current_signal_tiff_dir}\" \
+                    --output \"{clahe_dir}\" \
+                    --clip_limit {clip} --tile_grid_size {grid}"
+                run_command(cmd, "Step 1.0.2: CLAHE Enhancement")
+            else:
+                print(f"CLAHE enhanced folder exists: {clahe_dir}")
+            current_signal_tiff_dir = clahe_dir
+
         # 1.1 TIFF to Zarr
         if not zarr_path.exists():
             chunk_str = ",".join(map(str, zarr_cfg['chunk_size']))
             cmd = f"python src/modules/preprocessing/tiff_to_zarr.py \
-                --input \"{raw_tiff_dir}\" \
+                --input \"{current_signal_tiff_dir}\" \
                 --output \"{zarr_path}\" \
                 --chunk_size \"{chunk_str}\""
             run_command(cmd, "Step 1.1: Convert Raw TIFF to Zarr")
