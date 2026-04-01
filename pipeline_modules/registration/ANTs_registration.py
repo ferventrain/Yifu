@@ -7,7 +7,6 @@ import numpy as np
 import ants
 import tifffile
 from tqdm import tqdm
-from analyze_density import BrainDensityAnalyzer
 
 
 class BidirectionalRegistration:
@@ -150,19 +149,8 @@ class BidirectionalRegistration:
         """通用配准核心逻辑"""
         print(f"Performing {reg_type} registration...")
         print("--- METADATA VERIFICATION ---")
-        print(f"Fixed Image  | Spacing: {fixed.spacing}, Origin: {fixed.origin}")
-        print(f"Moving Image | Spacing: {moving.spacing}, Origin: {moving.origin}")
-        
-        # 始终将 Sample (register_image) 的直方图匹配到 Atlas
-        # 注意：需要判断哪个是 sample。根据初始化逻辑，self.register_image 是 sample。
-        # 如果 fixed 是 register_image，则它匹配 atlas (moving)。
-        # 如果 moving 是 register_image，则它匹配 atlas (fixed)。
-        
-        # 在原代码中，无论方向如何，都执行了:
-        # self.register_image = ants.histogram_match_image(self.register_image, self.atlas_image)
-        # 这一步应该在调用此函数前或者在此函数内完成，但需要引用 self.register_image
-        
-        # 为了保持原逻辑，我们在外部做 histogram match。
+        print(f"Fixed Image  | Shape: {fixed.shape}, Spacing: {fixed.spacing}, Origin: {fixed.origin}")
+        print(f"Moving Image | Shape: {moving.shape}, Spacing: {moving.spacing}, Origin: {moving.origin}")
         
         return ants.registration(
             fixed=fixed,
@@ -251,6 +239,7 @@ class BidirectionalRegistration:
         target_shape = self.original_shape # (Z, Y, X)
         
         print(f"Upsampling from {source_shape} to {target_shape}...")
+        print(f"Debug: ANTs raw shape = {arr.shape}, after transpose = {source_volume.shape}")
         
         import cv2
         
@@ -396,8 +385,9 @@ def main():
     if origin_shape_path.exists():
         with open(origin_shape_path, 'r') as f:
             original_shape = tuple(json.load(f)['original_shape'])
+        print(f'Loaded original shape from {origin_shape_path}: {original_shape}')
     else:
-        print(f'Warning: {origin_shape_path} not found. Skipping upsampling.')
+        print(f'Info: {origin_shape_path} not found. Will infer original shape from raw data.')
     
     registrator = BidirectionalRegistration(
         args.sample_dir, args.signal_channel, args.atlas_image, args.atlas_label,

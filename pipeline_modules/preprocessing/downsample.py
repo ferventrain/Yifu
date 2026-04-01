@@ -124,8 +124,8 @@ class ImageDownsampler:
             json.dump({'original_shape': original_shape}, f)
             
         # Choose interpolation method
-        # order=0 is nearest neighbor (for masks), order=1 is linear (for images)
-        interp_order = 0 if is_mask else 1
+        # Always use nearest neighbor for both images and masks
+        interp_order = 0
         
         # Process in chunks
         all_downsampled_slices = []
@@ -186,7 +186,8 @@ class ImageDownsampler:
             
         print(f"Original shape: {volume.shape}")
         
-        interp_order = 0 if is_mask else 1
+        # Always use nearest neighbor for both images and masks
+        interp_order = 0
         
         downsampled_volume = ndimage.zoom(
             volume,

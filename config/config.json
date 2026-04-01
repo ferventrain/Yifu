@@ -24,11 +24,10 @@
     "registration": {
         "method": "ants",
         "mode": "atlas2image",
-        "atlas_path": "s:/Yifu/Allen_brainatlas/atlas.tiff",
-        "annotation_path": "s:/Yifu/Allen_brainatlas/atlas_label.tiff",
+        "atlas_path": "S:\\Yifu\\data\\reference\\atlas.tiff",
+        "annotation_path": "S:\\Yifu\\data\\reference\\atlas_label.tiff",
         "transform_type": "SyN"
     },
-    
     "segmentation": {
         "method": "threshold", 
         
@@ -48,7 +47,7 @@
     },
     
     "analysis": {
-        "density_config": "src/modules/registration/add_id_ytw.json",
+        "density_config": "Region_Csv_Rev1_updated.CSV",
         "output_format": "xlsx"
     }
 }

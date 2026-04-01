@@ -90,12 +90,19 @@ def main():
     
     # Analysis
     analysis_cfg = cfg['analysis']
-    density_cfg_path = analysis_cfg.get('density_config', 'src/modules/registration/add_id_ytw.json')
+    density_cfg_raw = analysis_cfg.get('density_config', 'pipeline_modules/registration/add_id_ytw.json')
+    density_cfg_path = Path(density_cfg_raw)
+    if not density_cfg_path.is_absolute():
+        density_cfg_path = project_root / density_cfg_path
+    if not density_cfg_path.exists():
+        fallback_density_cfg = project_root / "pipeline_modules" / "registration" / "add_id_ytw.json"
+        if fallback_density_cfg.exists():
+            density_cfg_path = fallback_density_cfg
 
     # --- TEST MODE ---
     if args.test:
         print("Running Pipeline in TEST Mode...")
-        cmd = "python src/modules/segmentation/cellpose_dis.py --test"
+        cmd = "python pipeline_modules/segmentation/cellpose_distributed.py --test"
         run_command(cmd, "Test 1: Cellpose Model Check")
         return
     # -----------------
@@ -119,7 +126,7 @@ def main():
                 c = homo_cfg.get('c', 1.0)
                 d0_str = f"--d0 {homo_cfg['d0']}" if homo_cfg.get('d0') else ""
                 
-                cmd = f"python src/modules/preprocessing/homomorphic_filter.py \
+                cmd = f"python pipeline_modules/preprocessing/homomorphic_filter.py \
                     --input \"{current_signal_tiff_dir}\" \
                     --output \"{enhanced_dir}\" \
                     --rl {rl} --rh {rh} --c {c} {d0_str}"
@@ -134,7 +141,7 @@ def main():
                 clip = clahe_cfg.get('clip_limit', 2.0)
                 grid = clahe_cfg.get('tile_grid_size', 8)
                 
-                cmd = f"python src/modules/preprocessing/clahe_3d.py \
+                cmd = f"python pipeline_modules/preprocessing/clahe_3d.py \
                     --input \"{current_signal_tiff_dir}\" \
                     --output \"{clahe_dir}\" \
                     --clip_limit {clip} --tile_grid_size {grid}"
@@ -146,7 +153,7 @@ def main():
         # 1.1 TIFF to Zarr
         if not zarr_path.exists():
             chunk_str = ",".join(map(str, zarr_cfg['chunk_size']))
-            cmd = f"python src/modules/preprocessing/tiff_to_zarr.py \
+            cmd = f"python pipeline_modules/io/tiff_to_zarr.py \
                 --input \"{current_signal_tiff_dir}\" \
                 --output \"{zarr_path}\" \
                 --chunk_size \"{chunk_str}\""
@@ -173,7 +180,7 @@ def main():
                 
                 print(f"Calculated downsample factors (z,y,x): {factor_str} from config")
                 
-                cmd = f"python src/modules/preprocessing/downsample.py --input_folder \"{sample_dir}/ch{reg_ch}\" --factor \"{factor_str}\""
+                cmd = f"python pipeline_modules/preprocessing/downsample.py --input_folder \"{sample_dir}/ch{reg_ch}\" --factor \"{factor_str}\""
             except Exception as e:
                 print(f"Error calculating downsample factors from config: {e}")
                 print("Config content:", cfg)
@@ -182,6 +189,14 @@ def main():
             run_command(cmd, "Step 1.2: Downsample Registration Channel")
 
     # 2. Segmentation
+    # Auto-skip segmentation if mask folder already exists (external segmentation)
+    if mask_tiff_dir.exists() and any(mask_tiff_dir.iterdir()):
+        print(f"Found existing mask folder at {mask_tiff_dir}, skipping segmentation.")
+        args.skip_segmentation = True
+    elif mask_zarr_path.exists() and not mask_tiff_dir.exists():
+        print(f"Found existing mask Zarr at {mask_zarr_path}, will export to TIFF but skip segmentation.")
+        args.skip_segmentation = True
+    
     if not args.skip_segmentation:
         if not mask_zarr_path.exists():
             
@@ -191,7 +206,7 @@ def main():
                 model = cp_cfg['model']
                 diameter = cp_cfg['diameter']
                 
-                cmd = f"python src/modules/segmentation/cellpose_distributed.py \
+                cmd = f"python pipeline_modules/segmentation/cellpose_distributed.py \
                     --input_zarr \"{zarr_path}\" \
                     --output_zarr \"{mask_zarr_path}\" \
                     --workers {workers} \
@@ -203,7 +218,7 @@ def main():
                 thresh_val = th_cfg['value']
                 sigma = th_cfg['sigma']
                 
-                cmd = f"python src/modules/segmentation/intensity_threshold_segmentor.py \
+                cmd = f"python pipeline_modules/segmentation/intensity_threshold_segmentor.py \
                     --input_zarr \"{zarr_path}\" \
                     --output_zarr \"{mask_zarr_path}\" \
                     --threshold {thresh_val} \
@@ -217,7 +232,7 @@ def main():
         # Export Mask Zarr to TIFF
         if not mask_tiff_dir.exists():
             print(f"Exporting Mask Zarr to TIFF folder: {mask_tiff_dir}")
-            cmd = f"python -c \"from src.modules.segmentation.cellpose_distributed import export_zarr_to_tiff; export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
+            cmd = f"python -c \"from pipeline_modules.segmentation.cellpose_distributed import export_zarr_to_tiff; export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
             run_command(cmd, "Step 2.2: Export Mask Zarr to TIFF")
 
     # 3. Registration (ANTs)
@@ -233,7 +248,7 @@ def main():
         if warped_label_dir_check.exists() and any(warped_label_dir_check.iterdir()):
              print(f"Registration output exists at {warped_label_dir_check}. Skipping Step 3.")
         else:
-            cmd = f"python src/modules/registration/ANTs_registration.py \
+            cmd = f"python pipeline_modules/registration/ANTs_registration.py \
                 --sample_dir \"{sample_dir}\" \
                 --signal_channel {signal_ch} \
                 --register_channel {reg_ch} \
@@ -260,14 +275,16 @@ def main():
 
         if not mask_tiff_dir.exists():
              print(f"Exporting Mask Zarr to TIFF folder: {mask_tiff_dir}")
-             cmd = f"python -c \"from src.modules.segmentation.cellpose_distributed import export_zarr_to_tiff; export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
+             cmd = f"python -c \"from pipeline_modules.segmentation.cellpose_distributed import export_zarr_to_tiff; export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
              run_command(cmd, "Step 2.2: Export Mask Zarr to TIFF")
         
+        raw_signal_dir = sample_dir / f"ch{signal_ch}"
         output_excel = sample_dir / f"density_results_ch{signal_ch}.xlsx"
-        
-        cmd = f"python src/modules/registration/analyze_density.py \
-            --mask_folder \"{mask_tiff_dir}\" \
-            --label_folder \"{label_folder_arg}\" \
+
+        cmd = f"python pipeline_modules/registration/region_signal_analysis.py \
+            --mask_path \"{mask_tiff_dir}\" \
+            --label_path \"{label_folder_arg}\" \
+            --signal_path \"{raw_signal_dir}\" \
             --cfg \"{density_cfg_path}\" \
             --output \"{output_excel}\""
             

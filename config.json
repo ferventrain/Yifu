@@ -48,7 +48,7 @@
     },
     
     "analysis": {
-        "density_config": "src/modules/registration/add_id_ytw.json",
+        "density_config": "pipeline_modules/registration/add_id_ytw.json",
         "output_format": "xlsx"
     }
 }

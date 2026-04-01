@@ -1,5 +1,6 @@
 import h5py
 import os
+import re
 import tifffile
 import time
 import sys
