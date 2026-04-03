@@ -65,6 +65,9 @@ def convert_tiff_to_nifti_with_spacing(
         # 堆叠后数组的维度顺序是 (Z, Y, X)
         numpy_array = np.stack(image_slices, axis=0)
         print(f"成功创建NumPy数组, 形状为 (Z, Y, X): {numpy_array.shape}")
+        # Flip Z axis to correct orientation
+        # numpy_array = np.flip(numpy_array, axis=0)
+        # print(f"Z轴已翻转，翻转后形状仍为 (Z, Y, X): {numpy_array.shape}")
 
     except Exception as e:
         print(f"读取图像时发生错误: {e}")
@@ -99,13 +102,13 @@ def convert_tiff_to_nifti_with_spacing(
 
 #    - 如果是单个3D TIFF文件, 写完整的文件路径, 例如: Path("data/atlas/allen_atlas.tif")
 #    - 如果是包含多个2D切片的文件夹, 写文件夹的路径, 例如: Path("data/atlas_slices/")
-INPUT_PATH = Path(r"S:\Yifu\Allen_brainatlas\atlas_mask.tiff") 
+INPUT_PATH = Path(r"S:\Yifu\data\reference\atlas.tiff") 
 
 # 2. 设置输出路径
-OUTPUT_PATH = Path(r"S:\Yifu\Allen_brainatlas\atlas_mask.nii.gz")
+OUTPUT_PATH = Path(r"S:\Yifu\data\reference\atlas.nii.gz")
 
 # 3. 设置你的Atlas的物理间距 (Spacing)
-ATLAS_SPACING = (0.025, 0.025, 0.025) 
+ATLAS_SPACING = (1.0, 1.0, 1.0) 
 
 # --- 主程序入口 ---
 if __name__ == "__main__":

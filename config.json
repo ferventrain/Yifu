@@ -26,7 +26,8 @@
         "mode": "atlas2image",
         "atlas_path": "s:/Yifu/Allen_brainatlas/atlas.tiff",
         "annotation_path": "s:/Yifu/Allen_brainatlas/atlas_label.tiff",
-        "transform_type": "SyN"
+        "transform_type": "SyN",
+        "allow_reflection": false
     },
     
     "segmentation": {

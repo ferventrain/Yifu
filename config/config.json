@@ -16,7 +16,7 @@
             "chunk_size": 100  
         },
         "zarr": {
-            "chunk_size": [128, 256, 256],
+            "chunk_size": [256, 512, 512],
             "compressor": "default"
         }
     },
@@ -24,9 +24,10 @@
     "registration": {
         "method": "ants",
         "mode": "atlas2image",
-        "atlas_path": "S:\\Yifu\\data\\reference\\atlas.tiff",
-        "annotation_path": "S:\\Yifu\\data\\reference\\atlas_label.tiff",
-        "transform_type": "SyN"
+        "atlas_path": "S:\\Yifu\\data\\reference\\atlas.nii.gz",
+        "annotation_path": "S:\\Yifu\\data\\reference\\atlas_label.nii.gz",
+        "transform_type": "SyN",
+        "allow_reflection": false
     },
     "segmentation": {
         "method": "threshold", 
@@ -36,7 +37,7 @@
             "diameter": 30.0,
             "use_gpu": true,
             "workers": 4,
-            "block_size": [128, 256, 256]
+            "block_size": [256, 512, 512]
         },
         
         "threshold": {
@@ -47,7 +48,7 @@
     },
     
     "analysis": {
-        "density_config": "Region_Csv_Rev1_updated.CSV",
+        "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
         "output_format": "xlsx"
     }
 }

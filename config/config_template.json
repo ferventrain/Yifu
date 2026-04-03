@@ -11,12 +11,25 @@
     },
     
     "preprocessing": {
-        "homomorphic_filter": {
+        "channel_subtraction": {
             "apply": false,
-            "rl": 0.5,
-            "rh": 2.0,
-            "c": 1.0,
-            "d0": null
+            "background_channel": "ch0",
+            "weight": 1.0,
+            "adaptive": true,
+            "save_plots": true,
+            "sample_ratio": 0.005,
+            "min_samples": 10,
+            "max_samples": 50,
+            "compression": "lzw"
+        },
+        "tophat": {
+            "apply": false,
+            "kernel_size": 21
+        },
+        "scattering_removal": {
+            "apply": false,
+            "sigma": 50.0,
+            "weight": 1.0
         },
         "clahe": {
             "apply": false,
@@ -38,7 +51,8 @@
         "mode": "atlas2image",
         "atlas_path": "s:/Yifu/Allen_brainatlas/atlas.tiff",
         "annotation_path": "s:/Yifu/Allen_brainatlas/atlas_label.tiff",
-        "transform_type": "SyN"
+        "transform_type": "SyN",
+        "allow_reflection": false
     },
     
     "segmentation": {

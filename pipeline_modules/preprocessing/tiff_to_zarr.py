@@ -74,7 +74,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert TIFF folder to Zarr")
     parser.add_argument('--input', required=True, help='Input TIFF folder')
     parser.add_argument('--output', required=True, help='Output .zarr path')
-    parser.add_argument('--chunk_size', default="128,256,256", help='Chunk size z,y,x')
+    parser.add_argument('--chunk_size', default="256,512,512", help='Chunk size z,y,x')
     
     args = parser.parse_args()
     
@@ -82,6 +82,6 @@ if __name__ == "__main__":
         cz, cy, cx = map(int, args.chunk_size.split(','))
         chunk_size = (cz, cy, cx)
     except:
-        chunk_size = (128, 256, 256)
+        chunk_size = (256, 512, 512)
         
     convert_tiff_to_zarr(args.input, args.output, chunk_size)

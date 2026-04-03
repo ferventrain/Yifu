@@ -48,6 +48,13 @@ class BidirectionalRegistration:
         self.atlas_image = ants.image_read(atlas_image_path)
         self.atlas_label = ants.image_read(atlas_label_path)
         
+        # Force direction matrix to identity to avoid flipping/reflection
+        # [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        identity_direction = np.eye(3)
+        self.atlas_image.set_direction(identity_direction)
+        self.atlas_label.set_direction(identity_direction)
+        print("Forced atlas direction matrix to identity (no flipping)")
+        
         # Load Config
         if config_path and os.path.exists(config_path):
              with open(config_path, 'r') as f:
@@ -87,8 +94,13 @@ class BidirectionalRegistration:
         
         self.register_image = ants.image_read(str(reg_img_path))
         
+        # Force direction matrix to identity to avoid flipping/reflection
+        identity_direction = np.eye(3)
+        self.register_image.set_direction(identity_direction)
+        print("Forced register image direction matrix to identity (no flipping)")
+        
         # Density Config
-        self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'add_id_ytw.json')
+        self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Region_Csv_Rev1_updated.CSV')
 
     def _infer_original_shape(self) -> Optional[Tuple[int, int, int]]:
         """Try to infer original shape from raw TIFF files"""
@@ -127,20 +139,20 @@ class BidirectionalRegistration:
         
         if isinstance(data, ants.ANTsImage):
             arr = data.numpy()
-            # ANTs numpy is (x, y, z), transpose to (y, x, z) for TIFF
-            arr = np.transpose(arr, (1, 0, 2))
+            # ANTs: (X, Y, Z) -> TIFF: (Z, Y, X)
+            arr = np.transpose(arr, (2, 1, 0))
         else:
             arr = data
             
-        # Ensure 3D (y, x, z)
+        # Ensure 3D (Z, Y, X) - each slice along Z is (Y, X)
         if arr.ndim != 3:
             raise ValueError(f"Expected 3D array, got shape {arr.shape}")
             
         print(f"Saving {prefix} TIFFs to {output_dir} (shape: {arr.shape})...")
-        for i in range(arr.shape[2]):
+        for i in range(arr.shape[0]):
             tifffile.imwrite(
                 str(output_dir / f"{prefix}_{i:04d}.tiff"),
-                arr[:, :, i].astype(np.uint16),
+                arr[i, :, :].astype(np.uint16),
                 compression='lzw'
             )
 
@@ -149,8 +161,9 @@ class BidirectionalRegistration:
         """通用配准核心逻辑"""
         print(f"Performing {reg_type} registration...")
         print("--- METADATA VERIFICATION ---")
-        print(f"Fixed Image  | Shape: {fixed.shape}, Spacing: {fixed.spacing}, Origin: {fixed.origin}")
-        print(f"Moving Image | Shape: {moving.shape}, Spacing: {moving.spacing}, Origin: {moving.origin}")
+        print(f"Fixed Image  | Shape: {fixed.shape}, Spacing: {fixed.spacing}, Origin: {fixed.origin}, Direction: {fixed.direction}")
+        print(f"Moving Image | Shape: {moving.shape}, Spacing: {moving.spacing}, Origin: {moving.origin}, Direction: {moving.direction}")
+        print("Constraining: reflection disabled (orientation is manually aligned)")
         
         return ants.registration(
             fixed=fixed,
@@ -158,6 +171,7 @@ class BidirectionalRegistration:
             type_of_transform=reg_type,
             grad_step=0.1,
             aff_random_sampling_rate=0.5,
+            aff_do_reflection=False,
             **kwargs
         )
 

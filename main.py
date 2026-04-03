@@ -75,10 +75,10 @@ def main():
     reg_ch = cfg['input']['channels']['registration']
     
     # Preprocessing
+    from pipeline_modules.preprocessing.preprocessor import Preprocessor
+    preprocessing_cfg = cfg['preprocessing']
     ds_cfg = cfg['preprocessing']['downsample']
     zarr_cfg = cfg['preprocessing']['zarr']
-    homo_cfg = cfg['preprocessing'].get('homomorphic_filter', {'apply': False})
-    clahe_cfg = cfg['preprocessing'].get('clahe', {'apply': False})
     
     # Registration
     reg_cfg = cfg['registration']
@@ -115,45 +115,29 @@ def main():
     
     # 1. Preprocessing (Enhancement, TIFF -> Zarr & Downsampling)
     if not args.skip_preprocessing:
-        # 1.0 Image Enhancement (Homomorphic Filter / CLAHE)
+        # 1.0 Image Enhancement through configurable preprocessor
         current_signal_tiff_dir = raw_tiff_dir
         
-        if homo_cfg.get('apply', False):
-            enhanced_dir = sample_dir / f"ch{signal_ch}_homo"
-            if not enhanced_dir.exists():
-                rl = homo_cfg.get('rl', 0.5)
-                rh = homo_cfg.get('rh', 2.0)
-                c = homo_cfg.get('c', 1.0)
-                d0_str = f"--d0 {homo_cfg['d0']}" if homo_cfg.get('d0') else ""
-                
-                cmd = f"python pipeline_modules/preprocessing/homomorphic_filter.py \
-                    --input \"{current_signal_tiff_dir}\" \
-                    --output \"{enhanced_dir}\" \
-                    --rl {rl} --rh {rh} --c {c} {d0_str}"
-                run_command(cmd, "Step 1.0.1: Homomorphic Filtering")
-            else:
-                print(f"Homomorphic enhanced folder exists: {enhanced_dir}")
+        preprocessor = Preprocessor(preprocessing_cfg)
+        if len(preprocessor.steps) > 0:
+            enhanced_dir = sample_dir / f"ch{signal_ch}_preprocessed"
+            success = preprocessor.process_folder(
+                input_folder=current_signal_tiff_dir,
+                output_folder=enhanced_dir,
+                max_workers=None,
+                resume=True
+            )
+            if not success:
+                print("Preprocessing failed, exiting.")
+                sys.exit(1)
             current_signal_tiff_dir = enhanced_dir
-            
-        if clahe_cfg.get('apply', False):
-            clahe_dir = sample_dir / f"ch{signal_ch}_clahe"
-            if not clahe_dir.exists():
-                clip = clahe_cfg.get('clip_limit', 2.0)
-                grid = clahe_cfg.get('tile_grid_size', 8)
-                
-                cmd = f"python pipeline_modules/preprocessing/clahe_3d.py \
-                    --input \"{current_signal_tiff_dir}\" \
-                    --output \"{clahe_dir}\" \
-                    --clip_limit {clip} --tile_grid_size {grid}"
-                run_command(cmd, "Step 1.0.2: CLAHE Enhancement")
-            else:
-                print(f"CLAHE enhanced folder exists: {clahe_dir}")
-            current_signal_tiff_dir = clahe_dir
+        else:
+            print("No preprocessing enhancement steps enabled, using raw TIFF directly.")
 
         # 1.1 TIFF to Zarr
         if not zarr_path.exists():
             chunk_str = ",".join(map(str, zarr_cfg['chunk_size']))
-            cmd = f"python pipeline_modules/io/tiff_to_zarr.py \
+            cmd = f"python pipeline_modules/preprocessing/tiff_to_zarr.py \
                 --input \"{current_signal_tiff_dir}\" \
                 --output \"{zarr_path}\" \
                 --chunk_size \"{chunk_str}\""
@@ -267,26 +251,46 @@ def main():
         # Determine analysis mode and paths
         # Always atlas2image mode for main pipeline
         warped_label_dir = sample_dir / f"ch{signal_ch}_upsampled_label"
-        label_folder_arg = warped_label_dir
+        warped_label_zarr_path = sample_dir / f"ch{signal_ch}_upsampled_label.zarr"
         
         if not warped_label_dir.exists():
             print(f"Error: Warped label folder not found at {warped_label_dir}. Registration failed?")
             sys.exit(1)
 
-        if not mask_tiff_dir.exists():
-             print(f"Exporting Mask Zarr to TIFF folder: {mask_tiff_dir}")
-             cmd = f"python -c \"from pipeline_modules.segmentation.cellpose_distributed import export_zarr_to_tiff; export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
-             run_command(cmd, "Step 2.2: Export Mask Zarr to TIFF")
-        
-        raw_signal_dir = sample_dir / f"ch{signal_ch}"
-        output_excel = sample_dir / f"density_results_ch{signal_ch}.xlsx"
+        if not mask_zarr_path.exists():
+            if mask_tiff_dir.exists() and any(mask_tiff_dir.iterdir()):
+                chunk_str = ",".join(map(str, zarr_cfg['chunk_size']))
+                cmd = f"python pipeline_modules/preprocessing/tiff_to_zarr.py \
+                    --input \"{mask_tiff_dir}\" \
+                    --output \"{mask_zarr_path}\" \
+                    --chunk_size \"{chunk_str}\""
+                run_command(cmd, "Step 4.0: Convert Mask TIFF to Zarr")
+            else:
+                print(f"Error: Mask Zarr not found at {mask_zarr_path}, and mask TIFF folder is unavailable.")
+                sys.exit(1)
 
-        cmd = f"python pipeline_modules/registration/region_signal_analysis.py \
-            --mask_path \"{mask_tiff_dir}\" \
-            --label_path \"{label_folder_arg}\" \
-            --signal_path \"{raw_signal_dir}\" \
+        if not warped_label_zarr_path.exists():
+            chunk_str = ",".join(map(str, zarr_cfg['chunk_size']))
+            cmd = f"python pipeline_modules/preprocessing/tiff_to_zarr.py \
+                --input \"{warped_label_dir}\" \
+                --output \"{warped_label_zarr_path}\" \
+                --chunk_size \"{chunk_str}\""
+            run_command(cmd, "Step 4.1: Convert Registered Label TIFF to Zarr")
+
+        output_excel = sample_dir / f"density_results_ch{signal_ch}.xlsx"
+        resolution_xyz_str = ",".join(map(str, cfg['input']['resolution_xyz']))
+
+        cmd = f"python pipeline_modules/registration/region_signal_analysis_zarr_graph.py \
+            --mask_zarr \"{mask_zarr_path}\" \
+            --label_zarr \"{warped_label_zarr_path}\" \
+            --signal_zarr \"{zarr_path}\" \
             --cfg \"{density_cfg_path}\" \
-            --output \"{output_excel}\""
+            --output \"{output_excel}\" \
+            --min_voxels 10 \
+            --foreground_mode equal \
+            --foreground_label 1 \
+            --resolution_xyz \"{resolution_xyz_str}\" \
+            --pass1_workers 4"
             
         run_command(cmd, "Step 4: Density Analysis")
 

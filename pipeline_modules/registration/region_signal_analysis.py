@@ -3,7 +3,7 @@
 Streamed brain-region signal analysis.
 
 Design goals:
-1. Traverse regions defined in add_id_ytw.json
+1. Traverse regions defined in Region.csv file
 2. Avoid loading the full brain into memory
 3. Preserve 3D connected-component semantics for signal counting
 4. Export one Excel sheet per st_level
@@ -13,6 +13,7 @@ import argparse
 import ast
 import json
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import pandas as pd
@@ -50,8 +51,14 @@ def parse_args():
     parser.add_argument(
         "--chunk_depth",
         type=int,
-        default=16,
-        help="Number of z-slices processed per 3D chunk",
+        default=64,
+        help="Number of z-slices processed per 3D chunk. Larger values reduce boundary connections and speed things up if you have enough memory",
+    )
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=1,
+        help="Number of processes for parallel I/O. NOTE: With very large slices (10K+), keep this at 1 to avoid memory issues",
     )
     parser.add_argument(
         "--foreground_label",
@@ -61,7 +68,7 @@ def parse_args():
     )
     parser.add_argument(
         "--resolution_xyz",
-        default="1,1,1",
+        default="1.8,1.8,2.0",
         help="Voxel size in microns as x,y,z, for example 1.8,1.8,2.0",
     )
     return parser.parse_args()
@@ -121,7 +128,50 @@ def iter_volume_slices(path_like, volume_name):
                 raise ValueError(f"{volume_name} pages must be 2D, got {slice_data.shape}")
 
 
-def iter_volume_chunks(mask_path, label_path, signal_path, chunk_depth):
+def read_slice_worker(args):
+    mask_file, label_file, signal_file = args
+    return (
+        tifffile.imread(str(mask_file)),
+        tifffile.imread(str(label_file)),
+        tifffile.imread(str(signal_file)),
+    )
+
+
+def iter_volume_chunks_parallel(mask_path, label_path, signal_path, chunk_depth, num_processes):
+    mask_path = resolve_input(mask_path, "mask volume")
+    label_path = resolve_input(label_path, "label volume")
+    signal_path = resolve_input(signal_path, "signal volume")
+
+    if mask_path.is_dir():
+        mask_files = list_tiff_files(mask_path)
+        label_files = list_tiff_files(label_path)
+        signal_files = list_tiff_files(signal_path)
+    else:
+        raise ValueError("Parallel chunk iteration only supported for folder input")
+
+    if len(mask_files) != len(label_files) or len(mask_files) != len(signal_files):
+        raise ValueError(
+            f"Number of files mismatch: mask={len(mask_files)}, label={len(label_files)}, signal={len(signal_files)}"
+        )
+
+    from itertools import islice
+    with Pool(num_processes) as pool:
+        file_iterator = zip(mask_files, label_files, signal_files)
+
+        while True:
+            batch_files = list(islice(file_iterator, chunk_depth))
+            if not batch_files:
+                break
+            results = pool.map(read_slice_worker, batch_files)
+            mask_slices, label_slices, signal_slices = zip(*results)
+            yield (
+                np.stack(mask_slices, axis=0),
+                np.stack(label_slices, axis=0),
+                np.stack(signal_slices, axis=0),
+            )
+
+
+def iter_volume_chunks_sequential(mask_path, label_path, signal_path, chunk_depth):
     mask_iter = iter_volume_slices(mask_path, "mask volume")
     label_iter = iter_volume_slices(label_path, "label volume")
     signal_iter = iter_volume_slices(signal_path, "signal volume")
@@ -257,18 +307,47 @@ def make_component_record():
     }
 
 
-def make_union_find():
+def make_union_find(initial_capacity=100000):
+    # Pre-allocate numpy arrays for faster access
+    parent = np.zeros(initial_capacity, dtype=np.int32)
+    size_rank = np.zeros(initial_capacity, dtype=np.int32)
+    data = [None] * initial_capacity
     return {
-        "parent": {},
-        "size_rank": {},
-        "data": {},
+        "parent": parent,
+        "size_rank": size_rank,
+        "data": data,
         "next_id": 1,
+        "capacity": initial_capacity,
     }
+
+
+def _expand_union_find(union_find):
+    # Double capacity when full
+    old_capacity = union_find["capacity"]
+    new_capacity = old_capacity * 2
+    
+    new_parent = np.zeros(new_capacity, dtype=np.int32)
+    new_parent[:old_capacity] = union_find["parent"]
+    union_find["parent"] = new_parent
+    
+    new_size_rank = np.zeros(new_capacity, dtype=np.int32)
+    new_size_rank[:old_capacity] = union_find["size_rank"]
+    union_find["size_rank"] = new_size_rank
+    
+    new_data = [None] * new_capacity
+    new_data[:old_capacity] = union_find["data"]
+    union_find["data"] = new_data
+    
+    union_find["capacity"] = new_capacity
 
 
 def create_component(union_find):
     component_id = union_find["next_id"]
     union_find["next_id"] += 1
+    
+    if component_id >= union_find["capacity"]:
+        _expand_union_find(union_find)
+    
     union_find["parent"][component_id] = component_id
     union_find["size_rank"][component_id] = 1
     union_find["data"][component_id] = make_component_record()
@@ -276,10 +355,10 @@ def create_component(union_find):
 
 
 def find_root(union_find, component_id):
-    parent = union_find["parent"][component_id]
+    parent = int(union_find["parent"][component_id])
     if parent != component_id:
         union_find["parent"][component_id] = find_root(union_find, parent)
-    return union_find["parent"][component_id]
+    return int(union_find["parent"][component_id])
 
 
 def merge_region_dict(target_dict, source_dict):
@@ -293,8 +372,8 @@ def union_components(union_find, component_a, component_b):
     if root_a == root_b:
         return root_a
 
-    rank_a = union_find["size_rank"][root_a]
-    rank_b = union_find["size_rank"][root_b]
+    rank_a = int(union_find["size_rank"][root_a])
+    rank_b = int(union_find["size_rank"][root_b])
     if rank_a < rank_b:
         root_a, root_b = root_b, root_a
 
@@ -303,11 +382,11 @@ def union_components(union_find, component_a, component_b):
         union_find["size_rank"][root_a] += 1
 
     data_a = union_find["data"][root_a]
-    data_b = union_find["data"].pop(root_b)
+    data_b = union_find["data"][root_b]
+    union_find["data"][root_b] = None
     data_a["size"] += data_b["size"]
     merge_region_dict(data_a["region_voxels"], data_b["region_voxels"])
     merge_region_dict(data_a["region_intensity"], data_b["region_intensity"])
-    union_find["size_rank"].pop(root_b, None)
     return root_a
 
 
@@ -327,14 +406,12 @@ def update_component_stats(component_record, region_values, signal_values):
     region_counts = np.bincount(inverse_index)
     region_sums = np.bincount(inverse_index, weights=valid_signal.astype(np.float64, copy=False))
 
-    for idx, region_id in enumerate(unique_regions.tolist()):
+    region_voxels = component_record["region_voxels"]
+    region_intensity = component_record["region_intensity"]
+    for idx, region_id in enumerate(unique_regions):
         region_id = int(region_id)
-        component_record["region_voxels"][region_id] = (
-            component_record["region_voxels"].get(region_id, 0) + int(region_counts[idx])
-        )
-        component_record["region_intensity"][region_id] = (
-            component_record["region_intensity"].get(region_id, 0.0) + float(region_sums[idx])
-        )
+        region_voxels[region_id] = region_voxels.get(region_id, 0) + int(region_counts[idx])
+        region_intensity[region_id] = region_intensity.get(region_id, 0.0) + float(region_sums[idx])
 
 
 def add_pair_stats(component_record, region_ids, counts, intensity_sums):
@@ -348,57 +425,90 @@ def add_pair_stats(component_record, region_ids, counts, intensity_sums):
         )
 
 
-def accumulate_chunk_stats(union_find, global_id, local_component_mask, label_chunk, signal_chunk):
-    component_record = union_find["data"][global_id]
-    region_values = label_chunk[local_component_mask]
-    signal_values = signal_chunk[local_component_mask]
-    update_component_stats(component_record, region_values, signal_values)
+def accumulate_chunk_stats_vectorized(union_find, global_chunk, label_chunk, signal_chunk):
+    non_zero_mask = global_chunk > 0
+    if not np.any(non_zero_mask):
+        return
+
+    global_ids = global_chunk[non_zero_mask]
+    labels = label_chunk[non_zero_mask]
+    signals = signal_chunk[non_zero_mask]
+
+    unique_globals = np.unique(global_ids)
+
+    for global_id in unique_globals:
+        component_record = union_find["data"][int(global_id)]
+        mask = global_chunk == global_id
+        region_values = label_chunk[mask]
+        signal_values = signal_chunk[mask]
+        update_component_stats(component_record, region_values, signal_values)
 
 
 def build_boundary_pairs(previous_global_last_slice, current_first_slice_labels, union_find):
     if previous_global_last_slice is None:
         return {}
 
-    boundary_pairs = {}
     current_nonzero = current_first_slice_labels > 0
     if not np.any(current_nonzero):
-        return boundary_pairs
+        return {}
 
-    for row_offset in (-1, 0, 1):
-        for col_offset in (-1, 0, 1):
-            shifted_previous = np.roll(previous_global_last_slice, shift=(row_offset, col_offset), axis=(0, 1))
+    boundary_pairs = {}
+    rows, cols = previous_global_last_slice.shape
 
-            if row_offset > 0:
-                shifted_previous[:row_offset, :] = 0
-            elif row_offset < 0:
-                shifted_previous[row_offset:, :] = 0
+    offsets = [(-1, -1), (-1, 0), (-1, 1),
+               (0, -1),  (0, 0),  (0, 1),
+               (1, -1),  (1, 0),  (1, 1)]
 
-            if col_offset > 0:
-                shifted_previous[:, :col_offset] = 0
-            elif col_offset < 0:
-                shifted_previous[:, col_offset:] = 0
+    all_local = []
+    all_prev = []
 
-            overlap_mask = (shifted_previous > 0) & current_nonzero
-            if not np.any(overlap_mask):
-                continue
+    for row_offset, col_offset in offsets:
+        shifted_previous = np.zeros_like(previous_global_last_slice)
+        src_r_start = max(0, -row_offset)
+        src_r_end = rows - max(0, row_offset)
+        src_c_start = max(0, -col_offset)
+        src_c_end = cols - max(0, col_offset)
+        dst_r_start = max(0, row_offset)
+        dst_r_end = rows - max(0, -row_offset)
+        dst_c_start = max(0, col_offset)
+        dst_c_end = cols - max(0, -col_offset)
 
-            local_ids = current_first_slice_labels[overlap_mask].astype(np.int64, copy=False)
-            prev_ids = shifted_previous[overlap_mask].astype(np.int64, copy=False)
+        shifted_previous[dst_r_start:dst_r_end, dst_c_start:dst_c_end] = \
+            previous_global_last_slice[src_r_start:src_r_end, src_c_start:src_c_end]
 
-            pair_keys = (local_ids << 32) | prev_ids
-            unique_keys = np.unique(pair_keys)
-            for key in unique_keys.tolist():
-                local_id = int(key >> 32)
-                prev_id = int(key & 0xFFFFFFFF)
-                prev_root = find_root(union_find, prev_id)
-                if local_id not in boundary_pairs:
-                    boundary_pairs[local_id] = set()
-                boundary_pairs[local_id].add(prev_root)
+        overlap_mask = (shifted_previous > 0) & current_nonzero
+        if not np.any(overlap_mask):
+            continue
+
+        all_local.append(current_first_slice_labels[overlap_mask].astype(np.int64, copy=False))
+        all_prev.append(shifted_previous[overlap_mask].astype(np.int64, copy=False))
+
+    if not all_local:
+        return {}
+
+    all_local = np.concatenate(all_local)
+    all_prev = np.concatenate(all_prev)
+
+    pair_keys = (all_local << 32) | all_prev
+    unique_keys = np.unique(pair_keys)
+
+    prev_seen = {}
+    for key in unique_keys:
+        local_id = int(key >> 32)
+        prev_id = int(key & 0xFFFFFFFF)
+        if prev_id in prev_seen:
+            prev_root = prev_seen[prev_id]
+        else:
+            prev_root = find_root(union_find, prev_id)
+            prev_seen[prev_id] = prev_root
+        if local_id not in boundary_pairs:
+            boundary_pairs[local_id] = set()
+        boundary_pairs[local_id].add(prev_root)
 
     return boundary_pairs
 
 
-def build_connected_components(mask_path, label_path, signal_path, chunk_depth, total_slices, foreground_label):
+def build_connected_components(mask_path, label_path, signal_path, chunk_depth, total_slices, foreground_label, num_processes):
     print("Streaming chunks and building 3D connected components...")
     union_find = make_union_find()
     total_region_voxels = {}
@@ -406,15 +516,25 @@ def build_connected_components(mask_path, label_path, signal_path, chunk_depth, 
     processed_slices = 0
     total_chunks = max(1, (total_slices + chunk_depth - 1) // chunk_depth)
 
+    if num_processes > 1:
+        mask_path_obj = resolve_input(mask_path, "mask volume")
+        if mask_path_obj.is_dir():
+            chunk_iterator = iter_volume_chunks_parallel(mask_path, label_path, signal_path, chunk_depth, num_processes)
+        else:
+            print("Warning: Parallel I/O only supported for folder input, falling back to sequential")
+            chunk_iterator = iter_volume_chunks_sequential(mask_path, label_path, signal_path, chunk_depth)
+    else:
+        chunk_iterator = iter_volume_chunks_sequential(mask_path, label_path, signal_path, chunk_depth)
+
     with tqdm(total=total_slices, desc="Processing slices", unit="slice") as progress_bar:
         for chunk_index, (mask_chunk, label_chunk, signal_chunk) in enumerate(
-            iter_volume_chunks(mask_path, label_path, signal_path, chunk_depth),
+            chunk_iterator,
             start=1,
         ):
             positive_labels = label_chunk[label_chunk > 0]
             if positive_labels.size > 0:
                 unique_labels, counts = np.unique(positive_labels, return_counts=True)
-                for region_id, count in zip(unique_labels.tolist(), counts.tolist()):
+                for region_id, count in zip(unique_labels, counts):
                     total_region_voxels[int(region_id)] = total_region_voxels.get(int(region_id), 0) + int(count)
 
             binary_mask = mask_chunk == foreground_label
@@ -442,17 +562,14 @@ def build_connected_components(mask_path, label_path, signal_path, chunk_depth, 
                     local_to_global[local_id] = global_id
 
                 for local_id in range(1, num_local_components + 1):
-                    global_id = find_root(union_find, int(local_to_global[local_id]))
-                    local_to_global[local_id] = global_id
-                    local_component_mask = local_labels == local_id
-                    global_chunk[local_component_mask] = global_id
-                    accumulate_chunk_stats(
-                        union_find,
-                        global_id,
-                        local_component_mask,
-                        label_chunk,
-                        signal_chunk,
-                    )
+                    local_to_global[local_id] = find_root(union_find, int(local_to_global[local_id]))
+
+                global_chunk = local_to_global[local_labels]
+
+                unique_globals = np.unique(global_chunk)
+                unique_globals = unique_globals[unique_globals > 0]
+
+                accumulate_chunk_stats_vectorized(union_find, global_chunk, label_chunk, signal_chunk)
 
             previous_global_last_slice = global_chunk[-1] if global_chunk.shape[0] > 0 else previous_global_last_slice
             processed_slices += mask_chunk.shape[0]
@@ -475,7 +592,11 @@ def finalize_region_statistics(total_region_voxels, union_find, min_voxels):
     region_signal_counts = {}
     region_sum_intensity = {}
 
-    for root_id, component_record in union_find["data"].items():
+    next_id = union_find["next_id"]
+    for root_id in range(1, next_id):
+        component_record = union_find["data"][root_id]
+        if component_record is None:
+            continue
         if find_root(union_find, root_id) != root_id:
             continue
         if component_record["size"] < min_voxels:
@@ -622,6 +743,7 @@ def analyze_regions(
     chunk_depth,
     foreground_label,
     resolution_xyz,
+    num_processes,
 ):
     volume_shape = validate_shapes(mask_path, label_path, signal_path)
     region_tree = load_region_tree(cfg_path)
@@ -634,6 +756,7 @@ def analyze_regions(
         chunk_depth,
         volume_shape[0],
         foreground_label,
+        num_processes,
     )
     direct_stats = finalize_region_statistics(total_region_voxels, union_find, min_voxels)
 
@@ -662,6 +785,7 @@ def main():
         chunk_depth=args.chunk_depth,
         foreground_label=args.foreground_label,
         resolution_xyz=parse_resolution_xyz(args.resolution_xyz),
+        num_processes=args.num_processes,
     )
     print(f"Analysis finished. Excel saved to {args.output}")
 
