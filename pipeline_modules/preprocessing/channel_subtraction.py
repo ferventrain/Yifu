@@ -13,6 +13,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+DEFAULT_RANDOM_SEED = 42
+
 def parse_filename(filename):
     """
     Extract channel and Z-index from filename like YF2025102901_..._C1_Z0051.
@@ -24,7 +26,70 @@ def parse_filename(filename):
         return match.group(1), match.group(2)
     return None, None
 
-def collect_background_pixels(cx_file, c0_file, sample_size=10000):
+def _normalize_to_uint8(image):
+    """Normalize an array to uint8 for thresholding, preserving relative contrast."""
+    image = np.asarray(image)
+    if image.size == 0:
+        return np.zeros(0, dtype=np.uint8)
+
+    image = image.astype(np.float32, copy=False)
+    image_min = float(image.min())
+    image_max = float(image.max())
+    if image_max <= image_min:
+        return np.zeros(image.shape, dtype=np.uint8)
+
+    normalized = (image - image_min) / (image_max - image_min)
+    return np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
+
+
+def _estimate_tissue_non_signal_mask(img_cx_sample, img_c0_sample):
+    """
+    Build a fitting mask that keeps tissue pixels while excluding likely signal pixels.
+
+    The mask logic is:
+    1. Detect tissue mainly from C0, which better reflects autofluorescent tissue content.
+    2. Remove very bright Cx pixels that likely correspond to real signal.
+    3. Keep only the middle-low intensity portion of tissue pixels for stable fitting.
+    """
+    if img_cx_sample.size == 0 or img_c0_sample.size == 0:
+        return np.zeros_like(img_cx_sample, dtype=bool)
+
+    c0_uint8 = _normalize_to_uint8(img_c0_sample)
+    if c0_uint8.max() > 0:
+        c0_2d = c0_uint8.reshape(-1, 1)
+        _, tissue_mask = cv2.threshold(c0_2d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        tissue_mask = tissue_mask.ravel() > 0
+    else:
+        tissue_mask = np.zeros_like(img_c0_sample, dtype=bool)
+
+    if np.sum(tissue_mask) < 100:
+        c0_thresh = np.percentile(img_c0_sample, 60)
+        tissue_mask = img_c0_sample > c0_thresh
+
+    if np.sum(tissue_mask) < 100:
+        return np.zeros_like(img_cx_sample, dtype=bool)
+
+    cx_tissue = img_cx_sample[tissue_mask]
+    c0_tissue = img_c0_sample[tissue_mask]
+
+    cx_signal_thresh = np.percentile(cx_tissue, 85)
+    c0_low = np.percentile(c0_tissue, 5)
+    c0_high = np.percentile(c0_tissue, 95)
+
+    fit_mask = (
+        tissue_mask
+        & (img_cx_sample <= cx_signal_thresh)
+        & (img_c0_sample >= c0_low)
+        & (img_c0_sample <= c0_high)
+    )
+
+    if np.sum(fit_mask) < 100:
+        fit_mask = tissue_mask & (img_cx_sample <= np.percentile(cx_tissue, 90))
+
+    return fit_mask
+
+
+def collect_background_pixels(cx_file, c0_file, sample_size=10000, random_seed=DEFAULT_RANDOM_SEED):
     """
     Collect background pixels from a single image for global estimation.
     Returns (cx_bg, c0_bg) arrays of background pixel intensities.
@@ -39,26 +104,16 @@ def collect_background_pixels(cx_file, c0_file, sample_size=10000):
     img_c0_flat = img_c0.flatten()
     
     if len(img_cx_flat) > sample_size:
-        idx = np.random.choice(len(img_cx_flat), sample_size, replace=False)
+        rng = np.random.default_rng(random_seed)
+        idx = rng.choice(len(img_cx_flat), sample_size, replace=False)
         img_cx_sample = img_cx_flat[idx]
         img_c0_sample = img_c0_flat[idx]
     else:
         img_cx_sample = img_cx_flat
         img_c0_sample = img_c0_flat
-    
-    if img_cx_sample.max() > 0:
-        if img_cx_sample.max() > 255:
-            img_cx_norm = (img_cx_sample / img_cx_sample.max() * 255).astype(np.uint8)
-        else:
-            img_cx_norm = img_cx_sample.astype(np.uint8)
-        img_cx_norm_2d = img_cx_norm.reshape(-1, 1)
-        _, mask = cv2.threshold(img_cx_norm_2d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        mask = mask.ravel()
-    else:
-        mask = np.zeros_like(img_cx_sample)
-    
-    bg_mask = (mask == 0)
-    
+
+    bg_mask = _estimate_tissue_non_signal_mask(img_cx_sample, img_c0_sample)
+
     if np.sum(bg_mask) < 50:
         return None, None
     
@@ -68,7 +123,7 @@ def collect_background_pixels(cx_file, c0_file, sample_size=10000):
     return cx_bg, c0_bg
 
 
-def estimate_global_weight(cx_files, c0_files, plot_path=None):
+def estimate_global_weight(cx_files, c0_files, plot_path=None, random_seed=DEFAULT_RANDOM_SEED):
     """
     Estimate global weight from collected background pixels from multiple images.
     If plot_path is provided, saves a summary scatter plot.
@@ -76,8 +131,12 @@ def estimate_global_weight(cx_files, c0_files, plot_path=None):
     all_cx_bg = []
     all_c0_bg = []
     
-    for cx_file, c0_file in zip(cx_files, c0_files):
-        cx_bg, c0_bg = collect_background_pixels(cx_file, c0_file)
+    for i, (cx_file, c0_file) in enumerate(zip(cx_files, c0_files)):
+        cx_bg, c0_bg = collect_background_pixels(
+            cx_file,
+            c0_file,
+            random_seed=random_seed + i,
+        )
         if cx_bg is not None and len(cx_bg) > 0:
             all_cx_bg.extend(cx_bg)
             all_c0_bg.extend(c0_bg)
@@ -113,7 +172,8 @@ def estimate_global_weight(cx_files, c0_files, plot_path=None):
         plt.figure(figsize=(10, 7))
         
         sample_size = min(5000, len(all_cx_bg))
-        idx_sample = np.random.choice(len(all_cx_bg), sample_size, replace=False)
+        rng = np.random.default_rng(random_seed)
+        idx_sample = rng.choice(len(all_cx_bg), sample_size, replace=False)
         cx_sample = all_cx_bg[idx_sample]
         c0_sample = all_c0_bg[idx_sample]
         mask_sample = inlier_mask[idx_sample]
@@ -131,17 +191,23 @@ def estimate_global_weight(cx_files, c0_files, plot_path=None):
         
         plt.xlabel('C0 (autofluorescence) intensity')
         plt.ylabel('Cx (signal channel) intensity')
-        plt.title(f'Global weight estimation - {len(cx_files)} images, {np.sum(inlier_mask)} pixels used')
+        plt.title(f'Global weight estimation - {len(cx_files)} images, {np.sum(inlier_mask)} tissue non-signal pixels used')
         plt.legend(loc='upper left')
         plt.grid(alpha=0.3)
         plt.tight_layout()
         plt.savefig(plot_path, dpi=150)
         plt.close()
+
+    print(
+        f"  Weight fit diagnostics: slices={len(cx_files)}, "
+        f"pixels={len(all_cx_bg)}, inliers={int(np.sum(inlier_mask))}, "
+        f"a={a:.4f}, b={b:.2f}"
+    )
     
     return a
 
 
-def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None):
+def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None, random_seed=DEFAULT_RANDOM_SEED):
     """
     Estimate weight a by linear regression on background pixels only: Cx = a * C0 + b
     Uses Otsu thresholding to identify background (non-signal) pixels.
@@ -165,24 +231,15 @@ def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None
     img_c0_flat = img_c0.flatten()
     
     if len(img_cx_flat) > sample_size:
-        idx = np.random.choice(len(img_cx_flat), sample_size, replace=False)
+        rng = np.random.default_rng(random_seed)
+        idx = rng.choice(len(img_cx_flat), sample_size, replace=False)
         img_cx_sample = img_cx_flat[idx]
         img_c0_sample = img_c0_flat[idx]
     else:
         img_cx_sample = img_cx_flat
         img_c0_sample = img_c0_flat
-    
-    if img_cx_sample.max() > 0:
-        if img_cx_sample.max() > 255:
-            img_cx_norm = (img_cx_sample / img_cx_sample.max() * 255).astype(np.uint8)
-        else:
-            img_cx_norm = img_cx_sample.astype(np.uint8)
-        img_cx_norm_2d = img_cx_norm.reshape(-1, 1)
-        _, mask = cv2.threshold(img_cx_norm_2d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        mask = mask.ravel()
-    else:
-        mask = np.zeros_like(img_cx_sample)
-    bg_mask = (mask == 0)
+
+    bg_mask = _estimate_tissue_non_signal_mask(img_cx_sample, img_c0_sample)
     fg_mask = ~bg_mask
     
     if np.sum(bg_mask) < 100:
@@ -192,7 +249,7 @@ def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None
                     ha='center', va='center', fontsize=12, transform=plt.gca().transAxes)
             plt.xlabel('C0 intensity')
             plt.ylabel('Cx intensity')
-            plt.title(f'Too few background pixels, a=1.00')
+            plt.title(f'Too few tissue non-signal pixels, a=1.00')
             plt.tight_layout()
             plt.savefig(plot_path, dpi=150)
             plt.close()
@@ -230,11 +287,11 @@ def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None
         
         if len(cx_bg) > 1000:
             plt.scatter(c0_bg[~inlier_mask], cx_bg[~inlier_mask], 
-                       c='orange', alpha=0.6, s=15, label='Background outliers')
+                       c='orange', alpha=0.6, s=15, label='Fit outliers')
             plt.scatter(c0_bg[inlier_mask], cx_bg[inlier_mask], 
-                       c='blue', alpha=0.6, s=15, label='Background inliers (used)')
+                       c='blue', alpha=0.6, s=15, label='Tissue non-signal inliers')
         else:
-            plt.scatter(c0_bg, cx_bg, c='blue', alpha=0.6, s=15, label='Background (used)')
+            plt.scatter(c0_bg, cx_bg, c='blue', alpha=0.6, s=15, label='Tissue non-signal (used)')
         
         x_min, x_max = 0, max(img_c0_sample.max(), c0_bg.max())
         x_fit = np.linspace(x_min, x_max, 100)
@@ -243,7 +300,7 @@ def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None
         
         plt.xlabel('C0 (autofluorescence) intensity')
         plt.ylabel('Cx (signal channel) intensity')
-        plt.title(f'Intensity scatter plot - estimated weight a = {a:.3f}')
+        plt.title(f'Tissue non-signal fit - estimated weight a = {a:.3f}')
         plt.legend(loc='upper left')
         plt.grid(alpha=0.3)
         plt.tight_layout()

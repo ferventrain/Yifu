@@ -302,8 +302,9 @@ def run_channel_subtraction(root_path, background_channel='ch0', weight=1.0, ada
     if config_path and Path(config_path).exists():
         with open(config_path, 'r') as f:
             config_data = json.load(f)
-        if 'channel_subtraction' in config_data and 'estimated_weights' in config_data['channel_subtraction']:
-            estimated_weights = config_data['channel_subtraction']['estimated_weights']
+        cs_saved_cfg = config_data.get('preprocessing', {}).get('channel_subtraction', {})
+        if 'estimated_weights' in cs_saved_cfg:
+            estimated_weights = cs_saved_cfg['estimated_weights']
             print(f"Loaded {len(estimated_weights)} pre-estimated weights from config")
     
     channels_to_process = []
@@ -352,13 +353,9 @@ def run_channel_subtraction(root_path, background_channel='ch0', weight=1.0, ada
                 if output_path.exists():
                     existing_count += 1
             
-            # If most files are already processed, skip adaptive estimation
-            if existing_count > len(matched_pairs) * 0.8:
-                if adaptive:
-                    print(f"  Note: {existing_count}/{len(matched_pairs)} files already exist, skipping adaptive estimation")
-                    print(f"  Using base weight: {weight:.4f}")
-                final_weight = weight
-            elif adaptive:
+            if adaptive:
+                if existing_count > len(matched_pairs) * 0.8:
+                    print(f"  Note: {existing_count}/{len(matched_pairs)} files already exist; estimating weight from deterministic slice samples")
                 print(f"  Global adaptive weight estimation: ON")
                 n_total = len(matched_pairs)
                 n_sample = max(min_samples, min(max_samples, int(n_total * sample_ratio)))

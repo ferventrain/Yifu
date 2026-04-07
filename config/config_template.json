@@ -12,7 +12,7 @@
     
     "preprocessing": {
         "channel_subtraction": {
-            "apply": false,
+            "apply": true,
             "background_channel": "ch0",
             "weight": 1.0,
             "adaptive": true,
@@ -26,10 +26,18 @@
             "apply": false,
             "kernel_size": 21
         },
+        "rolling_ball": {
+            "apply": false,
+            "radius": 50
+        },
         "scattering_removal": {
             "apply": false,
             "sigma": 50.0,
             "weight": 1.0
+        },
+        "median_filter": {
+            "apply": true,
+            "kernel_size": 3
         },
         "clahe": {
             "apply": false,
