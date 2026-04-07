@@ -14,6 +14,8 @@ import cv2
 from .tophat_background import tophat_background_correction
 from .scattering_removal import remove_scattering
 from .masked_clahe import clahe_enhance
+from .median_filter import apply_median_filter
+from .rolling_ball_background import rolling_ball_background
 
 
 def process_single_image(input_path, output_path, steps):
@@ -43,6 +45,15 @@ def process_single_image(input_path, output_path, steps):
                     gray = current_img
                 tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
                 current_img = tophat.astype(dtype)
+
+            elif func == 'rolling_ball':
+                radius = kwargs.get('radius', 50)
+                if len(current_img.shape) == 3:
+                    gray = current_img[:, :, 0]
+                else:
+                    gray = current_img
+                corrected, _ = rolling_ball_background(gray, radius=radius)
+                current_img = corrected.astype(dtype)
             
             elif func == 'scattering_removal':
                 sigma = kwargs.get('sigma', 50.0)
@@ -78,7 +89,10 @@ def process_single_image(input_path, output_path, steps):
                 d0 = kwargs.get('d0', None)
                 result = homomorphic_filter(current_img, rl=rl, rh=rh, c=c, d0=d0)
                 current_img = result.astype(dtype)
-        
+            
+            elif func == 'median_filter':
+                kernel_size = kwargs.get('kernel_size', 3)
+                current_img = apply_median_filter(current_img, kernel_size=kernel_size)
         tifffile.imwrite(str(output_path), current_img, compression=None)
         return True
     
@@ -225,7 +239,7 @@ def channel_subtraction_worker(cx_file, c0_file, output_path, weight, compressio
 
 def run_channel_subtraction(root_path, background_channel='ch0', weight=1.0, adaptive=False, 
                            save_plots=False, sample_ratio=0.005, min_samples=10, max_samples=50, 
-                           max_workers=None, compression=None):
+                           max_workers=None, compression=None, config_path=None, output_dir=None):
     """Run channel subtraction on all channels except background channel.
     
     Args:
@@ -239,6 +253,8 @@ def run_channel_subtraction(root_path, background_channel='ch0', weight=1.0, ada
         max_samples: Maximum number of images to sample
         max_workers: Number of parallel workers
         compression: TIFF compression
+        config_path: Path to config.json for saving/loading estimated weights per channel
+        output_dir: Base output directory for preprocessed results
     """
     from .channel_subtraction import estimate_global_weight
     
@@ -281,66 +297,109 @@ def run_channel_subtraction(root_path, background_channel='ch0', weight=1.0, ada
     
     print(f"Using {max_workers} workers for parallel processing.")
     
+    # Load existing estimated weights from config if available
+    estimated_weights = {}
+    if config_path and Path(config_path).exists():
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+        if 'channel_subtraction' in config_data and 'estimated_weights' in config_data['channel_subtraction']:
+            estimated_weights = config_data['channel_subtraction']['estimated_weights']
+            print(f"Loaded {len(estimated_weights)} pre-estimated weights from config")
+    
+    channels_to_process = []
     for folder in root.iterdir():
-        if not folder.is_dir() or folder == bg_dir or folder.name.endswith("_subtracted"):
-            continue
+        if (folder.is_dir() and folder.name.startswith('ch') and 
+            folder != bg_dir and not folder.name.endswith('_subtracted') and 
+            not folder.name.endswith('_preprocessed')):
+            channels_to_process.append(folder.name)
+    
+    channel_subtracted_data = {}
+    
+    for channel in channels_to_process:
+        cx_input_dir = root / channel
         
-        target_subtracted_dir = root / f"{folder.name}_subtracted"
-        target_subtracted_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir:
+            base_output = Path(output_dir)
+            target_output_dir = base_output / f"{channel}_preprocessed"
+        else:
+            target_output_dir = root / f"{channel}_preprocessed"
+        target_output_dir.mkdir(parents=True, exist_ok=True)
         
-        print(f"\nProcessing folder: {folder.name} -> {target_subtracted_dir.name}")
+        print(f"\nProcessing channel: {channel} -> {target_output_dir.name}")
         
-        cx_files = list(folder.glob("*.tif*"))
+        cx_files = list(cx_input_dir.glob("*.tif*"))
         if not cx_files:
-            print(f"No TIFF files found in {folder.name}, skipping.")
+            print(f"No TIFF files found in {cx_input_dir.name}, skipping.")
             continue
         
         matched_pairs = []
         for cx_file in cx_files:
             _, z_idx = parse_filename(cx_file.name)
             if z_idx in bg_files:
-                matched_pairs.append((cx_file, bg_files[z_idx], target_subtracted_dir / cx_file.name, weight, compression))
+                matched_pairs.append((cx_file, bg_files[z_idx], target_output_dir / cx_file.name, weight, compression))
         
-        if not matched_pairs:
-            print(f"No matched files found in {folder.name}, skipping.")
-            continue
-        
-        print(f"  Found {len(matched_pairs)} matched files")
-        
-        if adaptive:
-            print(f"  Global adaptive weight estimation: ON")
-            n_total = len(matched_pairs)
-            n_sample = max(min_samples, min(max_samples, int(n_total * sample_ratio)))
-            print(f"  Sampling {n_sample} images out of {n_total}")
-            
-            import random
-            idx_sample = random.sample(range(n_total), n_sample)
-            sample_pairs = [matched_pairs[i] for i in idx_sample]
-            sample_cx = [p[0] for p in sample_pairs]
-            sample_c0 = [p[1] for p in sample_pairs]
-            
-            if save_plots:
-                plot_path = target_subtracted_dir / f"{folder.name}_global_fit.png"
-                global_a = estimate_global_weight(sample_cx, sample_c0, plot_path=plot_path)
-                print(f"  Global fit plot saved to: {plot_path}")
-            else:
-                global_a = estimate_global_weight(sample_cx, sample_c0)
-            
+        # Check if we have pre-estimated weight for this channel
+        if channel in estimated_weights:
+            if adaptive:
+                print(f"  Using pre-estimated weight from config: a = {estimated_weights[channel]:.4f}")
+            global_a = estimated_weights[channel]
             final_weight = weight * global_a
-            print(f"  Estimated a = {global_a:.4f}, final effective weight = {final_weight:.4f}")
-            
-            for i in range(len(matched_pairs)):
-                matched_pairs[i] = (
-                    matched_pairs[i][0],
-                    matched_pairs[i][1],
-                    matched_pairs[i][2],
-                    final_weight,
-                    matched_pairs[i][4]
-                )
+            print(f"  Final effective weight = {final_weight:.4f}")
         else:
-            print(f"  Fixed weight: {weight}")
-            final_weight = weight
+            # Check how many files are already processed (resume support)
+            existing_count = 0
+            for cx_file, _, output_path, _, _ in matched_pairs:
+                if output_path.exists():
+                    existing_count += 1
+            
+            # If most files are already processed, skip adaptive estimation
+            if existing_count > len(matched_pairs) * 0.8:
+                if adaptive:
+                    print(f"  Note: {existing_count}/{len(matched_pairs)} files already exist, skipping adaptive estimation")
+                    print(f"  Using base weight: {weight:.4f}")
+                final_weight = weight
+            elif adaptive:
+                print(f"  Global adaptive weight estimation: ON")
+                n_total = len(matched_pairs)
+                n_sample = max(min_samples, min(max_samples, int(n_total * sample_ratio)))
+                print(f"  Sampling {n_sample} images out of {n_total}")
+                
+                # Uniform step sampling (evenly spaced)
+                step = max(1, n_total // n_sample)
+                idx_sample = list(range(0, n_total, step))[:n_sample]
+                sample_pairs = [matched_pairs[i] for i in idx_sample]
+                sample_cx = [p[0] for p in sample_pairs]
+                sample_c0 = [p[1] for p in sample_pairs]
+                
+                if save_plots:
+                    plot_path = target_output_dir / f"{channel}_global_fit.png"
+                    global_a = estimate_global_weight(sample_cx, sample_c0, plot_path=plot_path)
+                    print(f"  Global fit plot saved to: {plot_path}")
+                else:
+                    global_a = estimate_global_weight(sample_cx, sample_c0)
+                
+                final_weight = weight * global_a
+                print(f"  Estimated a = {global_a:.4f}, final effective weight = {final_weight:.4f}")
+                
+                # Save the estimated weight for this channel
+                estimated_weights[channel] = global_a
+            else:
+                final_weight = weight
         
+        # Update all pairs with final weight
+        for i in range(len(matched_pairs)):
+            matched_pairs[i] = (
+                matched_pairs[i][0],
+                matched_pairs[i][1],
+                matched_pairs[i][2],
+                final_weight,
+                matched_pairs[i][4]
+            )
+        
+        # Store the matched pairs for later processing
+        channel_subtracted_data[channel] = matched_pairs
+        
+        # Run channel subtraction and output directly to preprocessed folder
         tasks = []
         for cx_file, c0_file, output_path, w, comp in matched_pairs:
             if not output_path.exists():
@@ -367,7 +426,27 @@ def run_channel_subtraction(root_path, background_channel='ch0', weight=1.0, ada
         
         print(f"  Done: {completed} completed, {failed} failed")
     
-    print(f"\nChannel subtraction complete for all channels!")
+    # Save estimated weights back to config.json if config_path provided
+    if config_path and adaptive and estimated_weights:
+        try:
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+            
+            if 'preprocessing' not in config_data:
+                config_data['preprocessing'] = {}
+            if 'channel_subtraction' not in config_data['preprocessing']:
+                config_data['preprocessing']['channel_subtraction'] = {}
+            
+            config_data['preprocessing']['channel_subtraction']['estimated_weights'] = estimated_weights
+            
+            with open(config_path, 'w') as f:
+                json.dump(config_data, f, indent=2)
+            
+            print(f"\nSaved {len(estimated_weights)} estimated weights to config: {config_path}")
+        except Exception as e:
+            print(f"\nWarning: Failed to save estimated weights to config: {str(e)}")
+    
+    print(f"\nChannel subtraction complete for all channels! Output in *_preprocessed")
     return True
 
 
@@ -408,17 +487,17 @@ def main():
     preprocessing_cfg = cfg['preprocessing']
     channels_cfg = cfg['input']['channels']
     
-    signal_ch = args.channel if args.channel else channels_cfg['signal']
-    print(f"Processing channel: {signal_ch}")
-    
     resume = not args.no_resume
     print(f"Resume enabled: {resume}")
+    
+    preprocessor = Preprocessor(preprocessing_cfg)
+    has_enhancement = len(preprocessor.steps) > 0
     
     if 'channel_subtraction' in preprocessing_cfg:
         cs_cfg = preprocessing_cfg['channel_subtraction']
         if cs_cfg.get('apply', False):
             print("\n" + "="*50)
-            print("Step: Channel Subtraction")
+            print("Step 1: Channel Subtraction")
             print("="*50)
             
             background_channel = cs_cfg.get('background_channel', 'ch0')
@@ -441,41 +520,115 @@ def main():
                 min_samples=min_samples,
                 max_samples=max_samples,
                 max_workers=args.workers,
-                compression=comp
+                compression=comp,
+                config_path=args.config,
+                output_dir=args.output_dir
             )
             
             if not success:
                 print("Channel subtraction failed, exiting.")
                 sys.exit(1)
+            
+            # If there are enhancement steps, apply them to the subtracted results
+            if has_enhancement:
+                print("\n" + "="*50)
+                print("Step 2: Image Enhancement (Preprocessor)")
+                print("="*50)
+                
+                # Get list of channels to process for enhancement
+                if args.channel:
+                    channels_to_enhance = [f"ch{args.channel}"]
+                elif 'channels' in preprocessing_cfg and preprocessing_cfg['channels']:
+                    channels_to_enhance = preprocessing_cfg['channels']
+                else:
+                    background_channel = cs_cfg.get('background_channel', 'ch0')
+                    channels_to_enhance = [f"ch{i}" for i in channels_cfg['signal'] if f"ch{i}" != background_channel]
+                
+                print(f"Channels to enhance: {channels_to_enhance}")
+                
+                base_output_folder = Path(args.output_dir) if args.output_dir else sample_dir
+                
+                for channel in channels_to_enhance:
+                    signal_ch = channel.replace('ch', '')
+                    print(f"\n{'='*50}")
+                    print(f"Enhancing channel: {channel} (signal ch{signal_ch})")
+                    print(f"{'='*50}")
+                    
+                    # Input is already subtracted, output directly to final preprocessed
+                    input_folder = base_output_folder / f"{channel}_preprocessed"
+                    output_folder = base_output_folder / f"{channel}_preprocessed"
+                    
+                    if not input_folder.exists():
+                        print(f"Error: Subtracted folder not found: {input_folder}")
+                        sys.exit(1)
+                    
+                    success = preprocessor.process_folder(
+                        input_folder=input_folder,
+                        output_folder=output_folder,
+                        max_workers=args.workers,
+                        resume=resume
+                    )
+                    
+                    if not success:
+                        print(f"\nPreprocessing failed for channel {channel}!")
+                        sys.exit(1)
+            else:
+                print("\n" + "="*50)
+                print("ALL CHANNELS PREPROCESSING COMPLETE")
+                print("="*50)
+                print("Note: No enhancement steps enabled, output in *_preprocessed")
+                sys.exit(0)
+    else:
+        # No channel subtraction, just do enhancement directly
+        print("\n" + "="*50)
+        print("Step: Image Enhancement (Preprocessor)")
+        print("="*50)
+        
+        if args.channel:
+            channels_to_process = [f"ch{args.channel}"]
+        elif 'channels' in preprocessing_cfg and preprocessing_cfg['channels']:
+            channels_to_process = preprocessing_cfg['channels']
+        else:
+            background_channel = cs_cfg.get('background_channel', 'ch0') if 'channel_subtraction' in preprocessing_cfg and preprocessing_cfg['channel_subtraction'].get('apply', False) else 'ch0'
+            channels_to_process = [f"ch{i}" for i in channels_cfg['signal'] if f"ch{i}" != background_channel]
+        
+        print(f"Channels to process: {channels_to_process}")
+        
+        if args.output_dir:
+            base_output_folder = Path(args.output_dir)
+        else:
+            base_output_folder = sample_dir
+        
+        preprocessor = Preprocessor(preprocessing_cfg)
+        
+        for channel in channels_to_process:
+            signal_ch = channel.replace('ch', '')
+            print(f"\n{'='*50}")
+            print(f"Processing channel: {channel} (signal ch{signal_ch})")
+            print(f"{'='*50}")
+            
+            input_folder = sample_dir / channel
+            output_folder = base_output_folder / f"{channel}_preprocessed"
+            
+            if len(preprocessor.steps) == 0:
+                print("No enhancement steps enabled, done.")
+                continue
+            
+            success = preprocessor.process_folder(
+                input_folder=input_folder,
+                output_folder=output_folder,
+                max_workers=args.workers,
+                resume=resume
+            )
+            
+            if not success:
+                print(f"\nPreprocessing failed for channel {channel}!")
+                sys.exit(1)
     
     print("\n" + "="*50)
-    print("Step: Image Enhancement (Preprocessor)")
+    print("ALL CHANNELS PREPROCESSING COMPLETE")
     print("="*50)
-    
-    input_folder = sample_dir / f"ch{signal_ch}"
-    if 'channel_subtraction' in preprocessing_cfg and preprocessing_cfg['channel_subtraction'].get('apply', False):
-        input_folder = sample_dir / f"ch{signal_ch}_subtracted"
-        if not input_folder.exists():
-            print(f"Error: Subtracted folder not found: {input_folder}")
-            sys.exit(1)
-    
-    if args.output_dir:
-        output_folder = Path(args.output_dir)
-    else:
-        output_folder = sample_dir / f"ch{signal_ch}_preprocessed"
-    
-    preprocessor = Preprocessor(preprocessing_cfg)
-    
-    if len(preprocessor.steps) == 0:
-        print("No enhancement steps enabled, done.")
-        sys.exit(0)
-    
-    success = preprocessor.process_folder(
-        input_folder=input_folder,
-        output_folder=output_folder,
-        max_workers=args.workers,
-        resume=resume
-    )
+    sys.exit(0)
     
     if success:
         print("\n" + "="*50)
