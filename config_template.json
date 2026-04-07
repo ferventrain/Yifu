@@ -61,7 +61,7 @@
     },
     
     "analysis": {
-        "density_config": "src/modules/registration/add_id_ytw.json",
+        "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
         "output_format": "xlsx"
     }
 }

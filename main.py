@@ -90,12 +90,12 @@ def main():
     
     # Analysis
     analysis_cfg = cfg['analysis']
-    density_cfg_raw = analysis_cfg.get('density_config', 'pipeline_modules/registration/add_id_ytw.json')
+    density_cfg_raw = analysis_cfg.get('density_config', 'pipeline_modules/registration/Region_Csv_Rev1_updated.CSV')
     density_cfg_path = Path(density_cfg_raw)
     if not density_cfg_path.is_absolute():
         density_cfg_path = project_root / density_cfg_path
     if not density_cfg_path.exists():
-        fallback_density_cfg = project_root / "pipeline_modules" / "registration" / "add_id_ytw.json"
+        fallback_density_cfg = project_root / "pipeline_modules" / "registration" / "Region_Csv_Rev1_updated.CSV"
         if fallback_density_cfg.exists():
             density_cfg_path = fallback_density_cfg
 
@@ -226,8 +226,8 @@ def main():
         # mode = reg_cfg['mode'] # Already loaded above
         
         # Check if output already exists to avoid re-running
-        # atlas2image produces: ch{signal_ch}_upsampled_label
-        warped_label_dir_check = sample_dir / f"ch{signal_ch}_upsampled_label"
+        # atlas2image produces a shared atlas label folder for the whole sample
+        warped_label_dir_check = sample_dir / "upsampled_atlas_label"
         
         if warped_label_dir_check.exists() and any(warped_label_dir_check.iterdir()):
              print(f"Registration output exists at {warped_label_dir_check}. Skipping Step 3.")
@@ -250,8 +250,8 @@ def main():
         
         # Determine analysis mode and paths
         # Always atlas2image mode for main pipeline
-        warped_label_dir = sample_dir / f"ch{signal_ch}_upsampled_label"
-        warped_label_zarr_path = sample_dir / f"ch{signal_ch}_upsampled_label.zarr"
+        warped_label_dir = sample_dir / "upsampled_atlas_label"
+        warped_label_zarr_path = sample_dir / "upsampled_atlas_label.zarr"
         
         if not warped_label_dir.exists():
             print(f"Error: Warped label folder not found at {warped_label_dir}. Registration failed?")

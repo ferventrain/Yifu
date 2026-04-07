@@ -243,7 +243,6 @@ def load_region_tree(cfg_path):
     region_df = region_df.reset_index(drop=True)
 
     nodes_by_id = {}
-    row_order_by_id = {}
     for row_index, row in region_df.iterrows():
         structure_id = int(row["id"])
         structure_path = parse_structure_id_path(row["structure_id_path"])
@@ -252,17 +251,13 @@ def load_region_tree(cfg_path):
 
         node = {
             "id": structure_id,
-            "id_ytw": structure_id,
-            "atlas_id": structure_id,
-            "name": str(row["name"]).split(",")[0] if pd.notna(row["name"]) else str(structure_id),
+            "name": str(row["name"]) if pd.notna(row["name"]) else str(structure_id),
             "acronym": parse_acronym_text(row["acronym"]),
             "st_level": st_level,
             "parent_structure_id": parent_structure_id,
-            "graph_order": row_index,
             "children": [],
         }
         nodes_by_id[structure_id] = node
-        row_order_by_id[structure_id] = row_index
 
     root_node = None
     for structure_id, node in nodes_by_id.items():
@@ -272,11 +267,11 @@ def load_region_tree(cfg_path):
             continue
         nodes_by_id[parent_structure_id]["children"].append(node)
 
+    if root_node is None and not region_df.empty:
+        root_node = nodes_by_id[int(region_df.iloc[0]["id"])]
+
     if root_node is None:
         raise ValueError(f"Could not determine root node from CSV: {cfg_path}")
-
-    for node in nodes_by_id.values():
-        node["children"].sort(key=lambda child: row_order_by_id.get(child["id"], 0))
 
     return root_node
 
@@ -292,10 +287,9 @@ def parse_resolution_xyz(resolution_text):
 
 
 def get_region_label_id(node):
-    for key in ("id", "id_ytw", "atlas_id"):
-        value = node.get(key)
-        if isinstance(value, (int, np.integer)) and value >= 0:
-            return int(value)
+    value = node.get("id")
+    if isinstance(value, (int, np.integer)) and value >= 0:
+        return int(value)
     return None
 
 
@@ -626,9 +620,8 @@ def finalize_region_statistics(total_region_voxels, union_find, min_voxels):
 
 
 def build_display_name(node, label_id):
-    name = node.get("name") or ""
-    acronym = node.get("acronym") or ""
-    return f"{name},{acronym}"
+    _ = label_id
+    return node.get("name") or ""
 
 
 def build_region_row(node, label_id, aggregated_stats, voxel_volume_um3):
@@ -639,7 +632,6 @@ def build_region_row(node, label_id, aggregated_stats, voxel_volume_um3):
     return {
         "Name": build_display_name(node, label_id),
         "st_level": node.get("st_level"),
-        "graph_order": node.get("graph_order", 0),
         "Total Voxels": total_voxels,
         "Signal Voxels": signal_voxels,
         "Voxel Density": voxel_density,
@@ -673,7 +665,7 @@ def flatten_region_rows(region_tree, direct_stats, voxel_volume_um3):
             aggregated["signal_count"] += child_aggregated["signal_count"]
             aggregated["sum_intensity"] += child_aggregated["sum_intensity"]
 
-        if label_id is not None and label_id > 0:
+        if label_id is not None and label_id > 0 and aggregated["total_voxels"] > 0:
             rows.append(build_region_row(node, label_id, aggregated, voxel_volume_um3))
 
         return aggregated
@@ -692,7 +684,7 @@ def flush_rows_to_excel(rows, output_path):
             pd.DataFrame().to_excel(writer, index=False, sheet_name="Level_0")
         return
 
-    dataframe = dataframe.sort_values(by=["st_level", "graph_order", "Name"], kind="stable").reset_index(drop=True)
+    dataframe = dataframe.sort_values(by=["st_level", "Name"], kind="stable").reset_index(drop=True)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         unique_levels = [

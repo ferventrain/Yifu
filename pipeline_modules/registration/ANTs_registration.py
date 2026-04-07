@@ -9,6 +9,30 @@ import tifffile
 from tqdm import tqdm
 
 
+def _ensure_label_storage_dtype(array: np.ndarray) -> np.dtype:
+    """Pick a TIFF-safe integer dtype that preserves atlas label ids."""
+    if np.issubdtype(array.dtype, np.integer):
+        max_value = int(array.max()) if array.size > 0 else 0
+        min_value = int(array.min()) if array.size > 0 else 0
+        if min_value >= 0:
+            if max_value <= np.iinfo(np.uint16).max:
+                return np.uint16
+            if max_value <= np.iinfo(np.uint32).max:
+                return np.uint32
+        if min_value >= np.iinfo(np.int32).min and max_value <= np.iinfo(np.int32).max:
+            return np.int32
+        return np.int64
+
+    if np.issubdtype(array.dtype, np.floating):
+        max_value = float(array.max()) if array.size > 0 else 0.0
+        min_value = float(array.min()) if array.size > 0 else 0.0
+        if np.allclose(array, np.round(array), atol=0):
+            rounded = np.rint(array)
+            return _ensure_label_storage_dtype(rounded.astype(np.int64))
+
+    raise ValueError(f"Label array must contain integer ids, got dtype={array.dtype}")
+
+
 class BidirectionalRegistration:
     """双向配准类：支持atlas到image和image到atlas的配准"""
     
@@ -147,12 +171,15 @@ class BidirectionalRegistration:
         # Ensure 3D (Z, Y, X) - each slice along Z is (Y, X)
         if arr.ndim != 3:
             raise ValueError(f"Expected 3D array, got shape {arr.shape}")
+
+        output_dtype = _ensure_label_storage_dtype(arr) if prefix in {"label", "mask"} else np.uint16
+        print(f"Saving dtype for {prefix}: {output_dtype}")
             
         print(f"Saving {prefix} TIFFs to {output_dir} (shape: {arr.shape})...")
         for i in range(arr.shape[0]):
             tifffile.imwrite(
                 str(output_dir / f"{prefix}_{i:04d}.tiff"),
-                arr[i, :, :].astype(np.uint16),
+                arr[i, :, :].astype(output_dtype, copy=False),
                 compression='lzw'
             )
 
@@ -251,9 +278,11 @@ class BidirectionalRegistration:
         
         source_shape = source_volume.shape
         target_shape = self.original_shape # (Z, Y, X)
+        output_dtype = _ensure_label_storage_dtype(source_volume)
         
         print(f"Upsampling from {source_shape} to {target_shape}...")
         print(f"Debug: ANTs raw shape = {arr.shape}, after transpose = {source_volume.shape}")
+        print(f"Preserving label dtype as {output_dtype}")
         
         import cv2
         
@@ -276,7 +305,7 @@ class BidirectionalRegistration:
             
             # Use nearest neighbor for labels
             resized_slice = cv2.resize(
-                source_slice.astype(np.uint16), 
+                source_slice.astype(np.float64, copy=False),
                 target_xy, 
                 interpolation=cv2.INTER_NEAREST
             )
@@ -284,7 +313,7 @@ class BidirectionalRegistration:
             # Save
             tifffile.imwrite(
                 str(output_path / f"label_{i:06d}.tiff"),
-                resized_slice,
+                np.rint(resized_slice).astype(output_dtype, copy=False),
                 compression='lzw'
             )
             
@@ -299,9 +328,12 @@ class BidirectionalRegistration:
         if results.get('warped_label') is not None:
             if mode == 'atlas2image':
                 # Upsample atlas label to original space
-                # Save directly to sample_dir/chX_upsampled_label
-                label_dir = self.sample_dir / f"ch{self.signal_channel}_upsampled_label"
-                self.upsample_label_chunked(results['warped_label'], str(label_dir))
+                # Save once per sample so all signal channels can reuse the same atlas label
+                label_dir = self.sample_dir / "upsampled_atlas_label"
+                if label_dir.exists() and any(label_dir.iterdir()):
+                    print(f"Upsampled atlas label already exists at {label_dir}. Skipping upsampling.")
+                else:
+                    self.upsample_label_chunked(results['warped_label'], str(label_dir))
             else:
                 # Save warped mask (already in atlas space)
                 mask_dir = self.sample_dir / f"ch{self.signal_channel}_warped_mask"

@@ -5,7 +5,7 @@
         "description": "Configuration for input data structure",
         "resolution_xyz": [1.8, 1.8, 2.0],
         "channels": {
-            "signal": "1",
+            "signal": "2",
             "registration": "0"
         }
     },

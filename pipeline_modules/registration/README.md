@@ -76,7 +76,7 @@ python ANTs_registration.py \
 python analyze_density.py \
   --mask_folder "S:\Sample\ch3_downsample_mask" \
   --label_folder "S:\Sample\ch3_atlas_label_downsampled" \
-  --cfg "add_id_ytw.json" \
+  --cfg "Region_Csv_Rev1_updated.CSV" \
   --output "density_results.xlsx"
 ```
 
