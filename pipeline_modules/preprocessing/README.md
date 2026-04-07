@@ -9,6 +9,7 @@
 | [channel\_subtraction.py](#channel_subtractionpy) | 通道背景减法      | 去除参考通道（如自发荧光通道）的背景信号   |
 | [downsample.py](#downsamplepy)                    | 3D图像降采样     | 减小数据体积，加速后续处理          |
 | [masked\_clahe.py](#masked_clahepy)               | CLAHE对比度增强  | 增强图像对比度，提升细节可见性        |
+| [median\_filter.py](#median_filterpy)             | 中值滤波         | 去除散点噪声并保留结构边缘          |
 | [scattering\_removal.py](#scattering_removalpy)   | 散射/光晕去除     | 去除光片散射造成的光晕背景          |
 | [tophat\_background.py](#tophat_backgroundpy)     | Top-Hat背景校正 | 去除不均匀背景噪声              |
 | [tiff\_to\_zarr.py](#tiff_to_zarrpy)              | TIFF转Zarr   | 将TIFF切片序列转换为OME-Zarr格式 |
@@ -209,6 +210,39 @@ python masked_clahe.py input.tiff --masked --clip-limit 3.0 --grid-size 8
 
 ***
 
+## median\_filter.py
+
+**功能：** 对 2D TIFF 图像应用中值滤波，抑制散点/椒盐噪声，同时尽量保留边缘结构。
+
+**适用场景：**
+
+- 散射去除后仍存在零星高亮噪声点
+- 希望在 CLAHE 增强前先做轻度去噪
+- 不希望像高斯模糊那样过度平滑边界
+
+**使用方法：**
+
+```bash
+# 默认 3x3 中值滤波
+python median_filter.py input.tiff
+
+# 使用 5x5 中值核
+python median_filter.py input.tiff --kernel_size 5
+
+# 指定输出路径
+python median_filter.py input.tiff --kernel_size 3 --output output_median.tiff
+```
+
+**参数说明：**
+
+- `image_path`: 输入 TIFF 路径（必需）
+- `--kernel_size`: 中值滤波核大小，必须为奇数（默认：3）
+- `--output`: 输出 TIFF 路径（默认自动生成 `*_median.tiff`）
+
+**输出：** `*_median.tiff`
+
+***
+
 ## scattering\_removal.py
 
 **功能：** 基于高斯背景估计去除光片散射造成的光晕背景。
@@ -341,10 +375,11 @@ python tiff_to_zarr.py --input ./tiff_folder --output ./volume.zarr --chunk_size
 原始采集数据
   └─→ channel_subtraction (减去C0背景)
        └─→ tophat_background (去除不均匀背景)
-            └─→ scattering_removal (去除散射光晕)
-                 └─→ masked_clahe (对比度增强)
-                      └─→ downsample (可选，降采样用于分割/预览)
-                           └─→ tiff_to_zarr (可选，转Zarr可视化)
+             └─→ scattering_removal (去除散射光晕)
+                 └─→ median_filter (去除散点噪声)
+                      └─→ masked_clahe (对比度增强)
+                           └─→ downsample (可选，降采样用于分割/预览)
+                                └─→ tiff_to_zarr (可选，转Zarr可视化)
 ```
 
 ### 2. 单通道数据仅背景校正
@@ -353,7 +388,8 @@ python tiff_to_zarr.py --input ./tiff_folder --output ./volume.zarr --chunk_size
 原始图像
   └─→ tophat_background
        └─→ scattering_removal
-            └─→ clahe
+            └─→ median_filter
+                 └─→ clahe
 ```
 
 ### 3. 仅格式转换
@@ -390,4 +426,3 @@ numcodecs
 2. **内存管理**: `downsample.py` 使用分块处理大体积数据，可通过 `chunk_size` 调整内存使用
 3. **插值方法**: `downsample.py` 始终使用最近邻插值，这对于分割掩码是正确的选择，对于强度图像也能保持原始分布
 4. **参数调优**: 散射去除的 `sigma` 参数建议根据目标结构大小调整，一般为目标直径的2-3倍
-
