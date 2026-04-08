@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import tifffile
@@ -21,7 +22,7 @@ def _build_ball_structure(radius: int) -> np.ndarray:
     return structure
 
 
-def rolling_ball_background(image: np.ndarray, radius: int = 50) -> tuple[np.ndarray, np.ndarray]:
+def rolling_ball_background(image: np.ndarray, radius: int = 50) -> Tuple[np.ndarray, np.ndarray]:
     """Estimate background with a rolling-ball opening and subtract it from the image."""
     if image.ndim != 2:
         raise ValueError(f"rolling_ball_background expects a 2D image, got shape={image.shape}")

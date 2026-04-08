@@ -17,13 +17,13 @@
             "weight": 1.0,
             "adaptive": true,
             "save_plots": true,
-            "sample_ratio": 0.005,
+            "sample_ratio": 0.01,
             "min_samples": 10,
             "max_samples": 50,
             "compression": "lzw"
         },
         "tophat": {
-            "apply": false,
+            "apply": true,
             "kernel_size": 21
         },
         "rolling_ball": {
@@ -31,8 +31,8 @@
             "radius": 50
         },
         "scattering_removal": {
-            "apply": false,
-            "sigma": 50.0,
+            "apply": true,
+            "sigma": 25.0,
             "weight": 1.0
         },
         "median_filter": {
@@ -51,7 +51,8 @@
         "zarr": {
             "chunk_size": [128, 256, 256],
             "compressor": "default"
-        }
+        },
+        "channels": [1,2,3]
     },
     
     "registration": {
