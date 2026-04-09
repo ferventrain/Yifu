@@ -166,7 +166,7 @@ def estimate_global_weight(cx_files, c0_files, plot_path=None, random_seed=DEFAU
     else:
         inlier_mask = np.ones_like(all_cx_bg, dtype=bool)
     
-    a = max(0.5, min(a, 1.5))
+    a = max(0.2, min(a, 1.6))
     
     if plot_path is not None:
         plt.figure(figsize=(10, 7))
@@ -276,7 +276,7 @@ def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None
     else:
         inlier_mask = np.ones_like(cx_bg, dtype=bool).ravel()
     
-    a = max(0.5, min(a, 1.5))
+    a = max(0.2, min(a, 1.6))
     
     if plot_path is not None:
         plt.figure(figsize=(10, 7))

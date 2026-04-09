@@ -18,6 +18,10 @@
             "c": 1.0,
             "d0": null
         },
+        "median_filter": {
+            "apply": false,
+            "kernel_size": 3
+        },
         "clahe": {
             "apply": false,
             "clip_limit": 2.0,
