@@ -67,5 +67,26 @@
     "analysis": {
         "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
         "output_format": "xlsx"
+    },
+
+    "tubule_reconstruction": {
+        "enabled": false,
+        "mask_dataset_name": "0",
+        "foreground_label": 1,
+        "dust_threshold": 100,
+        "parallel": 4,
+        "fix_borders": true,
+        "output_dirname": "tubule_reconstruction",
+        "teasar_params": {
+            "scale": 1.5,
+            "const": 300,
+            "pdrf_scale": 100000,
+            "pdrf_exponent": 4,
+            "soma_acceptance_threshold": 3500,
+            "soma_detection_threshold": 750,
+            "soma_invalidation_scale": 1.0,
+            "soma_invalidation_const": 300,
+            "max_paths": null
+        }
     }
 }

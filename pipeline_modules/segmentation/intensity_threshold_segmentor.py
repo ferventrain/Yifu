@@ -56,6 +56,43 @@ def segment_chunk(img, threshold, sigma, min_size):
         
     return labeled.astype(np.uint16)
 
+
+def list_existing_chunk_indices(data_in):
+    """List chunk indices that physically exist in the input store."""
+    store = data_in.store
+    array_path = getattr(data_in, "path", "")
+    dim_sep = getattr(data_in, "_dimension_separator", ".")
+    ndim = len(data_in.shape)
+
+    prefix = f"{array_path}/" if array_path else ""
+    existing = set()
+
+    for raw_key in store.keys():
+        key = str(raw_key)
+        if prefix and not key.startswith(prefix):
+            continue
+
+        rel = key[len(prefix):] if prefix else key
+
+        # Skip metadata and non-chunk files
+        if rel in {".zarray", ".zattrs", ".zgroup", "zarr.json"}:
+            continue
+        if rel.startswith("."):
+            continue
+
+        parts = rel.split(dim_sep)
+        if len(parts) != ndim:
+            continue
+
+        try:
+            idx = tuple(int(p) for p in parts)
+        except ValueError:
+            continue
+
+        existing.add(idx)
+
+    return sorted(existing)
+
 def main():
     parser = argparse.ArgumentParser(description="Run Intensity Threshold Segmentation (No Dask)")
     parser.add_argument('--input_zarr', required=True, help='Path to input .zarr directory')
@@ -64,6 +101,11 @@ def main():
     parser.add_argument('--threshold', default='otsu', help='Threshold value or "otsu"')
     parser.add_argument('--sigma', type=float, default=1.0, help='Gaussian smoothing sigma')
     parser.add_argument('--min_size', type=int, default=10, help='Minimum object size')
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Smoke-test mode: only process chunks that physically exist in the input store'
+    )
     
     args = parser.parse_args()
     
@@ -80,8 +122,6 @@ def main():
         
     shape = data_in.shape
     chunks = data_in.chunks
-    dtype = data_in.dtype
-    
     print(f"Input Shape: {shape}")
     print(f"Chunks: {chunks}")
     
@@ -98,27 +138,37 @@ def main():
         'datasets': [{'path': '0'}]
     }]
     
-    # 3. Process Chunk by Chunk
-    # We iterate over the Z-axis using the chunk size
-    z_chunk_size = chunks[0]
-    
     print(f"Running segmentation (Threshold={args.threshold}, Sigma={args.sigma})...")
-    
-    for z in tqdm(range(0, shape[0], z_chunk_size), desc="Segmenting Z-slices"):
-        z_end = min(z + z_chunk_size, shape[0])
-        
-        # Read chunk
-        # Reading full YX plane for a set of Z slices
-        vol_chunk = data_in[z:z_end, :, :]
-        
-        # Process
-        # Note: applying 3D operations (like gaussian filter) on chunks 
-        # ignores Z-context at boundaries. Ideally we need overlap.
-        # But for this simple implementation, we accept block-boundary effects.
-        seg_chunk = segment_chunk(vol_chunk, args.threshold, args.sigma, args.min_size)
-        
-        # Write chunk
-        data_out[z:z_end, :, :] = seg_chunk
+
+    if args.test:
+        existing_indices = list_existing_chunk_indices(data_in)
+        if not existing_indices:
+            print("No physical chunks found in input store. Nothing to process in --test mode.")
+            return
+
+        print(f"Test mode enabled: found {len(existing_indices)} physical chunks to process.")
+
+        for idx in tqdm(existing_indices, desc="Segmenting existing chunks"):
+            slices = []
+            for axis, chunk_idx in enumerate(idx):
+                start = chunk_idx * chunks[axis]
+                stop = min(start + chunks[axis], shape[axis])
+                slices.append(slice(start, stop))
+            slices = tuple(slices)
+
+            vol_chunk = np.asarray(data_in[slices])
+            seg_chunk = segment_chunk(vol_chunk, args.threshold, args.sigma, args.min_size)
+            data_out[slices] = seg_chunk
+    else:
+        # 3. Process chunk-by-chunk along Z
+        z_chunk_size = chunks[0]
+        for z in tqdm(range(0, shape[0], z_chunk_size), desc="Segmenting Z-slices"):
+            z_end = min(z + z_chunk_size, shape[0])
+
+            # Note: this reads the full YX plane for each Z chunk.
+            vol_chunk = data_in[z:z_end, :, :]
+            seg_chunk = segment_chunk(vol_chunk, args.threshold, args.sigma, args.min_size)
+            data_out[z:z_end, :, :] = seg_chunk
         
     print(f"Segmentation complete. Saved to {args.output_zarr}")
 
