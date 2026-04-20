@@ -190,9 +190,46 @@
 运行后会输出：
 
 - `vessel_branch_metrics.csv`
-  每一条血管分支的长度、半径、曲折度等指标
+  每一条血管分支的长度、半径、曲折度、branch depth、terminal branch 标记等指标
 - `vessel_network_summary.json`
-  整个样本的血管网络汇总指标
+  整个样本的血管网络汇总指标，包括 branch point count、end point count 等
+- `skeleton_vertices.csv`
+  骨架节点坐标表，包含每个节点的 `z_um / y_um / x_um / radius_um`
+- `skeleton_edges.csv`
+  骨架连边表，包含每条边连接的两个节点及对应空间坐标
+- `swc/`
+  如果加上 `--save_swc`，会导出每条 skeleton 对应的 `.swc` 文件，可用于 `kimimaro view`
+
+如果需要输出 skeleton，可在命令行中加入：
+
+```bash
+--save_skeleton
+```
+
+如果还需要输出 SWC，可加入：
+
+```bash
+--save_swc
+```
+
+如果需要在 napari 中查看重建出来的 edge，可使用：
+
+```bash
+python pipeline_modules/tubule_reconstruction/view_skeleton_napari.py \
+  --skeleton_edges_csv "path/to/skeleton_edges.csv" \
+  --image_zarr "path/to/image.zarr" \
+  --mask_zarr "path/to/mask.zarr" \
+  --resolution_xyz "1.8,1.8,2.0"
+```
+
+如果是 `--test` 模式输出，脚本会优先按 `skeleton_edges.csv` 里的 `chunk_index` 和 `chunk_start_zyx` 自动加载对应 chunk。
+当前脚本会使用 napari 的 `Vectors` 层来显示 skeleton edge，比把每条边当成单独 shape 更轻量。
+
+如果你安装了 `kimimaro[view]`，可以直接查看某一条骨架：
+
+```bash
+kimimaro view path/to/output/swc/skeleton_000000.swc
+```
 
 ## 当前版本说明
 
@@ -201,8 +238,11 @@
 - 已支持 `binary mask zarr -> skeleton -> branch metrics`
 - 已支持按 `resolution_xyz` 输出带物理单位的长度参数
 - 已支持 `--test` 模式，只处理物理存在的 chunk 并按 chunk 独立做重建
+- 已支持 `--chunkwise` 模式，按 chunk 流式读取数据，避免一次性把整块体数据读入内存
+- 已支持 `--halo_zyx`，在 chunkwise 模式下读取邻域 halo 来减轻边界伪影
+- 已支持 chunkwise 下的跨 chunk skeleton stitching
 - 还没有接入 `main.py`
-- 还没有实现真正的 block-wise skeleton stitching
+- 还没有实现更高级的全局 graph merging 与拓扑清理
 
 如果后续要处理超大体积全量数据，建议下一步补：
 
@@ -217,8 +257,47 @@
 - 只扫描并处理输入 Zarr 中真实存在的 chunk
 - 每个 chunk 独立做连通域、骨架和分支统计
 - 输出总表和 `vessel_chunk_metrics.csv`
+- 如果加上 `--save_skeleton`，还会额外输出包含 chunk 信息的 skeleton 顶点和边表
 
 需要注意：
 
 - `--test` 不会做跨 chunk 血管连接
 - 因此它的结果适合验证“模块能不能跑通”，不适合作为最终全局血管网络结果
+
+## `--chunkwise` 模式说明
+
+`--chunkwise` 用于大体积 mask 的正式分块处理，行为是：
+
+- 按 chunk 逐块读取，而不是整块载入内存
+- 可通过 `--halo_zyx` 读取邻域上下文，例如 `--halo_zyx "8,32,32"`
+- 如果加上 `--save_skeleton`，会优先导出位于 core chunk 内的 skeleton edge，减少邻域 halo 引入的重复显示
+- 默认会尝试对相邻 chunk 边界上的 endpoint 做最近邻 stitching
+- 可通过 `--stitch_max_distance_um` 控制跨 chunk 连边的最大距离
+- 如果不希望 stitching，可加入 `--no_stitch`
+
+需要注意：
+
+- 当前版本已经做了“halo 读邻域 + core 区域导出 + 相邻 chunk endpoint stitching”
+- 但还没有做更高级的全局 graph merging、环路修正和拓扑清理
+
+## 关于 terminal / 神经末梢数量
+
+如果你后面想把同样的方法迁移到神经末梢分析，`terminal count` 可以作为一个很有用的第一近似，但要注意：
+
+- `num_end_points` 更接近“图上的末端节点数量”
+- `num_end_points_non_boundary` 会进一步排除贴在 chunk 边界上的末端，更适合避免边界截断带来的假阳性
+- `num_terminal_branches` 更接近“末端分支段数量”
+
+如果你的网络近似树结构，并且已经做过噪声清理和短 spur 修剪，那么“末端节点数”通常可以近似看作“神经末梢数”。  
+但如果存在：
+
+- 环路
+- 边界截断
+- segmentation 噪声
+- 很短的假分支
+
+那就不能直接把 raw terminal count 当作最终神经末梢数量，最好至少再做一轮：
+
+1. 短 spur 过滤
+2. 边界 terminal 排除
+3. 必要时按 terminal branch 长度再筛选

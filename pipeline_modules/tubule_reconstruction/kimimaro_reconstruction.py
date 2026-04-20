@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import json
 from pathlib import Path
 
@@ -53,6 +54,23 @@ def parse_resolution_xyz(resolution_text):
     if len(parts) != 3:
         raise ValueError(f"resolution_xyz must have 3 comma-separated values, got: {resolution_text}")
     return tuple(float(part) for part in parts)
+
+
+def resolution_xyz_to_zyx(resolution_xyz):
+    resolution_xyz = parse_resolution_xyz(resolution_xyz)
+    return (float(resolution_xyz[2]), float(resolution_xyz[1]), float(resolution_xyz[0]))
+
+
+def parse_triplet_int(text):
+    if isinstance(text, (tuple, list)):
+        if len(text) != 3:
+            raise ValueError(f"Expected 3 integers, got: {text}")
+        return tuple(int(v) for v in text)
+
+    parts = [part.strip() for part in str(text).split(",") if part.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"Expected 3 comma-separated integers, got: {text}")
+    return tuple(int(part) for part in parts)
 
 
 def parse_roi(roi_text):
@@ -118,6 +136,23 @@ def chunk_index_to_slices(chunk_index, chunks, shape):
     return tuple(slices)
 
 
+def iter_all_chunk_indices(shape, chunks):
+    grid_shape = tuple((int(dim) + int(chunk) - 1) // int(chunk) for dim, chunk in zip(shape, chunks))
+    for z in range(grid_shape[0]):
+        for y in range(grid_shape[1]):
+            for x in range(grid_shape[2]):
+                yield (z, y, x)
+
+
+def expand_slices(core_slices, halo_zyx, shape):
+    expanded = []
+    for axis, (core_slice, halo, dim) in enumerate(zip(core_slices, halo_zyx, shape)):
+        start = max(0, int(core_slice.start) - int(halo))
+        stop = min(int(dim), int(core_slice.stop) + int(halo))
+        expanded.append(slice(start, stop))
+    return tuple(expanded)
+
+
 def _extract_binary_mask(mask_zarr, roi=None, foreground_label=1):
     if roi is None:
         mask = np.asarray(mask_zarr[:])
@@ -130,9 +165,122 @@ def _extract_binary_mask(mask_zarr, roi=None, foreground_label=1):
     return mask == foreground_label if foreground_label is not None else mask > 0
 
 
+def _make_chunk_metadata(chunk_index, chunk_slices, expanded_slices):
+    return {
+        "chunk_index": ".".join(str(v) for v in chunk_index),
+        "chunk_start_zyx": ",".join(str(s.start) for s in chunk_slices),
+        "chunk_stop_zyx": ",".join(str(s.stop) for s in chunk_slices),
+        "expanded_start_zyx": ",".join(str(s.start) for s in expanded_slices),
+        "expanded_stop_zyx": ",".join(str(s.stop) for s in expanded_slices),
+    }
+
+
+def _process_chunk_task(task):
+    resolution_xyz = parse_resolution_xyz(task["resolution_xyz"])
+    mask_zarr = open_zarr_dataset(task["mask_zarr_path"], dataset_name=task["dataset_name"])
+    chunk_index = tuple(task["chunk_index"])
+    chunks = tuple(task["chunks"])
+    shape = tuple(task["shape"])
+    halo_zyx = tuple(task["halo_zyx"])
+
+    chunk_slices = chunk_index_to_slices(chunk_index, chunks, shape)
+    expanded_slices = expand_slices(chunk_slices, halo_zyx, shape)
+    metadata = _make_chunk_metadata(chunk_index, chunk_slices, expanded_slices)
+
+    core_binary_mask = _extract_binary_mask(
+        mask_zarr,
+        roi=chunk_slices,
+        foreground_label=task["foreground_label"],
+    )
+    core_mask_voxels = int(np.count_nonzero(core_binary_mask))
+
+    if core_mask_voxels == 0:
+        chunk_summary = {
+            **metadata,
+            "mask_voxels": 0,
+            "expanded_mask_voxels": 0,
+            "connected_components": 0,
+            "num_skeletons": 0,
+            "num_branches": 0,
+            "total_branch_length_um": 0.0,
+        }
+        return {
+            "chunk_index": chunk_index,
+            "core_mask_voxels": 0,
+            "connected_components": 0,
+            "branch_table": branch_table_from_skeletons({}),
+            "vertex_table": pd.DataFrame(),
+            "edge_table": pd.DataFrame(),
+            "chunk_summary": chunk_summary,
+            "num_skeletons": 0,
+        }
+
+    binary_mask = _extract_binary_mask(
+        mask_zarr,
+        roi=expanded_slices,
+        foreground_label=task["foreground_label"],
+    )
+    expanded_mask_voxels = int(np.count_nonzero(binary_mask))
+
+    skeletons, meta = skeletonize_binary_mask(
+        binary_mask=binary_mask,
+        resolution_xyz=resolution_xyz,
+        dust_threshold=task["dust_threshold"],
+        fix_borders=task["fix_borders"],
+        parallel=task["kimimaro_parallel"],
+        teasar_params=task["teasar_params"],
+    )
+
+    branch_table = branch_table_from_skeletons(skeletons)
+    branch_table = _reindex_branch_table(branch_table, skeleton_offset=0, extra_columns=metadata)
+
+    if task["save_skeleton"]:
+        vertex_table, edge_table = skeleton_tables_from_skeletons(
+            skeletons,
+            extra_columns=metadata,
+            offset_zyx_um=np.asarray([s.start for s in expanded_slices], dtype=np.float64)
+            * np.asarray(resolution_xyz_to_zyx(resolution_xyz), dtype=np.float64),
+        )
+        vertex_table, edge_table = _annotate_core_membership(
+            vertex_table,
+            edge_table,
+            core_slices=chunk_slices,
+            resolution_xyz=resolution_xyz,
+        )
+        vertex_table, edge_table = _filter_skeleton_tables_to_core(vertex_table, edge_table)
+    else:
+        vertex_table, edge_table = pd.DataFrame(), pd.DataFrame()
+
+    chunk_summary = summarize_vessel_network(
+        binary_mask=core_binary_mask,
+        skeletons=skeletons,
+        branch_table=branch_table,
+        resolution_xyz=resolution_xyz,
+    )
+    chunk_summary.update(metadata)
+    chunk_summary["mask_voxels"] = core_mask_voxels
+    chunk_summary["expanded_mask_voxels"] = expanded_mask_voxels
+    chunk_summary["connected_components"] = int(meta["num_components"])
+
+    return {
+        "chunk_index": chunk_index,
+        "core_mask_voxels": core_mask_voxels,
+        "connected_components": int(meta["num_components"]),
+        "branch_table": branch_table,
+        "vertex_table": vertex_table,
+        "edge_table": edge_table,
+        "chunk_summary": chunk_summary,
+        "num_skeletons": len(skeletons),
+    }
+
+
 def _binary_to_component_labels(binary_mask):
     labeled, num_features = ndimage.label(binary_mask.astype(np.uint8))
-    return labeled.astype(np.uint32, copy=False), int(num_features)
+    # Keep a signed integer dtype for kimimaro. Unsigned labels can trigger
+    # dtype casting issues when kimimaro applies ROI offsets to skeleton vertices.
+    if num_features <= np.iinfo(np.int32).max:
+        return labeled.astype(np.int32, copy=False), int(num_features)
+    return labeled.astype(np.int64, copy=False), int(num_features)
 
 
 def _import_kimimaro():
@@ -143,7 +291,104 @@ def _import_kimimaro():
             "kimimaro is required for tubule reconstruction. "
             "Please install it before running this module."
         ) from exc
+    _patch_kimimaro_roi_cast_bug(kimimaro)
     return kimimaro
+
+
+def _patch_kimimaro_roi_cast_bug(kimimaro):
+    """Patch kimimaro ROI offset handling to avoid uint32/int64 casting errors.
+
+    Some kimimaro builds return skeleton.vertices as uint32 inside
+    intake.skeletonize_subset. When ROI offsets are applied with
+    `skeleton.vertices += roi.minpt`, NumPy can raise a casting error.
+    We patch the subset function to promote both operands to int64 first.
+    """
+    intake = kimimaro.intake
+    if getattr(intake, "_yifu_roi_cast_patch", False):
+        return
+
+    def patched_skeletonize_subset(
+        all_dbf,
+        cc_labels,
+        voxel_graph,
+        remapping,
+        teasar_params,
+        anisotropy,
+        all_slices,
+        border_targets,
+        extra_targets_before,
+        extra_targets_after,
+        progress,
+        fix_borders,
+        fix_branching,
+        cc_segids,
+    ):
+        skeletons = intake.defaultdict(list)
+
+        with intake.tqdm(cc_segids, disable=(not progress), desc="Skeletonizing Labels") as pbar:
+            for segid in pbar:
+                pbar.set_postfix(label=str(remapping[segid]))
+
+                slices = all_slices[segid - 1]
+                if slices is None:
+                    continue
+
+                roi = intake.Bbox.from_slices(slices)
+                if roi.volume() <= 1:
+                    continue
+
+                labels = cc_labels[slices]
+                labels = labels == segid
+                dbf = (labels * all_dbf[slices]).astype(np.float32)
+                cropped_voxel_graph = voxel_graph[slices] if voxel_graph is not None else None
+
+                manual_targets_before = []
+                manual_targets_after = []
+                root = None
+
+                def translate_to_roi(targets):
+                    targets = np.array(targets, dtype=np.int64)
+                    targets -= roi.minpt.astype(np.int64)
+                    return targets.tolist()
+
+                if len(border_targets[segid]) > 0:
+                    manual_targets_before = translate_to_roi(border_targets[segid])
+                    root = manual_targets_before.pop()
+
+                if segid in extra_targets_before and len(extra_targets_before[segid]) > 0:
+                    manual_targets_before.extend(translate_to_roi(extra_targets_before[segid]))
+
+                if segid in extra_targets_after and len(extra_targets_after[segid]) > 0:
+                    manual_targets_after.extend(translate_to_roi(extra_targets_after[segid]))
+
+                skeleton = kimimaro.trace.trace(
+                    labels,
+                    dbf,
+                    anisotropy=anisotropy,
+                    fix_branching=fix_branching,
+                    manual_targets_before=manual_targets_before,
+                    manual_targets_after=manual_targets_after,
+                    root=root,
+                    voxel_graph=cropped_voxel_graph,
+                    **teasar_params,
+                )
+
+                if skeleton.empty():
+                    continue
+
+                skeleton.vertices = skeleton.vertices.astype(np.int64, copy=False)
+                skeleton.vertices += roi.minpt.astype(np.int64)
+
+                orig_segid = remapping[segid]
+                skeleton.id = orig_segid
+                skeleton.vertices = skeleton.vertices.astype(np.float32, copy=False)
+                skeleton.vertices *= anisotropy
+                skeletons[orig_segid].append(skeleton)
+
+        return intake.merge(skeletons)
+
+    intake.skeletonize_subset = patched_skeletonize_subset
+    intake._yifu_roi_cast_patch = True
 
 
 def skeletonize_binary_mask(
@@ -160,8 +405,7 @@ def skeletonize_binary_mask(
     if num_components == 0:
         return {}, {"num_components": 0}
 
-    resolution_xyz = tuple(float(v) for v in resolution_xyz)
-    anisotropy_xyz = resolution_xyz
+    anisotropy_zyx = resolution_xyz_to_zyx(resolution_xyz)
     teasar_cfg = dict(DEFAULT_TEASAR_PARAMS)
     if teasar_params:
         teasar_cfg.update(teasar_params)
@@ -170,7 +414,7 @@ def skeletonize_binary_mask(
         labels,
         teasar_params=teasar_cfg,
         dust_threshold=int(dust_threshold),
-        anisotropy=anisotropy_xyz,
+        anisotropy=anisotropy_zyx,
         fix_branching=True,
         fix_borders=bool(fix_borders),
         progress=False,
@@ -244,6 +488,59 @@ def _collect_path(adjacency, edges, start_node, next_node, visited_edges):
     return path_nodes, path_edges
 
 
+def _compute_branch_depths(branches, degrees, vertices):
+    if not branches:
+        return []
+
+    branch_nodes = set()
+    for branch in branches:
+        branch_nodes.add(int(branch["start_node"]))
+        branch_nodes.add(int(branch["end_node"]))
+
+    node_graph = {node: set() for node in branch_nodes}
+    for branch in branches:
+        if branch.get("is_loop", False):
+            continue
+        start_node = int(branch["start_node"])
+        end_node = int(branch["end_node"])
+        node_graph.setdefault(start_node, set()).add(end_node)
+        node_graph.setdefault(end_node, set()).add(start_node)
+
+    endpoint_nodes = [node for node in branch_nodes if int(degrees[node]) == 1]
+    if endpoint_nodes:
+        root_node = min(endpoint_nodes, key=lambda node: float(vertices[node][0]))
+    else:
+        root_node = min(branch_nodes, key=lambda node: float(vertices[node][0]))
+
+    node_depths = {int(root_node): 0}
+    queue = [int(root_node)]
+    queue_index = 0
+
+    while queue_index < len(queue):
+        current = queue[queue_index]
+        queue_index += 1
+        for neighbor in node_graph.get(current, ()):
+            if neighbor in node_depths:
+                continue
+            node_depths[neighbor] = node_depths[current] + 1
+            queue.append(neighbor)
+
+    branch_depths = []
+    for branch in branches:
+        if branch.get("is_loop", False):
+            branch_depths.append(np.nan)
+            continue
+
+        start_depth = node_depths.get(int(branch["start_node"]))
+        end_depth = node_depths.get(int(branch["end_node"]))
+        if start_depth is None or end_depth is None:
+            branch_depths.append(np.nan)
+        else:
+            branch_depths.append(int(max(start_depth, end_depth)))
+
+    return branch_depths
+
+
 def _extract_branches_from_skeleton(skeleton_id, skeleton):
     vertices = np.asarray(getattr(skeleton, "vertices", np.empty((0, 3))), dtype=np.float64)
     edges = np.asarray(getattr(skeleton, "edges", np.empty((0, 2))), dtype=np.int64)
@@ -300,6 +597,17 @@ def _extract_branches_from_skeleton(skeleton_id, skeleton):
             )
         )
         branch_id += 1
+
+    branch_depths = _compute_branch_depths(branches, degrees, vertices)
+    for branch, branch_depth in zip(branches, branch_depths):
+        start_degree = int(degrees[int(branch["start_node"])])
+        end_degree = int(degrees[int(branch["end_node"])])
+        branch["start_degree"] = start_degree
+        branch["end_degree"] = end_degree
+        branch["branch_depth"] = branch_depth
+        branch["is_terminal_branch"] = bool((start_degree == 1) or (end_degree == 1))
+        branch["is_branch_to_branch"] = bool((start_degree >= 3) and (end_degree >= 3))
+        branch["is_root_branch"] = bool(np.isfinite(branch_depth) and int(branch_depth) == 1)
 
     return branches
 
@@ -396,6 +704,12 @@ def branch_table_from_skeletons(skeletons):
                 "num_points",
                 "num_edges",
                 "is_loop",
+                "start_degree",
+                "end_degree",
+                "branch_depth",
+                "is_terminal_branch",
+                "is_branch_to_branch",
+                "is_root_branch",
                 "branch_length_um",
                 "euclidean_length_um",
                 "tortuosity",
@@ -420,6 +734,339 @@ def _reindex_branch_table(branch_table, skeleton_offset=0, extra_columns=None):
             table[key] = value
 
     return table
+
+
+def skeleton_tables_from_skeletons(skeletons, extra_columns=None, offset_zyx_um=None):
+    vertex_rows = []
+    edge_rows = []
+    offset = np.asarray(offset_zyx_um if offset_zyx_um is not None else (0.0, 0.0, 0.0), dtype=np.float64)
+
+    for skeleton_id, skeleton in skeletons.items():
+        vertices = np.asarray(getattr(skeleton, "vertices", np.empty((0, 3))), dtype=np.float64)
+        edges = np.asarray(getattr(skeleton, "edges", np.empty((0, 2))), dtype=np.int64)
+        radii = _get_skeleton_radii(skeleton)
+
+        for node_id, point in enumerate(vertices):
+            global_point = point + offset
+            row = {
+                "skeleton_id": int(skeleton_id),
+                "node_id": int(node_id),
+                "z_um": float(global_point[0]),
+                "y_um": float(global_point[1]),
+                "x_um": float(global_point[2]),
+                "radius_um": float(radii[node_id]) if radii is not None else np.nan,
+            }
+            if extra_columns:
+                row.update(extra_columns)
+            vertex_rows.append(row)
+
+        for edge_id, (source_node, target_node) in enumerate(edges):
+            source_point = vertices[int(source_node)] + offset
+            target_point = vertices[int(target_node)] + offset
+            row = {
+                "skeleton_id": int(skeleton_id),
+                "edge_id": int(edge_id),
+                "source_node": int(source_node),
+                "target_node": int(target_node),
+                "source_z_um": float(source_point[0]),
+                "source_y_um": float(source_point[1]),
+                "source_x_um": float(source_point[2]),
+                "target_z_um": float(target_point[0]),
+                "target_y_um": float(target_point[1]),
+                "target_x_um": float(target_point[2]),
+                "edge_length_um": float(np.linalg.norm(target_point - source_point)),
+            }
+            if extra_columns:
+                row.update(extra_columns)
+            edge_rows.append(row)
+
+    vertex_table = pd.DataFrame(vertex_rows)
+    edge_table = pd.DataFrame(edge_rows)
+    return vertex_table, edge_table
+
+
+def _reindex_skeleton_tables(vertex_table, edge_table, skeleton_offset=0):
+    if not vertex_table.empty:
+        vertex_table = vertex_table.copy()
+        vertex_table["skeleton_id"] = vertex_table["skeleton_id"].astype(np.int64) + int(skeleton_offset)
+    if not edge_table.empty:
+        edge_table = edge_table.copy()
+        edge_table["skeleton_id"] = edge_table["skeleton_id"].astype(np.int64) + int(skeleton_offset)
+    return vertex_table, edge_table
+
+
+def _write_skeleton_tables(vertex_table, edge_table, output_root):
+    vertex_csv_path = output_root / "skeleton_vertices.csv"
+    edge_csv_path = output_root / "skeleton_edges.csv"
+    vertex_table.to_csv(vertex_csv_path, index=False)
+    edge_table.to_csv(edge_csv_path, index=False)
+    return vertex_csv_path, edge_csv_path
+
+
+def _write_single_swc(vertex_table, edge_table, swc_path):
+    if vertex_table.empty:
+        return
+
+    vertex_table = vertex_table.copy().sort_values(["node_id"]).reset_index(drop=True)
+    parent_map = {}
+
+    if not edge_table.empty:
+        for row in edge_table.itertuples(index=False):
+            source = int(row.source_node)
+            target = int(row.target_node)
+            parent_map.setdefault(target, source)
+
+    lines = ["# id type x y z radius parent"]
+    for row in vertex_table.itertuples(index=False):
+        node_id = int(row.node_id)
+        swc_id = node_id + 1
+        parent_node = parent_map.get(node_id, -1)
+        parent_id = parent_node + 1 if parent_node >= 0 else -1
+        radius = float(row.radius_um) if not pd.isna(row.radius_um) else 1.0
+
+        # SWC convention is x y z
+        lines.append(
+            f"{swc_id} 0 {float(row.x_um):.6f} {float(row.y_um):.6f} "
+            f"{float(row.z_um):.6f} {radius:.6f} {parent_id}"
+        )
+
+    swc_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_swc_files(vertex_table, edge_table, output_root):
+    swc_dir = output_root / "swc"
+    swc_dir.mkdir(parents=True, exist_ok=True)
+
+    if vertex_table.empty:
+        return swc_dir, []
+
+    edge_table = _normalize_edge_table_schema(edge_table)
+    written_paths = []
+
+    for skeleton_id, skeleton_vertices in vertex_table.groupby("skeleton_id"):
+        if edge_table.empty:
+            skeleton_edges = edge_table.iloc[0:0].copy()
+        else:
+            skeleton_edges = edge_table.loc[
+                (edge_table["source_skeleton_id"].astype(int) == int(skeleton_id))
+                | (edge_table["target_skeleton_id"].astype(int) == int(skeleton_id))
+                | (edge_table["skeleton_id"].astype(int) == int(skeleton_id))
+            ].copy()
+
+        swc_path = swc_dir / f"skeleton_{int(skeleton_id):06d}.swc"
+        _write_single_swc(skeleton_vertices, skeleton_edges, swc_path)
+        written_paths.append(swc_path)
+
+    return swc_dir, written_paths
+
+
+def _annotate_core_membership(vertex_table, edge_table, core_slices, resolution_xyz):
+    if vertex_table.empty and edge_table.empty:
+        return vertex_table, edge_table
+
+    resolution_zyx = np.asarray(resolution_xyz_to_zyx(resolution_xyz), dtype=np.float64)
+    core_start_um = np.asarray([s.start for s in core_slices], dtype=np.float64) * resolution_zyx
+    core_stop_um = np.asarray([s.stop for s in core_slices], dtype=np.float64) * resolution_zyx
+
+    if not vertex_table.empty:
+        vertex_table = vertex_table.copy()
+        coords = vertex_table[["z_um", "y_um", "x_um"]].to_numpy(dtype=np.float64)
+        in_core = np.all((coords >= core_start_um) & (coords < core_stop_um), axis=1)
+        z_min = np.isclose(coords[:, 0], core_start_um[0], atol=resolution_zyx[0] * 0.5)
+        z_max = np.isclose(coords[:, 0], core_stop_um[0] - resolution_zyx[0], atol=resolution_zyx[0] * 0.5)
+        y_min = np.isclose(coords[:, 1], core_start_um[1], atol=resolution_zyx[1] * 0.5)
+        y_max = np.isclose(coords[:, 1], core_stop_um[1] - resolution_zyx[1], atol=resolution_zyx[1] * 0.5)
+        x_min = np.isclose(coords[:, 2], core_start_um[2], atol=resolution_zyx[2] * 0.5)
+        x_max = np.isclose(coords[:, 2], core_stop_um[2] - resolution_zyx[2], atol=resolution_zyx[2] * 0.5)
+        touches_boundary = z_min | z_max | y_min | y_max | x_min | x_max
+        vertex_table["in_core"] = in_core
+        vertex_table["touches_core_boundary"] = touches_boundary
+        vertex_table["touch_z_min"] = z_min
+        vertex_table["touch_z_max"] = z_max
+        vertex_table["touch_y_min"] = y_min
+        vertex_table["touch_y_max"] = y_max
+        vertex_table["touch_x_min"] = x_min
+        vertex_table["touch_x_max"] = x_max
+
+    if not edge_table.empty:
+        edge_table = edge_table.copy()
+        source = edge_table[["source_z_um", "source_y_um", "source_x_um"]].to_numpy(dtype=np.float64)
+        target = edge_table[["target_z_um", "target_y_um", "target_x_um"]].to_numpy(dtype=np.float64)
+        midpoint = (source + target) / 2.0
+        midpoint_in_core = np.all((midpoint >= core_start_um) & (midpoint < core_stop_um), axis=1)
+        touches_boundary = np.any(
+            np.isclose(source, core_start_um[None, :], atol=resolution_zyx[None, :] * 0.5)
+            | np.isclose(source, core_stop_um[None, :] - resolution_zyx[None, :], atol=resolution_zyx[None, :] * 0.5)
+            | np.isclose(target, core_start_um[None, :], atol=resolution_zyx[None, :] * 0.5)
+            | np.isclose(target, core_stop_um[None, :] - resolution_zyx[None, :], atol=resolution_zyx[None, :] * 0.5),
+            axis=1,
+        )
+        edge_table["midpoint_in_core"] = midpoint_in_core
+        edge_table["touches_core_boundary"] = touches_boundary
+
+    return vertex_table, edge_table
+
+
+def _filter_skeleton_tables_to_core(vertex_table, edge_table):
+    if edge_table.empty:
+        return vertex_table.iloc[0:0].copy() if not vertex_table.empty else pd.DataFrame(), edge_table
+
+    keep_edges = (
+        edge_table["midpoint_in_core"].astype(bool)
+        if "midpoint_in_core" in edge_table.columns
+        else np.ones(len(edge_table), dtype=bool)
+    )
+    filtered_edges = edge_table.loc[keep_edges].copy()
+
+    if vertex_table.empty or filtered_edges.empty:
+        return pd.DataFrame(columns=vertex_table.columns if not vertex_table.empty else []), filtered_edges
+
+    keep_pairs = set(zip(filtered_edges["skeleton_id"].tolist(), filtered_edges["source_node"].tolist()))
+    keep_pairs.update(zip(filtered_edges["skeleton_id"].tolist(), filtered_edges["target_node"].tolist()))
+    keep_vertex_mask = [
+        (int(row.skeleton_id), int(row.node_id)) in keep_pairs
+        for row in vertex_table.itertuples(index=False)
+    ]
+    filtered_vertices = vertex_table.loc[keep_vertex_mask].copy()
+    return filtered_vertices, filtered_edges
+
+
+def _parse_chunk_index_text(chunk_index_text):
+    return tuple(int(part) for part in str(chunk_index_text).split("."))
+
+
+def _compute_vertex_degrees_from_edges(vertex_table, edge_table):
+    if vertex_table.empty:
+        return vertex_table
+
+    vertex_table = vertex_table.copy()
+    degree_map = {}
+
+    if not edge_table.empty:
+        for row in edge_table.itertuples(index=False):
+            degree_map[(int(row.skeleton_id), int(row.source_node))] = degree_map.get((int(row.skeleton_id), int(row.source_node)), 0) + 1
+            degree_map[(int(row.skeleton_id), int(row.target_node))] = degree_map.get((int(row.skeleton_id), int(row.target_node)), 0) + 1
+
+    vertex_table["degree"] = [
+        degree_map.get((int(row.skeleton_id), int(row.node_id)), 0)
+        for row in vertex_table.itertuples(index=False)
+    ]
+    return vertex_table
+
+
+def _normalize_edge_table_schema(edge_table):
+    edge_table = edge_table.copy()
+    if "source_skeleton_id" not in edge_table.columns:
+        edge_table["source_skeleton_id"] = edge_table["skeleton_id"]
+    if "target_skeleton_id" not in edge_table.columns:
+        edge_table["target_skeleton_id"] = edge_table["skeleton_id"]
+    if "is_stitch" not in edge_table.columns:
+        edge_table["is_stitch"] = False
+    return edge_table
+
+
+def stitch_skeleton_edges_across_chunks(vertex_table, edge_table, max_distance_um):
+    if vertex_table.empty or edge_table.empty:
+        return vertex_table, _normalize_edge_table_schema(edge_table), pd.DataFrame()
+
+    vertex_table = _compute_vertex_degrees_from_edges(vertex_table, edge_table)
+    edge_table = _normalize_edge_table_schema(edge_table)
+
+    endpoint_mask = (
+        vertex_table["in_core"].astype(bool)
+        & vertex_table["touches_core_boundary"].astype(bool)
+        & (vertex_table["degree"].astype(int) == 1)
+    )
+    endpoints = vertex_table.loc[endpoint_mask].copy()
+    if endpoints.empty:
+        return vertex_table, edge_table, pd.DataFrame()
+
+    endpoints["chunk_index_tuple"] = endpoints["chunk_index"].map(_parse_chunk_index_text)
+    chunk_set = set(endpoints["chunk_index_tuple"].tolist())
+    stitch_rows = []
+    used_nodes = set()
+    next_edge_id = int(edge_table["edge_id"].max()) + 1 if not edge_table.empty else 0
+
+    face_pairs = [
+        ("touch_z_max", "touch_z_min", (1, 0, 0)),
+        ("touch_y_max", "touch_y_min", (0, 1, 0)),
+        ("touch_x_max", "touch_x_min", (0, 0, 1)),
+    ]
+
+    for chunk_index in sorted(chunk_set):
+        chunk_rows = endpoints.loc[endpoints["chunk_index_tuple"] == chunk_index]
+        for face_a, face_b, delta in face_pairs:
+            neighbor_index = tuple(chunk_index[i] + delta[i] for i in range(3))
+            if neighbor_index not in chunk_set:
+                continue
+
+            a_rows = chunk_rows.loc[chunk_rows[face_a].astype(bool)]
+            if a_rows.empty:
+                continue
+
+            b_rows = endpoints.loc[
+                (endpoints["chunk_index_tuple"] == neighbor_index)
+                & endpoints[face_b].astype(bool)
+            ]
+            if b_rows.empty:
+                continue
+
+            candidate_pairs = []
+            for a in a_rows.itertuples(index=False):
+                a_key = (int(a.skeleton_id), int(a.node_id))
+                if a_key in used_nodes:
+                    continue
+                a_point = np.array([a.z_um, a.y_um, a.x_um], dtype=np.float64)
+
+                for b in b_rows.itertuples(index=False):
+                    b_key = (int(b.skeleton_id), int(b.node_id))
+                    if b_key in used_nodes:
+                        continue
+                    b_point = np.array([b.z_um, b.y_um, b.x_um], dtype=np.float64)
+                    distance_um = float(np.linalg.norm(a_point - b_point))
+                    if distance_um <= float(max_distance_um):
+                        candidate_pairs.append((distance_um, a, b))
+
+            candidate_pairs.sort(key=lambda item: item[0])
+            for distance_um, a, b in candidate_pairs:
+                a_key = (int(a.skeleton_id), int(a.node_id))
+                b_key = (int(b.skeleton_id), int(b.node_id))
+                if a_key in used_nodes or b_key in used_nodes:
+                    continue
+
+                used_nodes.add(a_key)
+                used_nodes.add(b_key)
+                stitch_rows.append(
+                    {
+                        "skeleton_id": int(a.skeleton_id),
+                        "edge_id": int(next_edge_id),
+                        "source_node": int(a.node_id),
+                        "target_node": int(b.node_id),
+                        "source_z_um": float(a.z_um),
+                        "source_y_um": float(a.y_um),
+                        "source_x_um": float(a.x_um),
+                        "target_z_um": float(b.z_um),
+                        "target_y_um": float(b.y_um),
+                        "target_x_um": float(b.x_um),
+                        "edge_length_um": float(distance_um),
+                        "chunk_index": str(a.chunk_index),
+                        "chunk_start_zyx": str(a.chunk_start_zyx),
+                        "chunk_stop_zyx": str(a.chunk_stop_zyx),
+                        "expanded_start_zyx": str(a.expanded_start_zyx),
+                        "expanded_stop_zyx": str(a.expanded_stop_zyx),
+                        "source_skeleton_id": int(a.skeleton_id),
+                        "target_skeleton_id": int(b.skeleton_id),
+                        "is_stitch": True,
+                    }
+                )
+                next_edge_id += 1
+
+    stitch_edge_table = pd.DataFrame(stitch_rows)
+    if stitch_edge_table.empty:
+        return vertex_table, edge_table, stitch_edge_table
+
+    combined_edge_table = pd.concat([edge_table, stitch_edge_table], ignore_index=True, sort=False)
+    return vertex_table, combined_edge_table, stitch_edge_table
 
 
 def summarize_vessel_network(binary_mask, skeletons, branch_table, resolution_xyz=(1.0, 1.0, 1.0)):
@@ -487,6 +1134,8 @@ def summarize_branch_table(branch_table):
             "max_branch_length_um": 0.0,
             "mean_tortuosity": np.nan,
             "mean_skeleton_radius_um": np.nan,
+            "num_terminal_branches": 0,
+            "max_branch_depth": None,
         }
 
     lengths = branch_table["branch_length_um"].to_numpy(dtype=np.float64)
@@ -510,6 +1159,39 @@ def summarize_branch_table(branch_table):
         "max_branch_length_um": float(lengths.max()),
         "mean_tortuosity": float(valid_tortuosities.mean()) if valid_tortuosities.size > 0 else np.nan,
         "mean_skeleton_radius_um": float(valid_radii.mean()) if valid_radii.size > 0 else np.nan,
+        "num_terminal_branches": int(branch_table["is_terminal_branch"].fillna(False).astype(bool).sum())
+        if "is_terminal_branch" in branch_table.columns
+        else None,
+        "max_branch_depth": int(np.nanmax(branch_table["branch_depth"].to_numpy(dtype=np.float64)))
+        if ("branch_depth" in branch_table.columns and np.any(np.isfinite(branch_table["branch_depth"].to_numpy(dtype=np.float64))))
+        else None,
+    }
+
+
+def summarize_graph_from_skeleton_tables(vertex_table, edge_table):
+    if vertex_table.empty:
+        return {
+            "num_vertices": 0,
+            "num_edges": 0,
+            "num_branch_points": 0,
+            "num_end_points": 0,
+            "num_end_points_non_boundary": 0,
+        }
+
+    vertex_table = _compute_vertex_degrees_from_edges(vertex_table, edge_table)
+    degrees = vertex_table["degree"].astype(int)
+    boundary_mask = (
+        vertex_table["touches_core_boundary"].astype(bool)
+        if "touches_core_boundary" in vertex_table.columns
+        else np.zeros(len(vertex_table), dtype=bool)
+    )
+
+    return {
+        "num_vertices": int(len(vertex_table)),
+        "num_edges": int(len(edge_table)),
+        "num_branch_points": int((degrees >= 3).sum()),
+        "num_end_points": int((degrees == 1).sum()),
+        "num_end_points_non_boundary": int(((degrees == 1) & (~boundary_mask)).sum()),
     }
 
 
@@ -538,6 +1220,8 @@ def analyze_binary_mask_zarr(
     fix_borders=True,
     parallel=1,
     teasar_params=None,
+    save_skeleton=False,
+    save_swc=False,
 ):
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
     mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
@@ -569,12 +1253,26 @@ def analyze_binary_mask_zarr(
     branch_table.to_csv(branch_csv_path, index=False)
     _write_summary_json(summary, summary_json_path)
 
-    return {
+    result = {
         "summary": summary,
         "branch_table": branch_table,
         "branch_csv_path": branch_csv_path,
         "summary_json_path": summary_json_path,
     }
+
+    if save_skeleton:
+        vertex_table, edge_table = skeleton_tables_from_skeletons(skeletons)
+        vertex_csv_path, edge_csv_path = _write_skeleton_tables(vertex_table, edge_table, output_root)
+        result["vertex_table"] = vertex_table
+        result["edge_table"] = edge_table
+        result["vertex_csv_path"] = vertex_csv_path
+        result["edge_csv_path"] = edge_csv_path
+        if save_swc:
+            swc_dir, swc_paths = write_swc_files(vertex_table, edge_table, output_root)
+            result["swc_dir"] = swc_dir
+            result["swc_paths"] = swc_paths
+
+    return result
 
 
 def analyze_binary_mask_zarr_test_mode(
@@ -587,90 +1285,143 @@ def analyze_binary_mask_zarr_test_mode(
     fix_borders=True,
     parallel=1,
     teasar_params=None,
+    save_skeleton=False,
+    save_swc=False,
+):
+    return analyze_binary_mask_zarr_chunkwise(
+        mask_zarr_path=mask_zarr_path,
+        output_dir=output_dir,
+        dataset_name=dataset_name,
+        resolution_xyz=resolution_xyz,
+        foreground_label=foreground_label,
+        dust_threshold=dust_threshold,
+        fix_borders=fix_borders,
+        parallel=parallel,
+        teasar_params=teasar_params,
+        save_skeleton=save_skeleton,
+        save_swc=save_swc,
+        process_existing_only=True,
+        halo_zyx=(0, 0, 0),
+        mode_name="test_chunkwise",
+    )
+
+
+def analyze_binary_mask_zarr_chunkwise(
+    mask_zarr_path,
+    output_dir,
+    dataset_name="0",
+    resolution_xyz=(1.0, 1.0, 1.0),
+    foreground_label=1,
+    dust_threshold=0,
+    fix_borders=True,
+    parallel=1,
+    teasar_params=None,
+    save_skeleton=False,
+    save_swc=False,
+    process_existing_only=False,
+    halo_zyx=(0, 0, 0),
+    mode_name="chunkwise",
+    stitch=True,
+    stitch_max_distance_um=5.0,
+    chunk_workers=1,
 ):
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
+    chunk_workers = max(1, int(chunk_workers))
     mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
+    halo_zyx = parse_triplet_int(halo_zyx)
     existing_chunks = list_existing_chunk_indices(mask_zarr)
-
-    if not existing_chunks:
+    if not existing_chunks and process_existing_only:
         raise ValueError("No physical chunks found in the input mask Zarr store.")
 
+    chunks = mask_zarr.chunks
+    shape = mask_zarr.shape
+    chunk_indices = existing_chunks if process_existing_only else list(iter_all_chunk_indices(shape, chunks))
+    kimimaro_parallel = int(parallel) if chunk_workers <= 1 else 1
+
+    task_payloads = [
+        {
+            "mask_zarr_path": str(mask_zarr_path),
+            "dataset_name": dataset_name,
+            "resolution_xyz": resolution_xyz,
+            "foreground_label": foreground_label,
+            "dust_threshold": dust_threshold,
+            "fix_borders": fix_borders,
+            "kimimaro_parallel": kimimaro_parallel,
+            "teasar_params": teasar_params,
+            "save_skeleton": save_skeleton,
+            "chunk_index": chunk_index,
+            "chunks": chunks,
+            "shape": shape,
+            "halo_zyx": halo_zyx,
+        }
+        for chunk_index in chunk_indices
+    ]
+
+    if chunk_workers <= 1:
+        chunk_results = [_process_chunk_task(task) for task in task_payloads]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=chunk_workers) as executor:
+            chunk_results = list(executor.map(_process_chunk_task, task_payloads))
+
+    chunk_results.sort(key=lambda item: tuple(item["chunk_index"]))
+
     all_branch_tables = []
+    all_vertex_tables = []
+    all_edge_tables = []
     chunk_rows = []
     skeleton_offset = 0
     total_mask_voxels = 0
     total_components = 0
-    chunks = mask_zarr.chunks
-    shape = mask_zarr.shape
 
-    for chunk_index in existing_chunks:
-        chunk_slices = chunk_index_to_slices(chunk_index, chunks, shape)
-        binary_mask = _extract_binary_mask(mask_zarr, roi=chunk_slices, foreground_label=foreground_label)
-        mask_voxels = int(np.count_nonzero(binary_mask))
-        total_mask_voxels += mask_voxels
+    for chunk_result in chunk_results:
+        total_mask_voxels += int(chunk_result["core_mask_voxels"])
+        total_components += int(chunk_result["connected_components"])
 
-        if mask_voxels == 0:
-            chunk_rows.append(
-                {
-                    "chunk_index": ".".join(str(v) for v in chunk_index),
-                    "chunk_start_zyx": ",".join(str(s.start) for s in chunk_slices),
-                    "chunk_stop_zyx": ",".join(str(s.stop) for s in chunk_slices),
-                    "mask_voxels": 0,
-                    "connected_components": 0,
-                    "num_skeletons": 0,
-                    "num_branches": 0,
-                    "total_branch_length_um": 0.0,
-                }
-            )
-            continue
-
-        skeletons, meta = skeletonize_binary_mask(
-            binary_mask=binary_mask,
-            resolution_xyz=resolution_xyz,
-            dust_threshold=dust_threshold,
-            fix_borders=fix_borders,
-            parallel=parallel,
-            teasar_params=teasar_params,
-        )
-        total_components += int(meta["num_components"])
-
-        branch_table = branch_table_from_skeletons(skeletons)
         branch_table = _reindex_branch_table(
-            branch_table,
+            chunk_result["branch_table"],
             skeleton_offset=skeleton_offset,
-            extra_columns={
-                "chunk_index": ".".join(str(v) for v in chunk_index),
-                "chunk_start_zyx": ",".join(str(s.start) for s in chunk_slices),
-                "chunk_stop_zyx": ",".join(str(s.stop) for s in chunk_slices),
-            },
         )
         all_branch_tables.append(branch_table)
 
-        chunk_summary = summarize_vessel_network(
-            binary_mask=binary_mask,
-            skeletons=skeletons,
-            branch_table=branch_table,
-            resolution_xyz=resolution_xyz,
-        )
-        chunk_summary["chunk_index"] = ".".join(str(v) for v in chunk_index)
-        chunk_summary["chunk_start_zyx"] = ",".join(str(s.start) for s in chunk_slices)
-        chunk_summary["chunk_stop_zyx"] = ",".join(str(s.stop) for s in chunk_slices)
-        chunk_summary["connected_components"] = int(meta["num_components"])
-        chunk_rows.append(chunk_summary)
+        if save_skeleton:
+            vertex_table, edge_table = _reindex_skeleton_tables(
+                chunk_result["vertex_table"],
+                chunk_result["edge_table"],
+                skeleton_offset=skeleton_offset,
+            )
+            all_vertex_tables.append(vertex_table)
+            all_edge_tables.append(edge_table)
 
-        skeleton_offset += len(skeletons)
+        chunk_rows.append(chunk_result["chunk_summary"])
+        skeleton_offset += int(chunk_result["num_skeletons"])
 
     combined_branch_table = (
         pd.concat(all_branch_tables, ignore_index=True)
         if all_branch_tables
         else branch_table_from_skeletons({})
     )
+    combined_vertex_table = (
+        pd.concat(all_vertex_tables, ignore_index=True)
+        if all_vertex_tables
+        else pd.DataFrame()
+    )
+    combined_edge_table = (
+        pd.concat(all_edge_tables, ignore_index=True)
+        if all_edge_tables
+        else pd.DataFrame()
+    )
     summary = summarize_branch_table(combined_branch_table)
-    summary["mode"] = "test_chunkwise"
-    summary["processed_chunks"] = int(len(existing_chunks))
+    summary["mode"] = mode_name
+    summary["processed_chunks"] = int(len(chunk_indices))
     summary["connected_components"] = int(total_components)
     summary["mask_voxels"] = int(total_mask_voxels)
     summary["mask_volume_um3"] = float(total_mask_voxels * np.prod(tuple(float(v) for v in resolution_xyz)))
+    summary["halo_zyx"] = [int(v) for v in halo_zyx]
+    summary["process_existing_only"] = bool(process_existing_only)
+    summary["stitch_enabled"] = bool(stitch)
+    summary["stitch_max_distance_um"] = float(stitch_max_distance_um)
+    summary["chunk_workers"] = int(chunk_workers)
+    summary["kimimaro_parallel_per_chunk"] = int(kimimaro_parallel)
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -681,15 +1432,52 @@ def analyze_binary_mask_zarr_test_mode(
 
     combined_branch_table.to_csv(branch_csv_path, index=False)
     pd.DataFrame(chunk_rows).to_csv(chunk_csv_path, index=False)
-    _write_summary_json(summary, summary_json_path)
 
-    return {
+    result = {
         "summary": summary,
         "branch_table": combined_branch_table,
         "branch_csv_path": branch_csv_path,
         "chunk_csv_path": chunk_csv_path,
         "summary_json_path": summary_json_path,
     }
+
+    if save_skeleton:
+        stitch_edge_table = pd.DataFrame()
+        if stitch:
+            combined_vertex_table, combined_edge_table, stitch_edge_table = stitch_skeleton_edges_across_chunks(
+                combined_vertex_table,
+                combined_edge_table,
+                max_distance_um=stitch_max_distance_um,
+            )
+        else:
+            combined_edge_table = _normalize_edge_table_schema(combined_edge_table)
+
+        vertex_csv_path, edge_csv_path = _write_skeleton_tables(combined_vertex_table, combined_edge_table, output_root)
+        result["vertex_table"] = combined_vertex_table
+        result["edge_table"] = combined_edge_table
+        result["vertex_csv_path"] = vertex_csv_path
+        result["edge_csv_path"] = edge_csv_path
+        summary["num_stitch_edges"] = int(len(stitch_edge_table))
+        if not stitch_edge_table.empty:
+            stitch_csv_path = output_root / "skeleton_stitch_edges.csv"
+            stitch_edge_table.to_csv(stitch_csv_path, index=False)
+            result["stitch_edge_table"] = stitch_edge_table
+            result["stitch_csv_path"] = stitch_csv_path
+            print(f"Skeleton stitch CSV: {stitch_csv_path}")
+        else:
+            summary["num_stitch_edges"] = 0
+
+        if save_swc:
+            swc_dir, swc_paths = write_swc_files(combined_vertex_table, combined_edge_table, output_root)
+            result["swc_dir"] = swc_dir
+            result["swc_paths"] = swc_paths
+
+        graph_summary = summarize_graph_from_skeleton_tables(combined_vertex_table, combined_edge_table)
+        summary.update(graph_summary)
+
+    _write_summary_json(summary, summary_json_path)
+
+    return result
 
 
 def build_argparser():
@@ -703,6 +1491,14 @@ def build_argparser():
     parser.add_argument("--dust_threshold", type=int, default=0, help="Minimum component size for kimimaro")
     parser.add_argument("--parallel", type=int, default=1, help="Kimimaro worker count")
     parser.add_argument("--no_fix_borders", action="store_true", help="Disable border fixing in kimimaro")
+    parser.add_argument("--save_skeleton", action="store_true", help="Export skeleton vertices and edges as CSV")
+    parser.add_argument("--save_swc", action="store_true", help="Export one SWC file per skeleton")
+    parser.add_argument("--chunkwise", action="store_true", help="Process the mask chunk-by-chunk instead of loading the full volume")
+    parser.add_argument("--chunk_workers", type=int, default=1, help="Number of worker processes for chunkwise processing")
+    parser.add_argument("--existing_only", action="store_true", help="In chunkwise mode, only process chunks that physically exist in the store")
+    parser.add_argument("--halo_zyx", default="0,0,0", help="Halo overlap in voxels for chunkwise processing as z,y,x")
+    parser.add_argument("--no_stitch", action="store_true", help="Disable cross-chunk skeleton stitching in chunkwise mode")
+    parser.add_argument("--stitch_max_distance_um", type=float, default=5.0, help="Maximum distance in microns for cross-chunk endpoint stitching")
     parser.add_argument(
         "--test",
         action="store_true",
@@ -726,6 +1522,27 @@ def main():
             dust_threshold=args.dust_threshold,
             fix_borders=not args.no_fix_borders,
             parallel=args.parallel,
+            save_skeleton=args.save_skeleton,
+            save_swc=args.save_swc,
+        )
+    elif args.chunkwise:
+        result = analyze_binary_mask_zarr_chunkwise(
+            mask_zarr_path=args.mask_zarr,
+            output_dir=args.output_dir,
+            dataset_name=args.dataset_name,
+            resolution_xyz=args.resolution_xyz,
+            foreground_label=args.foreground_label,
+            dust_threshold=args.dust_threshold,
+            fix_borders=not args.no_fix_borders,
+            parallel=args.parallel,
+            save_skeleton=args.save_skeleton,
+            save_swc=args.save_swc,
+            process_existing_only=args.existing_only,
+            halo_zyx=args.halo_zyx,
+            mode_name="chunkwise",
+            stitch=not args.no_stitch,
+            stitch_max_distance_um=args.stitch_max_distance_um,
+            chunk_workers=args.chunk_workers,
         )
     else:
         result = analyze_binary_mask_zarr(
@@ -738,6 +1555,8 @@ def main():
             dust_threshold=args.dust_threshold,
             fix_borders=not args.no_fix_borders,
             parallel=args.parallel,
+            save_skeleton=args.save_skeleton,
+            save_swc=args.save_swc,
         )
 
     print("Vessel reconstruction completed.")
@@ -745,6 +1564,14 @@ def main():
     print(f"Branch CSV: {result['branch_csv_path']}")
     if "chunk_csv_path" in result:
         print(f"Chunk CSV: {result['chunk_csv_path']}")
+    if "vertex_csv_path" in result:
+        print(f"Skeleton vertices CSV: {result['vertex_csv_path']}")
+    if "edge_csv_path" in result:
+        print(f"Skeleton edges CSV: {result['edge_csv_path']}")
+    if "stitch_csv_path" in result:
+        print(f"Skeleton stitch CSV: {result['stitch_csv_path']}")
+    if "swc_dir" in result:
+        print(f"SWC directory: {result['swc_dir']}")
 
 
 if __name__ == "__main__":

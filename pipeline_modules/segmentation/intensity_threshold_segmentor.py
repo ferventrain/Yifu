@@ -12,7 +12,7 @@ from numcodecs import Blosc
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.append(str(project_root))
 
-def segment_chunk(img, threshold, sigma, min_size):
+def segment_chunk(img, threshold, sigma, min_size, output_mode='label'):
     """
     Segment a single 3D chunk (or 2D slice)
     """
@@ -47,13 +47,16 @@ def segment_chunk(img, threshold, sigma, min_size):
     # However, 'intensity_threshold_segmentor' usually implies a semantic mask or local objects.
     
     labeled, num_features = ndimage.label(binary_mask)
-    
+
     if min_size > 0:
         sizes = ndimage.sum(binary_mask, labeled, range(num_features + 1))
         mask_size = sizes < min_size
         remove_pixel = mask_size[labeled]
         labeled[remove_pixel] = 0
-        
+
+    if output_mode == 'binary':
+        return (labeled > 0).astype(np.uint8)
+
     return labeled.astype(np.uint16)
 
 
@@ -102,6 +105,12 @@ def main():
     parser.add_argument('--sigma', type=float, default=1.0, help='Gaussian smoothing sigma')
     parser.add_argument('--min_size', type=int, default=10, help='Minimum object size')
     parser.add_argument(
+        '--output_mode',
+        choices=['label', 'binary'],
+        default='label',
+        help='Output connected-component labels or a pure binary mask'
+    )
+    parser.add_argument(
         '--test',
         action='store_true',
         help='Smoke-test mode: only process chunks that physically exist in the input store'
@@ -130,7 +139,8 @@ def main():
     root_out = zarr.group(store=store_out, overwrite=True)
     
     compressor = Blosc(cname='zstd', clevel=5, shuffle=Blosc.SHUFFLE)
-    data_out = root_out.create_dataset('0', shape=shape, chunks=chunks, dtype=np.uint16, compressor=compressor)
+    output_dtype = np.uint8 if args.output_mode == 'binary' else np.uint16
+    data_out = root_out.create_dataset('0', shape=shape, chunks=chunks, dtype=output_dtype, compressor=compressor)
     
     # Write metadata
     root_out.attrs['multiscales'] = [{
@@ -138,7 +148,10 @@ def main():
         'datasets': [{'path': '0'}]
     }]
     
-    print(f"Running segmentation (Threshold={args.threshold}, Sigma={args.sigma})...")
+    print(
+        f"Running segmentation (Threshold={args.threshold}, Sigma={args.sigma}, "
+        f"OutputMode={args.output_mode})..."
+    )
 
     if args.test:
         existing_indices = list_existing_chunk_indices(data_in)
@@ -157,7 +170,13 @@ def main():
             slices = tuple(slices)
 
             vol_chunk = np.asarray(data_in[slices])
-            seg_chunk = segment_chunk(vol_chunk, args.threshold, args.sigma, args.min_size)
+            seg_chunk = segment_chunk(
+                vol_chunk,
+                args.threshold,
+                args.sigma,
+                args.min_size,
+                output_mode=args.output_mode,
+            )
             data_out[slices] = seg_chunk
     else:
         # 3. Process chunk-by-chunk along Z
@@ -167,7 +186,13 @@ def main():
 
             # Note: this reads the full YX plane for each Z chunk.
             vol_chunk = data_in[z:z_end, :, :]
-            seg_chunk = segment_chunk(vol_chunk, args.threshold, args.sigma, args.min_size)
+            seg_chunk = segment_chunk(
+                vol_chunk,
+                args.threshold,
+                args.sigma,
+                args.min_size,
+                output_mode=args.output_mode,
+            )
             data_out[z:z_end, :, :] = seg_chunk
         
     print(f"Segmentation complete. Saved to {args.output_zarr}")
