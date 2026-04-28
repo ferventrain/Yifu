@@ -139,7 +139,7 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
     run_command(cmd, "Step 1.2: Downsample Registration Channel")
 
 
-def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path):
+def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_zarr_path=None):
     seg_method = seg_cfg["method"]
 
     if seg_method == "cellpose":
@@ -181,12 +181,17 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path):
             f'--foreground_class {model_cfg.get("foreground_class", 1)} '
             f'--probability_threshold {model_cfg.get("probability_threshold", 0.5)} '
             f'--output_mode "{model_cfg.get("output_mode", "binary")}" '
-            f'--output_dtype "{model_cfg.get("output_dtype", "uint8")}"'
+            f'--output_dtype "{model_cfg.get("output_dtype", "uint8")}" '
+            f'--probability_dtype "{model_cfg.get("probability_dtype", "float32")}"'
         )
+        if probability_zarr_path:
+            cmd += f' --probability_zarr "{probability_zarr_path}"'
         if model_cfg.get("patch_size"):
             cmd += f' --patch_size "{format_csv(model_cfg["patch_size"])}"'
         if model_cfg.get("chunk_size"):
             cmd += f' --chunk_size "{format_csv(model_cfg["chunk_size"])}"'
+        if model_cfg.get("normalize_percentiles"):
+            cmd += f' --normalize_percentiles "{format_csv(model_cfg["normalize_percentiles"])}"'
         if model_cfg.get("process_existing_only", False):
             cmd += ' --process_existing_only'
         return cmd
@@ -198,13 +203,24 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path):
 def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     mask_zarr_path = sample_dir / f"ch{signal_ch}_mask.zarr"
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask"
+    probability_zarr_path = None
+    if seg_cfg["method"] == "cfos_unet":
+        model_cfg = seg_cfg["cfos_unet"]
+        configured_probability_zarr = model_cfg.get("probability_zarr", "")
+        if configured_probability_zarr:
+            probability_zarr_path = Path(configured_probability_zarr)
+            if not probability_zarr_path.is_absolute():
+                probability_zarr_path = sample_dir / probability_zarr_path
+        elif model_cfg.get("save_probability", False):
+            probability_zarr_path = sample_dir / f"ch{signal_ch}_prob.zarr"
 
-    if directory_has_files(mask_tiff_dir):
+    probability_ready = probability_zarr_path is None or probability_zarr_path.exists()
+    if directory_has_files(mask_tiff_dir) and probability_ready:
         print(f"Found existing mask folder at {mask_tiff_dir}, skipping segmentation.")
         return mask_zarr_path, mask_tiff_dir
 
-    if not mask_zarr_path.exists():
-        seg_cmd = build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path)
+    if not mask_zarr_path.exists() or not probability_ready:
+        seg_cmd = build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_zarr_path)
         run_command(seg_cmd, f'Step 2.1: Segmentation ({seg_cfg["method"]})')
     else:
         print(f"Found existing mask Zarr at {mask_zarr_path}, skipping segmentation.")

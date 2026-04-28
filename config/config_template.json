@@ -82,6 +82,8 @@
 
         "cfos_unet": {
             "checkpoint_path": "S:/Yifu/models/cfos/best_model.pt",
+            "save_probability": true,
+            "probability_zarr": "",
             "dataset_name": "0",
             "patch_size": [128, 128, 128],
             "overlap": 0.25,
@@ -91,7 +93,9 @@
             "probability_threshold": 0.5,
             "process_existing_only": false,
             "output_mode": "binary",
-            "output_dtype": "uint8"
+            "output_dtype": "uint8",
+            "probability_dtype": "float32",
+            "normalize_percentiles": [1.0, 99.5]
         }
     },
     

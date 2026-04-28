@@ -32,6 +32,7 @@
         "input_zarr": {"type": "path", "required": true},
         "output_zarr": {"type": "path", "required": true},
         "checkpoint_path": {"type": "path", "required": true},
+        "probability_zarr": {"type": "path|null", "default": null},
         "dataset_name": {"type": "string", "default": "0"},
         "patch_size": {"type": "triplet_int|null", "default": null},
         "overlap": {"type": "float", "default": 0.25},
@@ -41,12 +42,36 @@
         "probability_threshold": {"type": "float", "default": 0.5},
         "output_mode": {"type": "string", "default": "binary", "choices": ["binary", "multiclass"]},
         "output_dtype": {"type": "string", "default": "uint8"},
+        "probability_dtype": {"type": "string", "default": "float32"},
         "process_existing_only": {"type": "bool", "default": false},
-        "chunk_size": {"type": "triplet_int|null", "default": null}
+        "chunk_size": {"type": "triplet_int|null", "default": null},
+        "normalize_percentiles": {"type": "pair_float", "default": [1.0, 99.5]}
       },
       "outputs": {
         "output_zarr": {"type": "dir"},
+        "probability_zarr": {"type": "dir", "required": false},
         "manifest_path": {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "cfos_unet_qc",
+      "function": "pipeline_modules.segmentation.cfos_unet_qc.build_review_queue",
+      "cli": "python pipeline_modules/segmentation/cfos_unet_qc.py",
+      "description": "Rank cFos U-Net masks and optional probability maps for active-learning review.",
+      "inputs": {
+        "records_csv": {"type": "path|null", "default": null},
+        "sample_root": {"type": "path|null", "default": null},
+        "sample_dirs": {"type": "path[]|null", "default": null},
+        "signal_ch": {"type": "string", "default": "2"},
+        "dataset_name": {"type": "string", "default": "0"},
+        "uncertainty_low": {"type": "float", "default": 0.4},
+        "uncertainty_high": {"type": "float", "default": 0.6},
+        "small_component_max_voxels": {"type": "int", "default": 32},
+        "top_n": {"type": "int", "default": 10}
+      },
+      "outputs": {
+        "output_csv": {"type": "path", "default": "review_queue.csv"},
+        "top_csv": {"type": "path", "default": "top10_review_queue.csv"}
       }
     },
     {

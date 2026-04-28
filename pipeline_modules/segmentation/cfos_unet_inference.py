@@ -141,6 +141,7 @@ def run_cfos_unet_inference(
     input_zarr: str | Path,
     output_zarr: str | Path,
     checkpoint_path: str | Path,
+    probability_zarr: str | Path | None = None,
     dataset_name: str = "0",
     patch_size: tuple[int, int, int] | None = None,
     overlap: float = 0.25,
@@ -151,6 +152,7 @@ def run_cfos_unet_inference(
     process_existing_only: bool = False,
     output_mode: str = "binary",
     output_dtype: str = "uint8",
+    probability_dtype: str = "float32",
     chunk_size: tuple[int, int, int] | None = None,
     normalize_percentiles: tuple[float, float] = (1.0, 99.5),
 ) -> dict[str, Any]:
@@ -163,6 +165,13 @@ def run_cfos_unet_inference(
         raise PipelineError(ErrorCode.INPUT_NOT_FOUND, "Input Zarr not found", {"input_zarr": str(input_path)})
     if not checkpoint.exists():
         raise PipelineError(ErrorCode.INPUT_NOT_FOUND, "Checkpoint not found", {"checkpoint_path": str(checkpoint)})
+    probability_path = Path(probability_zarr) if probability_zarr else None
+    if probability_path and probability_path == Path(output_zarr):
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "probability_zarr must be different from output_zarr",
+            {"probability_zarr": str(probability_path), "output_zarr": str(output_zarr)},
+        )
 
     data_in = open_zarr_dataset(input_path, dataset_name=dataset_name)
     model_bundle = load_cfos_unet_checkpoint(checkpoint, device="cpu")
@@ -177,7 +186,17 @@ def run_cfos_unet_inference(
     inferred_patch_size = patch_size or tuple(int(v) for v in checkpoint_args.get("patch_size", [128, 128, 128]))
     inferred_chunk_size = chunk_size or tuple(int(v) for v in getattr(data_in, "chunks", inferred_patch_size))
     output_dtype_np = np.dtype(output_dtype)
+    probability_dtype_np = np.dtype(probability_dtype)
     _, data_out = create_output_zarr(output_zarr, data_in.shape, inferred_chunk_size, output_dtype_np, dataset_name=dataset_name)
+    data_prob = None
+    if probability_path:
+        _, data_prob = create_output_zarr(
+            probability_path,
+            data_in.shape,
+            inferred_chunk_size,
+            probability_dtype_np,
+            dataset_name=dataset_name,
+        )
 
     processed_regions = 0
     if process_existing_only:
@@ -217,19 +236,22 @@ def run_cfos_unet_inference(
             batch_size=int(batch_size),
             device=resolved_device,
         )
+        probs = torch_mod.softmax(logits, dim=0)
+        fg_probs = probs[int(foreground_class)].cpu().numpy()
         if output_mode == "multiclass":
             pred_np = torch_mod.argmax(logits, dim=0).cpu().numpy().astype(output_dtype_np, copy=False)
         else:
-            probs = torch_mod.softmax(logits, dim=0)
-            fg_probs = probs[int(foreground_class)].cpu().numpy()
             pred_np = (fg_probs >= float(probability_threshold)).astype(output_dtype_np, copy=False)
         data_out[slices] = pred_np
+        if data_prob is not None:
+            data_prob[slices] = fg_probs.astype(probability_dtype_np, copy=False)
         processed_regions += 1
 
     result = {
         "success": True,
         "input_zarr": str(input_path),
         "output_zarr": str(Path(output_zarr)),
+        "probability_zarr": str(probability_path) if probability_path else "",
         "checkpoint_path": str(checkpoint),
         "dataset_name": dataset_name,
         "shape": list(data_in.shape),
@@ -241,6 +263,7 @@ def run_cfos_unet_inference(
         "base_channels": int(model_bundle["base_channels"]),
         "output_mode": output_mode,
         "output_dtype": output_dtype,
+        "probability_dtype": probability_dtype,
     }
     manifest_path = write_run_manifest(
         output_zarr,
@@ -249,6 +272,7 @@ def run_cfos_unet_inference(
         inputs={
             "input_zarr": str(input_path),
             "output_zarr": str(output_zarr),
+            "probability_zarr": str(probability_path) if probability_path else "",
             "checkpoint_path": str(checkpoint),
             "dataset_name": dataset_name,
             "patch_size": inferred_patch_size,
@@ -260,9 +284,10 @@ def run_cfos_unet_inference(
             "process_existing_only": process_existing_only,
             "output_mode": output_mode,
             "output_dtype": output_dtype,
+            "probability_dtype": probability_dtype,
             "chunk_size": inferred_chunk_size,
         },
-        outputs=[output_zarr],
+        outputs=[path for path in [output_zarr, probability_path] if path],
         started_at=started_at,
         extra=result,
     )
@@ -275,6 +300,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input_zarr", required=True, help="Input signal Zarr path")
     parser.add_argument("--output_zarr", required=True, help="Output mask Zarr path")
     parser.add_argument("--checkpoint_path", required=True, help="Checkpoint produced by train_cfos_3d_mlflow.py")
+    parser.add_argument("--probability_zarr", default="", help="Optional output Zarr path for foreground probabilities")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the input/output Zarr groups")
     parser.add_argument("--patch_size", default="", help="Override patch size as z,y,x")
     parser.add_argument("--overlap", type=float, default=0.25, help="Sliding-window overlap ratio")
@@ -285,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--process_existing_only", action="store_true", help="Only process physically present input chunks")
     parser.add_argument("--output_mode", choices=["binary", "multiclass"], default="binary")
     parser.add_argument("--output_dtype", default="uint8", help="numpy dtype for the output mask")
+    parser.add_argument("--probability_dtype", default="float32", help="numpy dtype for optional probability output")
     parser.add_argument("--chunk_size", default="", help="Override output chunk size as z,y,x")
     parser.add_argument("--normalize_percentiles", default="1.0,99.5", help="Percentile pair low,high for normalization")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
@@ -315,6 +342,7 @@ def main() -> int:
             input_zarr=args.input_zarr,
             output_zarr=args.output_zarr,
             checkpoint_path=args.checkpoint_path,
+            probability_zarr=args.probability_zarr or None,
             dataset_name=args.dataset_name,
             patch_size=_parse_triplet(args.patch_size),
             overlap=args.overlap,
@@ -325,6 +353,7 @@ def main() -> int:
             process_existing_only=args.process_existing_only,
             output_mode=args.output_mode,
             output_dtype=args.output_dtype,
+            probability_dtype=args.probability_dtype,
             chunk_size=_parse_triplet(args.chunk_size),
             normalize_percentiles=_parse_percentiles(args.normalize_percentiles),
         )

@@ -19,6 +19,8 @@ def test_segmentation_cfg_accepts_cfos_unet_fields():
             "method": "cfos_unet",
             "cfos_unet": {
                 "checkpoint_path": "models/best_model.pt",
+                "save_probability": True,
+                "probability_zarr": "sample/ch2_prob.zarr",
                 "patch_size": [128, 128, 128],
                 "chunk_size": [64, 64, 64],
                 "process_existing_only": True,
@@ -28,6 +30,8 @@ def test_segmentation_cfg_accepts_cfos_unet_fields():
     dumped = cfg.model_dump()
     assert dumped["method"] == "cfos_unet"
     assert dumped["cfos_unet"]["checkpoint_path"] == "models/best_model.pt"
+    assert dumped["cfos_unet"]["save_probability"] is True
+    assert dumped["cfos_unet"]["probability_zarr"] == "sample/ch2_prob.zarr"
     assert dumped["cfos_unet"]["patch_size"] == (128, 128, 128)
     assert dumped["cfos_unet"]["chunk_size"] == (64, 64, 64)
     assert dumped["cfos_unet"]["process_existing_only"] is True
@@ -45,6 +49,7 @@ def test_capability_manifest_contains_cfos_entrypoint():
     entrypoint_ids = {entry["id"] for entry in manifest["entrypoints"]}
     assert "threshold_segmentation" in entrypoint_ids
     assert "cfos_unet_inference" in entrypoint_ids
+    assert "cfos_unet_qc" in entrypoint_ids
     assert "export_zarr_to_tiff" in entrypoint_ids
 
 

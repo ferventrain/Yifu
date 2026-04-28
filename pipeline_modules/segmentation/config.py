@@ -71,6 +71,8 @@ class ThresholdSegmentationCfg(_ModelMixin):
 class CfosUNetInferenceCfg(_ModelMixin):
     apply: bool = True
     checkpoint_path: str = ""
+    save_probability: bool = False
+    probability_zarr: str = ""
     dataset_name: str = "0"
     patch_size: tuple[int, int, int] | None = None
     overlap: float = 0.25
@@ -81,6 +83,7 @@ class CfosUNetInferenceCfg(_ModelMixin):
     process_existing_only: bool = False
     output_mode: str = "binary"
     output_dtype: str = "uint8"
+    probability_dtype: str = "float32"
     chunk_size: tuple[int, int, int] | None = None
     normalize_percentiles: tuple[float, float] = (1.0, 99.5)
 
