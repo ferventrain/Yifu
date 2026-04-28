@@ -1,12 +1,25 @@
 import os
 import json
+import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Optional, Tuple, Union, Dict
+
 import numpy as np
 import ants
 import tifffile
 from tqdm import tqdm
+
+try:
+    from pipeline_modules.utils.errors import ErrorCode, PipelineError
+    from pipeline_modules.utils.run_manifest import write_run_manifest
+except ImportError:
+    PipelineError = None  # type: ignore[assignment,misc]
+    ErrorCode = None  # type: ignore[assignment]
+    write_run_manifest = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_label_storage_dtype(array: np.ndarray) -> np.dtype:
@@ -64,9 +77,9 @@ class BidirectionalRegistration:
             self.original_shape = original_shape
             
         if self.original_shape is None:
-            print("Warning: Could not determine original shape. Upsampling will be skipped/fail.")
+            logger.warning("Could not determine original shape. Upsampling will be skipped/fail.")
         else:
-            print(f"Original shape determined: {self.original_shape}")
+            logger.info("Original shape determined: %s", self.original_shape)
 
         # Load Atlas
         self.atlas_image = ants.image_read(atlas_image_path)
@@ -77,7 +90,7 @@ class BidirectionalRegistration:
         identity_direction = np.eye(3)
         self.atlas_image.set_direction(identity_direction)
         self.atlas_label.set_direction(identity_direction)
-        print("Forced atlas direction matrix to identity (no flipping)")
+        logger.info("Forced atlas direction matrix to identity (no flipping)")
         
         # Load Config
         if config_path and os.path.exists(config_path):
@@ -90,7 +103,7 @@ class BidirectionalRegistration:
                 self.atlas_resolution = full_config['preprocessing']['downsample']['target_resolution_xyz']
         else:
             # Fallback to old behavior if config_path not provided (though we should enforce it)
-            print("Warning: Config path not provided or not found. Falling back to resolution.json (Deprecated).")
+            logger.warning("Config path not provided or not found. Falling back to resolution.json (Deprecated).")
             current_dir = Path(__file__).parent
             resolution_config_path = current_dir / 'resolution.json'
             if resolution_config_path.exists():
@@ -100,12 +113,12 @@ class BidirectionalRegistration:
                 self.atlas_resolution = self.config['target_resolution']
             else:
                 # Absolute fallback default
-                print("Error: No resolution config found. Using defaults.")
+                logger.error("No resolution config found. Using defaults.")
                 self.source_resolution = [1.8, 1.8, 2.0]
                 self.atlas_resolution = [25.0, 25.0, 25.0]
 
-        print(f"Source Resolution: {self.source_resolution}")
-        print(f"Target Resolution: {self.atlas_resolution}")
+        logger.info("Source Resolution: %s", self.source_resolution)
+        logger.info("Target Resolution: %s", self.atlas_resolution)
         
         # Load Target Image (used for image2atlas warping)
         # Simplified: We don't load signal channel image by default to reduce dependencies
@@ -121,14 +134,14 @@ class BidirectionalRegistration:
         # Force direction matrix to identity to avoid flipping/reflection
         identity_direction = np.eye(3)
         self.register_image.set_direction(identity_direction)
-        print("Forced register image direction matrix to identity (no flipping)")
+        logger.info("Forced register image direction matrix to identity (no flipping)")
         
         # Density Config
         self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Region_Csv_Rev1_updated.CSV')
 
     def _infer_original_shape(self) -> Optional[Tuple[int, int, int]]:
         """Try to infer original shape from raw TIFF files"""
-        print("Attempting to infer original shape from raw data...")
+        logger.info("Attempting to infer original shape from raw data...")
         
         # Try target channel folder first, then register channel folder
         possible_folders = [
@@ -144,10 +157,10 @@ class BidirectionalRegistration:
                         first_img = tifffile.imread(str(tiff_files[0]))
                         # Shape is (Z, Y, X)
                         shape = (len(tiff_files),) + first_img.shape
-                        print(f"Found raw data in {folder}. Inferred shape: {shape}")
+                        logger.info("Found raw data in %s. Inferred shape: %s", folder, shape)
                         return shape
                     except Exception as e:
-                        print(f"Error reading {folder}: {e}")
+                        logger.error("Error reading %s: %s", folder, e)
         
         return None
     
@@ -173,9 +186,9 @@ class BidirectionalRegistration:
             raise ValueError(f"Expected 3D array, got shape {arr.shape}")
 
         output_dtype = _ensure_label_storage_dtype(arr) if prefix in {"label", "mask"} else np.uint16
-        print(f"Saving dtype for {prefix}: {output_dtype}")
+        logger.info("Saving dtype for %s: %s", prefix, output_dtype)
             
-        print(f"Saving {prefix} TIFFs to {output_dir} (shape: {arr.shape})...")
+        logger.info("Saving %s TIFFs to %s (shape: %s)...", prefix, output_dir, arr.shape)
         for i in range(arr.shape[0]):
             tifffile.imwrite(
                 str(output_dir / f"{prefix}_{i:04d}.tiff"),
@@ -186,11 +199,11 @@ class BidirectionalRegistration:
     def _perform_registration(self, fixed: ants.ANTsImage, moving: ants.ANTsImage, 
                             reg_type: str, **kwargs) -> Dict:
         """通用配准核心逻辑"""
-        print(f"Performing {reg_type} registration...")
-        print("--- METADATA VERIFICATION ---")
-        print(f"Fixed Image  | Shape: {fixed.shape}, Spacing: {fixed.spacing}, Origin: {fixed.origin}, Direction: {fixed.direction}")
-        print(f"Moving Image | Shape: {moving.shape}, Spacing: {moving.spacing}, Origin: {moving.origin}, Direction: {moving.direction}")
-        print("Constraining: reflection disabled (orientation is manually aligned)")
+        logger.info("Performing %s registration...", reg_type)
+        logger.info("--- METADATA VERIFICATION ---")
+        logger.info("Fixed Image  | Shape: %s, Spacing: %s, Origin: %s, Direction: %s", fixed.shape, fixed.spacing, fixed.origin, fixed.direction)
+        logger.info("Moving Image | Shape: %s, Spacing: %s, Origin: %s, Direction: %s", moving.shape, moving.spacing, moving.origin, moving.direction)
+        logger.info("Constraining: reflection disabled (orientation is manually aligned)")
         
         return ants.registration(
             fixed=fixed,
@@ -208,11 +221,11 @@ class BidirectionalRegistration:
             raise ValueError(f"Invalid mode: {mode}")
 
         # Histogram matching (Sample matches Atlas)
-        print("Performing histogram matching (Sample -> Atlas)...")
+        logger.info("Performing histogram matching (Sample -> Atlas)...")
         self.register_image = ants.histogram_match_image(self.register_image, self.atlas_image)
 
         if mode == 'atlas2image':
-            print("Mode: Atlas -> Image")
+            logger.info("Mode: Atlas -> Image")
             reg_result = self._perform_registration(
                 fixed=self.register_image, 
                 moving=self.atlas_image, 
@@ -236,7 +249,7 @@ class BidirectionalRegistration:
             }
             
         else: # image2atlas
-            print("Mode: Image -> Atlas")
+            logger.info("Mode: Image -> Atlas")
             reg_result = self._perform_registration(
                 fixed=self.atlas_image, 
                 moving=self.register_image, 
@@ -245,7 +258,7 @@ class BidirectionalRegistration:
             )
             
             # Simplified: Target image warping logic moved to analysis/heatmap program
-            print("Note: Target image warping logic has been moved to the analysis program.")
+            logger.info("Note: Target image warping logic has been moved to the analysis program.")
             
             return {
                 'warped_image': reg_result['warpedmovout'],
@@ -280,9 +293,9 @@ class BidirectionalRegistration:
         target_shape = self.original_shape # (Z, Y, X)
         output_dtype = _ensure_label_storage_dtype(source_volume)
         
-        print(f"Upsampling from {source_shape} to {target_shape}...")
-        print(f"Debug: ANTs raw shape = {arr.shape}, after transpose = {source_volume.shape}")
-        print(f"Preserving label dtype as {output_dtype}")
+        logger.info("Upsampling from %s to %s...", source_shape, target_shape)
+        logger.debug("ANTs raw shape = %s, after transpose = %s", arr.shape, source_volume.shape)
+        logger.info("Preserving label dtype as %s", output_dtype)
         
         import cv2
         
@@ -317,7 +330,7 @@ class BidirectionalRegistration:
                 compression='lzw'
             )
             
-        print(f"Saved {len(z_indices)} slices to {output_path}")
+        logger.info("Saved %d slices to %s", len(z_indices), output_path)
 
     def save_registration_results(self, results: Dict, save_transforms: bool = False, 
                                 save_registered_image: bool = False) -> None:
@@ -331,7 +344,7 @@ class BidirectionalRegistration:
                 # Save once per sample so all signal channels can reuse the same atlas label
                 label_dir = self.sample_dir / "upsampled_atlas_label"
                 if label_dir.exists() and any(label_dir.iterdir()):
-                    print(f"Upsampled atlas label already exists at {label_dir}. Skipping upsampling.")
+                    logger.info("Upsampled atlas label already exists at %s. Skipping upsampling.", label_dir)
                 else:
                     self.upsample_label_chunked(results['warped_label'], str(label_dir))
             else:
@@ -374,7 +387,7 @@ class BidirectionalRegistration:
         mask_folder = self.sample_dir / f"ch{self.signal_channel}_downsample_mask"
         
         if mask_folder.exists() and results.get('warped_label') is not None:
-            print(f"\nFound mask folder: {mask_folder}. Starting density analysis...")
+            logger.info("Found mask folder: %s. Starting density analysis...", mask_folder)
             
             # Save downsampled atlas label (registered)
             downsampled_label_dir = self.sample_dir / f"ch{self.signal_channel}_atlas_label_downsampled"
@@ -386,13 +399,13 @@ class BidirectionalRegistration:
                 
                 output_excel = self.sample_dir / f"density_analysis_ch{self.signal_channel}.xlsx"
                 analyzer.write_to_excel(analysis_results, str(output_excel))
-                print(f"Density analysis completed. Saved to {output_excel}")
+                logger.info("Density analysis completed. Saved to %s", output_excel)
             except Exception as e:
-                print(f"Error during density analysis: {e}")
+                logger.error("Error during density analysis: %s", e)
                 import traceback
                 traceback.print_exc()
         elif not mask_folder.exists():
-            print(f"Density analysis skipped. Mask folder {mask_folder} not found.")
+            logger.info("Density analysis skipped. Mask folder %s not found.", mask_folder)
 
     def run_full_pipeline(self, mode: str = 'atlas2image', registration_type: str = 'SyN',
                          save_registered_image: bool = True, save_transforms: bool = False) -> None:
@@ -407,6 +420,7 @@ class BidirectionalRegistration:
 
 def main():
     import argparse
+    import sys as _sys
     
     parser = argparse.ArgumentParser(description="Bidirectional registration between Allen atlas and LSFM images")
     parser.add_argument('--signal_channel', required=True, help='Signal channel (e.g. 0)')
@@ -422,27 +436,80 @@ def main():
     parser.add_argument('--save_transforms', action='store_true', help='Save transforms')
     parser.add_argument('--density_cfg', help='Density analysis config path')
     parser.add_argument('--config', help='Path to main config.json')
+    parser.add_argument(
+        '--json_logs',
+        action='store_true',
+        help='Emit NDJSON log records to stderr instead of plain text',
+    )
     
     args = parser.parse_args()
-    
-    # Load original shape if exists
-    original_shape = None
-    origin_shape_path = Path(args.sample_dir) / 'original_shape.json'
-    if origin_shape_path.exists():
-        with open(origin_shape_path, 'r') as f:
-            original_shape = tuple(json.load(f)['original_shape'])
-        print(f'Loaded original shape from {origin_shape_path}: {original_shape}')
+
+    if args.json_logs:
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record):
+                return json.dumps({
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                })
+        _handler = logging.StreamHandler(_sys.stderr)
+        _handler.setFormatter(_JsonFormatter())
+        logging.root.addHandler(_handler)
+        logging.root.setLevel(logging.INFO)
     else:
-        print(f'Info: {origin_shape_path} not found. Will infer original shape from raw data.')
-    
-    registrator = BidirectionalRegistration(
-        args.sample_dir, args.signal_channel, args.atlas_image, args.atlas_label,
-        args.register_channel, original_shape, args.density_cfg, args.config
-    )
-    
-    registrator.run_full_pipeline(
-        args.mode, args.registration_type, args.save_registered_image, args.save_transforms
-    )
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    try:
+        _started_at = time.time()
+
+        # Load original shape if exists
+        original_shape = None
+        origin_shape_path = Path(args.sample_dir) / 'original_shape.json'
+        if origin_shape_path.exists():
+            with open(origin_shape_path, 'r') as f:
+                original_shape = tuple(json.load(f)['original_shape'])
+            logger.info('Loaded original shape from %s: %s', origin_shape_path, original_shape)
+        else:
+            logger.info('Info: %s not found. Will infer original shape from raw data.', origin_shape_path)
+        
+        registrator = BidirectionalRegistration(
+            args.sample_dir, args.signal_channel, args.atlas_image, args.atlas_label,
+            args.register_channel, original_shape, args.density_cfg, args.config
+        )
+        
+        registrator.run_full_pipeline(
+            args.mode, args.registration_type, args.save_registered_image, args.save_transforms
+        )
+
+        # Write run manifest
+        if write_run_manifest is not None:
+            sample_dir = Path(args.sample_dir)
+            _output_files = []
+            label_dir = sample_dir / "upsampled_atlas_label"
+            if label_dir.exists():
+                _output_files.append(label_dir)
+            write_run_manifest(
+                sample_dir,
+                module="registration.ANTs_registration",
+                entrypoint="run_full_pipeline",
+                inputs={
+                    "sample_dir": args.sample_dir,
+                    "signal_channel": args.signal_channel,
+                    "register_channel": args.register_channel,
+                    "mode": args.mode,
+                    "registration_type": args.registration_type,
+                },
+                outputs=_output_files,
+                started_at=_started_at,
+            )
+
+        logger.info("Registration pipeline completed.")
+    except Exception as exc:
+        if PipelineError is not None and isinstance(exc, PipelineError):
+            print(json.dumps({"error_code": exc.code.value, "message": str(exc.message)}), file=_sys.stderr)
+            _sys.exit(exc.exit_code)
+        logger.exception("Unhandled error: %s", exc)
+        _sys.exit(1)
 
 
 if __name__ == "__main__":

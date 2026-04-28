@@ -1,0 +1,90 @@
+{
+  "schema_version": "1",
+  "module": "preprocessing",
+  "description": "Config-driven TIFF preprocessing, registration-channel downsampling, and TIFF-to-Zarr conversion.",
+  "entrypoints": [
+    {
+      "id": "run_preprocessing",
+      "function": "pipeline_modules.preprocessing.preprocessor.run_preprocessing",
+      "cli": "python -m pipeline_modules.preprocessing.preprocessor",
+      "description": "Apply optional channel subtraction plus ordered enhancement steps to one or more TIFF channels and emit per-channel manifests.",
+      "prerequisites": [
+        "Sample directory must exist",
+        "Requested channel TIFF directories must exist and contain TIFF slices"
+      ],
+      "inputs": {
+        "sample_dir": { "type": "path", "required": true },
+        "preprocessing_config": { "type": "object", "required": true, "description": "PreprocessingCfg-compatible mapping" },
+        "channel": { "type": "string|null", "default": null, "description": "Optional channel override such as '1' or 'ch1'" },
+        "max_workers": { "type": "int|null", "default": null },
+        "resume": { "type": "bool", "default": true },
+        "output_dir": { "type": "path|null", "default": null, "description": "Optional custom root for chX_preprocessed outputs" },
+        "config_path": { "type": "path|null", "default": null, "description": "Optional config.json path used when caching adaptive weights" },
+        "signal_ch": { "type": "string", "default": "ch0" },
+        "reg_ch": { "type": "string", "default": "ch1" }
+      },
+      "outputs": {
+        "channels": { "type": "array", "description": "Per-channel preprocessing results" },
+        "manifest_paths": { "type": "array", "description": "Per-output-directory _run_manifest.json paths" }
+      }
+    },
+    {
+      "id": "convert_tiff_to_zarr",
+      "function": "pipeline_modules.preprocessing.tiff_to_zarr.convert_tiff_to_zarr",
+      "cli": "python pipeline_modules/preprocessing/tiff_to_zarr.py",
+      "description": "Convert a TIFF stack directory into a directory-store Zarr volume with basic multiscales metadata.",
+      "prerequisites": [
+        "Input TIFF directory must exist and contain TIFF slices"
+      ],
+      "inputs": {
+        "input_dir": { "type": "path", "required": true },
+        "output_zarr": { "type": "path", "required": true },
+        "chunk_size": { "type": "triplet_int", "default": [128, 256, 256] },
+        "compressor": { "type": "string", "default": "default" },
+        "dataset_name": { "type": "string", "default": "0" }
+      },
+      "outputs": {
+        "output_zarr": { "type": "dir", "description": "Directory-store Zarr output" },
+        "manifest_path": { "type": "path", "description": "_run_manifest.json inside the Zarr store root" }
+      }
+    },
+    {
+      "id": "downsample_folder",
+      "function": "pipeline_modules.preprocessing.downsample.downsample_folder",
+      "cli": "python pipeline_modules/preprocessing/downsample.py",
+      "description": "Downsample a 3D TIFF stack into a new TIFF stack plus NIfTI volume, using nearest-neighbour interpolation.",
+      "prerequisites": [
+        "Input TIFF directory must exist and contain TIFF slices or a single OME-TIFF"
+      ],
+      "inputs": {
+        "input_folder": { "type": "path", "required": true },
+        "resolution_config_path": { "type": "path|null", "default": null },
+        "manual_factors": { "type": "triplet_float|null", "default": null, "description": "Downsample factors in z,y,x order" },
+        "output_folder": { "type": "path|null", "default": null },
+        "is_mask": { "type": "bool", "default": false },
+        "chunk_size": { "type": "int", "default": 100 }
+      },
+      "outputs": {
+        "output_dir": { "type": "dir", "description": "Downsampled TIFF stack directory" },
+        "nifti_path": { "type": "path", "description": "volume.nii.gz" },
+        "manifest_path": { "type": "path", "description": "_run_manifest.json" }
+      }
+    }
+  ],
+  "configuration_models": {
+    "PreprocessingCfg": "pipeline_modules.preprocessing.config.PreprocessingCfg",
+    "DownsampleCfg": "pipeline_modules.preprocessing.config.DownsampleCfg",
+    "ZarrCfg": "pipeline_modules.preprocessing.config.ZarrCfg"
+  },
+  "sample_layout": {
+    "class": "pipeline_modules.utils.sample_layout.SampleLayout",
+    "relevant_paths": {
+      "signal_tiff_dir": "SampleLayout.signal_tiff_dir",
+      "signal_tiff_preprocessed_dir": "SampleLayout.signal_tiff_preprocessed_dir",
+      "reg_tiff_dir": "SampleLayout.reg_tiff_dir",
+      "signal_zarr": "SampleLayout.signal_zarr",
+      "reg_downsample_dir": "SampleLayout.reg_downsample_dir",
+      "reg_downsample_nii": "SampleLayout.reg_downsample_nii"
+    }
+  }
+}

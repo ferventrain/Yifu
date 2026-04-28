@@ -4,7 +4,8 @@
 
 当前实现文件：
 
-- `kimimaro_reconstruction.py`
+- `kimimaro_reconstruction.py`：从 binary mask 到 skeleton + 全局血管网络参数
+- `region_vessel_analysis.py`：在已有 skeleton CSV 的基础上，按脑区（全名 / 缩写 / id）汇总血管参数
 
 当前核心流程：
 
@@ -301,3 +302,160 @@ kimimaro view path/to/output/swc/skeleton_000000.swc
 1. 短 spur 过滤
 2. 边界 terminal 排除
 3. 必要时按 terminal branch 长度再筛选
+
+## 按脑区输出血管参数（`region_vessel_analysis.py`）
+
+在完成一次带 `--save_skeleton` 的重建后，可以用 `region_vessel_analysis` 直接基于已有的 `skeleton_vertices.csv` 和 `skeleton_edges.csv`，按脑区输出血管参数，**无需重新跑骨架化**。
+
+### 工作原理
+
+1. 从 Allen region CSV 加载脑区树，建立 `id / 缩写 / 全名` 三套查找表
+2. 将用户提供的脑区查询解析到节点，并收集该节点的**全部子树 id**
+3. 读取 registered 的 annotation label Zarr，把每个 skeleton 顶点（按 `z_um/y_um/x_um`）和每条边的中点映射到对应体素，读取 annotation label
+4. 落入子树 id 集合的顶点 / 边归入该脑区，按脑区汇总参数
+
+顶点 / 边使用各自独立的 label 判定；边是否属于某脑区看其中点所在体素的 label（与 chunkwise core 判定保持一致）。
+
+### 输入要求
+
+- `skeleton_vertices.csv`：由 `--save_skeleton` 产出，必须包含 `skeleton_id / node_id / z_um / y_um / x_um`，可选 `radius_um`
+- `skeleton_edges.csv`：必须包含 `skeleton_id / source_node / target_node / edge_length_um` 和源点、终点的 `*_z_um / *_y_um / *_x_um`
+- `annotation_zarr`：已 registered 的 Allen label 体积，与 skeleton 的 um 坐标**共用原点**
+- `region CSV`：如 `pipeline_modules/registration/Region_Csv_Rev1_updated.CSV`
+
+**关键假设**：skeleton CSV 的 um 坐标和 annotation Zarr 在同一物理坐标系，点通过 `floor(point_um / annotation_resolution_zyx)` 映射到体素。如果两者坐标原点不同，需要先做对齐。
+
+### 输出文件
+
+写入 `--output_dir` 下：
+
+- `region_vessel_summary.csv`
+- `region_vessel_summary.json`
+
+每行（每个脑区查询）包含的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `query` | 用户输入的原始查询字符串 |
+| `region_id / region_acronym / region_name` | 解析到的脑区 |
+| `num_subtree_ids` | 子树节点数（包括自身） |
+| `num_skeletons` | 落入该脑区的骨架 id 数 |
+| `num_vertices / num_edges` | 该脑区内的顶点 / 边数 |
+| `num_branch_points` | 脑区内度 ≥ 3 的顶点数（仅基于脑区内的边重算度） |
+| `num_end_points` | 脑区内度 = 1 的顶点数 |
+| `total_length_um` | 脑区内所有 edge_length 之和 |
+| `mean_edge_length_um` | 脑区内 edge_length 均值 |
+| `mean_radius_um / median_radius_um / min_radius_um / max_radius_um` | 脑区内顶点 `radius_um` 的统计（跳过 NaN） |
+| `approx_vessel_volume_um3` | ∑ edge_length · π · r̄²，其中 r̄ 为边两端 radius 均值（骨架近似体积，不等同 mask 的真实体积） |
+
+### 命令行用法
+
+```powershell
+python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis `
+  --vertex_csv out/skeleton_vertices.csv `
+  --edge_csv out/skeleton_edges.csv `
+  --annotation_zarr registered/annotation.zarr `
+  --annotation_dataset_name 0 `
+  --annotation_resolution_xyz 25,25,25 `
+  --cfg pipeline_modules/registration/Region_Csv_Rev1_updated.CSV `
+  --regions "CTX;HPF;Thalamus;315" `
+  --output_dir out/region_vessels
+```
+
+参数说明：
+
+- `--vertex_csv / --edge_csv`：前置重建步骤的 skeleton 输出（必须用 `--save_skeleton` 跑过）
+- `--annotation_zarr / --annotation_dataset_name`：registered annotation label 的 Zarr 路径与内部 dataset 名
+- `--annotation_resolution_xyz`：annotation 体素物理尺寸，单位 μm，顺序 `x,y,z`。25 μm Allen CCF 写 `25,25,25`
+- `--cfg`：Allen region CSV
+- `--regions`：脑区查询列表，支持 **acronym / 全名 / 整数 id** 三种形式任意混用；分隔符支持逗号、分号、换行；大小写不敏感；自动包含该脑区子树
+- `--output_dir`：输出目录
+
+### Python API 用法
+
+```python
+from pipeline_modules.tubule_reconstruction import analyze_regions_from_skeleton
+
+result = analyze_regions_from_skeleton(
+    vertex_csv_path="out/skeleton_vertices.csv",
+    edge_csv_path="out/skeleton_edges.csv",
+    annotation_zarr_path="registered/annotation.zarr",
+    region_cfg_csv="pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+    regions=["CTX", "Hippocampal formation", 315],
+    output_dir="out/region_vessels",
+    annotation_resolution_xyz="25,25,25",
+)
+summary_df = result["summary_table"]
+```
+
+### 查询匹配顺序与歧义处理
+
+- 如果输入是纯整数，按 `region_id` 查
+- 否则先查 acronym，再查 full name；均不区分大小写
+- 如果一个字符串查询在同一层级上对应多个 id（歧义），会抛 `ValueError` 并建议改用 id
+- 找不到时抛 `KeyError`
+
+### 与 `check_region_coverage_zarr.py` 的区别
+
+`registration/check_region_coverage_zarr.py` 做的是“这个脑区在 label 体里有多少体素”的体素计数；
+`region_vessel_analysis.py` 做的是“这个脑区内血管骨架的长度 / 半径 / 分支拓扑”，侧重血管参数而非体素覆盖率。
+
+---
+
+## Agent-Native 集成接口
+
+本模块已按"Agent-Native"原则改造，可被自动化 agent 直接发现和调用。
+
+### 结构化配置（Pydantic）
+
+```python
+from pipeline_modules.tubule_reconstruction import TubuleReconstructionCfg, RegionVesselAnalysisCfg
+
+# 从 dict（如解析自 config.json）构建并验证
+cfg = TubuleReconstructionCfg(**config_json["tubule_reconstruction"])
+
+# 导出 JSON Schema（供 agent / IDE 做参数校验）
+from pipeline_modules.tubule_reconstruction import export_json_schema
+schema = export_json_schema()
+```
+
+### SampleLayout — 统一路径管理
+
+```python
+from pipeline_modules.tubule_reconstruction import layout_for_sample
+
+layout = layout_for_sample("/data/mouse01", signal_ch="ch0")
+# 所有路径通过属性访问，无需拼接字符串：
+layout.mask_zarr                   # /data/mouse01/ch0_mask.zarr
+layout.tubule_reconstruction_dir   # /data/mouse01/tubule_reconstruction
+layout.tubule_vertex_csv           # /data/mouse01/tubule_reconstruction/skeleton_vertices.csv
+layout.atlas_label_zarr            # /data/mouse01/upsampled_atlas_label.zarr
+```
+
+### Capability Manifest — 机器可读能力说明
+
+```python
+from pipeline_modules.tubule_reconstruction import load_capability_manifest
+
+manifest = load_capability_manifest()
+# manifest["entrypoints"] 列出所有入口函数、输入参数、输出文件、前置条件
+```
+
+也可直接读取 JSON 文件：`pipeline_modules/tubule_reconstruction/capability_manifest.json`
+
+全项目模块索引见：`capabilities.json`（项目根目录）。
+
+### 结构化错误与运行记录
+
+- 每次成功调用 `analyze_binary_mask_zarr[_chunkwise]` 或 `analyze_regions_from_skeleton` 后，`output_dir` 下自动写入 `_run_manifest.json`，记录输入参数、输出文件列表、耗时。
+- CLI 加 `--json_logs` 可将日志以 NDJSON 格式输出到 stderr，便于 agent 解析。
+- 发生结构化错误时，CLI 在 stderr 输出 `{"error_code": "...", "message": "..."}` 并以对应退出码退出（2 = 配置错误，3 = 输入缺失，1 = 运行时错误）。
+
+### 测试
+
+```powershell
+# 需要激活 conda 环境后执行
+pytest tests/test_utils.py tests/test_tubule_config.py tests/test_region_vessel_analysis.py -v
+```
+
+测试覆盖：`SampleLayout`、`PipelineError`/`ErrorCode`、`write_run_manifest`、Pydantic 配置模型、`analyze_regions_from_skeleton` 端到端 smoke test（全部使用合成数据，不依赖 GPU / kimimaro）。

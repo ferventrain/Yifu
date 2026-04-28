@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import logging
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +24,16 @@ from .kimimaro_reconstruction import (
     open_zarr_dataset,
     resolution_xyz_to_zyx,
 )
+
+try:
+    from pipeline_modules.utils.errors import ErrorCode, PipelineError
+    from pipeline_modules.utils.run_manifest import write_run_manifest
+except ImportError:
+    PipelineError = None  # type: ignore[assignment,misc]
+    ErrorCode = None  # type: ignore[assignment]
+    write_run_manifest = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_acronym_text(acronym_text):
@@ -300,7 +312,8 @@ def analyze_regions_from_skeleton(
     if len(annotation_zarr.shape) != 3:
         raise ValueError(f"Annotation Zarr must be 3D, got shape={annotation_zarr.shape}")
 
-    return _finalize_region_analysis(
+    _started_at = time.time()
+    result = _finalize_region_analysis(
         vertex_table=vertex_table,
         edge_table=edge_table,
         annotation_zarr=annotation_zarr,
@@ -308,6 +321,27 @@ def analyze_regions_from_skeleton(
         resolved=resolved,
         output_dir=output_dir,
     )
+
+    if output_dir is not None and write_run_manifest is not None:
+        _output_files = [v for k, v in result.items() if k.endswith("_path")]
+        result["manifest_path"] = write_run_manifest(
+            Path(output_dir),
+            module="tubule_reconstruction.region_vessel_analysis",
+            entrypoint="analyze_regions_from_skeleton",
+            inputs={
+                "vertex_csv_path": str(vertex_csv_path),
+                "edge_csv_path": str(edge_csv_path),
+                "annotation_zarr_path": str(annotation_zarr_path),
+                "region_cfg_csv": str(region_cfg_csv),
+                "regions": regions,
+                "annotation_dataset_name": annotation_dataset_name,
+                "annotation_resolution_xyz": annotation_resolution_xyz,
+            },
+            outputs=_output_files,
+            started_at=_started_at,
+        )
+
+    return result
 
 
 _SUMMARY_COLUMN_ORDER = [
@@ -431,33 +465,59 @@ def build_argparser():
         help="Comma/semicolon separated region queries (acronym, full name, or integer id)",
     )
     parser.add_argument("--output_dir", required=True, help="Directory for summary CSV/JSON outputs")
+    parser.add_argument(
+        "--json_logs",
+        action="store_true",
+        help="Emit NDJSON log records to stderr instead of plain text",
+    )
     return parser
 
 
 def main():
-    args = build_argparser().parse_args()
-    result = analyze_regions_from_skeleton(
-        vertex_csv_path=args.vertex_csv,
-        edge_csv_path=args.edge_csv,
-        annotation_zarr_path=args.annotation_zarr,
-        region_cfg_csv=args.cfg,
-        regions=args.regions,
-        output_dir=args.output_dir,
-        annotation_dataset_name=args.annotation_dataset_name,
-        annotation_resolution_xyz=args.annotation_resolution_xyz,
-    )
+    import sys as _sys
 
-    summary_table = result["summary_table"]
-    print("Per-region vessel summary:")
-    if summary_table.empty:
-        print("  (no rows)")
+    args = build_argparser().parse_args()
+
+    if args.json_logs:
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record):
+                return json.dumps({
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                })
+
+        _handler = logging.StreamHandler(_sys.stderr)
+        _handler.setFormatter(_JsonFormatter())
+        logging.root.addHandler(_handler)
+        logging.root.setLevel(logging.INFO)
     else:
-        with pd.option_context("display.max_columns", None, "display.width", 200):
-            print(summary_table.to_string(index=False))
-    if "summary_csv_path" in result:
-        print(f"Summary CSV:  {result['summary_csv_path']}")
-    if "summary_json_path" in result:
-        print(f"Summary JSON: {result['summary_json_path']}")
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    try:
+        result = analyze_regions_from_skeleton(
+            vertex_csv_path=args.vertex_csv,
+            edge_csv_path=args.edge_csv,
+            annotation_zarr_path=args.annotation_zarr,
+            region_cfg_csv=args.cfg,
+            regions=args.regions,
+            output_dir=args.output_dir,
+            annotation_dataset_name=args.annotation_dataset_name,
+            annotation_resolution_xyz=args.annotation_resolution_xyz,
+        )
+
+        summary_table = result["summary_table"]
+        logger.info("Per-region vessel summary: %d row(s)", len(summary_table))
+        if "summary_csv_path" in result:
+            logger.info("Summary CSV:  %s", result["summary_csv_path"])
+        if "summary_json_path" in result:
+            logger.info("Summary JSON: %s", result["summary_json_path"])
+    except Exception as exc:
+        if PipelineError is not None and isinstance(exc, PipelineError):
+            print(json.dumps({"error_code": exc.code.value, "message": str(exc.message)}), file=_sys.stderr)
+            _sys.exit(exc.exit_code)
+        logger.exception("Unhandled error: %s", exc)
+        _sys.exit(1)
 
 
 if __name__ == "__main__":

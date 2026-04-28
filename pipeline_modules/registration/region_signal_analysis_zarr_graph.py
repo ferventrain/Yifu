@@ -7,6 +7,7 @@ import argparse
 import ast
 import concurrent.futures
 import json
+import logging
 import shutil
 import time
 from itertools import product
@@ -18,6 +19,16 @@ import zarr
 from openpyxl.styles import Alignment, Font
 from scipy import ndimage
 from tqdm import tqdm
+
+try:
+    from pipeline_modules.utils.errors import ErrorCode, PipelineError
+    from pipeline_modules.utils.run_manifest import write_run_manifest
+except ImportError:
+    PipelineError = None  # type: ignore[assignment,misc]
+    ErrorCode = None  # type: ignore[assignment]
+    write_run_manifest = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 CONNECTIVITY_3D = np.ones((3, 3, 3), dtype=np.uint8)
@@ -59,6 +70,11 @@ def parse_args():
         type=int,
         default=1,
         help="Number of worker processes for Pass 1 block scanning",
+    )
+    parser.add_argument(
+        "--json_logs",
+        action="store_true",
+        help="Emit NDJSON log records to stderr instead of plain text",
     )
     return parser.parse_args()
 
@@ -116,7 +132,7 @@ def validate_zarr_inputs(mask_zarr, label_zarr, signal_zarr):
         )
     if len(mask_zarr.shape) != 3:
         raise ValueError(f"Expected 3D arrays, got shape={mask_zarr.shape}")
-    print(f"volume shape={mask_zarr.shape}")
+    logger.info("volume shape=%s", mask_zarr.shape)
 
 
 def choose_block_shape(mask_zarr, label_zarr, signal_zarr, requested_block_shape):
@@ -132,7 +148,7 @@ def choose_block_shape(mask_zarr, label_zarr, signal_zarr, requested_block_shape
 
     if candidate_chunks:
         block_shape = candidate_chunks[0]
-        print(f"Using Zarr chunk size as block size: {block_shape}")
+        logger.info("Using Zarr chunk size as block size: %s", block_shape)
         return block_shape
 
     raise ValueError("Could not infer block size from Zarr chunks; please provide --block_size")
@@ -531,7 +547,7 @@ def scan_blocks_and_write_artifacts(
     tmp_dir,
     pass1_workers,
 ):
-    print("Pass 1/3: scanning blocks and writing block artifacts...")
+    logger.info("Pass 1/3: scanning blocks and writing block artifacts...")
     tmp_dir.mkdir(parents=True, exist_ok=True)
     blocks_dir = tmp_dir / "blocks"
     blocks_dir.mkdir(parents=True, exist_ok=True)
@@ -592,7 +608,7 @@ def scan_blocks_and_write_artifacts(
                 )
         else:
             max_in_flight = max(int(pass1_workers) * 2, 1)
-            print(f"Pass 1 parallel workers: {pass1_workers}, in-flight tasks: {max_in_flight}")
+            logger.info("Pass 1 parallel workers: %s, in-flight tasks: %s", pass1_workers, max_in_flight)
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=int(pass1_workers),
                 initializer=init_pass1_worker,
@@ -763,7 +779,7 @@ def compare_neighbor_boundaries(arrays_a, arrays_b, block_delta, volume_shape, p
 
 
 def stitch_block_boundaries(manifest_payload):
-    print("Pass 2/3: stitching neighboring blocks through block boundaries...")
+    logger.info("Pass 2/3: stitching neighboring blocks through block boundaries...")
     volume_shape = tuple(int(value) for value in manifest_payload["volume_shape"])
     total_components = int(manifest_payload["total_components"])
     block_lookup = {tuple(block["grid_index"]): block for block in manifest_payload["blocks"]}
@@ -808,7 +824,7 @@ def stitch_block_boundaries(manifest_payload):
                 refresh=False,
             )
 
-    print("Compressing union-find roots...")
+    logger.info("Compressing union-find roots...")
     while True:
         compressed_parent = parent[parent]
         if np.array_equal(compressed_parent, parent):
@@ -819,7 +835,7 @@ def stitch_block_boundaries(manifest_payload):
 
 
 def build_root_sizes(manifest_payload, parent):
-    print("Pass 3/3a: aggregating merged component sizes...")
+    logger.info("Pass 3/3a: aggregating merged component sizes...")
     root_sizes = np.zeros(parent.shape[0], dtype=np.int64)
 
     with tqdm(total=len(manifest_payload["blocks"]), desc="Root sizes", unit="block") as progress_bar:
@@ -834,7 +850,7 @@ def build_root_sizes(manifest_payload, parent):
 
 
 def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels):
-    print("Pass 3/3b: collapsing merged objects into per-region statistics...")
+    logger.info("Pass 3/3b: collapsing merged objects into per-region statistics...")
     kept_root_mask = root_sizes >= int(min_voxels)
     kept_root_mask[0] = False
 
@@ -890,9 +906,9 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
     kept_components = int(np.count_nonzero((parent == np.arange(parent.shape[0], dtype=np.int64)) & kept_root_mask))
     kept_voxels = int(root_sizes[kept_root_mask].sum(dtype=np.int64))
-    print(
-        f"Kept {kept_components} connected components with >= {min_voxels} voxels, "
-        f"covering {kept_voxels} voxels"
+    logger.info(
+        "Kept %d connected components with >= %d voxels, covering %d voxels",
+        kept_components, min_voxels, kept_voxels,
     )
 
     total_region_voxels = {
@@ -913,10 +929,10 @@ def export_region_excel(region_tree, direct_stats, output_path, flush_every):
     for index, row in enumerate(all_rows, start=1):
         rows.append(row)
         if flush_every > 0 and index % flush_every == 0:
-            print(f"Flushing {len(rows)} rows to {output_path}")
+            logger.info("Flushing %d rows to %s", len(rows), output_path)
             flush_rows_to_excel(rows, output_path)
 
-    print(f"Final flush with {len(rows)} rows to {output_path}")
+    logger.info("Final flush with %d rows to %s", len(rows), output_path)
     flush_rows_to_excel(rows, output_path)
 
 
@@ -948,7 +964,7 @@ def analyze_zarr_graph(
 
     tmp_root = Path(tmp_dir) if str(tmp_dir).strip() else Path(f"{output_path}_zarr_graph_tmp")
     if tmp_root.exists():
-        print(f"Cleaning existing temporary directory: {tmp_root}")
+        logger.info("Cleaning existing temporary directory: %s", tmp_root)
         shutil.rmtree(tmp_root)
 
     total_start_time = time.perf_counter()
@@ -968,15 +984,15 @@ def analyze_zarr_graph(
             tmp_dir=tmp_root,
             pass1_workers=pass1_workers,
         )
-        print(f"Timing | Pass 1 scan: {time.perf_counter() - pass1_start_time:.2f}s")
+        logger.info("Timing | Pass 1 scan: %.2fs", time.perf_counter() - pass1_start_time)
 
         pass2_start_time = time.perf_counter()
         parent = stitch_block_boundaries(manifest_payload)
-        print(f"Timing | Pass 2 stitch: {time.perf_counter() - pass2_start_time:.2f}s")
+        logger.info("Timing | Pass 2 stitch: %.2fs", time.perf_counter() - pass2_start_time)
 
         pass3a_start_time = time.perf_counter()
         root_sizes = build_root_sizes(manifest_payload, parent)
-        print(f"Timing | Pass 3a root sizes: {time.perf_counter() - pass3a_start_time:.2f}s")
+        logger.info("Timing | Pass 3a root sizes: %.2fs", time.perf_counter() - pass3a_start_time)
 
         pass3b_start_time = time.perf_counter()
         direct_stats = aggregate_final_region_stats(
@@ -985,40 +1001,90 @@ def analyze_zarr_graph(
             root_sizes=root_sizes,
             min_voxels=min_voxels,
         )
-        print(f"Timing | Pass 3b region collapse: {time.perf_counter() - pass3b_start_time:.2f}s")
+        logger.info("Timing | Pass 3b region collapse: %.2fs", time.perf_counter() - pass3b_start_time)
 
         export_start_time = time.perf_counter()
         export_region_excel(region_tree, direct_stats, output_path, flush_every)
-        print(f"Timing | Excel export: {time.perf_counter() - export_start_time:.2f}s")
+        logger.info("Timing | Excel export: %.2fs", time.perf_counter() - export_start_time)
     finally:
-        print(f"Timing | Total analysis: {time.perf_counter() - total_start_time:.2f}s")
+        logger.info("Timing | Total analysis: %.2fs", time.perf_counter() - total_start_time)
         if keep_tmp:
-            print(f"Temporary block artifacts kept at {tmp_root}")
+            logger.info("Temporary block artifacts kept at %s", tmp_root)
         elif tmp_root.exists():
-            print(f"Removing temporary block artifacts at {tmp_root}")
+            logger.info("Removing temporary block artifacts at %s", tmp_root)
             shutil.rmtree(tmp_root)
 
 
 def main():
+    import sys as _sys
+
     args = parse_args()
-    analyze_zarr_graph(
-        mask_zarr_path=args.mask_zarr,
-        label_zarr_path=args.label_zarr,
-        signal_zarr_path=args.signal_zarr,
-        cfg_path=args.cfg,
-        output_path=args.output,
-        dataset_name=args.dataset_name,
-        block_size=parse_block_size(args.block_size),
-        foreground_mode=args.foreground_mode,
-        foreground_label=args.foreground_label,
-        min_voxels=args.min_voxels,
-        flush_every=args.flush_every,
-        resolution_xyz=parse_resolution_xyz(args.resolution_xyz),
-        tmp_dir=args.tmp_dir,
-        keep_tmp=args.keep_tmp,
-        pass1_workers=args.pass1_workers,
-    )
-    print(f"Analysis finished. Excel saved to {args.output}")
+
+    if args.json_logs:
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record):
+                return json.dumps({
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                })
+        _handler = logging.StreamHandler(_sys.stderr)
+        _handler.setFormatter(_JsonFormatter())
+        logging.root.addHandler(_handler)
+        logging.root.setLevel(logging.INFO)
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    try:
+        _started_at = time.time()
+
+        analyze_zarr_graph(
+            mask_zarr_path=args.mask_zarr,
+            label_zarr_path=args.label_zarr,
+            signal_zarr_path=args.signal_zarr,
+            cfg_path=args.cfg,
+            output_path=args.output,
+            dataset_name=args.dataset_name,
+            block_size=parse_block_size(args.block_size),
+            foreground_mode=args.foreground_mode,
+            foreground_label=args.foreground_label,
+            min_voxels=args.min_voxels,
+            flush_every=args.flush_every,
+            resolution_xyz=parse_resolution_xyz(args.resolution_xyz),
+            tmp_dir=args.tmp_dir,
+            keep_tmp=args.keep_tmp,
+            pass1_workers=args.pass1_workers,
+        )
+
+        if write_run_manifest is not None:
+            output_dir = Path(args.output).parent
+            write_run_manifest(
+                output_dir,
+                module="registration.region_signal_analysis_zarr_graph",
+                entrypoint="analyze_zarr_graph",
+                inputs={
+                    "mask_zarr_path": args.mask_zarr,
+                    "label_zarr_path": args.label_zarr,
+                    "signal_zarr_path": args.signal_zarr,
+                    "cfg_path": args.cfg,
+                    "output_path": args.output,
+                    "dataset_name": args.dataset_name,
+                    "foreground_mode": args.foreground_mode,
+                    "foreground_label": args.foreground_label,
+                    "min_voxels": args.min_voxels,
+                    "resolution_xyz": args.resolution_xyz,
+                },
+                outputs=[Path(args.output)],
+                started_at=_started_at,
+            )
+
+        logger.info("Analysis finished. Excel saved to %s", args.output)
+    except Exception as exc:
+        if PipelineError is not None and isinstance(exc, PipelineError):
+            print(json.dumps({"error_code": exc.code.value, "message": str(exc.message)}), file=_sys.stderr)
+            _sys.exit(exc.exit_code)
+        logger.exception("Unhandled error: %s", exc)
+        _sys.exit(1)
 
 
 if __name__ == "__main__":

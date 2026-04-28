@@ -1,0 +1,110 @@
+{
+  "schema_version": "1",
+  "project": "Yifu",
+  "description": "LSFM brain vasculature analysis pipeline. Converts raw TIFF stacks to vessel skeleton metrics with per-region summaries aligned to the Allen Brain Atlas.",
+  "modules": [
+    {
+      "id": "preprocessing",
+      "path": "pipeline_modules/preprocessing",
+      "description": "TIFF-to-Zarr conversion, downsampling, and optional contrast enhancement.",
+      "agent_native": true,
+      "capability_manifest": "pipeline_modules/preprocessing/capability_manifest.json",
+      "primary_scripts": [
+        "pipeline_modules/preprocessing/preprocessor.py",
+        "pipeline_modules/preprocessing/tiff_to_zarr.py",
+        "pipeline_modules/preprocessing/downsample.py"
+      ],
+      "python_package": "pipeline_modules.preprocessing",
+      "config_models": {
+        "PreprocessingCfg": "pipeline_modules.preprocessing.config.PreprocessingCfg",
+        "DownsampleCfg": "pipeline_modules.preprocessing.config.DownsampleCfg",
+        "ZarrCfg": "pipeline_modules.preprocessing.config.ZarrCfg"
+      },
+      "outputs_to": ["signal_zarr", "reg_downsample_nii"]
+    },
+    {
+      "id": "registration",
+      "path": "pipeline_modules/registration",
+      "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
+      "agent_native": true,
+      "capability_manifest": "pipeline_modules/registration/capability_manifest.json",
+      "primary_scripts": [
+        "pipeline_modules/registration/ANTs_registration.py",
+        "pipeline_modules/registration/region_signal_analysis_zarr_graph.py",
+        "pipeline_modules/registration/check_region_coverage_zarr.py",
+        "pipeline_modules/registration/merge_atlas_regions.py"
+      ],
+      "python_package": "pipeline_modules.registration",
+      "config_models": {
+        "RegistrationCfg": "pipeline_modules.registration.config.RegistrationCfg",
+        "AnalysisCfg": "pipeline_modules.registration.config.AnalysisCfg"
+      },
+      "inputs_from": ["signal_zarr", "mask_zarr", "reg_downsample_nii"],
+      "outputs_to": ["atlas_label_zarr", "atlas_label_tiff_dir", "density_results_xlsx"]
+    },
+    {
+      "id": "segmentation",
+      "path": "pipeline_modules/segmentation",
+      "description": "Vessel / cell mask generation from signal Zarr using thresholding or local-checkpoint 3D U-Net inference.",
+      "agent_native": true,
+      "capability_manifest": "pipeline_modules/segmentation/capability_manifest.json",
+      "primary_scripts": [
+        "pipeline_modules/segmentation/intensity_threshold_segmentor.py",
+        "pipeline_modules/segmentation/cfos_unet_inference.py"
+      ],
+      "python_package": "pipeline_modules.segmentation",
+      "config_models": {
+        "SegmentationCfg": "pipeline_modules.segmentation.config.SegmentationCfg",
+        "ThresholdSegmentationCfg": "pipeline_modules.segmentation.config.ThresholdSegmentationCfg",
+        "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg"
+      },
+      "outputs_to": ["mask_zarr", "mask_tiff_dir"]
+    },
+    {
+      "id": "tubule_reconstruction",
+      "path": "pipeline_modules/tubule_reconstruction",
+      "description": "Vessel skeleton reconstruction from binary mask Zarr (kimimaro/TEASAR) with per-brain-region vessel parameter summaries.",
+      "agent_native": true,
+      "capability_manifest": "pipeline_modules/tubule_reconstruction/capability_manifest.json",
+      "primary_scripts": [
+        "pipeline_modules/tubule_reconstruction/kimimaro_reconstruction.py",
+        "pipeline_modules/tubule_reconstruction/region_vessel_analysis.py"
+      ],
+      "python_package": "pipeline_modules.tubule_reconstruction",
+      "config_models": {
+        "TubuleReconstructionCfg": "pipeline_modules.tubule_reconstruction.config.TubuleReconstructionCfg",
+        "RegionVesselAnalysisCfg": "pipeline_modules.tubule_reconstruction.config.RegionVesselAnalysisCfg"
+      },
+      "inputs_from": ["mask_zarr", "atlas_label_zarr"],
+      "outputs_to": ["tubule_reconstruction_dir"]
+    },
+    {
+      "id": "utils",
+      "path": "pipeline_modules/utils",
+      "description": "Shared utilities: SampleLayout (canonical path registry), PipelineError (structured errors), write_run_manifest.",
+      "agent_native": true,
+      "capability_manifest": null,
+      "python_package": "pipeline_modules.utils",
+      "key_classes": {
+        "SampleLayout": "pipeline_modules.utils.sample_layout.SampleLayout",
+        "PipelineError": "pipeline_modules.utils.errors.PipelineError",
+        "ErrorCode": "pipeline_modules.utils.errors.ErrorCode",
+        "write_run_manifest": "pipeline_modules.utils.run_manifest.write_run_manifest"
+      }
+    }
+  ],
+  "sample_layout": {
+    "class": "pipeline_modules.utils.sample_layout.SampleLayout",
+    "description": "Single source of truth for all conventionally-named artefacts under a sample directory. Instantiate with sample_dir + signal_ch + reg_ch to resolve any path without string literals.",
+    "example": "from pipeline_modules.utils import SampleLayout; layout = SampleLayout(sample_dir='/data/mouse01', signal_ch='ch0', reg_ch='ch1')"
+  },
+  "default_data_flow": [
+    {"step": 1, "module": "preprocessing",        "produces": "signal_zarr"},
+    {"step": 2, "module": "preprocessing",        "produces": "reg_downsample_nii"},
+    {"step": 3, "module": "segmentation",         "produces": "mask_zarr"},
+    {"step": 4, "module": "registration",         "produces": "atlas_label_zarr"},
+    {"step": 5, "module": "registration",         "produces": "density_results_xlsx"},
+    {"step": 6, "module": "tubule_reconstruction","produces": "tubule_reconstruction_dir",
+     "note": "Requires mask_zarr; region summary additionally requires atlas_label_zarr and save_skeleton=true"}
+  ]
+}

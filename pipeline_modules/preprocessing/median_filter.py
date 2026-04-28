@@ -1,13 +1,14 @@
 import argparse
 from pathlib import Path
 
-import cv2
 import numpy as np
 import tifffile
 
 
 def apply_median_filter(image: np.ndarray, kernel_size: int = 3) -> np.ndarray:
     """Apply a 2D median filter and preserve the input dtype."""
+    import cv2
+
     if kernel_size <= 1:
         return image.copy()
     if kernel_size % 2 == 0:

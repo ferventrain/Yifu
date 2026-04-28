@@ -16,3 +16,4 @@
 
 ## 系统工具依赖
 *   **Git**: 需要安装 Git 用于代码版本管理和克隆仓库
+*   **uv**： curl -LsSf https://astral.sh/uv/install.sh | sh

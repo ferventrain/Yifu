@@ -1,0 +1,344 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+try:
+    from pipeline_modules.utils.errors import ErrorCode, PipelineError
+    from pipeline_modules.utils.run_manifest import write_run_manifest
+    from pipeline_modules.segmentation.cfos_unet_model import load_cfos_unet_checkpoint, normalize_volume
+    from pipeline_modules.segmentation.zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
+except ImportError:  # pragma: no cover
+    from ..utils.errors import ErrorCode, PipelineError
+    from ..utils.run_manifest import write_run_manifest
+    from .cfos_unet_model import load_cfos_unet_checkpoint, normalize_volume
+    from .zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
+
+logger = logging.getLogger(__name__)
+
+
+def _configure_logging(json_logs: bool) -> None:
+    if json_logs:
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                return json.dumps(
+                    {
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "message": record.getMessage(),
+                    },
+                    ensure_ascii=False,
+                )
+
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(_JsonFormatter())
+        logging.root.handlers.clear()
+        logging.root.addHandler(handler)
+        logging.root.setLevel(logging.INFO)
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+
+def _resolve_device(torch_mod, requested: str) -> str:
+    requested = (requested or "auto").lower()
+    if requested == "auto":
+        return "cuda" if torch_mod.cuda.is_available() else "cpu"
+    return requested
+
+
+def _compute_tile_starts(length: int, tile: int, stride: int) -> list[int]:
+    if length <= tile:
+        return [0]
+    starts = list(range(0, length - tile + 1, max(stride, 1)))
+    if starts[-1] != length - tile:
+        starts.append(length - tile)
+    return starts
+
+
+def _iter_chunk_slices(shape: tuple[int, int, int], chunks: tuple[int, int, int]):
+    for z in range(0, shape[0], chunks[0]):
+        z_end = min(z + chunks[0], shape[0])
+        for y in range(0, shape[1], chunks[1]):
+            y_end = min(y + chunks[1], shape[1])
+            for x in range(0, shape[2], chunks[2]):
+                x_end = min(x + chunks[2], shape[2])
+                yield (slice(z, z_end), slice(y, y_end), slice(x, x_end))
+
+
+def _infer_volume(
+    volume_np,
+    *,
+    model,
+    torch_mod,
+    patch_size: tuple[int, int, int],
+    overlap: float,
+    batch_size: int,
+    device: str,
+):
+    import numpy as np
+
+    tile_d, tile_h, tile_w = patch_size
+    stride_d = max(1, int(round(tile_d * (1.0 - overlap))))
+    stride_h = max(1, int(round(tile_h * (1.0 - overlap))))
+    stride_w = max(1, int(round(tile_w * (1.0 - overlap))))
+
+    d, h, w = volume_np.shape
+    pad_d = max(tile_d - d, 0)
+    pad_h = max(tile_h - h, 0)
+    pad_w = max(tile_w - w, 0)
+    if pad_d or pad_h or pad_w:
+        volume_np = np.pad(volume_np, ((0, pad_d), (0, pad_h), (0, pad_w)), mode="constant")
+    padded_shape = volume_np.shape
+
+    logits_acc = None
+    count_acc = None
+    pending_patches = []
+    pending_coords = []
+
+    z_starts = _compute_tile_starts(padded_shape[0], tile_d, stride_d)
+    y_starts = _compute_tile_starts(padded_shape[1], tile_h, stride_h)
+    x_starts = _compute_tile_starts(padded_shape[2], tile_w, stride_w)
+
+    def flush_pending():
+        nonlocal logits_acc, count_acc, pending_patches, pending_coords
+        if not pending_patches:
+            return
+        batch_np = np.stack(pending_patches, axis=0)[:, None, ...].astype("float32")
+        batch_tensor = torch_mod.from_numpy(batch_np).to(device)
+        with torch_mod.no_grad():
+            logits = model(batch_tensor).detach().float().cpu()
+        if logits_acc is None:
+            num_classes = int(logits.shape[1])
+            logits_acc = torch_mod.zeros((num_classes,) + padded_shape, dtype=torch_mod.float32)
+            count_acc = torch_mod.zeros((1,) + padded_shape, dtype=torch_mod.float32)
+        for batch_index, (z0, y0, x0) in enumerate(pending_coords):
+            logits_acc[:, z0:z0 + tile_d, y0:y0 + tile_h, x0:x0 + tile_w] += logits[batch_index]
+            count_acc[:, z0:z0 + tile_d, y0:y0 + tile_h, x0:x0 + tile_w] += 1.0
+        pending_patches = []
+        pending_coords = []
+
+    for z0 in z_starts:
+        for y0 in y_starts:
+            for x0 in x_starts:
+                pending_patches.append(volume_np[z0:z0 + tile_d, y0:y0 + tile_h, x0:x0 + tile_w])
+                pending_coords.append((z0, y0, x0))
+                if len(pending_patches) >= max(1, batch_size):
+                    flush_pending()
+    flush_pending()
+
+    averaged_logits = logits_acc / count_acc.clamp(min=1.0)
+    return averaged_logits[:, :d, :h, :w]
+
+
+def run_cfos_unet_inference(
+    *,
+    input_zarr: str | Path,
+    output_zarr: str | Path,
+    checkpoint_path: str | Path,
+    dataset_name: str = "0",
+    patch_size: tuple[int, int, int] | None = None,
+    overlap: float = 0.25,
+    batch_size: int = 1,
+    device: str = "auto",
+    foreground_class: int = 1,
+    probability_threshold: float = 0.5,
+    process_existing_only: bool = False,
+    output_mode: str = "binary",
+    output_dtype: str = "uint8",
+    chunk_size: tuple[int, int, int] | None = None,
+    normalize_percentiles: tuple[float, float] = (1.0, 99.5),
+) -> dict[str, Any]:
+    import numpy as np
+
+    started_at = time.time()
+    input_path = Path(input_zarr)
+    checkpoint = Path(checkpoint_path)
+    if not input_path.exists():
+        raise PipelineError(ErrorCode.INPUT_NOT_FOUND, "Input Zarr not found", {"input_zarr": str(input_path)})
+    if not checkpoint.exists():
+        raise PipelineError(ErrorCode.INPUT_NOT_FOUND, "Checkpoint not found", {"checkpoint_path": str(checkpoint)})
+
+    data_in = open_zarr_dataset(input_path, dataset_name=dataset_name)
+    model_bundle = load_cfos_unet_checkpoint(checkpoint, device="cpu")
+    torch_mod = model_bundle["torch"]
+    resolved_device = _resolve_device(torch_mod, device)
+    if resolved_device != "cpu":
+        model_bundle = load_cfos_unet_checkpoint(checkpoint, device=resolved_device)
+        torch_mod = model_bundle["torch"]
+
+    model = model_bundle["model"]
+    checkpoint_args = model_bundle["checkpoint_args"]
+    inferred_patch_size = patch_size or tuple(int(v) for v in checkpoint_args.get("patch_size", [128, 128, 128]))
+    inferred_chunk_size = chunk_size or tuple(int(v) for v in getattr(data_in, "chunks", inferred_patch_size))
+    output_dtype_np = np.dtype(output_dtype)
+    _, data_out = create_output_zarr(output_zarr, data_in.shape, inferred_chunk_size, output_dtype_np, dataset_name=dataset_name)
+
+    processed_regions = 0
+    if process_existing_only:
+        existing_indices = list_existing_chunk_indices(data_in)
+        if not existing_indices:
+            raise PipelineError(
+                ErrorCode.EMPTY_RESULT,
+                "No physical chunks found in input store",
+                {"input_zarr": str(input_path)},
+            )
+        chunk_slices_iter = []
+        shape = tuple(int(v) for v in data_in.shape)
+        chunks = tuple(int(v) for v in getattr(data_in, "chunks", inferred_chunk_size))
+        for idx in existing_indices:
+            slices = []
+            for axis, chunk_idx_val in enumerate(idx):
+                start = chunk_idx_val * chunks[axis]
+                stop = min(start + chunks[axis], shape[axis])
+                slices.append(slice(start, stop))
+            chunk_slices_iter.append(tuple(slices))
+    else:
+        chunk_slices_iter = list(_iter_chunk_slices(tuple(int(v) for v in data_in.shape), inferred_chunk_size))
+
+    for slices in chunk_slices_iter:
+        volume_np = np.asarray(data_in[slices])
+        volume_np = normalize_volume(
+            volume_np,
+            low_pct=float(normalize_percentiles[0]),
+            high_pct=float(normalize_percentiles[1]),
+        )
+        logits = _infer_volume(
+            volume_np,
+            model=model,
+            torch_mod=torch_mod,
+            patch_size=inferred_patch_size,
+            overlap=float(overlap),
+            batch_size=int(batch_size),
+            device=resolved_device,
+        )
+        if output_mode == "multiclass":
+            pred_np = torch_mod.argmax(logits, dim=0).cpu().numpy().astype(output_dtype_np, copy=False)
+        else:
+            probs = torch_mod.softmax(logits, dim=0)
+            fg_probs = probs[int(foreground_class)].cpu().numpy()
+            pred_np = (fg_probs >= float(probability_threshold)).astype(output_dtype_np, copy=False)
+        data_out[slices] = pred_np
+        processed_regions += 1
+
+    result = {
+        "success": True,
+        "input_zarr": str(input_path),
+        "output_zarr": str(Path(output_zarr)),
+        "checkpoint_path": str(checkpoint),
+        "dataset_name": dataset_name,
+        "shape": list(data_in.shape),
+        "chunks": list(inferred_chunk_size),
+        "patch_size": list(inferred_patch_size),
+        "processed_regions": processed_regions,
+        "resolved_device": resolved_device,
+        "num_classes": int(model_bundle["num_classes"]),
+        "base_channels": int(model_bundle["base_channels"]),
+        "output_mode": output_mode,
+        "output_dtype": output_dtype,
+    }
+    manifest_path = write_run_manifest(
+        output_zarr,
+        module="segmentation",
+        entrypoint="run_cfos_unet_inference",
+        inputs={
+            "input_zarr": str(input_path),
+            "output_zarr": str(output_zarr),
+            "checkpoint_path": str(checkpoint),
+            "dataset_name": dataset_name,
+            "patch_size": inferred_patch_size,
+            "overlap": overlap,
+            "batch_size": batch_size,
+            "device": resolved_device,
+            "foreground_class": foreground_class,
+            "probability_threshold": probability_threshold,
+            "process_existing_only": process_existing_only,
+            "output_mode": output_mode,
+            "output_dtype": output_dtype,
+            "chunk_size": inferred_chunk_size,
+        },
+        outputs=[output_zarr],
+        started_at=started_at,
+        extra=result,
+    )
+    result["manifest_path"] = str(manifest_path)
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run local cFos 3D U-Net checkpoint inference on a Zarr volume")
+    parser.add_argument("--input_zarr", required=True, help="Input signal Zarr path")
+    parser.add_argument("--output_zarr", required=True, help="Output mask Zarr path")
+    parser.add_argument("--checkpoint_path", required=True, help="Checkpoint produced by train_cfos_3d_mlflow.py")
+    parser.add_argument("--dataset_name", default="0", help="Dataset name inside the input/output Zarr groups")
+    parser.add_argument("--patch_size", default="", help="Override patch size as z,y,x")
+    parser.add_argument("--overlap", type=float, default=0.25, help="Sliding-window overlap ratio")
+    parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size in number of tiles")
+    parser.add_argument("--device", default="auto", help="auto / cpu / cuda")
+    parser.add_argument("--foreground_class", type=int, default=1, help="Foreground class index")
+    parser.add_argument("--probability_threshold", type=float, default=0.5, help="Foreground probability threshold for binary output")
+    parser.add_argument("--process_existing_only", action="store_true", help="Only process physically present input chunks")
+    parser.add_argument("--output_mode", choices=["binary", "multiclass"], default="binary")
+    parser.add_argument("--output_dtype", default="uint8", help="numpy dtype for the output mask")
+    parser.add_argument("--chunk_size", default="", help="Override output chunk size as z,y,x")
+    parser.add_argument("--normalize_percentiles", default="1.0,99.5", help="Percentile pair low,high for normalization")
+    parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
+    return parser.parse_args()
+
+
+def _parse_triplet(value: str) -> tuple[int, int, int] | None:
+    if not str(value).strip():
+        return None
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if len(parts) != 3:
+        raise PipelineError(ErrorCode.ARGUMENT_INVALID, "Expected three comma-separated integers", {"value": value})
+    return (int(parts[0]), int(parts[1]), int(parts[2]))
+
+
+def _parse_percentiles(value: str) -> tuple[float, float]:
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if len(parts) != 2:
+        raise PipelineError(ErrorCode.ARGUMENT_INVALID, "Expected two comma-separated percentiles", {"value": value})
+    return (float(parts[0]), float(parts[1]))
+
+
+def main() -> int:
+    args = parse_args()
+    _configure_logging(args.json_logs)
+    try:
+        result = run_cfos_unet_inference(
+            input_zarr=args.input_zarr,
+            output_zarr=args.output_zarr,
+            checkpoint_path=args.checkpoint_path,
+            dataset_name=args.dataset_name,
+            patch_size=_parse_triplet(args.patch_size),
+            overlap=args.overlap,
+            batch_size=args.batch_size,
+            device=args.device,
+            foreground_class=args.foreground_class,
+            probability_threshold=args.probability_threshold,
+            process_existing_only=args.process_existing_only,
+            output_mode=args.output_mode,
+            output_dtype=args.output_dtype,
+            chunk_size=_parse_triplet(args.chunk_size),
+            normalize_percentiles=_parse_percentiles(args.normalize_percentiles),
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    except PipelineError as exc:
+        print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)
+        return exc.exit_code
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Unhandled cfos_unet inference error: %s", exc)
+        wrapped = PipelineError(ErrorCode.INTERNAL_ERROR, "Unhandled cfos_unet inference error", {"error": str(exc)})
+        print(json.dumps(wrapped.to_dict(), ensure_ascii=False), file=sys.stderr)
+        return wrapped.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

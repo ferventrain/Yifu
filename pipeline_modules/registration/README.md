@@ -92,3 +92,63 @@ python segmentation/cellpose_segmentation.py \
   --patch_size "128,256,256" \
   --batch_size 4
 ```
+
+---
+
+## Agent-Native 集成接口
+
+本模块已按"Agent-Native"原则改造，可被自动化 agent 直接发现和调用。
+
+### 结构化配置（Pydantic）
+
+```python
+from pipeline_modules.registration import RegistrationCfg, AnalysisCfg
+
+# 从 dict（如解析自 config.json）构建并验证
+reg_cfg = RegistrationCfg(**config_json["registration"])
+ana_cfg = AnalysisCfg(**config_json["analysis"])
+
+# 导出 JSON Schema（供 agent / IDE 做参数校验）
+from pipeline_modules.registration import export_json_schema
+schema = export_json_schema()
+```
+
+### SampleLayout — 统一路径管理
+
+```python
+from pipeline_modules.registration import layout_for_sample
+
+layout = layout_for_sample("/data/mouse01", signal_ch="ch0", reg_ch="ch1")
+layout.reg_downsample_nii     # /data/mouse01/ch1_downsample/volume.nii.gz
+layout.atlas_label_tiff_dir  # /data/mouse01/upsampled_atlas_label
+layout.mask_zarr             # /data/mouse01/ch0_mask.zarr
+layout.signal_zarr           # /data/mouse01/ch0.zarr
+layout.density_results_xlsx  # /data/mouse01/density_analysis_ch0.xlsx
+```
+
+### Capability Manifest — 机器可读能力说明
+
+```python
+from pipeline_modules.registration import load_capability_manifest
+
+manifest = load_capability_manifest()
+# manifest["entrypoints"] 列出4个入口函数、输入参数、输出文件、前置条件
+```
+
+也可直接读取 JSON 文件：`pipeline_modules/registration/capability_manifest.json`
+
+全项目模块索引见：`capabilities.json`（项目根目录）。
+
+### 结构化错误与运行记录
+
+- 所有 CLI 脚本支持 `--json_logs`，将日志以 NDJSON 格式输出到 stderr，便于 agent 解析。
+- `ANTs_registration.py` 和 `region_signal_analysis_zarr_graph.py` 在成功完成后自动写入 `_run_manifest.json`。
+- 发生结构化错误时，CLI 在 stderr 输出 `{"error_code": "...", "message": "..."}` 并以对应退出码退出（2 = 配置错误，3 = 输入缺失，1 = 运行时错误）。
+
+### 测试
+
+```powershell
+pytest tests/test_registration.py -v
+```
+
+测试覆盖：`RegistrationCfg` / `AnalysisCfg` Pydantic 模型验证、`layout_for_sample`、`export_json_schema`、`load_capability_manifest`、`load_region_tree` / `resolve_target_node` smoke test、`build_nearest_ancestor_mapping` smoke test。

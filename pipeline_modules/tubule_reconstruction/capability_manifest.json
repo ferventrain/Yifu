@@ -1,0 +1,123 @@
+{
+  "schema_version": "1",
+  "module": "tubule_reconstruction",
+  "description": "Vessel / tubule skeleton reconstruction from binary mask Zarr using kimimaro/TEASAR, with optional per-brain-region summary.",
+  "entrypoints": [
+    {
+      "id": "analyze_binary_mask_zarr",
+      "function": "pipeline_modules.tubule_reconstruction.kimimaro_reconstruction.analyze_binary_mask_zarr",
+      "cli": "python pipeline_modules/tubule_reconstruction/kimimaro_reconstruction.py",
+      "description": "Skeletonise a full-volume binary mask Zarr and compute network metrics.",
+      "prerequisites": [
+        "Binary mask Zarr store must exist (e.g. SampleLayout.mask_zarr)"
+      ],
+      "inputs": {
+        "mask_zarr_path": {"type": "path", "required": true, "description": "Path to binary mask Zarr store"},
+        "output_dir":     {"type": "path", "required": true, "description": "Directory to write outputs; created if missing"},
+        "dataset_name":   {"type": "string", "default": "0"},
+        "resolution_xyz": {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
+        "foreground_label": {"type": "int", "default": 1},
+        "roi":            {"type": "object|null", "default": null, "description": "{\"z\":[lo,hi],\"y\":[lo,hi],\"x\":[lo,hi]}"},
+        "dust_threshold": {"type": "int", "default": 0},
+        "fix_borders":    {"type": "bool", "default": true},
+        "parallel":       {"type": "int", "default": 1},
+        "teasar_params":  {"type": "TeasarParams", "default": null, "description": "Dict matching TeasarParams fields; null uses defaults"},
+        "save_skeleton":  {"type": "bool", "default": false},
+        "save_swc":       {"type": "bool", "default": false}
+      },
+      "outputs": {
+        "branch_csv_path":   {"type": "path", "description": "vessel_branch_metrics.csv"},
+        "summary_json_path": {"type": "path", "description": "vessel_network_summary.json"},
+        "vertex_csv_path":   {"type": "path", "optional": true, "description": "skeleton_vertices.csv (requires save_skeleton)"},
+        "edge_csv_path":     {"type": "path", "optional": true, "description": "skeleton_edges.csv (requires save_skeleton)"},
+        "swc_dir":           {"type": "path", "optional": true, "description": "SWC directory (requires save_swc)"},
+        "manifest_path":     {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "analyze_binary_mask_zarr_chunkwise",
+      "function": "pipeline_modules.tubule_reconstruction.kimimaro_reconstruction.analyze_binary_mask_zarr_chunkwise",
+      "cli": "python pipeline_modules/tubule_reconstruction/kimimaro_reconstruction.py --chunkwise",
+      "description": "Chunk-by-chunk skeletonisation with optional cross-chunk stitching. Use this for large volumes that do not fit in RAM.",
+      "prerequisites": [
+        "Binary mask Zarr store must exist",
+        "save_skeleton is implicitly true (skeleton tables are always written in chunkwise mode)"
+      ],
+      "inputs": {
+        "mask_zarr_path": {"type": "path", "required": true},
+        "output_dir":     {"type": "path", "required": true},
+        "dataset_name":   {"type": "string", "default": "0"},
+        "resolution_xyz": {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
+        "foreground_label": {"type": "int", "default": 1},
+        "dust_threshold": {"type": "int", "default": 0},
+        "fix_borders":    {"type": "bool", "default": true},
+        "parallel":       {"type": "int", "default": 1},
+        "teasar_params":  {"type": "TeasarParams", "default": null},
+        "save_skeleton":  {"type": "bool", "default": false},
+        "save_swc":       {"type": "bool", "default": false},
+        "process_existing_only": {"type": "bool", "default": false},
+        "halo_zyx":       {"type": "triplet_int_vox", "default": [0, 0, 0]},
+        "stitch":         {"type": "bool", "default": true},
+        "stitch_max_distance_um": {"type": "float", "default": 5.0},
+        "chunk_workers":  {"type": "int", "default": 1}
+      },
+      "outputs": {
+        "branch_csv_path":   {"type": "path", "description": "vessel_branch_metrics.csv"},
+        "chunk_csv_path":    {"type": "path", "description": "vessel_chunk_metrics.csv"},
+        "summary_json_path": {"type": "path", "description": "vessel_network_summary.json"},
+        "vertex_csv_path":   {"type": "path", "optional": true},
+        "edge_csv_path":     {"type": "path", "optional": true},
+        "stitch_csv_path":   {"type": "path", "optional": true},
+        "swc_dir":           {"type": "path", "optional": true},
+        "manifest_path":     {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "analyze_regions_from_skeleton",
+      "function": "pipeline_modules.tubule_reconstruction.region_vessel_analysis.analyze_regions_from_skeleton",
+      "cli": "python pipeline_modules/tubule_reconstruction/region_vessel_analysis.py",
+      "description": "Compute per-brain-region vessel parameters by sampling an Allen-style annotation label Zarr at skeleton vertex / edge positions.",
+      "prerequisites": [
+        "skeleton_vertices.csv and skeleton_edges.csv must exist (outputs of analyze_binary_mask_zarr[_chunkwise] with save_skeleton=true)",
+        "Registered annotation label Zarr must exist (e.g. SampleLayout.atlas_label_zarr)",
+        "Allen region CSV must exist (default: pipeline_modules/registration/Region_Csv_Rev1_updated.CSV)"
+      ],
+      "inputs": {
+        "vertex_csv_path":            {"type": "path", "required": true, "description": "skeleton_vertices.csv"},
+        "edge_csv_path":              {"type": "path", "required": true, "description": "skeleton_edges.csv"},
+        "annotation_zarr_path":       {"type": "path", "required": true, "description": "Registered annotation label Zarr"},
+        "region_cfg_csv":             {"type": "path", "required": true, "description": "Allen region CSV"},
+        "regions":                    {"type": "string|list[string]", "required": true, "description": "Comma/semicolon list of region queries (acronym, full name, or integer id)"},
+        "output_dir":                 {"type": "path|null", "default": null, "description": "If set, write CSV/JSON + manifest here"},
+        "annotation_dataset_name":    {"type": "string", "default": "0"},
+        "annotation_resolution_xyz":  {"type": "triplet_float_um", "default": [25.0, 25.0, 25.0]}
+      },
+      "outputs": {
+        "summary_table":      {"type": "DataFrame", "description": "In-memory pandas DataFrame with per-region metrics"},
+        "summary_csv_path":   {"type": "path", "optional": true, "description": "region_vessel_summary.csv (only when output_dir set)"},
+        "summary_json_path":  {"type": "path", "optional": true, "description": "region_vessel_summary.json (only when output_dir set)"},
+        "manifest_path":      {"type": "path", "optional": true, "description": "_run_manifest.json (only when output_dir set)"}
+      }
+    }
+  ],
+  "configuration_models": {
+    "TubuleReconstructionCfg": "pipeline_modules.tubule_reconstruction.config.TubuleReconstructionCfg",
+    "RegionVesselAnalysisCfg": "pipeline_modules.tubule_reconstruction.config.RegionVesselAnalysisCfg",
+    "TeasarParams":            "pipeline_modules.tubule_reconstruction.config.TeasarParams"
+  },
+  "sample_layout": {
+    "class": "pipeline_modules.utils.sample_layout.SampleLayout",
+    "relevant_paths": {
+      "mask_zarr":               "SampleLayout.mask_zarr",
+      "atlas_label_zarr":        "SampleLayout.atlas_label_zarr",
+      "tubule_reconstruction_dir": "SampleLayout.tubule_reconstruction_dir",
+      "tubule_branch_csv":       "SampleLayout.tubule_branch_csv",
+      "tubule_summary_json":     "SampleLayout.tubule_summary_json",
+      "tubule_vertex_csv":       "SampleLayout.tubule_vertex_csv",
+      "tubule_edge_csv":         "SampleLayout.tubule_edge_csv",
+      "tubule_region_summary_csv":  "SampleLayout.tubule_region_summary_csv",
+      "tubule_region_summary_json": "SampleLayout.tubule_region_summary_json",
+      "tubule_run_manifest":     "SampleLayout.tubule_run_manifest"
+    }
+  }
+}

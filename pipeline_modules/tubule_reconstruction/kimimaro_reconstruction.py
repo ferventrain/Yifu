@@ -1,12 +1,24 @@
 import argparse
 import concurrent.futures
 import json
+import logging
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import zarr
 from scipy import ndimage
+
+try:
+    from pipeline_modules.utils.errors import ErrorCode, PipelineError
+    from pipeline_modules.utils.run_manifest import write_run_manifest
+except ImportError:  # running the file directly without project root on sys.path
+    PipelineError = None  # type: ignore[assignment,misc]
+    ErrorCode = None  # type: ignore[assignment]
+    write_run_manifest = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_TEASAR_PARAMS = {
@@ -1223,6 +1235,7 @@ def analyze_binary_mask_zarr(
     save_skeleton=False,
     save_swc=False,
 ):
+    _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
     mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
     binary_mask = _extract_binary_mask(mask_zarr, roi=roi, foreground_label=foreground_label)
@@ -1271,6 +1284,26 @@ def analyze_binary_mask_zarr(
             swc_dir, swc_paths = write_swc_files(vertex_table, edge_table, output_root)
             result["swc_dir"] = swc_dir
             result["swc_paths"] = swc_paths
+
+    if write_run_manifest is not None:
+        _output_files = [v for k, v in result.items() if k.endswith("_path") or k == "swc_dir"]
+        result["manifest_path"] = write_run_manifest(
+            output_root,
+            module="tubule_reconstruction.kimimaro_reconstruction",
+            entrypoint="analyze_binary_mask_zarr",
+            inputs={
+                "mask_zarr_path": str(mask_zarr_path),
+                "dataset_name": dataset_name,
+                "resolution_xyz": resolution_xyz,
+                "foreground_label": foreground_label,
+                "dust_threshold": dust_threshold,
+                "fix_borders": fix_borders,
+                "save_skeleton": save_skeleton,
+                "save_swc": save_swc,
+            },
+            outputs=_output_files,
+            started_at=_started_at,
+        )
 
     return result
 
@@ -1325,6 +1358,7 @@ def analyze_binary_mask_zarr_chunkwise(
     stitch_max_distance_um=5.0,
     chunk_workers=1,
 ):
+    _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
     chunk_workers = max(1, int(chunk_workers))
     mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
@@ -1463,7 +1497,7 @@ def analyze_binary_mask_zarr_chunkwise(
             stitch_edge_table.to_csv(stitch_csv_path, index=False)
             result["stitch_edge_table"] = stitch_edge_table
             result["stitch_csv_path"] = stitch_csv_path
-            print(f"Skeleton stitch CSV: {stitch_csv_path}")
+            logger.info("Skeleton stitch CSV: %s", stitch_csv_path)
         else:
             summary["num_stitch_edges"] = 0
 
@@ -1476,6 +1510,28 @@ def analyze_binary_mask_zarr_chunkwise(
         summary.update(graph_summary)
 
     _write_summary_json(summary, summary_json_path)
+
+    if write_run_manifest is not None:
+        _output_files = [v for k, v in result.items() if k.endswith("_path") or k == "swc_dir"]
+        result["manifest_path"] = write_run_manifest(
+            output_root,
+            module="tubule_reconstruction.kimimaro_reconstruction",
+            entrypoint="analyze_binary_mask_zarr_chunkwise",
+            inputs={
+                "mask_zarr_path": str(mask_zarr_path),
+                "dataset_name": dataset_name,
+                "resolution_xyz": resolution_xyz,
+                "foreground_label": foreground_label,
+                "dust_threshold": dust_threshold,
+                "fix_borders": fix_borders,
+                "save_skeleton": save_skeleton,
+                "save_swc": save_swc,
+                "stitch": stitch,
+                "stitch_max_distance_um": stitch_max_distance_um,
+            },
+            outputs=_output_files,
+            started_at=_started_at,
+        )
 
     return result
 
@@ -1504,6 +1560,11 @@ def build_argparser():
         action="store_true",
         help="Smoke-test mode: only process chunks that physically exist in the input mask store",
     )
+    parser.add_argument(
+        "--json_logs",
+        action="store_true",
+        help="Emit NDJSON log records to stderr instead of plain text",
+    )
     return parser
 
 
@@ -1511,67 +1572,96 @@ def main():
     parser = build_argparser()
     args = parser.parse_args()
 
-    roi = parse_roi(args.roi) if args.roi else None
-    if args.test:
-        result = analyze_binary_mask_zarr_test_mode(
-            mask_zarr_path=args.mask_zarr,
-            output_dir=args.output_dir,
-            dataset_name=args.dataset_name,
-            resolution_xyz=args.resolution_xyz,
-            foreground_label=args.foreground_label,
-            dust_threshold=args.dust_threshold,
-            fix_borders=not args.no_fix_borders,
-            parallel=args.parallel,
-            save_skeleton=args.save_skeleton,
-            save_swc=args.save_swc,
-        )
-    elif args.chunkwise:
-        result = analyze_binary_mask_zarr_chunkwise(
-            mask_zarr_path=args.mask_zarr,
-            output_dir=args.output_dir,
-            dataset_name=args.dataset_name,
-            resolution_xyz=args.resolution_xyz,
-            foreground_label=args.foreground_label,
-            dust_threshold=args.dust_threshold,
-            fix_borders=not args.no_fix_borders,
-            parallel=args.parallel,
-            save_skeleton=args.save_skeleton,
-            save_swc=args.save_swc,
-            process_existing_only=args.existing_only,
-            halo_zyx=args.halo_zyx,
-            mode_name="chunkwise",
-            stitch=not args.no_stitch,
-            stitch_max_distance_um=args.stitch_max_distance_um,
-            chunk_workers=args.chunk_workers,
-        )
-    else:
-        result = analyze_binary_mask_zarr(
-            mask_zarr_path=args.mask_zarr,
-            output_dir=args.output_dir,
-            dataset_name=args.dataset_name,
-            resolution_xyz=args.resolution_xyz,
-            foreground_label=args.foreground_label,
-            roi=roi,
-            dust_threshold=args.dust_threshold,
-            fix_borders=not args.no_fix_borders,
-            parallel=args.parallel,
-            save_skeleton=args.save_skeleton,
-            save_swc=args.save_swc,
-        )
+    if args.json_logs:
+        import sys
 
-    print("Vessel reconstruction completed.")
-    print(f"Summary JSON: {result['summary_json_path']}")
-    print(f"Branch CSV: {result['branch_csv_path']}")
-    if "chunk_csv_path" in result:
-        print(f"Chunk CSV: {result['chunk_csv_path']}")
-    if "vertex_csv_path" in result:
-        print(f"Skeleton vertices CSV: {result['vertex_csv_path']}")
-    if "edge_csv_path" in result:
-        print(f"Skeleton edges CSV: {result['edge_csv_path']}")
-    if "stitch_csv_path" in result:
-        print(f"Skeleton stitch CSV: {result['stitch_csv_path']}")
-    if "swc_dir" in result:
-        print(f"SWC directory: {result['swc_dir']}")
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record):
+                import json as _json
+                return _json.dumps({
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                })
+
+        _handler = logging.StreamHandler(sys.stderr)
+        _handler.setFormatter(_JsonFormatter())
+        logging.root.addHandler(_handler)
+        logging.root.setLevel(logging.INFO)
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    import sys as _sys
+
+    try:
+        roi = parse_roi(args.roi) if args.roi else None
+        if args.test:
+            result = analyze_binary_mask_zarr_test_mode(
+                mask_zarr_path=args.mask_zarr,
+                output_dir=args.output_dir,
+                dataset_name=args.dataset_name,
+                resolution_xyz=args.resolution_xyz,
+                foreground_label=args.foreground_label,
+                dust_threshold=args.dust_threshold,
+                fix_borders=not args.no_fix_borders,
+                parallel=args.parallel,
+                save_skeleton=args.save_skeleton,
+                save_swc=args.save_swc,
+            )
+        elif args.chunkwise:
+            result = analyze_binary_mask_zarr_chunkwise(
+                mask_zarr_path=args.mask_zarr,
+                output_dir=args.output_dir,
+                dataset_name=args.dataset_name,
+                resolution_xyz=args.resolution_xyz,
+                foreground_label=args.foreground_label,
+                dust_threshold=args.dust_threshold,
+                fix_borders=not args.no_fix_borders,
+                parallel=args.parallel,
+                save_skeleton=args.save_skeleton,
+                save_swc=args.save_swc,
+                process_existing_only=args.existing_only,
+                halo_zyx=args.halo_zyx,
+                mode_name="chunkwise",
+                stitch=not args.no_stitch,
+                stitch_max_distance_um=args.stitch_max_distance_um,
+                chunk_workers=args.chunk_workers,
+            )
+        else:
+            result = analyze_binary_mask_zarr(
+                mask_zarr_path=args.mask_zarr,
+                output_dir=args.output_dir,
+                dataset_name=args.dataset_name,
+                resolution_xyz=args.resolution_xyz,
+                foreground_label=args.foreground_label,
+                roi=roi,
+                dust_threshold=args.dust_threshold,
+                fix_borders=not args.no_fix_borders,
+                parallel=args.parallel,
+                save_skeleton=args.save_skeleton,
+                save_swc=args.save_swc,
+            )
+
+        logger.info("Vessel reconstruction completed.")
+        logger.info("Summary JSON: %s", result["summary_json_path"])
+        logger.info("Branch CSV: %s", result["branch_csv_path"])
+        if "chunk_csv_path" in result:
+            logger.info("Chunk CSV: %s", result["chunk_csv_path"])
+        if "vertex_csv_path" in result:
+            logger.info("Skeleton vertices CSV: %s", result["vertex_csv_path"])
+        if "edge_csv_path" in result:
+            logger.info("Skeleton edges CSV: %s", result["edge_csv_path"])
+        if "stitch_csv_path" in result:
+            logger.info("Skeleton stitch CSV: %s", result["stitch_csv_path"])
+        if "swc_dir" in result:
+            logger.info("SWC directory: %s", result["swc_dir"])
+    except Exception as exc:
+        if PipelineError is not None and isinstance(exc, PipelineError):
+            import json as _json
+            print(_json.dumps({"error_code": exc.code.value, "message": str(exc.message)}), file=_sys.stderr)
+            _sys.exit(exc.exit_code)
+        logger.exception("Unhandled error: %s", exc)
+        _sys.exit(1)
 
 
 if __name__ == "__main__":

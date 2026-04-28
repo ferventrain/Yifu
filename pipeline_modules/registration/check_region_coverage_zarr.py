@@ -6,11 +6,24 @@ Supports Zarr and NIfTI reference/sample labels.
 
 import argparse
 import ast
+import logging
+import json
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+try:
+    from pipeline_modules.utils.errors import ErrorCode, PipelineError
+    from pipeline_modules.utils.run_manifest import write_run_manifest
+except ImportError:
+    PipelineError = None  # type: ignore[assignment,misc]
+    ErrorCode = None  # type: ignore[assignment]
+    write_run_manifest = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -33,6 +46,11 @@ def parse_args():
         type=int,
         default=20,
         help="How many zero-voxel descendants to show in the report",
+    )
+    parser.add_argument(
+        "--json_logs",
+        action="store_true",
+        help="Emit NDJSON log records to stderr instead of plain text",
     )
     return parser.parse_args()
 
@@ -237,108 +255,140 @@ def format_node_label(node):
 
 
 def main():
+    import sys as _sys
+
     args = parse_args()
-    label_volume = open_label_volume(args.label_zarr, args.dataset_name)
-    if len(label_volume.shape) != 3:
-        raise ValueError(f"Expected 3D label volume, got shape={label_volume.shape}")
 
-    block_shape = choose_block_shape(label_volume, parse_block_size(args.block_size))
-    print(f"Label shape: {label_volume.shape}")
-    print(f"Block shape: {block_shape}")
-
-    nodes_by_id, acronym_to_ids = load_region_tree(args.cfg)
-    target_node = resolve_target_node(
-        nodes_by_id,
-        acronym_to_ids,
-        region_id=args.region_id,
-        acronym=args.acronym,
-    )
-
-    voxel_counts = count_label_voxels(label_volume, block_shape)
-    subtree_nodes = collect_subtree_nodes(target_node)
-    sample_summary = summarize_subtree_counts(subtree_nodes, voxel_counts)
-    subtree_total_voxels = sample_summary["subtree_total"]
-    direct_voxels = sample_summary["direct_counts"][target_node["id"]]
-    nonzero_nodes = sample_summary["nonzero_nodes"]
-    zero_nodes = sample_summary["zero_nodes"]
-
-    print("\n=== Target Region Coverage ===")
-    print(f"Target: {format_node_label(target_node)}")
-    print(f"Direct voxels on target id: {direct_voxels}")
-    print(f"Subtree voxel total: {subtree_total_voxels}")
-    print(f"Subtree node count: {len(subtree_nodes)}")
-    print(f"Subtree nodes with voxels > 0: {len(nonzero_nodes)}")
-    print(f"Subtree nodes with voxels = 0: {len(zero_nodes)}")
-
-    if direct_voxels == 0 and subtree_total_voxels == 0:
-        print("Interpretation: this region subtree is absent from the current label Zarr.")
-    elif direct_voxels == 0 and subtree_total_voxels > 0:
-        print("Interpretation: the parent region id has no direct voxels, but some descendants are present.")
+    if args.json_logs:
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record):
+                return json.dumps({
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                })
+        _handler = logging.StreamHandler(_sys.stderr)
+        _handler.setFormatter(_JsonFormatter())
+        logging.root.addHandler(_handler)
+        logging.root.setLevel(logging.INFO)
     else:
-        print("Interpretation: this region id itself is present in the current label Zarr.")
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    print("\n=== Present Descendants ===")
-    for node in sorted(nonzero_nodes, key=lambda item: (-voxel_counts.get(item["id"], 0), item["name"]))[:20]:
-        print(f"{voxel_counts.get(node['id'], 0):>12} voxels | {format_node_label(node)}")
+    try:
+        label_volume = open_label_volume(args.label_zarr, args.dataset_name)
+        if len(label_volume.shape) != 3:
+            raise ValueError(f"Expected 3D label volume, got shape={label_volume.shape}")
 
-    print("\n=== Zero-Voxel Descendants ===")
-    for node in sorted(zero_nodes, key=lambda item: item["name"])[: max(0, args.top_zero)]:
-        print(f"{0:>12} voxels | {format_node_label(node)}")
+        block_shape = choose_block_shape(label_volume, parse_block_size(args.block_size))
+        logger.info("Label shape: %s", label_volume.shape)
+        logger.info("Block shape: %s", block_shape)
 
-    missing_label_ids = sorted(
-        node["id"]
-        for node in subtree_nodes
-        if node["id"] not in voxel_counts
-    )
-    if missing_label_ids:
-        print("\n=== Missing IDs In Label Zarr ===")
-        print(",".join(str(region_id) for region_id in missing_label_ids[:100]))
+        nodes_by_id, acronym_to_ids = load_region_tree(args.cfg)
+        target_node = resolve_target_node(
+            nodes_by_id,
+            acronym_to_ids,
+            region_id=args.region_id,
+            acronym=args.acronym,
+        )
 
-    if args.reference_label_zarr:
-        print("\n=== Reference Comparison ===")
-        reference_label_volume = open_label_volume(args.reference_label_zarr, args.dataset_name)
-        if len(reference_label_volume.shape) != 3:
-            raise ValueError(f"Expected 3D reference label volume, got shape={reference_label_volume.shape}")
+        voxel_counts = count_label_voxels(label_volume, block_shape)
+        subtree_nodes = collect_subtree_nodes(target_node)
+        sample_summary = summarize_subtree_counts(subtree_nodes, voxel_counts)
+        subtree_total_voxels = sample_summary["subtree_total"]
+        direct_voxels = sample_summary["direct_counts"][target_node["id"]]
+        nonzero_nodes = sample_summary["nonzero_nodes"]
+        zero_nodes = sample_summary["zero_nodes"]
 
-        reference_block_shape = choose_block_shape(reference_label_volume, parse_block_size(args.block_size))
-        print(f"Reference label shape: {reference_label_volume.shape}")
-        print(f"Reference block shape: {reference_block_shape}")
-        reference_voxel_counts = count_label_voxels(reference_label_volume, reference_block_shape)
-        reference_summary = summarize_subtree_counts(subtree_nodes, reference_voxel_counts)
+        logger.info("")
+        logger.info("=== Target Region Coverage ===")
+        logger.info("Target: %s", format_node_label(target_node))
+        logger.info("Direct voxels on target id: %d", direct_voxels)
+        logger.info("Subtree voxel total: %d", subtree_total_voxels)
+        logger.info("Subtree node count: %d", len(subtree_nodes))
+        logger.info("Subtree nodes with voxels > 0: %d", len(nonzero_nodes))
+        logger.info("Subtree nodes with voxels = 0: %d", len(zero_nodes))
 
-        print(f"Reference direct voxels on target id: {reference_summary['direct_counts'][target_node['id']]}")
-        print(f"Reference subtree voxel total: {reference_summary['subtree_total']}")
-        print(f"Reference subtree nodes with voxels > 0: {len(reference_summary['nonzero_nodes'])}")
-        print(f"Reference subtree nodes with voxels = 0: {len(reference_summary['zero_nodes'])}")
+        if direct_voxels == 0 and subtree_total_voxels == 0:
+            logger.info("Interpretation: this region subtree is absent from the current label Zarr.")
+        elif direct_voxels == 0 and subtree_total_voxels > 0:
+            logger.info("Interpretation: the parent region id has no direct voxels, but some descendants are present.")
+        else:
+            logger.info("Interpretation: this region id itself is present in the current label Zarr.")
 
-        atlas_present_sample_missing = [
-            node for node in subtree_nodes
-            if reference_summary["direct_counts"][node["id"]] > 0 and sample_summary["direct_counts"][node["id"]] == 0
-        ]
-        sample_present_reference_missing = [
-            node for node in subtree_nodes
-            if reference_summary["direct_counts"][node["id"]] == 0 and sample_summary["direct_counts"][node["id"]] > 0
-        ]
+        logger.info("")
+        logger.info("=== Present Descendants ===")
+        for node in sorted(nonzero_nodes, key=lambda item: (-voxel_counts.get(item["id"], 0), item["name"]))[:20]:
+            logger.info("%12d voxels | %s", voxel_counts.get(node['id'], 0), format_node_label(node))
 
-        print("\n=== Present In Reference But Missing In Sample ===")
-        for node in sorted(
-            atlas_present_sample_missing,
-            key=lambda item: (-reference_summary["direct_counts"][item["id"]], item["name"])
-        )[:50]:
-            print(
-                f"{reference_summary['direct_counts'][node['id']]:>12} ref voxels | "
-                f"{0:>12} sample voxels | {format_node_label(node)}"
-            )
+        logger.info("")
+        logger.info("=== Zero-Voxel Descendants ===")
+        for node in sorted(zero_nodes, key=lambda item: item["name"])[: max(0, args.top_zero)]:
+            logger.info("%12d voxels | %s", 0, format_node_label(node))
 
-        print("\n=== Present In Sample But Missing In Reference ===")
-        for node in sorted(
-            sample_present_reference_missing,
-            key=lambda item: (-sample_summary["direct_counts"][item["id"]], item["name"])
-        )[:50]:
-            print(
-                f"{0:>12} ref voxels | "
-                f"{sample_summary['direct_counts'][node['id']]:>12} sample voxels | {format_node_label(node)}"
-            )
+        missing_label_ids = sorted(
+            node["id"]
+            for node in subtree_nodes
+            if node["id"] not in voxel_counts
+        )
+        if missing_label_ids:
+            logger.info("")
+            logger.info("=== Missing IDs In Label Zarr ===")
+            logger.info("%s", ",".join(str(region_id) for region_id in missing_label_ids[:100]))
+
+        if args.reference_label_zarr:
+            logger.info("")
+            logger.info("=== Reference Comparison ===")
+            reference_label_volume = open_label_volume(args.reference_label_zarr, args.dataset_name)
+            if len(reference_label_volume.shape) != 3:
+                raise ValueError(f"Expected 3D reference label volume, got shape={reference_label_volume.shape}")
+
+            reference_block_shape = choose_block_shape(reference_label_volume, parse_block_size(args.block_size))
+            logger.info("Reference label shape: %s", reference_label_volume.shape)
+            logger.info("Reference block shape: %s", reference_block_shape)
+            reference_voxel_counts = count_label_voxels(reference_label_volume, reference_block_shape)
+            reference_summary = summarize_subtree_counts(subtree_nodes, reference_voxel_counts)
+
+            logger.info("Reference direct voxels on target id: %d", reference_summary['direct_counts'][target_node['id']])
+            logger.info("Reference subtree voxel total: %d", reference_summary['subtree_total'])
+            logger.info("Reference subtree nodes with voxels > 0: %d", len(reference_summary['nonzero_nodes']))
+            logger.info("Reference subtree nodes with voxels = 0: %d", len(reference_summary['zero_nodes']))
+
+            atlas_present_sample_missing = [
+                node for node in subtree_nodes
+                if reference_summary["direct_counts"][node["id"]] > 0 and sample_summary["direct_counts"][node["id"]] == 0
+            ]
+            sample_present_reference_missing = [
+                node for node in subtree_nodes
+                if reference_summary["direct_counts"][node["id"]] == 0 and sample_summary["direct_counts"][node["id"]] > 0
+            ]
+
+            logger.info("")
+            logger.info("=== Present In Reference But Missing In Sample ===")
+            for node in sorted(
+                atlas_present_sample_missing,
+                key=lambda item: (-reference_summary["direct_counts"][item["id"]], item["name"])
+            )[:50]:
+                logger.info(
+                    "%12d ref voxels | %12d sample voxels | %s",
+                    reference_summary['direct_counts'][node['id']], 0, format_node_label(node),
+                )
+
+            logger.info("")
+            logger.info("=== Present In Sample But Missing In Reference ===")
+            for node in sorted(
+                sample_present_reference_missing,
+                key=lambda item: (-sample_summary["direct_counts"][item["id"]], item["name"])
+            )[:50]:
+                logger.info(
+                    "%12d ref voxels | %12d sample voxels | %s",
+                    0, sample_summary['direct_counts'][node['id']], format_node_label(node),
+                )
+    except Exception as exc:
+        if PipelineError is not None and isinstance(exc, PipelineError):
+            print(json.dumps({"error_code": exc.code.value, "message": str(exc.message)}), file=_sys.stderr)
+            _sys.exit(exc.exit_code)
+        logger.exception("Unhandled error: %s", exc)
+        _sys.exit(1)
 
 
 if __name__ == "__main__":

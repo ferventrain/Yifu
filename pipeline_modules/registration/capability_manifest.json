@@ -1,0 +1,131 @@
+{
+  "schema_version": "1",
+  "module": "registration",
+  "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
+  "entrypoints": [
+    {
+      "id": "run_full_pipeline",
+      "function": "pipeline_modules.registration.ANTs_registration.BidirectionalRegistration.run_full_pipeline",
+      "cli": "python pipeline_modules/registration/ANTs_registration.py",
+      "description": "Run ANTs registration (atlas2image or image2atlas), save warped labels, and optionally save transforms and registered image.",
+      "prerequisites": [
+        "Downsampled registration-channel NIfTI must exist at SampleLayout.reg_downsample_nii",
+        "Allen atlas template + annotation NIfTI must be available"
+      ],
+      "inputs": {
+        "sample_dir":          {"type": "path", "required": true, "description": "Sample root directory"},
+        "signal_channel":      {"type": "string", "required": true, "description": "Signal channel label (e.g. '0')"},
+        "atlas_image":         {"type": "path", "required": true, "description": "Allen atlas template image (.tiff / .nii.gz)"},
+        "atlas_label":         {"type": "path", "required": true, "description": "Allen atlas annotation label image"},
+        "register_channel":    {"type": "string", "required": true, "description": "Registration channel label (e.g. '1')"},
+        "mode":                {"type": "string", "default": "atlas2image", "choices": ["atlas2image", "image2atlas"]},
+        "registration_type":   {"type": "string", "default": "SyN", "choices": ["Rigid", "Affine", "SyN", "SyNRA"]},
+        "save_registered_image": {"type": "bool", "default": false},
+        "save_transforms":     {"type": "bool", "default": false},
+        "config":              {"type": "path|null", "default": null, "description": "Path to main config.json for resolution info"},
+        "density_cfg":         {"type": "path|null", "default": null}
+      },
+      "outputs": {
+        "upsampled_atlas_label": {"type": "dir", "description": "sample_dir/upsampled_atlas_label (TIFF stack)"},
+        "warped_mask_dir":       {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_mask (image2atlas mode)"},
+        "warped_image_dir":      {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_image (if save_registered_image)"},
+        "transforms_dir":        {"type": "dir", "optional": true, "description": "sample_dir/transforms (if save_transforms)"},
+        "manifest_path":         {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "analyze_zarr_graph",
+      "function": "pipeline_modules.registration.region_signal_analysis_zarr_graph.analyze_zarr_graph",
+      "cli": "python pipeline_modules/registration/region_signal_analysis_zarr_graph.py",
+      "description": "Zarr-native 3-pass block-graph analysis: scan blocks, stitch boundaries, collapse into per-region object statistics and export Excel.",
+      "prerequisites": [
+        "Mask Zarr, label Zarr, and signal Zarr must exist and share the same shape",
+        "Allen region CSV must be available"
+      ],
+      "inputs": {
+        "mask_zarr_path":       {"type": "path", "required": true},
+        "label_zarr_path":      {"type": "path", "required": true},
+        "signal_zarr_path":     {"type": "path", "required": true},
+        "cfg_path":             {"type": "path", "required": true, "description": "Allen region CSV"},
+        "output_path":          {"type": "path", "required": true, "description": "Output Excel file path"},
+        "dataset_name":         {"type": "string", "default": "0"},
+        "block_size":           {"type": "triplet_int|null", "default": null, "description": "Override block size as z,y,x"},
+        "foreground_mode":      {"type": "string", "default": "equal", "choices": ["equal", "nonzero"]},
+        "foreground_label":     {"type": "int", "default": 1},
+        "min_voxels":           {"type": "int", "default": 10},
+        "flush_every":          {"type": "int", "default": 25},
+        "resolution_xyz":       {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
+        "tmp_dir":              {"type": "path|null", "default": null},
+        "keep_tmp":             {"type": "bool", "default": false},
+        "pass1_workers":        {"type": "int", "default": 1}
+      },
+      "outputs": {
+        "excel_path":    {"type": "path", "description": "Per-region signal statistics Excel workbook"},
+        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "check_region_coverage",
+      "function": "pipeline_modules.registration.check_region_coverage_zarr.main",
+      "cli": "python pipeline_modules/registration/check_region_coverage_zarr.py",
+      "description": "Check voxel coverage of a target region subtree inside a registered label volume. Optionally compare against a reference label volume.",
+      "prerequisites": [
+        "Registered label Zarr or NIfTI must exist",
+        "Allen region CSV must be available"
+      ],
+      "inputs": {
+        "label_zarr":           {"type": "path", "required": true},
+        "reference_label_zarr": {"type": "path|null", "default": null},
+        "cfg":                  {"type": "path", "required": true, "description": "Allen region CSV"},
+        "dataset_name":         {"type": "string", "default": "0"},
+        "region_id":            {"type": "int|null", "default": null},
+        "acronym":              {"type": "string|null", "default": null},
+        "block_size":           {"type": "triplet_int|null", "default": null},
+        "top_zero":             {"type": "int", "default": 20}
+      },
+      "outputs": {
+        "report": {"type": "log", "description": "Coverage report emitted as structured log messages"}
+      }
+    },
+    {
+      "id": "merge_atlas_regions",
+      "function": "pipeline_modules.registration.merge_atlas_regions.process_one_volume",
+      "cli": "python pipeline_modules/registration/merge_atlas_regions.py",
+      "description": "Remap fine-grained Allen atlas label IDs into a coarser target-region set using nearest-ancestor mapping. Supports built-in presets (e.g. wb20) or custom target IDs.",
+      "prerequisites": [
+        "Atlas label volume (TIFF or NIfTI) must exist",
+        "Allen region CSV must be available"
+      ],
+      "inputs": {
+        "input":             {"type": "path+", "required": true, "description": "One or more atlas label volumes"},
+        "cfg":               {"type": "path", "required": true, "description": "Allen region CSV"},
+        "preset":            {"type": "string", "default": "wb20", "description": "Built-in coarse-region preset"},
+        "output_dir":        {"type": "path|null", "default": null},
+        "output_suffix":     {"type": "string", "default": ""},
+        "target_ids":        {"type": "string|null", "default": null, "description": "Comma-separated parent IDs to override preset"},
+        "preserve_unmapped": {"type": "bool", "default": false}
+      },
+      "outputs": {
+        "output_volume": {"type": "path", "description": "Remapped label volume"},
+        "summary_csv":   {"type": "path", "description": "Per-target region voxel counts CSV"},
+        "manifest_path": {"type": "path", "optional": true, "description": "_run_manifest.json (when output_dir set)"}
+      }
+    }
+  ],
+  "configuration_models": {
+    "RegistrationCfg": "pipeline_modules.registration.config.RegistrationCfg",
+    "AnalysisCfg": "pipeline_modules.registration.config.AnalysisCfg"
+  },
+  "sample_layout": {
+    "class": "pipeline_modules.utils.sample_layout.SampleLayout",
+    "relevant_paths": {
+      "reg_downsample_dir":    "SampleLayout.reg_downsample_dir",
+      "reg_downsample_nii":    "SampleLayout.reg_downsample_nii",
+      "atlas_label_zarr":      "SampleLayout.atlas_label_zarr",
+      "atlas_label_tiff_dir":  "SampleLayout.atlas_label_tiff_dir",
+      "mask_zarr":             "SampleLayout.mask_zarr",
+      "signal_zarr":           "SampleLayout.signal_zarr",
+      "density_results_xlsx":  "SampleLayout.density_results_xlsx"
+    }
+  }
+}

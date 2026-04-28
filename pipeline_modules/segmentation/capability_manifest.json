@@ -1,0 +1,80 @@
+{
+  "schema_version": "1",
+  "module": "segmentation",
+  "description": "Threshold-based and local-checkpoint 3D U-Net segmentation over signal Zarr volumes, with TIFF export helpers.",
+  "entrypoints": [
+    {
+      "id": "threshold_segmentation",
+      "function": "pipeline_modules.segmentation.intensity_threshold_segmentor.run_threshold_segmentation",
+      "cli": "python pipeline_modules/segmentation/intensity_threshold_segmentor.py",
+      "description": "Apply threshold-based segmentation on a Zarr volume and write a mask Zarr store.",
+      "inputs": {
+        "input_zarr": {"type": "path", "required": true},
+        "output_zarr": {"type": "path", "required": true},
+        "threshold": {"type": "string", "default": "otsu"},
+        "sigma": {"type": "float", "default": 0.0},
+        "min_size": {"type": "int", "default": 10},
+        "output_mode": {"type": "string", "default": "binary", "choices": ["binary", "label"]},
+        "dataset_name": {"type": "string", "default": "0"},
+        "process_existing_only": {"type": "bool", "default": false}
+      },
+      "outputs": {
+        "output_zarr": {"type": "dir"},
+        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "cfos_unet_inference",
+      "function": "pipeline_modules.segmentation.cfos_unet_inference.run_cfos_unet_inference",
+      "cli": "python pipeline_modules/segmentation/cfos_unet_inference.py",
+      "description": "Load a local checkpoint produced by train_cfos_3d_mlflow.py and run sliding-window inference on a Zarr volume.",
+      "inputs": {
+        "input_zarr": {"type": "path", "required": true},
+        "output_zarr": {"type": "path", "required": true},
+        "checkpoint_path": {"type": "path", "required": true},
+        "dataset_name": {"type": "string", "default": "0"},
+        "patch_size": {"type": "triplet_int|null", "default": null},
+        "overlap": {"type": "float", "default": 0.25},
+        "batch_size": {"type": "int", "default": 1},
+        "device": {"type": "string", "default": "auto"},
+        "foreground_class": {"type": "int", "default": 1},
+        "probability_threshold": {"type": "float", "default": 0.5},
+        "output_mode": {"type": "string", "default": "binary", "choices": ["binary", "multiclass"]},
+        "output_dtype": {"type": "string", "default": "uint8"},
+        "process_existing_only": {"type": "bool", "default": false},
+        "chunk_size": {"type": "triplet_int|null", "default": null}
+      },
+      "outputs": {
+        "output_zarr": {"type": "dir"},
+        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "export_zarr_to_tiff",
+      "function": "pipeline_modules.segmentation.zarr_utils.export_zarr_to_tiff",
+      "cli": "python -c \"from pipeline_modules.segmentation import export_zarr_to_tiff; ...\"",
+      "description": "Export a mask Zarr store into a TIFF stack directory.",
+      "inputs": {
+        "input_zarr": {"type": "path", "required": true},
+        "output_dir": {"type": "path", "required": true},
+        "dataset_name": {"type": "string", "default": "0"}
+      },
+      "outputs": {
+        "output_dir": {"type": "dir"}
+      }
+    }
+  ],
+  "configuration_models": {
+    "SegmentationCfg": "pipeline_modules.segmentation.config.SegmentationCfg",
+    "ThresholdSegmentationCfg": "pipeline_modules.segmentation.config.ThresholdSegmentationCfg",
+    "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg"
+  },
+  "sample_layout": {
+    "class": "pipeline_modules.utils.sample_layout.SampleLayout",
+    "relevant_paths": {
+      "signal_zarr": "SampleLayout.signal_zarr",
+      "mask_zarr": "SampleLayout.mask_zarr",
+      "mask_tiff_dir": "SampleLayout.mask_tiff_dir"
+    }
+  }
+}
