@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
@@ -105,6 +107,8 @@ def _infer_volume(
     y_starts = _compute_tile_starts(padded_shape[1], tile_h, stride_h)
     x_starts = _compute_tile_starts(padded_shape[2], tile_w, stride_w)
 
+    use_amp = device.startswith("cuda")
+
     def flush_pending():
         nonlocal logits_acc, count_acc, pending_patches, pending_coords
         if not pending_patches:
@@ -112,11 +116,15 @@ def _infer_volume(
         batch_np = np.stack(pending_patches, axis=0)[:, None, ...].astype("float32")
         batch_tensor = torch_mod.from_numpy(batch_np).to(device)
         with torch_mod.no_grad():
-            logits = model(batch_tensor).detach().float().cpu()
+            if use_amp:
+                with torch_mod.autocast(device_type="cuda", dtype=torch_mod.float16):
+                    logits = model(batch_tensor).detach().float()
+            else:
+                logits = model(batch_tensor).detach().float()
         if logits_acc is None:
             num_classes = int(logits.shape[1])
-            logits_acc = torch_mod.zeros((num_classes,) + padded_shape, dtype=torch_mod.float32)
-            count_acc = torch_mod.zeros((1,) + padded_shape, dtype=torch_mod.float32)
+            logits_acc = torch_mod.zeros((num_classes,) + padded_shape, dtype=torch_mod.float32, device=device)
+            count_acc = torch_mod.zeros((1,) + padded_shape, dtype=torch_mod.float32, device=device)
         for batch_index, (z0, y0, x0) in enumerate(pending_coords):
             logits_acc[:, z0:z0 + tile_d, y0:y0 + tile_h, x0:x0 + tile_w] += logits[batch_index]
             count_acc[:, z0:z0 + tile_d, y0:y0 + tile_h, x0:x0 + tile_w] += 1.0
@@ -132,8 +140,8 @@ def _infer_volume(
                     flush_pending()
     flush_pending()
 
-    averaged_logits = logits_acc / count_acc.clamp(min=1.0)
-    return averaged_logits[:, :d, :h, :w]
+    averaged_logits = (logits_acc / count_acc.clamp(min=1.0))[:, :d, :h, :w]
+    return averaged_logits.cpu()
 
 
 def run_cfos_unet_inference(
@@ -155,6 +163,8 @@ def run_cfos_unet_inference(
     probability_dtype: str = "float32",
     chunk_size: tuple[int, int, int] | None = None,
     normalize_percentiles: tuple[float, float] = (1.0, 99.5),
+    skip_empty: bool = False,
+    skip_eps: float = 0.0,
 ) -> dict[str, Any]:
     import numpy as np
 
@@ -182,6 +192,13 @@ def run_cfos_unet_inference(
         torch_mod = model_bundle["torch"]
 
     model = model_bundle["model"]
+    if hasattr(torch_mod, "compile") and resolved_device.startswith("cuda"):
+        try:
+            import triton  # noqa: F401
+            logger.info("Compiling model with torch.compile ...")
+            model = torch_mod.compile(model)
+        except ImportError:
+            logger.info("Triton not available (Windows), skipping torch.compile")
     checkpoint_args = model_bundle["checkpoint_args"]
     inferred_patch_size = patch_size or tuple(int(v) for v in checkpoint_args.get("patch_size", [128, 128, 128]))
     inferred_chunk_size = chunk_size or tuple(int(v) for v in getattr(data_in, "chunks", inferred_patch_size))
@@ -199,6 +216,7 @@ def run_cfos_unet_inference(
         )
 
     processed_regions = 0
+    skipped_chunks = 0
     if process_existing_only:
         existing_indices = list_existing_chunk_indices(data_in)
         if not existing_indices:
@@ -220,8 +238,18 @@ def run_cfos_unet_inference(
     else:
         chunk_slices_iter = list(_iter_chunk_slices(tuple(int(v) for v in data_in.shape), inferred_chunk_size))
 
-    for slices in chunk_slices_iter:
+    total_chunks = len(chunk_slices_iter)
+    logger.info("Starting inference on %d chunks, patch_size=%s, batch_size=%d, device=%s%s",
+                total_chunks, inferred_patch_size, batch_size, resolved_device,
+                ", skip_empty=True eps=%.4f" % skip_eps if skip_empty else "")
+    for slices in tqdm(chunk_slices_iter, desc="Inference", unit="chunk"):
         volume_np = np.asarray(data_in[slices])
+        if skip_empty and float(volume_np.max()) <= float(skip_eps):
+            data_out[slices] = np.zeros(volume_np.shape, dtype=output_dtype_np)
+            if data_prob is not None:
+                data_prob[slices] = np.zeros(volume_np.shape, dtype=probability_dtype_np)
+            skipped_chunks += 1
+            continue
         volume_np = normalize_volume(
             volume_np,
             low_pct=float(normalize_percentiles[0]),
@@ -247,6 +275,9 @@ def run_cfos_unet_inference(
             data_prob[slices] = fg_probs.astype(probability_dtype_np, copy=False)
         processed_regions += 1
 
+    if skip_empty and skipped_chunks:
+        logger.info("Skipped %d/%d empty chunks (max <= %.4f)", skipped_chunks, total_chunks, skip_eps)
+
     result = {
         "success": True,
         "input_zarr": str(input_path),
@@ -258,6 +289,7 @@ def run_cfos_unet_inference(
         "chunks": list(inferred_chunk_size),
         "patch_size": list(inferred_patch_size),
         "processed_regions": processed_regions,
+        "skipped_chunks": skipped_chunks,
         "resolved_device": resolved_device,
         "num_classes": int(model_bundle["num_classes"]),
         "base_channels": int(model_bundle["base_channels"]),
@@ -286,6 +318,8 @@ def run_cfos_unet_inference(
             "output_dtype": output_dtype,
             "probability_dtype": probability_dtype,
             "chunk_size": inferred_chunk_size,
+            "skip_empty": skip_empty,
+            "skip_eps": skip_eps,
         },
         outputs=[path for path in [output_zarr, probability_path] if path],
         started_at=started_at,
@@ -303,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probability_zarr", default="", help="Optional output Zarr path for foreground probabilities")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the input/output Zarr groups")
     parser.add_argument("--patch_size", default="", help="Override patch size as z,y,x")
-    parser.add_argument("--overlap", type=float, default=0.25, help="Sliding-window overlap ratio")
+    parser.add_argument("--overlap", type=float, default=0.125, help="Sliding-window overlap ratio")
     parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size in number of tiles")
     parser.add_argument("--device", default="auto", help="auto / cpu / cuda")
     parser.add_argument("--foreground_class", type=int, default=1, help="Foreground class index")
@@ -315,6 +349,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk_size", default="", help="Override output chunk size as z,y,x")
     parser.add_argument("--normalize_percentiles", default="1.0,99.5", help="Percentile pair low,high for normalization")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
+    parser.add_argument("--skip_empty", action="store_true", help="Skip chunks whose max pixel value <= skip_eps")
+    parser.add_argument("--skip_eps", type=float, default=100.0, help="Max-value threshold for skip_empty (default 100.0)")
     return parser.parse_args()
 
 
@@ -356,6 +392,8 @@ def main() -> int:
             probability_dtype=args.probability_dtype,
             chunk_size=_parse_triplet(args.chunk_size),
             normalize_percentiles=_parse_percentiles(args.normalize_percentiles),
+            skip_empty=args.skip_empty,
+            skip_eps=args.skip_eps,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0

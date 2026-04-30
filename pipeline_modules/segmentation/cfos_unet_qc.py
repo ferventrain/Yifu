@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
@@ -138,7 +140,8 @@ def compute_sample_qc_metrics(
     num_components = 0
     small_components = 0
 
-    for slices in _iter_chunk_slices(shape, chunks):
+    total_chunks = math.prod(int(math.ceil(s / c)) for s, c in zip(shape, chunks))
+    for slices in tqdm(_iter_chunk_slices(shape, chunks), total=total_chunks, desc=f"QC {sample_id}", unit="chunk"):
         mask_chunk = np.asarray(mask_data[slices]) > 0
         total_voxels += int(mask_chunk.size)
         foreground_voxels += int(mask_chunk.sum())

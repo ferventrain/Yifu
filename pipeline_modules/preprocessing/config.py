@@ -139,7 +139,7 @@ class DownsampleCfg(_ModelMixin):
 
 @dataclass(frozen=True)
 class ZarrCfg(_ModelMixin):
-    chunk_size: tuple[int, int, int] = (128, 256, 256)
+    chunk_size: tuple[int, int, int] = (256, 256, 256)
     compressor: str = "default"
 
     def __post_init__(self) -> None:
