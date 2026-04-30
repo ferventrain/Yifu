@@ -57,7 +57,7 @@
       "id": "cfos_unet_qc",
       "function": "pipeline_modules.segmentation.cfos_unet_qc.build_review_queue",
       "cli": "python pipeline_modules/segmentation/cfos_unet_qc.py",
-      "description": "Rank cFos U-Net masks and optional probability maps for active-learning review.",
+      "description": "Rank the worst cFos U-Net blocks for manual review and export image/mask previews for the top-ranked blocks.",
       "inputs": {
         "records_csv": {"type": "path|null", "default": null},
         "sample_root": {"type": "path|null", "default": null},
@@ -67,11 +67,13 @@
         "uncertainty_low": {"type": "float", "default": 0.4},
         "uncertainty_high": {"type": "float", "default": 0.6},
         "small_component_max_voxels": {"type": "int", "default": 32},
-        "top_n": {"type": "int", "default": 10}
+        "top_n": {"type": "int", "default": 10},
+        "preview_dir": {"type": "path|null", "default": null}
       },
       "outputs": {
         "output_csv": {"type": "path", "default": "review_queue.csv"},
-        "top_csv": {"type": "path", "default": "top10_review_queue.csv"}
+        "top_csv": {"type": "path", "default": "top10_review_queue.csv"},
+        "preview_dir": {"type": "dir", "default": "top10_review_queue_previews"}
       }
     },
     {
