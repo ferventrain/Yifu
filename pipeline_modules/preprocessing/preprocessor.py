@@ -8,6 +8,7 @@ import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -142,8 +143,19 @@ def apply_processing_steps(img: np.ndarray, steps: list[tuple[str, Mapping[str, 
         elif func == "scattering_removal":
             sigma = float(kwargs.get("sigma", 50.0))
             weight = float(kwargs.get("weight", 1.0))
+            accelerate = bool(kwargs.get("accelerate", True))
             img_float = current_img.astype(np.float64)
-            background = cv2.GaussianBlur(img_float, ksize=(0, 0), sigmaX=sigma, sigmaY=sigma)
+            height, width = img_float.shape[:2]
+            if accelerate and sigma > 20 and min(height, width) > 500:
+                downsample_ratio = max(2, int(sigma / 20))
+                new_h = max(1, height // downsample_ratio)
+                new_w = max(1, width // downsample_ratio)
+                img_down = cv2.resize(img_float, (new_w, new_h))
+                sigma_down = sigma / downsample_ratio
+                background_down = cv2.GaussianBlur(img_down, ksize=(0, 0), sigmaX=sigma_down, sigmaY=sigma_down)
+                background = cv2.resize(background_down, (width, height), interpolation=cv2.INTER_CUBIC)
+            else:
+                background = cv2.GaussianBlur(img_float, ksize=(0, 0), sigmaX=sigma, sigmaY=sigma)
             result = np.clip(img_float - weight * background, 0, None)
             if np.issubdtype(dtype, np.integer):
                 max_val = np.iinfo(dtype).max
@@ -218,7 +230,7 @@ def channel_subtraction_worker(
 
 
 def _default_workers(max_workers: int | None) -> int:
-    workers = max_workers if max_workers is not None else max(1, (os.cpu_count() or 2) // 2)
+    workers = max_workers if max_workers is not None else max(1, (os.cpu_count() or 2) // 16)
     if os.name == "nt" and workers > 61:
         logger.info("Capping worker count to 61 due to Windows multiprocessing limits")
         workers = 61
@@ -322,7 +334,7 @@ class Preprocessor:
             logger.info("Processing %d TIFF slices with %d workers", len(tasks), workers)
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(process_single_image, *task): task[0].name for task in tasks}
-                for future in as_completed(futures):
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Processing slices", unit="slice"):
                     result = future.result()
                     if result["success"]:
                         processed += 1
@@ -546,7 +558,7 @@ def run_channel_subtraction(
         if tasks:
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(channel_subtraction_worker, *task): task[0].name for task in tasks}
-                for future in as_completed(futures):
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Channel subtraction", unit="slice"):
                     result = future.result()
                     if result["success"]:
                         processed += 1

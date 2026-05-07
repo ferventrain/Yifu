@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 # High performance settings for powerful PC
 # BATCH_SIZE = 128 means reading ~20GB at a time.
 # 如果你的内存大于64GB，可以尝试这个值
-BATCH_SIZE = 64
+BATCH_SIZE = 16
 # 增加线程数以榨干CPU
 MAX_WORKERS = 32
 

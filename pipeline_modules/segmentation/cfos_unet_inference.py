@@ -153,7 +153,7 @@ def run_cfos_unet_inference(
     dataset_name: str = "0",
     patch_size: tuple[int, int, int] | None = None,
     overlap: float = 0.25,
-    batch_size: int = 1,
+    batch_size: int = 4,
     device: str = "auto",
     foreground_class: int = 1,
     probability_threshold: float = 0.5,
@@ -338,7 +338,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the input/output Zarr groups")
     parser.add_argument("--patch_size", default="", help="Override patch size as z,y,x")
     parser.add_argument("--overlap", type=float, default=0.125, help="Sliding-window overlap ratio")
-    parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size in number of tiles")
+    parser.add_argument("--batch_size", type=int, default=4, help="Inference batch size in number of tiles")
     parser.add_argument("--device", default="auto", help="auto / cpu / cuda")
     parser.add_argument("--foreground_class", type=int, default=1, help="Foreground class index")
     parser.add_argument("--probability_threshold", type=float, default=0.5, help="Foreground probability threshold for binary output")

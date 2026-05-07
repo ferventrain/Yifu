@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tqdm import tqdm
 from typing import Any
 
 import numpy as np
@@ -123,10 +126,14 @@ def convert_tiff_to_zarr(
     }]
 
     z_chunk = chunk_size[0]
-    for start in range(0, shape[0], z_chunk):
-        end = min(start + z_chunk, shape[0])
-        stack = [tifffile.imread(file_path) for file_path in tiff_files[start:end]]
-        dataset[start:end] = np.stack(stack)
+    n_chunks = math.ceil(shape[0] / z_chunk)
+    n_workers = min(4, max(1, n_chunks))
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for start in tqdm(range(0, shape[0], z_chunk), total=n_chunks, desc="Converting to Zarr", unit="chunk"):
+            end = min(start + z_chunk, shape[0])
+            slices_files = tiff_files[start:end]
+            images = list(pool.map(tifffile.imread, [str(f) for f in slices_files]))
+            dataset[start:end] = np.stack(images)
 
     result = {
         "success": True,

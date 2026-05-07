@@ -67,6 +67,18 @@ def test_capabilities_json_marks_segmentation_agent_native():
     assert segmentation["capability_manifest"] == "pipeline_modules/segmentation/capability_manifest.json"
 
 
+
+
+
+
+def test_cfos_qc_manifest_uses_block_review_outputs():
+    manifest = load_capability_manifest()
+    qc_entry = next(entry for entry in manifest["entrypoints"] if entry["id"] == "cfos_unet_qc")
+    assert "blocks" in qc_entry["description"].lower()
+    assert "preview_dir" in qc_entry["inputs"]
+    assert "preview_dir" in qc_entry["outputs"]
+
+
 def test_package_exports_config_classes():
     assert SegmentationCfg is not None
     assert ThresholdSegmentationCfg is not None

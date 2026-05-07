@@ -56,22 +56,42 @@
     {
       "id": "cfos_unet_qc",
       "function": "pipeline_modules.segmentation.cfos_unet_qc.build_review_queue",
-      "cli": "python pipeline_modules/segmentation/cfos_unet_qc.py",
-      "description": "Rank cFos U-Net masks and optional probability maps for active-learning review.",
+      "cli": "python -m pipeline_modules.segmentation.cfos_unet_qc",
+      "description": "Rank the worst cFos U-Net blocks for manual review and export image/mask TIFF previews for the selected top blocks. Use records_csv when the image Zarr name is not the default ch{signal_ch}.zarr, for example ch1_preprocessed.zarr.",
+      "usage": {
+        "records_csv_format": "CSV columns: sample_id,image_zarr,mask_zarr,probability_zarr,threshold_zarr. threshold_zarr may be empty.",
+        "example_records_csv": "sample_id,image_zarr,mask_zarr,probability_zarr,threshold_zarr\nHenl_1,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_preprocessed.zarr,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_mask.zarr,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_prob.zarr,",
+        "example_command": "python -m pipeline_modules.segmentation.cfos_unet_qc --records_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\qc_records.csv --output_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\review_queue.csv --top_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue.csv --preview_dir H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue_previews --top_n 30 --max_per_large_grid 10",
+        "selection_rule": "Blocks are first sorted by review_score. The final preview set contains up to top_n blocks, with at most max_per_large_grid blocks per large grid. A large grid is defined by the first two numbers in chunk_index, e.g. chunk_index 7.7.18 belongs to large grid 7-7.",
+        "block_name_rule": "Preview file names and block_id use source sample_id plus chunk position, e.g. Henl_1_7-7-18_mask.tiff.",
+        "preview_layout": "preview_dir/image contains *_image.tiff; preview_dir/mask contains *_mask.tiff."
+      },
       "inputs": {
         "records_csv": {"type": "path|null", "default": null},
         "sample_root": {"type": "path|null", "default": null},
         "sample_dirs": {"type": "path[]|null", "default": null},
         "signal_ch": {"type": "string", "default": "2"},
+        "mask_suffix": {"type": "string", "default": "_mask.zarr"},
+        "probability_suffix": {"type": "string", "default": "_prob.zarr"},
+        "threshold_suffix": {"type": "string", "default": ""},
         "dataset_name": {"type": "string", "default": "0"},
+        "chunk_size": {"type": "triplet_int|null", "default": null},
         "uncertainty_low": {"type": "float", "default": 0.4},
         "uncertainty_high": {"type": "float", "default": 0.6},
         "small_component_max_voxels": {"type": "int", "default": 32},
-        "top_n": {"type": "int", "default": 10}
+        "top_n": {"type": "int", "default": 30},
+        "max_per_large_grid": {"type": "int", "default": 10},
+        "output_csv": {"type": "path", "default": "review_queue.csv"},
+        "top_csv": {"type": "path|null", "default": null},
+        "preview_dir": {"type": "path|null", "default": null},
+        "skip_missing": {"type": "bool", "default": false}
       },
       "outputs": {
         "output_csv": {"type": "path", "default": "review_queue.csv"},
-        "top_csv": {"type": "path", "default": "top10_review_queue.csv"}
+        "top_csv": {"type": "path", "default": "top30_review_queue.csv"},
+        "preview_dir": {"type": "dir", "default": "top30_review_queue_previews"},
+        "preview_image_tiffs": {"type": "dir", "default": "top30_review_queue_previews/image"},
+        "preview_mask_tiffs": {"type": "dir", "default": "top30_review_queue_previews/mask"}
       }
     },
     {
