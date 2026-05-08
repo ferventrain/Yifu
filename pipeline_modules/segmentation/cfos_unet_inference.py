@@ -14,12 +14,12 @@ from tqdm import tqdm
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
-    from pipeline_modules.segmentation.cfos_unet_model import load_cfos_unet_checkpoint, normalize_volume
+    from pipeline_modules.segmentation.cfos_unet_model import load_cfos_unet_checkpoint
     from pipeline_modules.segmentation.zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
 except ImportError:  # pragma: no cover
     from ..utils.errors import ErrorCode, PipelineError
     from ..utils.run_manifest import write_run_manifest
-    from .cfos_unet_model import load_cfos_unet_checkpoint, normalize_volume
+    from .cfos_unet_model import load_cfos_unet_checkpoint
     from .zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,77 @@ def _infer_volume(
     return averaged_logits.cpu()
 
 
+def _compute_global_percentiles(
+    data_in,
+    chunk_slices_iter,
+    low_pct: float,
+    high_pct: float,
+):
+    """Compute global percentile values across all chunks via histogram accumulation."""
+    import numpy as np
+
+    # Sub-pass 1: determine global min / max
+    global_min = float("inf")
+    global_max = float("-inf")
+    for slices in tqdm(chunk_slices_iter, desc="Global min/max", unit="chunk"):
+        chunk = np.asarray(data_in[slices])
+        global_min = min(global_min, float(chunk.min()))
+        global_max = max(global_max, float(chunk.max()))
+
+    if global_max <= global_min:
+        return float(global_min), float(global_max)
+
+    # Sub-pass 2: accumulate histogram and derive percentiles
+    num_bins = 1 << 16
+    bin_edges = np.linspace(global_min, global_max, num_bins + 1)
+    hist = np.zeros(num_bins, dtype=np.int64)
+
+    for slices in tqdm(chunk_slices_iter, desc="Global histogram", unit="chunk"):
+        chunk = np.asarray(data_in[slices])
+        h, _ = np.histogram(chunk.ravel(), bins=bin_edges)
+        hist += h.astype(np.int64)
+
+    total = hist.sum()
+    if total == 0:
+        return float(global_min), float(global_max)
+
+    cumsum = np.cumsum(hist)
+    bin_width = (global_max - global_min) / num_bins
+
+    def _interp_percentile(pct: float) -> float:
+        target = total * pct / 100.0
+        idx = int(np.searchsorted(cumsum, target))
+        idx = min(max(idx, 0), num_bins - 1)
+        count_before = float(cumsum[idx - 1]) if idx > 0 else 0.0
+        count_in_bin = float(hist[idx])
+        if count_in_bin > 0:
+            fraction = (target - count_before) / count_in_bin
+        else:
+            fraction = 0.0
+        return float(bin_edges[idx]) + fraction * bin_width
+
+    return _interp_percentile(low_pct), _interp_percentile(high_pct)
+
+
+def _normalize_with_bounds(volume, low: float, high: float):
+    """Normalize volume to [0, 1] using pre-computed percentile bounds.
+
+    Mirrors the logic of ``normalize_volume`` but uses externally computed
+    percentile bounds so that all chunks share the same normalisation.
+    When ``high <= low`` the entire volume is effectively constant, so
+    return zeros (consistent with clip-then-subtract on a flat signal).
+    """
+    import numpy as np
+
+    volume = volume.astype(np.float32, copy=False)
+    if high <= low:
+        return np.zeros_like(volume)
+    volume = np.clip(volume, low, high)
+    volume = volume - low
+    volume = volume / max(high - low, 1e-6)
+    return volume
+
+
 def run_cfos_unet_inference(
     *,
     input_zarr: str | Path,
@@ -239,9 +310,20 @@ def run_cfos_unet_inference(
         chunk_slices_iter = list(_iter_chunk_slices(tuple(int(v) for v in data_in.shape), inferred_chunk_size))
 
     total_chunks = len(chunk_slices_iter)
-    logger.info("Starting inference on %d chunks, patch_size=%s, batch_size=%d, device=%s%s",
-                total_chunks, inferred_patch_size, batch_size, resolved_device,
-                ", skip_empty=True eps=%.4f" % skip_eps if skip_empty else "")
+    global_low, global_high = _compute_global_percentiles(
+        data_in,
+        chunk_slices_iter,
+        float(normalize_percentiles[0]),
+        float(normalize_percentiles[1]),
+    )
+    logger.info(
+        "Starting inference on %d chunks, patch_size=%s, batch_size=%d, device=%s%s"
+        " | global norm bounds: low=%.4f high=%.4f (p%.1f, p%.1f)",
+        total_chunks, inferred_patch_size, batch_size, resolved_device,
+        ", skip_empty=True eps=%.4f" % skip_eps if skip_empty else "",
+        global_low, global_high,
+        float(normalize_percentiles[0]), float(normalize_percentiles[1]),
+    )
     for slices in tqdm(chunk_slices_iter, desc="Inference", unit="chunk"):
         volume_np = np.asarray(data_in[slices])
         if skip_empty and float(volume_np.max()) <= float(skip_eps):
@@ -250,11 +332,7 @@ def run_cfos_unet_inference(
                 data_prob[slices] = np.zeros(volume_np.shape, dtype=probability_dtype_np)
             skipped_chunks += 1
             continue
-        volume_np = normalize_volume(
-            volume_np,
-            low_pct=float(normalize_percentiles[0]),
-            high_pct=float(normalize_percentiles[1]),
-        )
+        volume_np = _normalize_with_bounds(volume_np, global_low, global_high)
         logits = _infer_volume(
             volume_np,
             model=model,
