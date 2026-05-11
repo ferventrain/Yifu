@@ -166,7 +166,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert a TIFF folder to a directory-store Zarr volume")
     parser.add_argument("--input", required=True, help="Input TIFF folder")
     parser.add_argument("--output", required=True, help="Output .zarr path")
-    parser.add_argument("--chunk_size", default="128,256,256", help="Chunk size z,y,x")
+    parser.add_argument("--chunk_size", default="256,256,256", help="Chunk size z,y,x")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()

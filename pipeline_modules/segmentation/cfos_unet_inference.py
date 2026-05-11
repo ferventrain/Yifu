@@ -427,7 +427,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk_size", default="", help="Override output chunk size as z,y,x")
     parser.add_argument("--normalize_percentiles", default="1.0,99.5", help="Percentile pair low,high for normalization")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
-    parser.add_argument("--skip_empty", action="store_true", help="Skip chunks whose max pixel value <= skip_eps")
+    parser.add_argument("--skip_empty", action="store_true", default=True, help="Skip chunks whose max pixel value <= skip_eps")
+    parser.add_argument("--no_skip_empty", action="store_false", dest="skip_empty", help="Disable skipping empty chunks")
     parser.add_argument("--skip_eps", type=float, default=100.0, help="Max-value threshold for skip_empty (default 100.0)")
     return parser.parse_args()
 

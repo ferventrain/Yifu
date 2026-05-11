@@ -498,10 +498,23 @@ def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
-def _large_grid_key(record: dict[str, Any]) -> str:
+def _large_grid_key(
+    record: dict[str, Any],
+    *,
+    large_grid_size: tuple[int, int, int] = (1024, 1024, 1024),
+    chunk_size: tuple[int, int, int] = (256, 256, 256),
+) -> str:
     parts = str(record.get("chunk_index") or "").split(".")
-    if len(parts) >= 2:
-        return f"{parts[0]}-{parts[1]}"
+    if len(parts) >= 3:
+        cz, cy, cx = int(parts[0]), int(parts[1]), int(parts[2])
+        lgz, lgy, lgx = large_grid_size
+        cz_size = chunk_size[0]
+        cy_size = chunk_size[1]
+        cx_size = chunk_size[2]
+        grid_z = cz // (lgz // cz_size)
+        grid_y = cy // (lgy // cy_size)
+        grid_x = cx // (lgx // cx_size)
+        return f"{grid_z}-{grid_y}-{grid_x}"
     return str(record.get("sample_id") or "")
 
 
@@ -510,13 +523,15 @@ def select_top_records(
     *,
     top_n: int,
     max_per_large_grid: int,
+    large_grid_size: tuple[int, int, int] = (1024, 1024, 1024),
+    chunk_size: tuple[int, int, int] = (256, 256, 256),
 ) -> list[dict[str, Any]]:
     selected = []
     grid_counts: dict[str, int] = {}
     for record in records:
         if len(selected) >= int(top_n):
             break
-        grid_key = _large_grid_key(record)
+        grid_key = _large_grid_key(record, large_grid_size=large_grid_size, chunk_size=chunk_size)
         if grid_counts.get(grid_key, 0) >= int(max_per_large_grid):
             continue
         selected.append(record)
@@ -669,6 +684,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--small_component_max_voxels", type=int, default=32)
     parser.add_argument("--top_n", type=int, default=30)
     parser.add_argument("--max_per_large_grid", type=int, default=10)
+    parser.add_argument("--large_grid_size", default="1024,1024,1024", help="Large grid size z,y,x (default 1024,1024,1024)")
     parser.add_argument("--output_csv", default="review_queue.csv")
     parser.add_argument("--top_csv", default="", help="Optional separate CSV for the top-N rows")
     parser.add_argument("--preview_dir", default="", help="Optional directory for top-N block image and mask TIFF previews")
@@ -709,10 +725,14 @@ def main() -> int:
             skip_missing=args.skip_missing,
         )
         output_csv = Path(args.output_csv)
+        parsed_chunk_size = _parse_triplet(args.chunk_size) or (256, 256, 256)
+        parsed_large_grid_size = _parse_triplet(args.large_grid_size) or (1024, 1024, 1024)
         top_records = select_top_records(
             ranked,
             top_n=max(int(args.top_n), 0),
             max_per_large_grid=max(int(args.max_per_large_grid), 0),
+            large_grid_size=parsed_large_grid_size,
+            chunk_size=parsed_chunk_size,
         )
         top_csv = Path(args.top_csv) if args.top_csv else output_csv.with_name(f"top{args.top_n}_{output_csv.name}")
         preview_dir = Path(args.preview_dir) if args.preview_dir else top_csv.with_name(f"{top_csv.stem}_previews")
