@@ -23,7 +23,9 @@
         "parallel":       {"type": "int", "default": 1},
         "teasar_params":  {"type": "TeasarParams", "default": null, "description": "Dict matching TeasarParams fields; null uses defaults"},
         "save_skeleton":  {"type": "bool", "default": false},
-        "save_swc":       {"type": "bool", "default": false}
+        "save_swc":       {"type": "bool", "default": false},
+        "merge_branch_points_distance_um": {"type": "float", "default": 0.0, "description": "Merge branch points within this distance (um). 0=disabled"},
+        "prune_spurs_max_length_um": {"type": "float", "default": 0.0, "description": "Prune terminal branches shorter than this (um). 0=disabled"}
       },
       "outputs": {
         "branch_csv_path":   {"type": "path", "description": "vessel_branch_metrics.csv"},
@@ -59,7 +61,9 @@
         "halo_zyx":       {"type": "triplet_int_vox", "default": [0, 0, 0]},
         "stitch":         {"type": "bool", "default": true},
         "stitch_max_distance_um": {"type": "float", "default": 5.0},
-        "chunk_workers":  {"type": "int", "default": 1}
+        "chunk_workers":  {"type": "int", "default": 1},
+        "merge_branch_points_distance_um": {"type": "float", "default": 0.0, "description": "Merge branch points within this distance (um). 0=disabled"},
+        "prune_spurs_max_length_um": {"type": "float", "default": 0.0, "description": "Prune terminal branches shorter than this (um). 0=disabled"}
       },
       "outputs": {
         "branch_csv_path":   {"type": "path", "description": "vessel_branch_metrics.csv"},

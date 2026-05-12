@@ -29,7 +29,7 @@ from .rolling_ball_background import rolling_ball_background
 
 logger = logging.getLogger(__name__)
 
-_BOOKKEEPING_KEYS = {"downsample", "zarr", "channel_subtraction"}
+_BOOKKEEPING_KEYS = {"downsample", "zarr", "channel_subtraction", "tubular_enhancement", "edge_signal_removal"}
 
 
 def _configure_logging(json_logs: bool) -> None:

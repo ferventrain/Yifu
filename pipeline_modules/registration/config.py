@@ -11,7 +11,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated, Any, Sequence
+from typing import Any, Optional, Sequence, Tuple
+
+try:
+    from typing import Annotated
+except ImportError:  # pragma: no cover - Python < 3.9
+    from typing_extensions import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -31,7 +36,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _Triplet = Annotated[
-    tuple[float, float, float],
+    Tuple[float, float, float],
     Field(description="Three-value tuple in (x, y, z) order"),
 ]
 
@@ -115,7 +120,7 @@ class AnalysisCfg(BaseModel):
     )
     output_format: str = Field("xlsx", description="Output format: 'xlsx'")
     dataset_name: str = Field("0", description="Dataset name inside Zarr groups")
-    block_size: tuple[int, int, int] | None = Field(
+    block_size: Optional[Tuple[int, int, int]] = Field(
         None,
         description="Override block size as (z, y, x); None infers from Zarr chunks",
     )

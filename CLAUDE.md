@@ -227,8 +227,10 @@ This directory owns:
 - registration-channel downsampling + NIfTI export (`downsample.py`)
 - mask upsampling (`upsample_mask.py`)
 - channel subtraction utilities (`channel_subtraction.py`)
+- **3D tubular enhancement** (`tubular_enhancement.py`) — Frangi/Meijering/Sato filters on Zarr volumes
+- **Edge signal removal** (`edge_signal_removal.py`) — suppresses bright sheet-like noise at brain edges using atlas label
 
-Important implementation detail: `Preprocessor` builds its enhancement pipeline by iterating the JSON `preprocessing` object in order, skipping bookkeeping sections such as `downsample`, `zarr`, and `channel_subtraction`. If preprocessing order matters, change the config order rather than assuming a hardcoded sequence.
+Important implementation detail: `Preprocessor` builds its enhancement pipeline by iterating the JSON `preprocessing` object in order, skipping bookkeeping sections such as `downsample`, `zarr`, `channel_subtraction`, `tubular_enhancement`, and `edge_signal_removal`. If preprocessing order matters, change the config order rather than assuming a hardcoded sequence.
 
 ### `pipeline_modules/segmentation`
 
@@ -266,11 +268,13 @@ For a sample with signal channel `chX` and registration channel `chY`, `main.py`
 2. optional enhanced TIFF stack: `sample_dir/chX_preprocessed/`
 3. signal Zarr: `sample_dir/chX.zarr`
 4. registration downsample output: `sample_dir/chY_downsample/volume.nii.gz`
-5. segmentation mask Zarr: `sample_dir/chX_mask.zarr`
-6. exported mask TIFF stack: `sample_dir/chX_mask/`
-7. warped atlas label TIFF stack: `sample_dir/upsampled_atlas_label/`
-8. warped atlas label Zarr: `sample_dir/upsampled_atlas_label.zarr`
-9. region stats Excel: `sample_dir/density_results_chX.xlsx`
+5. warped atlas label TIFF stack: `sample_dir/upsampled_atlas_label/`
+6. warped atlas label Zarr: `sample_dir/upsampled_atlas_label.zarr`
+7. optional cleaned Zarr (edge removal): `sample_dir/chX_clean.zarr`
+8. optional enhanced Zarr (tubular): `sample_dir/chX_enhanced.zarr`
+9. segmentation mask Zarr: `sample_dir/chX_mask.zarr`
+10. exported mask TIFF stack: `sample_dir/chX_mask/`
+11. region stats Excel: `sample_dir/density_results_chX.xlsx`
 
 A lot of the repo logic assumes these names. Preserve them unless the task is specifically to redesign path conventions.
 
@@ -291,7 +295,9 @@ Important config behaviors from code:
 
 - `input.channels.signal` and `input.channels.registration` drive path naming like `ch0`, `ch1`
 - `preprocessing.downsample.target_resolution_xyz` is used to derive Z/Y/X downsample factors for registration
-- `segmentation.method` selects either `cellpose` or `threshold`
+- `preprocessing.edge_signal_removal.apply` gates the 3D edge noise removal (needs atlas label from registration)
+- `preprocessing.tubular_enhancement.apply` gates the 3D Frangi/Meijering tubular filter
+- `segmentation.method` selects `cellpose`, `threshold`, or `cfos_unet`
 - `analysis.density_config` is resolved relative to the project root if not absolute
 - `tubule_reconstruction` is already represented in `config_template.json`, but not yet called by `main.py`
 
@@ -325,3 +331,13 @@ When repository docs disagree, prefer these sources in roughly this order:
 5. older per-module READMEs
 
 Some READMEs describe planned or older flows that are not fully wired into the current main pipeline.
+
+## Pipeline script generation skill
+
+When the user describes a new sample analysis with image characteristics, use the `generate-pipeline` skill
+(`.claude/skills/generate-pipeline.md`) to generate a shell script that runs the full or partial pipeline
+from TIFF preprocessing through density analysis. The user triggers this by saying things like:
+
+- "帮我生成一个pipeline脚本，样本在 X，有神经纤维和边缘噪声"
+- "只跑 tubular enhancement 和 segmentation"
+- "新样本来了，需要完整的分析流程"

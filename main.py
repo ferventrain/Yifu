@@ -7,6 +7,7 @@ from pathlib import Path
 # Add project root to path
 project_root = Path(__file__).parent
 sys.path.append(str(project_root))
+PYTHON_EXE = sys.executable
 
 MAIN_PIPELINE_REGISTRATION_MODE = "atlas2image"
 
@@ -40,7 +41,7 @@ def format_csv(values):
 def run_tiff_to_zarr(input_path, output_path, chunk_size, desc):
     chunk_str = format_csv(chunk_size)
     cmd = (
-        f'python pipeline_modules/preprocessing/tiff_to_zarr.py '
+        f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.tiff_to_zarr '
         f'--input "{input_path}" '
         f'--output "{output_path}" '
         f'--chunk_size "{chunk_str}"'
@@ -132,7 +133,7 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
         sys.exit(1)
 
     cmd = (
-        f'python pipeline_modules/preprocessing/downsample.py '
+        f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.downsample '
         f'--input_folder "{sample_dir / f"ch{reg_ch}"}" '
         f'--factor "{factor_str}"'
     )
@@ -149,7 +150,7 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
             sys.exit(1)
         cp_cfg = seg_cfg["cellpose"]
         return (
-            f'python pipeline_modules/segmentation/cellpose_distributed.py '
+            f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.cellpose_distributed '
             f'--input_zarr "{zarr_path}" '
             f'--output_zarr "{mask_zarr_path}" '
             f'--workers {cp_cfg["workers"]} '
@@ -160,7 +161,7 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
     if seg_method == "threshold":
         th_cfg = seg_cfg["threshold"]
         return (
-            f'python pipeline_modules/segmentation/intensity_threshold_segmentor.py '
+            f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.intensity_threshold_segmentor '
             f'--input_zarr "{zarr_path}" '
             f'--output_zarr "{mask_zarr_path}" '
             f'--threshold {th_cfg["value"]} '
@@ -170,13 +171,13 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
     if seg_method == "cfos_unet":
         model_cfg = seg_cfg["cfos_unet"]
         cmd = (
-            f'python pipeline_modules/segmentation/cfos_unet_inference.py '
+            f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.cfos_unet_inference '
             f'--input_zarr "{zarr_path}" '
             f'--output_zarr "{mask_zarr_path}" '
             f'--checkpoint_path "{model_cfg["checkpoint_path"]}" '
             f'--dataset_name "{model_cfg.get("dataset_name", "0")}" '
             f'--overlap {model_cfg.get("overlap", 0.25)} '
-            f'--batch_size {model_cfg.get("batch_size", 1)} '
+            f'--batch_size {model_cfg.get("batch_size", 4)} '
             f'--device "{model_cfg.get("device", "auto")}" '
             f'--foreground_class {model_cfg.get("foreground_class", 1)} '
             f'--probability_threshold {model_cfg.get("probability_threshold", 0.5)} '
@@ -227,7 +228,7 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
 
     if not directory_has_files(mask_tiff_dir):
         export_cmd = (
-            f'python -c "from pipeline_modules.segmentation '
+            f'"{PYTHON_EXE}" -c "from pipeline_modules.segmentation '
             f'import export_zarr_to_tiff; '
             f"export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
         )
@@ -237,26 +238,42 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
 
 
 def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, config_path):
+    """Run ANTs registration and ensure label Zarr exists.
+
+    Returns (warped_label_tiff_dir, warped_label_zarr_path).
+    """
     warped_label_dir = sample_dir / "upsampled_atlas_label"
+    warped_label_zarr_path = sample_dir / "upsampled_atlas_label.zarr"
 
     if directory_has_files(warped_label_dir):
-        print(f"Registration output exists at {warped_label_dir}. Skipping Step 3.")
-        return warped_label_dir
+        print(f"Registration output exists at {warped_label_dir}. Skipping ANTs registration.")
+    else:
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.registration.ANTs_registration '
+            f'--sample_dir "{sample_dir}" '
+            f'--signal_channel {signal_ch} '
+            f'--register_channel {reg_ch} '
+            f'--atlas_image "{reg_cfg["atlas_path"]}" '
+            f'--atlas_label "{reg_cfg["annotation_path"]}" '
+            f'--mode {MAIN_PIPELINE_REGISTRATION_MODE} '
+            f'--save_registered_image '
+            f'--save_transforms '
+            f'--config "{config_path}"'
+        )
+        run_command(cmd, "Step 2: ANTs Registration (Atlas -> Image)")
 
-    cmd = (
-        f'python pipeline_modules/registration/ANTs_registration.py '
-        f'--sample_dir "{sample_dir}" '
-        f'--signal_channel {signal_ch} '
-        f'--register_channel {reg_ch} '
-        f'--atlas_image "{reg_cfg["atlas_path"]}" '
-        f'--atlas_label "{reg_cfg["annotation_path"]}" '
-        f'--mode {MAIN_PIPELINE_REGISTRATION_MODE} '
-        f'--save_registered_image '
-        f'--save_transforms '
-        f'--config "{config_path}"'
-    )
-    run_command(cmd, "Step 3: ANTs Registration (Atlas -> Image)")
-    return warped_label_dir
+    # Ensure label Zarr for downstream modules
+    if not warped_label_zarr_path.exists():
+        run_tiff_to_zarr(
+            warped_label_dir,
+            warped_label_zarr_path,
+            (128, 256, 256),
+            "Step 2.1: Convert Atlas Label TIFF to Zarr",
+        )
+    else:
+        print(f"Label Zarr exists, skipping conversion: {warped_label_zarr_path}")
+
+    return warped_label_dir, warped_label_zarr_path
 
 
 def ensure_mask_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg):
@@ -287,26 +304,29 @@ def run_density_analysis(
     signal_ch,
     zarr_path,
     mask_zarr_path,
+    warped_label_zarr_path,
     zarr_cfg,
     density_cfg_path,
     resolution_xyz,
 ):
     warped_label_dir = sample_dir / "upsampled_atlas_label"
-    warped_label_zarr_path = sample_dir / "upsampled_atlas_label.zarr"
 
     if not directory_has_files(warped_label_dir):
         print(f"Error: Warped label folder not found at {warped_label_dir}. Registration failed?")
         sys.exit(1)
 
+    if not warped_label_zarr_path.exists():
+        print(f"Error: Label Zarr not found at {warped_label_zarr_path}.")
+        sys.exit(1)
+
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask"
     ensure_mask_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg)
-    ensure_label_zarr(warped_label_dir, warped_label_zarr_path, zarr_cfg)
 
     output_excel = sample_dir / f"density_results_ch{signal_ch}.xlsx"
     resolution_xyz_str = format_csv(resolution_xyz)
 
     cmd = (
-        f'python pipeline_modules/registration/region_signal_analysis_zarr_graph.py '
+        f'"{PYTHON_EXE}" -m pipeline_modules.registration.region_signal_analysis_zarr_graph '
         f'--mask_zarr "{mask_zarr_path}" '
         f'--label_zarr "{warped_label_zarr_path}" '
         f'--signal_zarr "{zarr_path}" '
@@ -318,22 +338,23 @@ def run_density_analysis(
         f'--resolution_xyz "{resolution_xyz_str}" '
         f'--pass1_workers 4'
     )
-    run_command(cmd, "Step 4: Density Analysis")
+    run_command(cmd, "Step 6: Density Analysis")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LSFM main pipeline: preprocessing -> segmentation -> registration -> analysis"
+        description="LSFM main pipeline: preprocessing -> registration -> edge removal -> tubular enhancement -> segmentation -> analysis"
     )
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     parser.add_argument("--sample_dir", help="Root directory of the sample")
     parser.add_argument("--test", action="store_true", help="Run in test mode (quick checks only)")
+    parser.add_argument("--skip_registration", action="store_true", help="Skip ANTs registration")
     args = parser.parse_args()
 
     if args.test:
         print("Running Pipeline in TEST Mode...")
         run_command(
-            'python -c "from pipeline_modules.segmentation import load_capability_manifest; '
+            f'"{PYTHON_EXE}" -c "from pipeline_modules.segmentation import load_capability_manifest; '
             'import json; print(json.dumps(load_capability_manifest(), ensure_ascii=False)[:200])"',
             "Test 1: Segmentation Module Import Check",
         )
@@ -361,24 +382,90 @@ def main():
     reg_cfg = cfg["registration"]
     density_cfg_path = resolve_density_cfg_path(cfg["analysis"])
 
+    # ---- Step 1: TIFF preprocessing + Zarr ----
     zarr_path = ensure_signal_zarr(sample_dir, signal_ch, preprocessing_cfg, zarr_cfg)
+    original_zarr_path = zarr_path
+
+    # ---- Step 1.5: Registration downsample ----
     ensure_registration_downsample(
         sample_dir,
         reg_ch,
         cfg["input"]["resolution_xyz"],
         preprocessing_cfg["downsample"]["target_resolution_xyz"],
     )
+
+    # ---- Step 2: ANTs Registration (atlas label for edge removal) ----
+    warped_label_dir = warped_label_zarr = None
+    if not args.skip_registration:
+        warped_label_dir, warped_label_zarr = ensure_registration_outputs(
+            sample_dir, signal_ch, reg_ch, reg_cfg, config_path,
+        )
+
+    # ---- Step 3: Edge signal removal (uses atlas label) ----
+    esr_cfg = preprocessing_cfg.get("edge_signal_removal", {})
+    if esr_cfg.get("apply", False) and warped_label_zarr:
+        clean_zarr_path = sample_dir / f"ch{signal_ch}_clean.zarr"
+        if clean_zarr_path.exists():
+            print(f"Cleaned Zarr exists, skipping edge signal removal: {clean_zarr_path}")
+        else:
+            cmd = (
+                f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.edge_signal_removal '
+                f'--input_zarr "{original_zarr_path}" '
+                f'--label_zarr "{warped_label_zarr}" '
+                f'--output_zarr "{clean_zarr_path}" '
+                f'--edge_width_px {esr_cfg.get("edge_width_px", 20)} '
+                f'--suppression_weight {esr_cfg.get("suppression_weight", 0.8)} '
+                f'--brightness_pct {esr_cfg.get("brightness_pct", 90.0)} '
+                f'--smooth_sigma {esr_cfg.get("smooth_sigma", 5.0)} '
+                f'--slab_depth {esr_cfg.get("slab_depth", 32)}'
+            )
+            if esr_cfg.get("export_tiff", False):
+                tiff_out = esr_cfg.get("tiff_output") or str(sample_dir / f"ch{signal_ch}_clean_tiff")
+                cmd += f' --export_tiff "{tiff_out}"'
+            run_command(cmd, "Step 3: Edge Signal Removal")
+        zarr_path = clean_zarr_path
+
+    # ---- Step 4: 3D Tubular Enhancement (optional) ----
+    te_cfg = preprocessing_cfg.get("tubular_enhancement", {})
+    if te_cfg.get("apply", False):
+        enhanced_zarr_path = sample_dir / f"ch{signal_ch}_enhanced.zarr"
+        if enhanced_zarr_path.exists():
+            print(f"Enhanced Zarr exists, skipping tubular enhancement: {enhanced_zarr_path}")
+        else:
+            sigmas_str = format_csv(te_cfg["sigmas"])
+            cmd = (
+                f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.tubular_enhancement '
+                f'--input_zarr "{zarr_path}" '
+                f'--output_zarr "{enhanced_zarr_path}" '
+                f'--method {te_cfg.get("method", "frangi")} '
+                f'--sigmas "{sigmas_str}" '
+                f'--slab_depth {te_cfg.get("slab_depth", 32)}'
+            )
+            if te_cfg.get("black_ridges", False):
+                cmd += " --black_ridges"
+            if te_cfg.get("output_dtype"):
+                cmd += f' --output_dtype {te_cfg["output_dtype"]}'
+            if te_cfg.get("export_tiff", False):
+                tiff_out = te_cfg.get("tiff_output") or str(sample_dir / f"ch{signal_ch}_enhanced_tiff")
+                cmd += f' --export_tiff "{tiff_out}"'
+            run_command(cmd, "Step 4: 3D Tubular Enhancement")
+        zarr_path = enhanced_zarr_path
+
+    # ---- Step 5: Segmentation ----
     mask_zarr_path, _ = ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg)
-    ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, config_path)
-    run_density_analysis(
-        sample_dir,
-        signal_ch,
-        zarr_path,
-        mask_zarr_path,
-        zarr_cfg,
-        density_cfg_path,
-        cfg["input"]["resolution_xyz"],
-    )
+
+    # ---- Step 6: Density Analysis ----
+    if warped_label_zarr:
+        run_density_analysis(
+            sample_dir,
+            signal_ch,
+            zarr_path,
+            mask_zarr_path,
+            warped_label_zarr,
+            zarr_cfg,
+            density_cfg_path,
+            cfg["input"]["resolution_xyz"],
+        )
 
     print("\n" + "=" * 50)
     print("PIPELINE COMPLETED SUCCESSFULLY")

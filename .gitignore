@@ -15,6 +15,7 @@ Thumbs.db
 # Project specific
 *.log
 *.tmp
+best_model.pt
 results/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask_vis.png
 results/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask.tiff
 results/spotiflow_results/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410.csv

@@ -19,7 +19,12 @@ Model design notes
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Any, Sequence
+from typing import Any, Optional, Sequence, Tuple
+
+try:
+    from typing import Annotated
+except ImportError:  # pragma: no cover - Python < 3.9
+    from typing_extensions import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -30,7 +35,7 @@ except ImportError:  # running the file directly without project root on sys.pat
 
 
 _Triplet = Annotated[
-    tuple[float, float, float],
+    Tuple[float, float, float],
     Field(description="Three-value tuple in (x, y, z) order"),
 ]
 
@@ -69,7 +74,7 @@ class TeasarParams(BaseModel):
     soma_detection_threshold: int = Field(750, description="Soma-like region detection threshold")
     soma_invalidation_scale: float = Field(1.0, description="Soma invalidation scale")
     soma_invalidation_const: int = Field(300, description="Soma invalidation const")
-    max_paths: int | None = Field(None, description="Per-component path cap; None disables it")
+    max_paths: Optional[int] = Field(None, description="Per-component path cap; None disables it")
 
 
 class TubuleReconstructionCfg(BaseModel):
@@ -96,9 +101,12 @@ class TubuleReconstructionCfg(BaseModel):
     process_existing_only: bool = Field(
         False, description="In chunkwise mode, only process chunks that physically exist in the store"
     )
-    halo_zyx: tuple[int, int, int] = Field((0, 0, 0), description="Halo overlap in voxels as (z, y, x)")
+    halo_zyx: Tuple[int, int, int] = Field((0, 0, 0), description="Halo overlap in voxels as (z, y, x)")
     stitch: bool = Field(True, description="Stitch endpoints across chunk boundaries in chunkwise mode")
     stitch_max_distance_um: float = Field(5.0, ge=0.0, description="Max distance for cross-chunk endpoint stitching")
+
+    merge_branch_points_distance_um: float = Field(0.0, ge=0.0, description="Merge branch points within this distance (um). 0=disabled")
+    prune_spurs_max_length_um: float = Field(0.0, ge=0.0, description="Prune terminal branches shorter than this (um). 0=disabled")
 
     teasar_params: TeasarParams = Field(default_factory=TeasarParams)
 
@@ -128,7 +136,7 @@ class RegionVesselAnalysisCfg(BaseModel):
         (25.0, 25.0, 25.0),
         description="Annotation voxel size in um as (x, y, z); 25 um Allen CCF is (25, 25, 25)",
     )
-    regions: tuple[str, ...] = Field(
+    regions: Tuple[str, ...] = Field(
         default_factory=tuple,
         description=(
             "Region queries; each entry is an Allen acronym, full name, or integer id "

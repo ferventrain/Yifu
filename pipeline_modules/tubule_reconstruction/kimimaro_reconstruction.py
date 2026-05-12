@@ -820,13 +820,45 @@ def _write_single_swc(vertex_table, edge_table, swc_path):
         return
 
     vertex_table = vertex_table.copy().sort_values(["node_id"]).reset_index(drop=True)
-    parent_map = {}
+    node_ids = set(vertex_table["node_id"].astype(int).tolist())
 
+    # Build undirected adjacency from edge table
+    adj = {nid: [] for nid in node_ids}
     if not edge_table.empty:
         for row in edge_table.itertuples(index=False):
-            source = int(row.source_node)
-            target = int(row.target_node)
-            parent_map.setdefault(target, source)
+            src, tgt = int(row.source_node), int(row.target_node)
+            if src in node_ids and tgt in node_ids:
+                adj[src].append(tgt)
+                adj[tgt].append(src)
+
+    # BFS from root to assign parent for every reachable node
+    parent_map = {}
+    visited = set()
+
+    unvisited = set(node_ids)
+    while unvisited:
+        # Pick root: prefer node with degree 1 (endpoint), else smallest id
+        root = None
+        for nid in sorted(unvisited):
+            if len(adj.get(nid, [])) == 1:
+                root = nid
+                break
+        if root is None:
+            root = min(unvisited)
+
+        parent_map[root] = -1
+        queue = [root]
+        visited.add(root)
+        unvisited.discard(root)
+
+        while queue:
+            current = queue.pop(0)
+            for neighbor in adj[current]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    unvisited.discard(neighbor)
+                    parent_map[neighbor] = current
+                    queue.append(neighbor)
 
     lines = ["# id type x y z radius parent"]
     for row in vertex_table.itertuples(index=False):
@@ -836,7 +868,6 @@ def _write_single_swc(vertex_table, edge_table, swc_path):
         parent_id = parent_node + 1 if parent_node >= 0 else -1
         radius = float(row.radius_um) if not pd.isna(row.radius_um) else 1.0
 
-        # SWC convention is x y z
         lines.append(
             f"{swc_id} 0 {float(row.x_um):.6f} {float(row.y_um):.6f} "
             f"{float(row.z_um):.6f} {radius:.6f} {parent_id}"
@@ -975,6 +1006,433 @@ def _normalize_edge_table_schema(edge_table):
     if "is_stitch" not in edge_table.columns:
         edge_table["is_stitch"] = False
     return edge_table
+
+
+# ---------------------------------------------------------------------------
+# Skeleton graph postprocessing: merge nearby branch points + prune short spurs
+# ---------------------------------------------------------------------------
+
+
+def _build_graph_from_tables(vertex_table, edge_table):
+    """Build mutable adjacency structures from vertex/edge DataFrames.
+
+    Returns
+    -------
+    coords : dict[(skel_id, node_id)] -> np.array([z, y, x])
+    radii  : dict[(skel_id, node_id)] -> float
+    adj    : dict[(skel_id, node_id)] -> set[(skel_id, node_id)]
+    """
+    coords = {}
+    radii = {}
+    adj = {}
+
+    for row in vertex_table.itertuples(index=False):
+        key = (int(row.skeleton_id), int(row.node_id))
+        coords[key] = np.array([row.z_um, row.y_um, row.x_um], dtype=np.float64)
+        radii[key] = float(row.radius_um) if hasattr(row, "radius_um") and not pd.isna(row.radius_um) else 0.0
+        adj[key] = set()
+
+    for row in edge_table.itertuples(index=False):
+        sk = int(row.skeleton_id)
+        src = (sk, int(row.source_node))
+        tgt = (sk, int(row.target_node))
+        if src not in adj:
+            adj[src] = set()
+        if tgt not in adj:
+            adj[tgt] = set()
+        adj[src].add(tgt)
+        adj[tgt].add(src)
+
+    return coords, radii, adj
+
+
+def _merge_nearby_branch_points(coords, radii, adj, distance_um):
+    """Merge branch points (degree >= 3) that are within distance_um of each other.
+
+    Uses greedy clustering within each connected component of branch points.
+    Returns the number of merges performed.
+    """
+    if distance_um <= 0:
+        return 0
+
+    bp_keys = [k for k, neighbors in adj.items() if len(neighbors) >= 3]
+    if not bp_keys:
+        return 0
+
+    from scipy.spatial import cKDTree
+
+    bp_coords_arr = np.array([coords[k] for k in bp_keys], dtype=np.float64)
+    tree = cKDTree(bp_coords_arr)
+    pairs = tree.query_pairs(r=distance_um)
+
+    if not pairs:
+        return 0
+
+    # Union-find for clustering
+    parent = list(range(len(bp_keys)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Only merge within same skeleton
+    for i, j in pairs:
+        if bp_keys[i][0] == bp_keys[j][0]:
+            union(i, j)
+
+    clusters = {}
+    for i in range(len(bp_keys)):
+        root = find(i)
+        clusters.setdefault(root, []).append(i)
+
+    num_merges = 0
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+
+        member_keys = [bp_keys[m] for m in members]
+        degrees = [len(adj[k]) for k in member_keys]
+        best_idx = int(np.argmax(degrees))
+        representative = member_keys[best_idx]
+
+        # Update representative coordinate to cluster centroid
+        centroid = np.mean([coords[k] for k in member_keys], axis=0)
+        coords[representative] = centroid
+
+        for k in member_keys:
+            if k == representative:
+                continue
+
+            # Rewire all neighbors of k to representative
+            for neighbor in list(adj[k]):
+                adj[neighbor].discard(k)
+                if neighbor != representative:
+                    adj[neighbor].add(representative)
+                    adj[representative].add(neighbor)
+
+            # Remove k from graph
+            del adj[k]
+            del coords[k]
+            del radii[k]
+            num_merges += 1
+
+    # Remove self-loops
+    for k in list(adj.keys()):
+        adj[k].discard(k)
+
+    return num_merges
+
+
+def _prune_short_spurs(coords, adj, max_length_um):
+    """Iteratively remove terminal branches shorter than max_length_um.
+
+    A spur is a path from a degree-1 node to the nearest degree!=2 node
+    whose total length <= max_length_um.
+
+    Returns the number of spur branches pruned.
+    """
+    if max_length_um <= 0:
+        return 0
+
+    total_pruned = 0
+
+    while True:
+        pruned_this_pass = 0
+        terminals = [k for k, neighbors in adj.items() if len(neighbors) == 1]
+
+        for terminal in terminals:
+            if terminal not in adj or len(adj[terminal]) != 1:
+                continue
+
+            # Trace path from terminal until we hit a non-degree-2 node
+            path = [terminal]
+            current = terminal
+            prev = None
+            length = 0.0
+
+            while True:
+                neighbors = [n for n in adj[current] if n != prev]
+                if not neighbors:
+                    break
+                next_node = neighbors[0]
+                length += float(np.linalg.norm(coords[next_node] - coords[current]))
+                if length > max_length_um:
+                    break
+                path.append(next_node)
+                if len(adj[next_node]) != 2:
+                    # Reached a junction or another terminal
+                    break
+                prev = current
+                current = next_node
+
+            # Only prune if: path ends at a junction (degree >= 3) and length <= threshold
+            if length > max_length_um:
+                continue
+            if len(path) < 2:
+                continue
+            junction = path[-1]
+            if junction not in adj or len(adj[junction]) < 3:
+                continue
+
+            # Remove all nodes in path except the junction
+            for node in path[:-1]:
+                for neighbor in list(adj.get(node, set())):
+                    adj[neighbor].discard(node)
+                if node in adj:
+                    del adj[node]
+                if node in coords:
+                    del coords[node]
+
+            pruned_this_pass += 1
+
+        total_pruned += pruned_this_pass
+        if pruned_this_pass == 0:
+            break
+
+    return total_pruned
+
+
+def _rebuild_tables_from_graph(coords, radii, adj, original_vertex_table):
+    """Rebuild vertex_table and edge_table from the cleaned graph structures."""
+    # Preserve extra columns from original vertex table
+    extra_cols = [c for c in original_vertex_table.columns
+                  if c not in ("skeleton_id", "node_id", "z_um", "y_um", "x_um", "radius_um", "degree")]
+
+    # Build lookup for extra columns from original table
+    orig_extra = {}
+    if extra_cols:
+        for row in original_vertex_table.itertuples(index=False):
+            key = (int(row.skeleton_id), int(row.node_id))
+            orig_extra[key] = {col: getattr(row, col) for col in extra_cols}
+
+    vertex_rows = []
+    for key in sorted(coords.keys()):
+        sk_id, node_id = key
+        c = coords[key]
+        row = {
+            "skeleton_id": sk_id,
+            "node_id": node_id,
+            "z_um": float(c[0]),
+            "y_um": float(c[1]),
+            "x_um": float(c[2]),
+            "radius_um": radii.get(key, np.nan),
+        }
+        if key in orig_extra:
+            row.update(orig_extra[key])
+        vertex_rows.append(row)
+
+    edge_rows = []
+    seen_edges = set()
+    edge_id_counter = 0
+    for key in sorted(adj.keys()):
+        sk_id, node_id = key
+        for neighbor in sorted(adj[key]):
+            edge_pair = (min(key, neighbor), max(key, neighbor))
+            if edge_pair in seen_edges:
+                continue
+            seen_edges.add(edge_pair)
+
+            n_sk, n_node = neighbor
+            src_c = coords[key]
+            tgt_c = coords[neighbor]
+            edge_rows.append({
+                "skeleton_id": sk_id,
+                "edge_id": edge_id_counter,
+                "source_node": node_id,
+                "target_node": n_node,
+                "source_z_um": float(src_c[0]),
+                "source_y_um": float(src_c[1]),
+                "source_x_um": float(src_c[2]),
+                "target_z_um": float(tgt_c[0]),
+                "target_y_um": float(tgt_c[1]),
+                "target_x_um": float(tgt_c[2]),
+                "edge_length_um": float(np.linalg.norm(tgt_c - src_c)),
+            })
+            edge_id_counter += 1
+
+    new_vertex_table = pd.DataFrame(vertex_rows) if vertex_rows else pd.DataFrame(
+        columns=list(original_vertex_table.columns)
+    )
+    new_edge_table = pd.DataFrame(edge_rows) if edge_rows else pd.DataFrame(
+        columns=["skeleton_id", "edge_id", "source_node", "target_node",
+                 "source_z_um", "source_y_um", "source_x_um",
+                 "target_z_um", "target_y_um", "target_x_um", "edge_length_um"]
+    )
+
+    return new_vertex_table, new_edge_table
+
+
+def _branch_table_from_tables(vertex_table, edge_table):
+    """Recompute branch metrics from cleaned vertex/edge tables."""
+    if vertex_table.empty or edge_table.empty:
+        return branch_table_from_skeletons({})
+
+    all_branches = []
+    for skeleton_id, skel_verts in vertex_table.groupby("skeleton_id"):
+        skel_edges = edge_table[edge_table["skeleton_id"] == skeleton_id]
+        if skel_edges.empty:
+            continue
+
+        node_ids = skel_verts["node_id"].tolist()
+        node_id_set = set(node_ids)
+        node_coords = {}
+        node_radii = {}
+        for row in skel_verts.itertuples(index=False):
+            nid = int(row.node_id)
+            node_coords[nid] = np.array([row.z_um, row.y_um, row.x_um], dtype=np.float64)
+            node_radii[nid] = float(row.radius_um) if not pd.isna(row.radius_um) else np.nan
+
+        local_adj = {nid: [] for nid in node_id_set}
+        edge_list = []
+        for row in skel_edges.itertuples(index=False):
+            src, tgt = int(row.source_node), int(row.target_node)
+            if src in node_id_set and tgt in node_id_set:
+                eidx = len(edge_list)
+                edge_list.append((src, tgt))
+                local_adj[src].append((tgt, eidx))
+                local_adj[tgt].append((src, eidx))
+
+        degrees = {nid: len(local_adj[nid]) for nid in node_id_set}
+        branch_nodes = {nid for nid, d in degrees.items() if d != 2}
+        visited_edges = set()
+        branch_id = 0
+
+        for node in sorted(branch_nodes):
+            for neighbor, eidx in local_adj[node]:
+                if eidx in visited_edges:
+                    continue
+
+                path_nodes = [node, neighbor]
+                path_edges = [eidx]
+                visited_edges.add(eidx)
+                prev, current = node, neighbor
+
+                while degrees.get(current, 0) == 2:
+                    candidates = [(n, ei) for n, ei in local_adj[current] if n != prev and ei not in visited_edges]
+                    if not candidates:
+                        break
+                    next_n, next_ei = candidates[0]
+                    visited_edges.add(next_ei)
+                    path_nodes.append(next_n)
+                    path_edges.append(next_ei)
+                    prev, current = current, next_n
+
+                if len(path_nodes) < 2:
+                    continue
+
+                pts = np.array([node_coords[n] for n in path_nodes], dtype=np.float64)
+                seg_lengths = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
+                branch_length = float(seg_lengths.sum())
+                euclidean = float(np.linalg.norm(pts[-1] - pts[0]))
+                tortuosity = branch_length / euclidean if euclidean > 1e-12 else np.nan
+
+                path_radii = [node_radii[n] for n in path_nodes if not np.isnan(node_radii.get(n, np.nan))]
+
+                start_node = path_nodes[0]
+                end_node = path_nodes[-1]
+                start_deg = degrees.get(start_node, 0)
+                end_deg = degrees.get(end_node, 0)
+
+                all_branches.append({
+                    "skeleton_id": int(skeleton_id),
+                    "branch_id": branch_id,
+                    "start_node": start_node,
+                    "end_node": end_node,
+                    "num_points": len(path_nodes),
+                    "num_edges": len(path_edges),
+                    "is_loop": False,
+                    "start_degree": start_deg,
+                    "end_degree": end_deg,
+                    "branch_depth": np.nan,
+                    "is_terminal_branch": bool(start_deg == 1 or end_deg == 1),
+                    "is_branch_to_branch": bool(start_deg >= 3 and end_deg >= 3),
+                    "is_root_branch": False,
+                    "branch_length_um": branch_length,
+                    "euclidean_length_um": euclidean,
+                    "tortuosity": tortuosity,
+                    "mean_radius_um": float(np.mean(path_radii)) if path_radii else np.nan,
+                    "max_radius_um": float(np.max(path_radii)) if path_radii else np.nan,
+                    "min_radius_um": float(np.min(path_radii)) if path_radii else np.nan,
+                })
+                branch_id += 1
+
+    if not all_branches:
+        return branch_table_from_skeletons({})
+    return pd.DataFrame(all_branches)
+
+
+def postprocess_skeleton_tables(
+    vertex_table,
+    edge_table,
+    merge_branch_points_distance_um=0.0,
+    prune_spurs_max_length_um=0.0,
+):
+    """Apply graph-level cleanup to skeleton tables.
+
+    Parameters
+    ----------
+    vertex_table, edge_table : pd.DataFrame
+        As produced by skeleton_tables_from_skeletons or chunkwise assembly.
+    merge_branch_points_distance_um : float
+        Cluster and merge branch points within this distance. 0 = disabled.
+    prune_spurs_max_length_um : float
+        Remove terminal branches shorter than this. 0 = disabled.
+
+    Returns
+    -------
+    cleaned_vertex_table, cleaned_edge_table, cleaned_branch_table, cleanup_stats
+    """
+    if merge_branch_points_distance_um <= 0 and prune_spurs_max_length_um <= 0:
+        branch_table = _branch_table_from_tables(vertex_table, edge_table)
+        return vertex_table, edge_table, branch_table, {}
+
+    if vertex_table.empty or edge_table.empty:
+        branch_table = branch_table_from_skeletons({})
+        return vertex_table, edge_table, branch_table, {}
+
+    n_verts_before = len(vertex_table)
+    n_edges_before = len(edge_table)
+
+    coords, radii, adj = _build_graph_from_tables(vertex_table, edge_table)
+
+    num_merges = _merge_nearby_branch_points(coords, radii, adj, merge_branch_points_distance_um)
+    num_spurs_pruned = _prune_short_spurs(coords, adj, prune_spurs_max_length_um)
+
+    # Remove isolated nodes (degree 0)
+    isolated = [k for k, neighbors in adj.items() if len(neighbors) == 0]
+    for k in isolated:
+        del adj[k]
+        if k in coords:
+            del coords[k]
+
+    cleaned_vertex_table, cleaned_edge_table = _rebuild_tables_from_graph(coords, radii, adj, vertex_table)
+    cleaned_branch_table = _branch_table_from_tables(cleaned_vertex_table, cleaned_edge_table)
+
+    stats = {
+        "postprocess_enabled": True,
+        "merge_branch_points_distance_um": float(merge_branch_points_distance_um),
+        "prune_spurs_max_length_um": float(prune_spurs_max_length_um),
+        "num_branchpoint_merges": int(num_merges),
+        "num_spur_branches_pruned": int(num_spurs_pruned),
+        "num_vertices_removed_postprocess": int(n_verts_before - len(cleaned_vertex_table)),
+        "num_edges_removed_postprocess": int(n_edges_before - len(cleaned_edge_table)),
+    }
+
+    logger.info(
+        "Postprocess: merged %d branch points, pruned %d spurs, removed %d vertices / %d edges",
+        num_merges, num_spurs_pruned,
+        stats["num_vertices_removed_postprocess"],
+        stats["num_edges_removed_postprocess"],
+    )
+
+    return cleaned_vertex_table, cleaned_edge_table, cleaned_branch_table, stats
 
 
 def stitch_skeleton_edges_across_chunks(vertex_table, edge_table, max_distance_um):
@@ -1234,6 +1692,8 @@ def analyze_binary_mask_zarr(
     teasar_params=None,
     save_skeleton=False,
     save_swc=False,
+    merge_branch_points_distance_um=0.0,
+    prune_spurs_max_length_um=0.0,
 ):
     _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
@@ -1275,6 +1735,19 @@ def analyze_binary_mask_zarr(
 
     if save_skeleton:
         vertex_table, edge_table = skeleton_tables_from_skeletons(skeletons)
+
+        postprocess_active = (merge_branch_points_distance_um > 0 or prune_spurs_max_length_um > 0)
+        if postprocess_active:
+            vertex_table, edge_table, branch_table, cleanup_stats = postprocess_skeleton_tables(
+                vertex_table, edge_table,
+                merge_branch_points_distance_um=merge_branch_points_distance_um,
+                prune_spurs_max_length_um=prune_spurs_max_length_um,
+            )
+            summary.update(cleanup_stats)
+            # Rewrite branch CSV with cleaned data
+            branch_table.to_csv(branch_csv_path, index=False)
+            result["branch_table"] = branch_table
+
         vertex_csv_path, edge_csv_path = _write_skeleton_tables(vertex_table, edge_table, output_root)
         result["vertex_table"] = vertex_table
         result["edge_table"] = edge_table
@@ -1357,6 +1830,8 @@ def analyze_binary_mask_zarr_chunkwise(
     stitch=True,
     stitch_max_distance_um=5.0,
     chunk_workers=1,
+    merge_branch_points_distance_um=0.0,
+    prune_spurs_max_length_um=0.0,
 ):
     _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
@@ -1501,6 +1976,24 @@ def analyze_binary_mask_zarr_chunkwise(
         else:
             summary["num_stitch_edges"] = 0
 
+        postprocess_active = (merge_branch_points_distance_um > 0 or prune_spurs_max_length_um > 0)
+        if postprocess_active:
+            combined_vertex_table, combined_edge_table, cleaned_branch_table, cleanup_stats = postprocess_skeleton_tables(
+                combined_vertex_table, combined_edge_table,
+                merge_branch_points_distance_um=merge_branch_points_distance_um,
+                prune_spurs_max_length_um=prune_spurs_max_length_um,
+            )
+            summary.update(cleanup_stats)
+            combined_branch_table = cleaned_branch_table
+            combined_branch_table.to_csv(branch_csv_path, index=False)
+            result["branch_table"] = combined_branch_table
+            # Rewrite skeleton tables with cleaned data
+            vertex_csv_path, edge_csv_path = _write_skeleton_tables(combined_vertex_table, combined_edge_table, output_root)
+            result["vertex_table"] = combined_vertex_table
+            result["edge_table"] = combined_edge_table
+            result["vertex_csv_path"] = vertex_csv_path
+            result["edge_csv_path"] = edge_csv_path
+
         if save_swc:
             swc_dir, swc_paths = write_swc_files(combined_vertex_table, combined_edge_table, output_root)
             result["swc_dir"] = swc_dir
@@ -1555,6 +2048,8 @@ def build_argparser():
     parser.add_argument("--halo_zyx", default="0,0,0", help="Halo overlap in voxels for chunkwise processing as z,y,x")
     parser.add_argument("--no_stitch", action="store_true", help="Disable cross-chunk skeleton stitching in chunkwise mode")
     parser.add_argument("--stitch_max_distance_um", type=float, default=5.0, help="Maximum distance in microns for cross-chunk endpoint stitching")
+    parser.add_argument("--merge_branch_points_distance_um", type=float, default=0.0, help="Merge branch points within this distance (um). 0=disabled")
+    parser.add_argument("--prune_spurs_max_length_um", type=float, default=0.0, help="Prune terminal branches shorter than this (um). 0=disabled")
     parser.add_argument(
         "--test",
         action="store_true",
@@ -1626,6 +2121,8 @@ def main():
                 stitch=not args.no_stitch,
                 stitch_max_distance_um=args.stitch_max_distance_um,
                 chunk_workers=args.chunk_workers,
+                merge_branch_points_distance_um=args.merge_branch_points_distance_um,
+                prune_spurs_max_length_um=args.prune_spurs_max_length_um,
             )
         else:
             result = analyze_binary_mask_zarr(
@@ -1640,6 +2137,8 @@ def main():
                 parallel=args.parallel,
                 save_skeleton=args.save_skeleton,
                 save_swc=args.save_swc,
+                merge_branch_points_distance_um=args.merge_branch_points_distance_um,
+                prune_spurs_max_length_um=args.prune_spurs_max_length_um,
             )
 
         logger.info("Vessel reconstruction completed.")

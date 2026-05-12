@@ -129,6 +129,28 @@ class ClaheCfg(_ModelMixin):
 
 
 @dataclass(frozen=True)
+class EdgeSignalRemovalCfg(_ModelMixin):
+    apply: bool = False
+    edge_width_px: int = 20
+    suppression_weight: float = 0.8
+    brightness_pct: float = 90.0
+    smooth_sigma: float = 5.0
+    export_tiff: bool = False
+
+
+@dataclass(frozen=True)
+class TubularEnhancementCfg(_ModelMixin):
+    apply: bool = False
+    method: str = "frangi"
+    sigmas: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+    black_ridges: bool = False
+    export_tiff: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sigmas", tuple(float(s) for s in self.sigmas))
+
+
+@dataclass(frozen=True)
 class DownsampleCfg(_ModelMixin):
     target_resolution_xyz: tuple[float, float, float] = (25.0, 25.0, 25.0)
     chunk_size: int = 100
@@ -157,6 +179,8 @@ class PreprocessingCfg(_ModelMixin):
     median_filter: MedianFilterCfg = field(default_factory=MedianFilterCfg)
     scattering_removal: ScatteringRemovalCfg = field(default_factory=ScatteringRemovalCfg)
     clahe: ClaheCfg = field(default_factory=ClaheCfg)
+    edge_signal_removal: EdgeSignalRemovalCfg = field(default_factory=EdgeSignalRemovalCfg)
+    tubular_enhancement: TubularEnhancementCfg = field(default_factory=TubularEnhancementCfg)
     downsample: DownsampleCfg = field(default_factory=DownsampleCfg)
     zarr: ZarrCfg = field(default_factory=ZarrCfg)
 
@@ -168,6 +192,8 @@ class PreprocessingCfg(_ModelMixin):
         object.__setattr__(self, "median_filter", MedianFilterCfg.model_validate(self.median_filter))
         object.__setattr__(self, "scattering_removal", ScatteringRemovalCfg.model_validate(self.scattering_removal))
         object.__setattr__(self, "clahe", ClaheCfg.model_validate(self.clahe))
+        object.__setattr__(self, "edge_signal_removal", EdgeSignalRemovalCfg.model_validate(self.edge_signal_removal))
+        object.__setattr__(self, "tubular_enhancement", TubularEnhancementCfg.model_validate(self.tubular_enhancement))
         object.__setattr__(self, "downsample", DownsampleCfg.model_validate(self.downsample))
         object.__setattr__(self, "zarr", ZarrCfg.model_validate(self.zarr))
 
@@ -184,6 +210,8 @@ class PreprocessingCfg(_ModelMixin):
                 "median_filter": {"type": "object"},
                 "scattering_removal": {"type": "object"},
                 "clahe": {"type": "object"},
+                "edge_signal_removal": {"type": "object"},
+                "tubular_enhancement": {"type": "object"},
                 "downsample": {"type": "object"},
                 "zarr": {"type": "object"},
             },

@@ -22,10 +22,7 @@
       "sample_ratio": 0.01,
       "min_samples": 10,
       "max_samples": 50,
-      "compression": "lzw",
-      "estimated_weights": {
-        "ch1": 0.5752731793797186
-      }
+      "compression": "lzw"
     },
     "tophat": {
       "apply": true,
@@ -49,6 +46,21 @@
       "clip_limit": 2.0,
       "tile_grid_size": 8
     },
+    "edge_signal_removal": {
+      "apply": false,
+      "edge_width_px": 20,
+      "suppression_weight": 0.8,
+      "brightness_pct": 90.0,
+      "smooth_sigma": 5.0,
+      "export_tiff": false
+    },
+    "tubular_enhancement": {
+      "apply": false,
+      "method": "frangi",
+      "sigmas": [1, 2, 4, 8],
+      "black_ridges": false,
+      "export_tiff": false
+    },
     "downsample": {
       "target_resolution_xyz": [
         25.0,
@@ -59,7 +71,7 @@
     },
     "zarr": {
       "chunk_size": [
-        128,
+        256,
         256,
         256
       ],
@@ -74,20 +86,20 @@
   "registration": {
     "method": "ants",
     "mode": "atlas2image",
-    "atlas_path": "s:/Yifu/Allen_brainatlas/atlas.tiff",
-    "annotation_path": "s:/Yifu/Allen_brainatlas/atlas_label.tiff",
+    "atlas_path": "S:/Yifu/data/reference/atlas.tiff",
+    "annotation_path": "S:/Yifu/data/reference/atlas_label.tiff",
     "transform_type": "SyN",
     "allow_reflection": false
   },
   "segmentation": {
-    "method": "threshold",
+    "method": "cfos_unet",
     "cellpose": {
       "model": "cyto3",
       "diameter": 30.0,
       "use_gpu": true,
       "workers": 4,
       "block_size": [
-        128,
+        256,
         256,
         256
       ]
@@ -96,6 +108,23 @@
       "value": "1000",
       "sigma": 0,
       "min_object_size": 10
+    },
+    "cfos_unet": {
+      "checkpoint_path": "S:/Yifu/best_model.pt",
+      "save_probability": true,
+      "probability_zarr": "",
+      "dataset_name": "0",
+      "patch_size": [128, 128, 128],
+      "overlap": 0.25,
+      "batch_size": 1,
+      "device": "auto",
+      "foreground_class": 1,
+      "probability_threshold": 0.5,
+      "process_existing_only": false,
+      "output_mode": "binary",
+      "output_dtype": "uint8",
+      "probability_dtype": "float32",
+      "normalize_percentiles": [1.0, 99.5]
     }
   },
   "analysis": {

@@ -44,6 +44,21 @@
             "clip_limit": 2.0,
             "tile_grid_size": 8
         },
+        "edge_signal_removal": {
+            "apply": false,
+            "edge_width_px": 20,
+            "suppression_weight": 0.8,
+            "brightness_pct": 90.0,
+            "smooth_sigma": 5.0,
+            "export_tiff": false
+        },
+        "tubular_enhancement": {
+            "apply": false,
+            "method": "frangi",
+            "sigmas": [1, 2, 4, 8],
+            "black_ridges": false,
+            "export_tiff": false
+        },
         "downsample": {
             "target_resolution_xyz": [25.0, 25.0, 25.0],
             "chunk_size": 100  
