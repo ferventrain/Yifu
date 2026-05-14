@@ -1,0 +1,7 @@
+monai
+monailabel
+nibabel
+tifffile
+zarr<3
+numcodecs
+torch
