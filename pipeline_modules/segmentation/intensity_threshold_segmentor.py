@@ -82,6 +82,47 @@ def segment_chunk(img, threshold, sigma, min_size, output_mode: str = "label"):
     return labeled.astype(np.uint16)
 
 
+def _find_incomplete_z_ranges(data_out, shape, chunks):
+    import zarr
+    store = data_out.store if hasattr(data_out, 'store') else data_out.chunk_store
+    array_path = getattr(data_out, "path", "")
+    dim_sep = getattr(data_out, "_dimension_separator", ".")
+    prefix = f"{array_path}/" if array_path else ""
+
+    existing = set()
+    for raw_key in store.keys():
+        key = str(raw_key)
+        if prefix and not key.startswith(prefix):
+            continue
+        rel = key[len(prefix):] if prefix else key
+        if rel in {".zarray", ".zattrs", ".zgroup", "zarr.json"}:
+            continue
+        if rel.startswith("."):
+            continue
+        parts = rel.split(dim_sep)
+        if len(parts) != 3:
+            continue
+        try:
+            idx = tuple(int(part) for part in parts)
+        except ValueError:
+            continue
+        existing.add(idx)
+
+    z_chunk_size = chunks[0]
+    n_z_chunks = (shape[0] + z_chunk_size - 1) // z_chunk_size
+    n_y_chunks = (shape[1] + chunks[1] - 1) // chunks[1]
+    n_x_chunks = (shape[2] + chunks[2] - 1) // chunks[2]
+    expected_per_z = n_y_chunks * n_x_chunks
+
+    incomplete = []
+    for z_idx in range(n_z_chunks):
+        z_found = sum(1 for (cz, cy, cx) in existing if cz == z_idx)
+        if z_found < expected_per_z:
+            incomplete.append(z_idx)
+
+    return incomplete
+
+
 def run_threshold_segmentation(
     *,
     input_zarr: str | Path,
@@ -92,6 +133,7 @@ def run_threshold_segmentation(
     output_mode: str = "binary",
     dataset_name: str = "0",
     process_existing_only: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     started_at = time.time()
     input_path = Path(input_zarr)
@@ -106,36 +148,26 @@ def run_threshold_segmentation(
     shape = tuple(int(v) for v in data_in.shape)
     chunks = tuple(int(v) for v in data_in.chunks)
     output_dtype = "uint8" if output_mode == "binary" else "uint16"
-    _, data_out = create_output_zarr(output_zarr, shape, chunks, output_dtype, dataset_name=dataset_name)
+    output_path = Path(output_zarr)
 
     processed_chunks = 0
-    if process_existing_only:
-        existing_indices = list_existing_chunk_indices(data_in)
-        if not existing_indices:
-            raise PipelineError(
-                ErrorCode.EMPTY_RESULT,
-                "No physical chunks found in input store",
-                {"input_zarr": str(input_path)},
-            )
-        for idx in existing_indices:
-            slices = []
-            for axis, chunk_idx in enumerate(idx):
-                start = chunk_idx * chunks[axis]
-                stop = min(start + chunks[axis], shape[axis])
-                slices.append(slice(start, stop))
-            slices = tuple(slices)
-            data_out[slices] = segment_chunk(
-                data_in[slices],
-                threshold,
-                sigma,
-                min_size,
-                output_mode=output_mode,
-            )
-            processed_chunks += 1
-    else:
+
+    if resume and output_path.exists():
+        import zarr
+        logger.info("Resuming: opening existing output Zarr at %s", output_path)
+        root_out = zarr.open(str(output_path), mode='r+')
+        data_out = root_out[dataset_name]
+        incomplete_z_indices = _find_incomplete_z_ranges(data_out, shape, chunks)
+        logger.info("Found %d incomplete z-ranges out of %d total z-chunks (incomplete: %s)",
+                     len(incomplete_z_indices),
+                     (shape[0] + chunks[0] - 1) // chunks[0],
+                     incomplete_z_indices)
+
         z_chunk_size = chunks[0]
-        for z in range(0, shape[0], z_chunk_size):
+        for z_idx in incomplete_z_indices:
+            z = z_idx * z_chunk_size
             z_end = min(z + z_chunk_size, shape[0])
+            logger.info("Processing z-range [%d:%d) (z-chunk %d)", z, z_end, z_idx)
             data_out[z:z_end, :, :] = segment_chunk(
                 data_in[z:z_end, :, :],
                 threshold,
@@ -144,6 +176,44 @@ def run_threshold_segmentation(
                 output_mode=output_mode,
             )
             processed_chunks += 1
+    else:
+        _, data_out = create_output_zarr(output_zarr, shape, chunks, output_dtype, dataset_name=dataset_name)
+
+        if process_existing_only:
+            existing_indices = list_existing_chunk_indices(data_in)
+            if not existing_indices:
+                raise PipelineError(
+                    ErrorCode.EMPTY_RESULT,
+                    "No physical chunks found in input store",
+                    {"input_zarr": str(input_path)},
+                )
+            for idx in existing_indices:
+                slices = []
+                for axis, chunk_idx in enumerate(idx):
+                    start = chunk_idx * chunks[axis]
+                    stop = min(start + chunks[axis], shape[axis])
+                    slices.append(slice(start, stop))
+                slices = tuple(slices)
+                data_out[slices] = segment_chunk(
+                    data_in[slices],
+                    threshold,
+                    sigma,
+                    min_size,
+                    output_mode=output_mode,
+                )
+                processed_chunks += 1
+        else:
+            z_chunk_size = chunks[0]
+            for z in range(0, shape[0], z_chunk_size):
+                z_end = min(z + z_chunk_size, shape[0])
+                data_out[z:z_end, :, :] = segment_chunk(
+                    data_in[z:z_end, :, :],
+                    threshold,
+                    sigma,
+                    min_size,
+                    output_mode=output_mode,
+                )
+                processed_chunks += 1
 
     result = {
         "success": True,
@@ -171,6 +241,7 @@ def run_threshold_segmentation(
             "min_size": min_size,
             "output_mode": output_mode,
             "process_existing_only": process_existing_only,
+            "resume": resume,
         },
         outputs=[output_zarr],
         started_at=started_at,
@@ -190,6 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_mode", choices=["label", "binary"], default="binary")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
     parser.add_argument("--test", action="store_true", help="Only process chunks that physically exist in the input store")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing output Zarr, skipping completed z-chunks")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()
 
@@ -207,6 +279,7 @@ def main() -> int:
             output_mode=args.output_mode,
             dataset_name=args.dataset_name,
             process_existing_only=args.test,
+            resume=args.resume,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0

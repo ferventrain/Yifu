@@ -24,11 +24,13 @@ def organize_files(directory='.'):
     
     print(f"正在处理: {target_dir}")
     
-    # 匹配 *_Ch\d* 或 *_C\d_* 模式的文件
+    # 匹配 *_Ch\d* 或 *_C\d_* 或 *_C\d{2}.* 模式的文件
     # 模式1: 旧模式 *_Ch\d*
-    pattern_old = re.compile(r'.*_Ch\d+.*')
+    pattern_old = re.compile(r'.*_ch\d+.*')
     # 模式2: 新模式 *_C\d_* (例如 ..._C0_...)
     pattern_new = re.compile(r'.*_C(\d+)_.*\.tif.*', re.IGNORECASE)
+    # 模式3: 新模式 *_CXX (例如 ..._C02.tif)
+    pattern_cXX = re.compile(r'.*_C(\d{2})\.[^.]+', re.IGNORECASE)
     
     moved_count = 0
     
@@ -51,7 +53,14 @@ def organize_files(directory='.'):
                 channel_num = match_new.group(1)
                 # 文件夹名为 ch0, ch1... (chx格式)
                 folder_name = f"ch{int(channel_num)}"
-                
+
+            # 尝试匹配 CXX 模式 (C01, C02...)
+            # 例如: YF2025121501_hanyong_nao_1_T00000_Z00001_C02.tif
+            elif pattern_cXX.match(file_path.name):
+                match_cXX = pattern_cXX.match(file_path.name)
+                channel_num = match_cXX.group(1)
+                folder_name = f"ch{int(channel_num)}"
+
             # 尝试匹配旧模式 (Ch0, Ch1...)
             elif pattern_old.match(file_path.name):
                 # 按 '_' 或 '.' 分割文件名

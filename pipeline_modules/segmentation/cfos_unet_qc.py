@@ -208,6 +208,8 @@ def compute_block_qc_metrics(
     uncertainty_low: float = 0.4,
     uncertainty_high: float = 0.6,
     small_component_max_voxels: int = 32,
+    skip_empty_blocks: bool = True,
+    workers: int = 32,
 ) -> list[dict[str, Any]]:
     import numpy as np
 
@@ -222,6 +224,7 @@ def compute_block_qc_metrics(
     image_path = arrays["image_path"]
     probability_path = arrays["probability_path"]
     threshold_path = arrays["threshold_path"]
+    image_data = arrays["image_data"]
     mask_data = arrays["mask_data"]
     probability_data = arrays["probability_data"]
     threshold_data = arrays["threshold_data"]
@@ -235,11 +238,19 @@ def compute_block_qc_metrics(
     total_blocks = math.prod(math.ceil(s / c) for s, c in zip(shape, chunks))
     all_blocks = list(_iter_blocks(shape, chunks))
 
-    def _scan_one_block(block):
+    def _scan_one_block(block, _skip_empty=skip_empty_blocks):
         slices = block["_slices"]
         mask_chunk = np.asarray(mask_data[slices]) > 0
         total_voxels = max(int(mask_chunk.size), 1)
         foreground_voxels = int(mask_chunk.sum())
+
+        if _skip_empty:
+            if image_data is None:
+                print("ERROR: --no_skip_empty_blocks not set but image_zarr (ch1_preprocessed.zarr) is missing", file=sys.stderr)
+                sys.exit(1)
+            image_chunk = np.asarray(image_data[slices])
+            if float(image_chunk.max()) <= 240.0:
+                return None
 
         uncertain_voxels = 0
         if probability_data is not None:
@@ -294,7 +305,7 @@ def compute_block_qc_metrics(
     from concurrent.futures import as_completed
 
     metrics = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_scan_one_block, b): b for b in all_blocks}
         for future in tqdm(
             as_completed(futures),
@@ -302,7 +313,9 @@ def compute_block_qc_metrics(
             desc=f"Scanning blocks ({sample_id})",
             unit="block",
         ):
-            metrics.append(future.result())
+            result = future.result()
+            if result is not None:
+                metrics.append(result)
 
     return metrics
 
@@ -548,6 +561,8 @@ def build_review_queue(
     uncertainty_high: float = 0.6,
     small_component_max_voxels: int = 32,
     skip_missing: bool = False,
+    skip_empty_blocks: bool = True,
+    workers: int = 32,
 ) -> list[dict[str, Any]]:
     metrics = []
     for record in records:
@@ -572,6 +587,8 @@ def build_review_queue(
                 uncertainty_low=uncertainty_low,
                 uncertainty_high=uncertainty_high,
                 small_component_max_voxels=small_component_max_voxels,
+                skip_empty_blocks=skip_empty_blocks,
+                workers=workers,
             )
         )
     return score_qc_records(metrics)
@@ -693,6 +710,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip records with missing image, mask, probability, or threshold paths",
     )
+    parser.add_argument(
+        "--no_skip_empty_blocks",
+        action="store_true",
+        help="Include all-zero mask blocks in QC scanning (default: skip them)",
+    )
+    parser.add_argument("--workers", type=int, default=32, help="Thread pool workers for block scanning (default 32)")
     return parser.parse_args()
 
 
@@ -723,6 +746,8 @@ def main() -> int:
             uncertainty_high=args.uncertainty_high,
             small_component_max_voxels=args.small_component_max_voxels,
             skip_missing=args.skip_missing,
+            skip_empty_blocks=not args.no_skip_empty_blocks,
+            workers=args.workers,
         )
         output_csv = Path(args.output_csv)
         parsed_chunk_size = _parse_triplet(args.chunk_size) or (256, 256, 256)

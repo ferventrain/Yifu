@@ -235,7 +235,7 @@ def run_cfos_unet_inference(
     chunk_size: tuple[int, int, int] | None = None,
     normalize_percentiles: tuple[float, float] = (1.0, 99.5),
     skip_empty: bool = False,
-    skip_eps: float = 0.0,
+    skip_eps: float = 240.0,
 ) -> dict[str, Any]:
     import numpy as np
 
@@ -429,7 +429,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     parser.add_argument("--skip_empty", action="store_true", default=True, help="Skip chunks whose max pixel value <= skip_eps")
     parser.add_argument("--no_skip_empty", action="store_false", dest="skip_empty", help="Disable skipping empty chunks")
-    parser.add_argument("--skip_eps", type=float, default=100.0, help="Max-value threshold for skip_empty (default 100.0)")
+    parser.add_argument("--skip_eps", type=float, default=240.0, help="Max-value threshold for skip_empty (default 240.0)")
     return parser.parse_args()
 
 
