@@ -4,6 +4,8 @@ import sys
 from typing import Dict
 
 import monailabel
+from monailabel.config import settings
+from monailabel.interfaces.datastore import Datastore
 from monailabel.interfaces.app import MONAILabelApp
 from monailabel.interfaces.tasks.infer_v2 import InferTask
 from monailabel.interfaces.tasks.scoring import ScoringMethod
@@ -17,6 +19,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from lib.activelearning import HighestScoreStrategy
+from lib.datastore import CFOSLocalDatastore
 from lib.infers import CFOSActiveLearningInfer
 from lib.scoring import CFOSUncertaintyScoring
 
@@ -40,6 +43,15 @@ class CFOSActiveLearningApp(MONAILabelApp):
         infer_task = CFOSActiveLearningInfer(self.conf)
         logger.info("+++ Adding Inferer:: %s => %s", self.model_name, infer_task)
         return {self.model_name: infer_task}
+
+    def init_datastore(self) -> Datastore:
+        logger.info("Init CFOS Datastore for: %s", self.studies)
+        return CFOSLocalDatastore(
+            self.studies,
+            extensions=settings.MONAI_LABEL_DATASTORE_FILE_EXT,
+            auto_reload=settings.MONAI_LABEL_DATASTORE_AUTO_RELOAD,
+            read_only=settings.MONAI_LABEL_DATASTORE_READ_ONLY,
+        )
 
     def init_trainers(self):
         return {}

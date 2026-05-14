@@ -125,7 +125,7 @@ def apply_registration(mask_array, reference_path, transforms):
     return np.transpose(warped.numpy(), (2, 1, 0))
 
 
-def build_local_signal_volume(signal_volume, sigma=1.5, alpha=1.0, atlas_mask=None, kernel_size=11):
+def build_local_signal_volume(signal_volume, sigma=1.5, alpha=1.0, atlas_mask=None, kernel_size=11, normalize=False):
     volume = np.asarray(signal_volume, dtype=np.float32).copy()
     if atlas_mask is not None:
         mask = np.asarray(atlas_mask) > 0
@@ -149,6 +149,10 @@ def build_local_signal_volume(signal_volume, sigma=1.5, alpha=1.0, atlas_mask=No
     local_signal = img_out.cpu().numpy().squeeze().astype(np.float32) * float(alpha)
     if atlas_mask is not None:
         local_signal[~mask] = 0
+    if normalize:
+        max_value = float(local_signal.max())
+        if max_value > 0:
+            local_signal /= max_value
     return local_signal
 
 
@@ -282,7 +286,7 @@ def render_local_signal_atlas_slice(
     spec: AtlasSliceSpec,
     output_path: str | Path,
     *,
-    cmap_name: str = "white_orange_red_black",
+    cmap_name: str = "coolwarm",
     vmin: float = 0.0,
     vmax: float | None = None,
     dpi: int = 300,
@@ -365,31 +369,238 @@ def _parse_triplet(value: str) -> tuple[float, float, float]:
     return tuple(float(part) for part in parts)  # type: ignore[return-value]
 
 
+def _add_gaussian_soma(
+    volume: np.ndarray,
+    center: tuple[float, float, float],
+    *,
+    radius: tuple[float, float, float],
+    amplitude: float,
+) -> None:
+    shape = volume.shape
+    cd, ca, cm = center
+    rd, ra, rm = radius
+    d0, d1 = max(int(cd - rd * 3), 0), min(int(cd + rd * 3) + 1, shape[0])
+    a0, a1 = max(int(ca - ra * 3), 0), min(int(ca + ra * 3) + 1, shape[1])
+    m0, m1 = max(int(cm - rm * 3), 0), min(int(cm + rm * 3) + 1, shape[2])
+    d, a, m = np.ogrid[d0:d1, a0:a1, m0:m1]
+    soma = amplitude * np.exp(-0.5 * (((d - cd) / rd) ** 2 + ((a - ca) / ra) ** 2 + ((m - cm) / rm) ** 2))
+    volume[d0:d1, a0:a1, m0:m1] += soma.astype(np.float32)
+
+
+def _bezier_points(
+    start: np.ndarray,
+    control: np.ndarray,
+    end: np.ndarray,
+    count: int,
+) -> np.ndarray:
+    t = np.linspace(0.0, 1.0, count, dtype=np.float32)[:, None]
+    return (1 - t) ** 2 * start + 2 * (1 - t) * t * control + t**2 * end
+
+
+def _add_fiber_trace(
+    volume: np.ndarray,
+    points: np.ndarray,
+    *,
+    amplitude: float,
+    radius: tuple[float, float, float] = (0.8, 1.6, 1.6),
+    step: float = 0.7,
+) -> None:
+    shape = np.array(volume.shape)
+    rd, ra, rm = radius
+    if len(points) < 2:
+        return
+
+    dense_points = [points[0].astype(np.float32)]
+    for start, end in zip(points[:-1], points[1:]):
+        segment = end - start
+        distance = float(np.linalg.norm(segment))
+        count = max(int(np.ceil(distance / max(step, 1e-3))), 1)
+        for t in np.linspace(0.0, 1.0, count + 1, dtype=np.float32)[1:]:
+            dense_points.append((start + segment * t).astype(np.float32))
+
+    for idx, point in enumerate(dense_points):
+        taper = float(np.interp(idx, [0, max(len(dense_points) - 1, 1)], [amplitude, amplitude * 0.42]))
+        cd, ca, cm = point
+        d0, d1 = max(int(cd - rd * 2.5), 0), min(int(cd + rd * 2.5) + 1, shape[0])
+        a0, a1 = max(int(ca - ra * 2.5), 0), min(int(ca + ra * 2.5) + 1, shape[1])
+        m0, m1 = max(int(cm - rm * 2.5), 0), min(int(cm + rm * 2.5) + 1, shape[2])
+        d, a, m = np.ogrid[d0:d1, a0:a1, m0:m1]
+        brush = taper * np.exp(-0.5 * (((d - cd) / rd) ** 2 + ((a - ca) / ra) ** 2 + ((m - cm) / rm) ** 2))
+        volume[d0:d1, a0:a1, m0:m1] += brush.astype(np.float32)
+
+
 def build_synthetic_prv_signal(
     atlas_labels: np.ndarray,
     *,
     center: tuple[float, float, float] | None = None,
     spread: tuple[float, float, float] = (15.0, 70.0, 55.0),
+    neuron_count: int = 100,
 ) -> np.ndarray:
     shape = atlas_labels.shape
     if center is None:
-        center = (shape[0] * 0.46, shape[1] * 0.48, shape[2] * 0.56)
-    d, a, m = np.ogrid[: shape[0], : shape[1], : shape[2]]
+        center = (shape[0] * 0.46, shape[1] * 0.50, shape[2] * 0.55)
+
+    rng = np.random.default_rng(7)
     signal = np.zeros(shape, dtype=np.float32)
+    fiber_seed = np.zeros(shape, dtype=np.float32)
+    center_arr = np.asarray(center, dtype=np.float32)
+    dv_spread, ap_spread, ml_spread = spread
 
-    components = [
-        (center, spread, 1.0),
-        ((center[0] - 9, center[1] - 42, center[2] + 36), (spread[0] * 0.95, spread[1] * 0.75, spread[2] * 0.62), 0.58),
-        ((center[0] + 8, center[1] + 64, center[2] - 42), (spread[0] * 0.9, spread[1] * 0.85, spread[2] * 0.7), 0.42),
-        ((center[0] - 18, center[1] + 12, center[2] - 76), (spread[0] * 0.65, spread[1] * 0.55, spread[2] * 0.45), 0.28),
-    ]
-    for component_center, component_spread, weight in components:
-        cd, ca, cm = component_center
-        sd, sa, sm = component_spread
-        signal += weight * np.exp(-0.5 * (((d - cd) / sd) ** 2 + ((a - ca) / sa) ** 2 + ((m - cm) / sm) ** 2)).astype(np.float32)
+    cluster_count = max(6, min(14, max(int(neuron_count) // 12, 1)))
+    cluster_centers: list[np.ndarray] = []
+    for idx in range(cluster_count):
+        if idx == 0:
+            cluster_centers.append(center_arr.copy())
+            continue
+        angle = rng.uniform(0.0, np.pi * 2.0)
+        radial = np.sqrt(rng.uniform(0.08, 1.0))
+        candidate = center_arr + np.array(
+            [
+                rng.normal(0, dv_spread * 0.35),
+                np.cos(angle) * ap_spread * radial * 1.1 + rng.normal(0, ap_spread * 0.18),
+                np.sin(angle) * ml_spread * radial * 1.15 + rng.normal(0, ml_spread * 0.18),
+            ],
+            dtype=np.float32,
+        )
+        candidate = np.clip(candidate, [0, 0, 0], np.array(shape, dtype=np.float32) - 1)
+        if atlas_labels[tuple(np.round(candidate).astype(int))] > 0:
+            cluster_centers.append(candidate.astype(np.float32))
 
-    texture = 1.0 + 0.08 * np.sin(a / 16.0) + 0.06 * np.cos(m / 19.0)
-    signal *= texture.astype(np.float32)
+    soma_centers: list[np.ndarray] = []
+    attempts = 0
+    target_count = max(int(neuron_count), 1)
+    while len(soma_centers) < target_count and attempts < target_count * 60:
+        attempts += 1
+        cluster = cluster_centers[attempts % len(cluster_centers)]
+        candidate = cluster + np.array(
+            [
+                rng.normal(0, max(dv_spread * 0.22, 2.0)),
+                rng.normal(0, max(ap_spread * 0.16, 5.0)),
+                rng.normal(0, max(ml_spread * 0.16, 5.0)),
+            ],
+            dtype=np.float32,
+        )
+        candidate = np.clip(candidate, [0, 0, 0], np.array(shape, dtype=np.float32) - 1)
+        idx = tuple(np.round(candidate).astype(int))
+        if atlas_labels[idx] <= 0:
+            continue
+        if any(np.linalg.norm(candidate - existing) < 3.2 for existing in soma_centers):
+            continue
+        soma_centers.append(candidate.astype(np.float32))
+
+    if not soma_centers:
+        raise ValueError("Could not place any synthetic neurons inside atlas mask")
+
+    for soma in soma_centers:
+        distance = float(np.linalg.norm((soma - center_arr) / np.maximum(np.asarray(spread, dtype=np.float32), 1.0)))
+        amp = float(np.clip(1.06 - 0.18 * distance + rng.normal(0, 0.045), 0.34, 1.0))
+        radius = (
+            float(rng.uniform(1.1, 1.8)),
+            float(rng.uniform(2.1, 3.4)),
+            float(rng.uniform(2.1, 3.6)),
+        )
+        _add_gaussian_soma(signal, tuple(soma), radius=radius, amplitude=amp)
+
+        nearest_cluster = min(cluster_centers, key=lambda cluster: float(np.linalg.norm(cluster - soma)))
+        start_anchor = nearest_cluster + np.array(
+            [
+                rng.normal(0, dv_spread * 0.08),
+                rng.normal(0, ap_spread * 0.08),
+                rng.normal(0, ml_spread * 0.08),
+            ],
+            dtype=np.float32,
+        )
+        start_anchor = np.clip(start_anchor, [0, 0, 0], np.array(shape, dtype=np.float32) - 1)
+        midpoint = (start_anchor + soma) / 2
+        control = midpoint + np.array(
+            [
+                rng.normal(0, dv_spread * 0.18),
+                rng.normal(0, ap_spread * 0.24),
+                rng.normal(0, ml_spread * 0.24),
+            ],
+            dtype=np.float32,
+        )
+        trunk_points = _bezier_points(start_anchor, control, soma, 180)
+        trunk_amp = float(rng.uniform(0.22, 0.42))
+        _add_fiber_trace(
+            fiber_seed,
+            trunk_points,
+            amplitude=trunk_amp,
+            radius=(0.42, 0.86, 0.86),
+            step=0.38,
+        )
+
+        branch_total = int(rng.integers(3, 7))
+        for _ in range(branch_total):
+            branch_scale = float(rng.uniform(0.16, 0.9))
+            branch_start = trunk_points[int(len(trunk_points) * branch_scale)]
+            branch_direction = soma - nearest_cluster
+            lateral = np.array(
+                [
+                    rng.normal(0, dv_spread * 0.18),
+                    rng.normal(0, ap_spread * 0.34),
+                    rng.normal(0, ml_spread * 0.34),
+                ],
+                dtype=np.float32,
+            )
+            branch_end = branch_start + branch_direction * rng.uniform(0.06, 0.18) + lateral
+            branch_end = np.clip(branch_end, [0, 0, 0], np.array(shape, dtype=np.float32) - 1)
+            if atlas_labels[tuple(np.round(branch_end).astype(int))] <= 0:
+                continue
+            branch_control = (branch_start + branch_end) / 2 + np.array(
+                [
+                    rng.normal(0, dv_spread * 0.1),
+                    rng.normal(0, ap_spread * 0.16),
+                    rng.normal(0, ml_spread * 0.16),
+                ],
+                dtype=np.float32,
+            )
+            branch_points = _bezier_points(branch_start, branch_control, branch_end, 110)
+            branch_amp = float(rng.uniform(0.08, 0.16))
+            _add_fiber_trace(
+                fiber_seed,
+                branch_points,
+                amplitude=branch_amp,
+                radius=(0.34, 0.68, 0.68),
+                step=0.34,
+            )
+
+            twig_total = int(rng.integers(1, 4))
+            for _ in range(twig_total):
+                twig_scale = float(rng.uniform(0.22, 0.88))
+                twig_start = branch_points[int(len(branch_points) * twig_scale)]
+                twig_end = twig_start + np.array(
+                    [
+                        rng.normal(0, dv_spread * 0.08),
+                        rng.normal(0, ap_spread * 0.18),
+                        rng.normal(0, ml_spread * 0.18),
+                    ],
+                    dtype=np.float32,
+                )
+                twig_end = np.clip(twig_end, [0, 0, 0], np.array(shape, dtype=np.float32) - 1)
+                if atlas_labels[tuple(np.round(twig_end).astype(int))] <= 0:
+                    continue
+                twig_control = (twig_start + twig_end) / 2 + np.array(
+                    [
+                        rng.normal(0, dv_spread * 0.05),
+                        rng.normal(0, ap_spread * 0.08),
+                        rng.normal(0, ml_spread * 0.08),
+                    ],
+                    dtype=np.float32,
+                )
+                twig_points = _bezier_points(twig_start, twig_control, twig_end, 72)
+                _add_fiber_trace(
+                    fiber_seed,
+                    twig_points,
+                    amplitude=float(rng.uniform(0.04, 0.09)),
+                    radius=(0.28, 0.52, 0.52),
+                    step=0.3,
+                )
+
+    fiber_signal = ndimage.gaussian_filter(fiber_seed, sigma=(0.42, 0.72, 0.72), mode="constant")
+    fiber_core = ndimage.gaussian_filter(fiber_seed, sigma=(0.12, 0.18, 0.18), mode="constant")
+    signal += fiber_signal * 1.02 + fiber_core * 0.28
+    signal += ndimage.gaussian_filter(signal, sigma=(0.24, 0.34, 0.34), mode="constant") * 0.04
     signal[atlas_labels <= 0] = 0
     signal -= float(signal.min())
     max_value = float(signal.max())
@@ -403,14 +614,15 @@ def generate_prv_sample(
     label_path: str | Path = DEFAULT_ATLAS_LABEL,
     output_dir: str | Path = "S:/可视化素材/heatmap",
     sample_count: int = 10,
-    cmap_name: str = "white_orange_red_black",
+    cmap_name: str = "white_blue_red",
     dpi: int = 300,
     center: tuple[float, float, float] | None = None,
     spread: tuple[float, float, float] = (15.0, 70.0, 55.0),
+    neuron_count: int = 100,
 ) -> list[Path]:
     label_path = Path(label_path)
     labels = np.asarray(tifffile.memmap(str(label_path)))
-    signal = build_synthetic_prv_signal(labels, center=center, spread=spread)
+    signal = build_synthetic_prv_signal(labels, center=center, spread=spread, neuron_count=neuron_count)
     brain_dv = np.flatnonzero(np.any(labels > 0, axis=(1, 2)))
     if len(brain_dv) == 0:
         raise ValueError("Atlas label contains no nonzero brain voxels")
@@ -418,6 +630,10 @@ def generate_prv_sample(
     start = int(np.quantile(brain_dv, 0.22))
     stop = int(np.quantile(brain_dv, 0.78))
     indices = np.linspace(start, stop, int(sample_count)).round().astype(int)
+    peak_index = int(np.argmax(signal.max(axis=(1, 2))))
+    if len(indices) > 0:
+        indices[len(indices) // 2] = peak_index
+        indices = np.clip(np.sort(indices), int(brain_dv.min()), int(brain_dv.max()))
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -467,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bregma-index", default="18,216,228")
     parser.add_argument("--vmin", type=float, default=0.0)
     parser.add_argument("--vmax", type=float, default=None)
-    parser.add_argument("--cmap", default="white_orange_red_black")
+    parser.add_argument("--cmap", default="white_blue_red")
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--line-width", type=float, default=0.16)
     parser.add_argument("--brain-outline-width", type=float, default=0.42)
@@ -477,6 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-count", type=int, default=10)
     parser.add_argument("--sample-center", type=_parse_triplet, default=None, help="Synthetic PRV center as dv,ap,ml index")
     parser.add_argument("--sample-spread", type=_parse_triplet, default=(15.0, 70.0, 55.0), help="Synthetic PRV spread as dv,ap,ml voxels")
+    parser.add_argument("--sample-neuron-count", type=int, default=100, help="Approximate number of synthetic neuron somas")
     return parser
 
 
@@ -502,7 +719,7 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("--input, --output, and --coord are required for --mode atlas-slice")
             signal = read_tiff_stack(args.input).astype(np.float32)
             labels = np.asarray(tifffile.memmap(str(args.label)))
-            local_signal = build_local_signal_volume(signal, sigma=args.sigma, alpha=args.alpha, atlas_mask=labels)
+            local_signal = build_local_signal_volume(signal, sigma=args.sigma, alpha=args.alpha, atlas_mask=labels, normalize=True)
             spec = AtlasSliceSpec(args.plane, args.coord_system, args.coord, args.atlas_resolution_um, parse_bregma_index(args.bregma_index))
             output_path = render_local_signal_atlas_slice(
                 local_signal,
@@ -527,6 +744,7 @@ def main(argv: list[str] | None = None) -> int:
                 dpi=args.dpi,
                 center=args.sample_center,
                 spread=args.sample_spread,
+                neuron_count=args.sample_neuron_count,
             )
             payload = {"mode": args.mode, "output_dir": str(args.sample_output_dir), "outputs": [str(path) for path in outputs]}
     except Exception as exc:

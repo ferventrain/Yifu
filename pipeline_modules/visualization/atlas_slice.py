@@ -95,6 +95,15 @@ WHITE_ORANGE_RED_BLACK_CMAP = LinearSegmentedColormap.from_list(
     ],
 )
 
+WHITE_BLUE_RED_CMAP = LinearSegmentedColormap.from_list(
+    "white_blue_red",
+    [
+        (0.0, "#ffffff"),
+        (0.42, "#2f6fff"),
+        (1.0, "#e31a1c"),
+    ],
+)
+
 
 @dataclass(frozen=True)
 class SliceHeatmapStyle:
@@ -578,6 +587,8 @@ def _contours_to_svg_d(contours: list[np.ndarray]) -> list[str]:
 def _colormap_by_name(name: str):
     if name == "white_orange_red_black":
         return WHITE_ORANGE_RED_BLACK_CMAP
+    if name == "white_blue_red":
+        return WHITE_BLUE_RED_CMAP
     cmap = plt.get_cmap(name)
     if not isinstance(cmap, LinearSegmentedColormap):
         return LinearSegmentedColormap.from_list(name, cmap(np.linspace(0.0, 1.0, 256)))

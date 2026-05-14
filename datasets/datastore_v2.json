@@ -1,0 +1,60 @@
+{
+  "name": "new-dataset",
+  "description": "New Dataset",
+  "images_dir": ".",
+  "labels_dir": "labels",
+  "objects": {
+    "sham_5-8-19_image": {
+      "image": {
+        "ext": ".nii.gz",
+        "info": {
+          "client_id": "user-xyz",
+          "user": "admin",
+          "ts": 1778725852,
+          "name": "sham_5-8-19_image.nii.gz",
+          "strategy": {
+            "cfos_unet": {
+              "score": 0.009446781128644943,
+              "mean_entropy": 0.009446781128644943,
+              "max_entropy": 0.6931471824645996,
+              "foreground_ratio": 0.016915977001190186
+            },
+            "random": {
+              "ts": 1778738391,
+              "client_id": "user-xyz"
+            }
+          }
+        }
+      },
+      "labels": {
+        "final": {
+          "ext": ".nii.gz",
+          "info": {
+            "label_info": [
+              {
+                "name": "cfos",
+                "idx": 2
+              }
+            ],
+            "model": "cfos_unet",
+            "client_id": "user-xyz",
+            "ts": 1778738529,
+            "name": "sham_5-8-19_image.nii.gz"
+          }
+        }
+      }
+    },
+    "sham_6-7-20_image": {
+      "image": {
+        "ext": ".nii.gz",
+        "info": {
+          "client_id": "user-xyz",
+          "user": "admin",
+          "ts": 1778740243,
+          "name": "sham_6-7-20_image.nii.gz"
+        }
+      },
+      "labels": {}
+    }
+  }
+}
