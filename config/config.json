@@ -121,6 +121,7 @@
       "foreground_class": 1,
       "probability_threshold": 0.5,
       "process_existing_only": false,
+      "rerun_if_model_updated": true,
       "output_mode": "binary",
       "output_dtype": "uint8",
       "probability_dtype": "float32",

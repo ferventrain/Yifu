@@ -14,12 +14,12 @@ from tqdm import tqdm
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
-    from pipeline_modules.segmentation.cfos_unet_model import load_cfos_unet_checkpoint
+    from pipeline_modules.segmentation.cfos_unet_model import load_cfos_unet_checkpoint, normalize_volume
     from pipeline_modules.segmentation.zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
 except ImportError:  # pragma: no cover
     from ..utils.errors import ErrorCode, PipelineError
     from ..utils.run_manifest import write_run_manifest
-    from .cfos_unet_model import load_cfos_unet_checkpoint
+    from .cfos_unet_model import load_cfos_unet_checkpoint, normalize_volume
     from .zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,13 @@ def _resolve_device(torch_mod, requested: str) -> str:
     return requested
 
 
+def _resolve_gpu_ids(torch_mod, gpu_ids: tuple[int, ...] | None) -> list[int]:
+    if not gpu_ids:
+        return []
+    visible_gpu_count = int(torch_mod.cuda.device_count())
+    return [gpu_id for gpu_id in gpu_ids if 0 <= int(gpu_id) < visible_gpu_count]
+
+
 def _compute_tile_starts(length: int, tile: int, stride: int) -> list[int]:
     if length <= tile:
         return [0]
@@ -61,6 +68,15 @@ def _compute_tile_starts(length: int, tile: int, stride: int) -> list[int]:
     if starts[-1] != length - tile:
         starts.append(length - tile)
     return starts
+
+
+def _autocast_context(torch_mod, device: str):
+    if device.startswith("cuda") and hasattr(torch_mod, "autocast"):
+        return torch_mod.autocast(device_type="cuda", dtype=torch_mod.float16)
+
+    from contextlib import nullcontext
+
+    return nullcontext()
 
 
 def _iter_chunk_slices(shape: tuple[int, int, int], chunks: tuple[int, int, int]):
@@ -107,24 +123,19 @@ def _infer_volume(
     y_starts = _compute_tile_starts(padded_shape[1], tile_h, stride_h)
     x_starts = _compute_tile_starts(padded_shape[2], tile_w, stride_w)
 
-    use_amp = device.startswith("cuda")
-
     def flush_pending():
         nonlocal logits_acc, count_acc, pending_patches, pending_coords
         if not pending_patches:
             return
         batch_np = np.stack(pending_patches, axis=0)[:, None, ...].astype("float32")
         batch_tensor = torch_mod.from_numpy(batch_np).to(device)
-        with torch_mod.no_grad():
-            if use_amp:
-                with torch_mod.autocast(device_type="cuda", dtype=torch_mod.float16):
-                    logits = model(batch_tensor).detach().float()
-            else:
-                logits = model(batch_tensor).detach().float()
+        with torch_mod.inference_mode():
+            with _autocast_context(torch_mod, device):
+                logits = model(batch_tensor).detach().float().cpu()
         if logits_acc is None:
             num_classes = int(logits.shape[1])
-            logits_acc = torch_mod.zeros((num_classes,) + padded_shape, dtype=torch_mod.float32, device=device)
-            count_acc = torch_mod.zeros((1,) + padded_shape, dtype=torch_mod.float32, device=device)
+            logits_acc = torch_mod.zeros((num_classes,) + padded_shape, dtype=torch_mod.float32)
+            count_acc = torch_mod.zeros((1,) + padded_shape, dtype=torch_mod.float32)
         for batch_index, (z0, y0, x0) in enumerate(pending_coords):
             logits_acc[:, z0:z0 + tile_d, y0:y0 + tile_h, x0:x0 + tile_w] += logits[batch_index]
             count_acc[:, z0:z0 + tile_d, y0:y0 + tile_h, x0:x0 + tile_w] += 1.0
@@ -140,79 +151,8 @@ def _infer_volume(
                     flush_pending()
     flush_pending()
 
-    averaged_logits = (logits_acc / count_acc.clamp(min=1.0))[:, :d, :h, :w]
-    return averaged_logits.cpu()
-
-
-def _compute_global_percentiles(
-    data_in,
-    chunk_slices_iter,
-    low_pct: float,
-    high_pct: float,
-):
-    """Compute global percentile values across all chunks via histogram accumulation."""
-    import numpy as np
-
-    # Sub-pass 1: determine global min / max
-    global_min = float("inf")
-    global_max = float("-inf")
-    for slices in tqdm(chunk_slices_iter, desc="Global min/max", unit="chunk"):
-        chunk = np.asarray(data_in[slices])
-        global_min = min(global_min, float(chunk.min()))
-        global_max = max(global_max, float(chunk.max()))
-
-    if global_max <= global_min:
-        return float(global_min), float(global_max)
-
-    # Sub-pass 2: accumulate histogram and derive percentiles
-    num_bins = 1 << 16
-    bin_edges = np.linspace(global_min, global_max, num_bins + 1)
-    hist = np.zeros(num_bins, dtype=np.int64)
-
-    for slices in tqdm(chunk_slices_iter, desc="Global histogram", unit="chunk"):
-        chunk = np.asarray(data_in[slices])
-        h, _ = np.histogram(chunk.ravel(), bins=bin_edges)
-        hist += h.astype(np.int64)
-
-    total = hist.sum()
-    if total == 0:
-        return float(global_min), float(global_max)
-
-    cumsum = np.cumsum(hist)
-    bin_width = (global_max - global_min) / num_bins
-
-    def _interp_percentile(pct: float) -> float:
-        target = total * pct / 100.0
-        idx = int(np.searchsorted(cumsum, target))
-        idx = min(max(idx, 0), num_bins - 1)
-        count_before = float(cumsum[idx - 1]) if idx > 0 else 0.0
-        count_in_bin = float(hist[idx])
-        if count_in_bin > 0:
-            fraction = (target - count_before) / count_in_bin
-        else:
-            fraction = 0.0
-        return float(bin_edges[idx]) + fraction * bin_width
-
-    return _interp_percentile(low_pct), _interp_percentile(high_pct)
-
-
-def _normalize_with_bounds(volume, low: float, high: float):
-    """Normalize volume to [0, 1] using pre-computed percentile bounds.
-
-    Mirrors the logic of ``normalize_volume`` but uses externally computed
-    percentile bounds so that all chunks share the same normalisation.
-    When ``high <= low`` the entire volume is effectively constant, so
-    return zeros (consistent with clip-then-subtract on a flat signal).
-    """
-    import numpy as np
-
-    volume = volume.astype(np.float32, copy=False)
-    if high <= low:
-        return np.zeros_like(volume)
-    volume = np.clip(volume, low, high)
-    volume = volume - low
-    volume = volume / max(high - low, 1e-6)
-    return volume
+    averaged_logits = logits_acc / count_acc.clamp(min=1.0)
+    return averaged_logits[:, :d, :h, :w]
 
 
 def run_cfos_unet_inference(
@@ -224,8 +164,9 @@ def run_cfos_unet_inference(
     dataset_name: str = "0",
     patch_size: tuple[int, int, int] | None = None,
     overlap: float = 0.25,
-    batch_size: int = 4,
+    batch_size: int = 1,
     device: str = "auto",
+    gpu_ids: tuple[int, ...] | None = None,
     foreground_class: int = 1,
     probability_threshold: float = 0.5,
     process_existing_only: bool = False,
@@ -234,8 +175,6 @@ def run_cfos_unet_inference(
     probability_dtype: str = "float32",
     chunk_size: tuple[int, int, int] | None = None,
     normalize_percentiles: tuple[float, float] = (1.0, 99.5),
-    skip_empty: bool = False,
-    skip_eps: float = 240.0,
 ) -> dict[str, Any]:
     import numpy as np
 
@@ -258,18 +197,15 @@ def run_cfos_unet_inference(
     model_bundle = load_cfos_unet_checkpoint(checkpoint, device="cpu")
     torch_mod = model_bundle["torch"]
     resolved_device = _resolve_device(torch_mod, device)
-    if resolved_device != "cpu":
-        model_bundle = load_cfos_unet_checkpoint(checkpoint, device=resolved_device)
+    active_gpu_ids = _resolve_gpu_ids(torch_mod, gpu_ids) if resolved_device.startswith("cuda") else []
+    model_device = f"cuda:{active_gpu_ids[0]}" if active_gpu_ids else resolved_device
+    if model_device != "cpu":
+        model_bundle = load_cfos_unet_checkpoint(checkpoint, device=model_device)
         torch_mod = model_bundle["torch"]
 
     model = model_bundle["model"]
-    if hasattr(torch_mod, "compile") and resolved_device.startswith("cuda"):
-        try:
-            import triton  # noqa: F401
-            logger.info("Compiling model with torch.compile ...")
-            model = torch_mod.compile(model)
-        except ImportError:
-            logger.info("Triton not available (Windows), skipping torch.compile")
+    if len(active_gpu_ids) >= 2:
+        model = torch_mod.nn.DataParallel(model, device_ids=active_gpu_ids, output_device=active_gpu_ids[0])
     checkpoint_args = model_bundle["checkpoint_args"]
     inferred_patch_size = patch_size or tuple(int(v) for v in checkpoint_args.get("patch_size", [128, 128, 128]))
     inferred_chunk_size = chunk_size or tuple(int(v) for v in getattr(data_in, "chunks", inferred_patch_size))
@@ -287,7 +223,6 @@ def run_cfos_unet_inference(
         )
 
     processed_regions = 0
-    skipped_chunks = 0
     if process_existing_only:
         existing_indices = list_existing_chunk_indices(data_in)
         if not existing_indices:
@@ -309,52 +244,33 @@ def run_cfos_unet_inference(
     else:
         chunk_slices_iter = list(_iter_chunk_slices(tuple(int(v) for v in data_in.shape), inferred_chunk_size))
 
-    total_chunks = len(chunk_slices_iter)
-    global_low, global_high = _compute_global_percentiles(
-        data_in,
-        chunk_slices_iter,
-        float(normalize_percentiles[0]),
-        float(normalize_percentiles[1]),
-    )
-    logger.info(
-        "Starting inference on %d chunks, patch_size=%s, batch_size=%d, device=%s%s"
-        " | global norm bounds: low=%.4f high=%.4f (p%.1f, p%.1f)",
-        total_chunks, inferred_patch_size, batch_size, resolved_device,
-        ", skip_empty=True eps=%.4f" % skip_eps if skip_empty else "",
-        global_low, global_high,
-        float(normalize_percentiles[0]), float(normalize_percentiles[1]),
-    )
-    for slices in tqdm(chunk_slices_iter, desc="Inference", unit="chunk"):
-        volume_np = np.asarray(data_in[slices])
-        if skip_empty and float(volume_np.max()) <= float(skip_eps):
-            data_out[slices] = np.zeros(volume_np.shape, dtype=output_dtype_np)
-            if data_prob is not None:
-                data_prob[slices] = np.zeros(volume_np.shape, dtype=probability_dtype_np)
-            skipped_chunks += 1
-            continue
-        volume_np = _normalize_with_bounds(volume_np, global_low, global_high)
-        logits = _infer_volume(
-            volume_np,
-            model=model,
-            torch_mod=torch_mod,
-            patch_size=inferred_patch_size,
-            overlap=float(overlap),
+    with torch_mod.inference_mode():
+        for slices in tqdm(chunk_slices_iter, total=len(chunk_slices_iter), desc="cFos inference", unit="chunk"):
+            volume_np = np.asarray(data_in[slices])
+            volume_np = normalize_volume(
+                volume_np,
+                low_pct=float(normalize_percentiles[0]),
+                high_pct=float(normalize_percentiles[1]),
+            )
+            logits = _infer_volume(
+                volume_np,
+                model=model,
+                torch_mod=torch_mod,
+                patch_size=inferred_patch_size,
+                overlap=float(overlap),
             batch_size=int(batch_size),
-            device=resolved_device,
+            device=model_device,
         )
-        probs = torch_mod.softmax(logits, dim=0)
-        fg_probs = probs[int(foreground_class)].cpu().numpy()
-        if output_mode == "multiclass":
-            pred_np = torch_mod.argmax(logits, dim=0).cpu().numpy().astype(output_dtype_np, copy=False)
-        else:
-            pred_np = (fg_probs >= float(probability_threshold)).astype(output_dtype_np, copy=False)
-        data_out[slices] = pred_np
-        if data_prob is not None:
-            data_prob[slices] = fg_probs.astype(probability_dtype_np, copy=False)
-        processed_regions += 1
-
-    if skip_empty and skipped_chunks:
-        logger.info("Skipped %d/%d empty chunks (max <= %.4f)", skipped_chunks, total_chunks, skip_eps)
+            probs = torch_mod.softmax(logits, dim=0)
+            fg_probs = probs[int(foreground_class)].cpu().numpy()
+            if output_mode == "multiclass":
+                pred_np = torch_mod.argmax(logits, dim=0).cpu().numpy().astype(output_dtype_np, copy=False)
+            else:
+                pred_np = (fg_probs >= float(probability_threshold)).astype(output_dtype_np, copy=False)
+            data_out[slices] = pred_np
+            if data_prob is not None:
+                data_prob[slices] = fg_probs.astype(probability_dtype_np, copy=False)
+            processed_regions += 1
 
     result = {
         "success": True,
@@ -367,7 +283,6 @@ def run_cfos_unet_inference(
         "chunks": list(inferred_chunk_size),
         "patch_size": list(inferred_patch_size),
         "processed_regions": processed_regions,
-        "skipped_chunks": skipped_chunks,
         "resolved_device": resolved_device,
         "num_classes": int(model_bundle["num_classes"]),
         "base_channels": int(model_bundle["base_channels"]),
@@ -396,8 +311,6 @@ def run_cfos_unet_inference(
             "output_dtype": output_dtype,
             "probability_dtype": probability_dtype,
             "chunk_size": inferred_chunk_size,
-            "skip_empty": skip_empty,
-            "skip_eps": skip_eps,
         },
         outputs=[path for path in [output_zarr, probability_path] if path],
         started_at=started_at,
@@ -415,9 +328,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probability_zarr", default="", help="Optional output Zarr path for foreground probabilities")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the input/output Zarr groups")
     parser.add_argument("--patch_size", default="", help="Override patch size as z,y,x")
-    parser.add_argument("--overlap", type=float, default=0.125, help="Sliding-window overlap ratio")
-    parser.add_argument("--batch_size", type=int, default=4, help="Inference batch size in number of tiles")
+    parser.add_argument("--overlap", type=float, default=0.25, help="Sliding-window overlap ratio")
+    parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size in number of tiles")
     parser.add_argument("--device", default="auto", help="auto / cpu / cuda")
+    parser.add_argument("--gpu_ids", default="", help="Comma-separated GPU ids for DataParallel, e.g. 0,1")
     parser.add_argument("--foreground_class", type=int, default=1, help="Foreground class index")
     parser.add_argument("--probability_threshold", type=float, default=0.5, help="Foreground probability threshold for binary output")
     parser.add_argument("--process_existing_only", action="store_true", help="Only process physically present input chunks")
@@ -427,9 +341,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk_size", default="", help="Override output chunk size as z,y,x")
     parser.add_argument("--normalize_percentiles", default="1.0,99.5", help="Percentile pair low,high for normalization")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
-    parser.add_argument("--skip_empty", action="store_true", default=True, help="Skip chunks whose max pixel value <= skip_eps")
-    parser.add_argument("--no_skip_empty", action="store_false", dest="skip_empty", help="Disable skipping empty chunks")
-    parser.add_argument("--skip_eps", type=float, default=240.0, help="Max-value threshold for skip_empty (default 240.0)")
     return parser.parse_args()
 
 
@@ -449,6 +360,13 @@ def _parse_percentiles(value: str) -> tuple[float, float]:
     return (float(parts[0]), float(parts[1]))
 
 
+def _parse_gpu_ids(value: str) -> tuple[int, ...] | None:
+    text = str(value).strip()
+    if not text:
+        return None
+    return tuple(int(part.strip()) for part in text.split(",") if part.strip())
+
+
 def main() -> int:
     args = parse_args()
     _configure_logging(args.json_logs)
@@ -463,6 +381,7 @@ def main() -> int:
             overlap=args.overlap,
             batch_size=args.batch_size,
             device=args.device,
+            gpu_ids=_parse_gpu_ids(args.gpu_ids),
             foreground_class=args.foreground_class,
             probability_threshold=args.probability_threshold,
             process_existing_only=args.process_existing_only,
@@ -471,8 +390,6 @@ def main() -> int:
             probability_dtype=args.probability_dtype,
             chunk_size=_parse_triplet(args.chunk_size),
             normalize_percentiles=_parse_percentiles(args.normalize_percentiles),
-            skip_empty=args.skip_empty,
-            skip_eps=args.skip_eps,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0

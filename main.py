@@ -38,6 +38,60 @@ def format_csv(values):
     return ",".join(map(str, values))
 
 
+def remove_path(path):
+    path = Path(path)
+    if not path.exists():
+        return
+    if path.is_dir():
+        for child in path.iterdir():
+            remove_path(child)
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def newest_mtime(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    if path.is_file():
+        return path.stat().st_mtime
+    newest = path.stat().st_mtime
+    for child in path.rglob("*"):
+        try:
+            newest = max(newest, child.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def cfos_unet_checkpoint_path(model_cfg):
+    checkpoint_value = str(model_cfg.get("checkpoint_path", "")).strip()
+    if not checkpoint_value:
+        return None
+    checkpoint_path = Path(checkpoint_value)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = project_root / checkpoint_path
+    return checkpoint_path
+
+
+def cfos_unet_outputs_are_stale(model_cfg, output_paths):
+    if not model_cfg.get("rerun_if_model_updated", False):
+        return False
+    checkpoint_path = cfos_unet_checkpoint_path(model_cfg)
+    if checkpoint_path is None:
+        print("Warning: rerun_if_model_updated is enabled but checkpoint_path is empty.")
+        return False
+    if not checkpoint_path.exists():
+        print(f"Warning: checkpoint not found for freshness check: {checkpoint_path}")
+        return False
+    checkpoint_mtime = checkpoint_path.stat().st_mtime
+    existing_output_mtimes = [mtime for mtime in (newest_mtime(path) for path in output_paths if path) if mtime is not None]
+    if not existing_output_mtimes:
+        return True
+    return checkpoint_mtime > min(existing_output_mtimes)
+
+
 def run_tiff_to_zarr(input_path, output_path, chunk_size, desc):
     chunk_str = format_csv(chunk_size)
     cmd = (
@@ -205,6 +259,7 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     mask_zarr_path = sample_dir / f"ch{signal_ch}_mask.zarr"
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask"
     probability_zarr_path = None
+    force_rerun = False
     if seg_cfg["method"] == "cfos_unet":
         model_cfg = seg_cfg["cfos_unet"]
         configured_probability_zarr = model_cfg.get("probability_zarr", "")
@@ -214,17 +269,26 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
                 probability_zarr_path = sample_dir / probability_zarr_path
         elif model_cfg.get("save_probability", False):
             probability_zarr_path = sample_dir / f"ch{signal_ch}_prob.zarr"
+        force_rerun = cfos_unet_outputs_are_stale(model_cfg, [mask_zarr_path, mask_tiff_dir, probability_zarr_path])
 
     probability_ready = probability_zarr_path is None or probability_zarr_path.exists()
-    if directory_has_files(mask_tiff_dir) and probability_ready:
+    if force_rerun:
+        print("cFos U-Net checkpoint is newer than existing segmentation outputs; rerunning segmentation.")
+
+    if not force_rerun and directory_has_files(mask_tiff_dir) and probability_ready:
         print(f"Found existing mask folder at {mask_tiff_dir}, skipping segmentation.")
         return mask_zarr_path, mask_tiff_dir
 
-    if not mask_zarr_path.exists() or not probability_ready:
+    segmentation_ran = False
+    if force_rerun or not mask_zarr_path.exists() or not probability_ready:
         seg_cmd = build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_zarr_path)
         run_command(seg_cmd, f'Step 2.1: Segmentation ({seg_cfg["method"]})')
+        segmentation_ran = True
     else:
         print(f"Found existing mask Zarr at {mask_zarr_path}, skipping segmentation.")
+
+    if force_rerun and segmentation_ran and directory_has_files(mask_tiff_dir):
+        remove_path(mask_tiff_dir)
 
     if not directory_has_files(mask_tiff_dir):
         export_cmd = (

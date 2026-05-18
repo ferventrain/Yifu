@@ -24,6 +24,7 @@ def test_segmentation_cfg_accepts_cfos_unet_fields():
                 "patch_size": [128, 128, 128],
                 "chunk_size": [64, 64, 64],
                 "process_existing_only": True,
+                "rerun_if_model_updated": True,
             },
         }
     )
@@ -35,6 +36,7 @@ def test_segmentation_cfg_accepts_cfos_unet_fields():
     assert dumped["cfos_unet"]["patch_size"] == (128, 128, 128)
     assert dumped["cfos_unet"]["chunk_size"] == (64, 64, 64)
     assert dumped["cfos_unet"]["process_existing_only"] is True
+    assert dumped["cfos_unet"]["rerun_if_model_updated"] is True
 
 
 def test_schema_export_contains_expected_models():
