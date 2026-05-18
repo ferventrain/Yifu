@@ -661,7 +661,7 @@ def export_block_previews(
         sample_preview_dir = preview_path
         sample_preview_dir.mkdir(parents=True, exist_ok=True)
         block_id = str(record.get("block_id") or "block")
-        image_preview_path = sample_preview_dir / 'image' / f"{block_id}_image.tiff"
+        image_preview_path = sample_preview_dir / 'image' / f"{block_id}.tiff"
         mask_preview_path = sample_preview_dir / 'mask' / f"{block_id}_mask.tiff"
         image_preview_path.parent.mkdir(parents=True, exist_ok=True)
         mask_preview_path.parent.mkdir(parents=True, exist_ok=True)

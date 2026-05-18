@@ -190,5 +190,7 @@ def test_export_block_previews_writes_image_and_mask_tiffs(tmp_path: Path):
     mask_preview = tifffile.imread(str(mask_preview_path))
     assert image_preview.shape == (2, 2, 2)
     assert mask_preview.shape == (2, 2, 2)
+    assert image_preview_path.name == "sample_0-0-0.tiff"
+    assert mask_preview_path.name == "sample_0-0-0_mask.tiff"
     np.testing.assert_array_equal(image_preview, image[0:2, 0:2, 0:2])
     np.testing.assert_array_equal(mask_preview, mask[0:2, 0:2, 0:2])

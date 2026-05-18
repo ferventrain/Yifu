@@ -64,7 +64,7 @@
         "example_command": "python -m pipeline_modules.segmentation.cfos_unet_qc --records_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\qc_records.csv --output_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\review_queue.csv --top_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue.csv --preview_dir H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue_previews --top_n 30 --max_per_large_grid 10",
         "selection_rule": "Blocks are first sorted by review_score. The final preview set contains up to top_n blocks, with at most max_per_large_grid blocks per large grid. A large grid is defined by the first two numbers in chunk_index, e.g. chunk_index 7.7.18 belongs to large grid 7-7.",
         "block_name_rule": "Preview file names and block_id use source sample_id plus chunk position, e.g. Henl_1_7-7-18_mask.tiff.",
-        "preview_layout": "preview_dir/image contains *_image.tiff; preview_dir/mask contains *_mask.tiff."
+        "preview_layout": "preview_dir/image contains *.tiff using block_id only; preview_dir/mask contains *_mask.tiff."
       },
       "inputs": {
         "records_csv": {"type": "path|null", "default": null},
