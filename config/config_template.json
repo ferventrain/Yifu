@@ -50,7 +50,8 @@
             "suppression_weight": 0.8,
             "brightness_pct": 90.0,
             "smooth_sigma": 5.0,
-            "export_tiff": false
+            "min_area_px": 50,
+            "max_workers": 8
         },
         "tubular_enhancement": {
             "apply": false,
@@ -108,6 +109,7 @@
             "foreground_class": 1,
             "probability_threshold": 0.5,
             "process_existing_only": false,
+            "skip_below_threshold": 100.0,
             "rerun_if_model_updated": true,
             "output_mode": "binary",
             "output_dtype": "uint8",

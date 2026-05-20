@@ -135,16 +135,15 @@ def calculate_downsample_factor_str(input_res, target_res):
     return ",".join(f"{factor:.4f}" for factor in factors_zyx)
 
 
-def ensure_signal_zarr(sample_dir, signal_ch, preprocessing_cfg, zarr_cfg):
+def ensure_signal_tiff_dir(sample_dir, signal_ch, preprocessing_cfg, *, output_dir=None):
     from pipeline_modules.preprocessing.preprocessor import Preprocessor
 
     raw_tiff_dir = sample_dir / f"ch{signal_ch}"
-    zarr_path = sample_dir / f"ch{signal_ch}.zarr"
     current_signal_tiff_dir = raw_tiff_dir
 
     preprocessor = Preprocessor(preprocessing_cfg)
     if preprocessor.steps:
-        enhanced_dir = sample_dir / f"ch{signal_ch}_preprocessed"
+        enhanced_dir = Path(output_dir) if output_dir is not None else sample_dir / f"ch{signal_ch}_preprocessed"
         success = preprocessor.process_folder(
             input_folder=current_signal_tiff_dir,
             output_folder=enhanced_dir,
@@ -158,11 +157,17 @@ def ensure_signal_zarr(sample_dir, signal_ch, preprocessing_cfg, zarr_cfg):
     else:
         print("No preprocessing enhancement steps enabled, using raw TIFF directly.")
 
+    return current_signal_tiff_dir
+
+
+def ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg):
+    zarr_path = sample_dir / f"ch{signal_ch}.zarr"
+
     if zarr_path.exists():
         print(f"Zarr file exists, skipping conversion: {zarr_path}")
     else:
         run_tiff_to_zarr(
-            current_signal_tiff_dir,
+            signal_tiff_dir,
             zarr_path,
             zarr_cfg["chunk_size"],
             "Step 1.1: Convert Signal TIFF to Zarr",
@@ -247,6 +252,8 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
             cmd += f' --chunk_size "{format_csv(model_cfg["chunk_size"])}"'
         if model_cfg.get("normalize_percentiles"):
             cmd += f' --normalize_percentiles "{format_csv(model_cfg["normalize_percentiles"])}"'
+        if model_cfg.get("skip_below_threshold") is not None:
+            cmd += f' --skip_below_threshold {model_cfg.get("skip_below_threshold")}'
         if model_cfg.get("process_existing_only", False):
             cmd += ' --process_existing_only'
         return cmd
@@ -457,11 +464,7 @@ def main():
     reg_cfg = cfg["registration"]
     density_cfg_path = resolve_density_cfg_path(cfg["analysis"])
 
-    # ---- Step 1: TIFF preprocessing + Zarr ----
-    zarr_path = ensure_signal_zarr(sample_dir, signal_ch, preprocessing_cfg, zarr_cfg)
-    original_zarr_path = zarr_path
-
-    # ---- Step 1.5: Registration downsample ----
+    # ---- Step 1: Registration downsample ----
     ensure_registration_downsample(
         sample_dir,
         reg_ch,
@@ -476,29 +479,35 @@ def main():
             sample_dir, signal_ch, reg_ch, reg_cfg, config_path,
         )
 
-    # ---- Step 3: Edge signal removal (uses atlas label) ----
+    # ---- Step 3: TIFF preprocessing + optional edge signal removal ----
     esr_cfg = preprocessing_cfg.get("edge_signal_removal", {})
-    if esr_cfg.get("apply", False) and warped_label_zarr:
-        clean_zarr_path = sample_dir / f"ch{signal_ch}_clean.zarr"
+    edge_removal_enabled = esr_cfg.get("apply", False)
+    if edge_removal_enabled and warped_label_zarr:
+        raw_tiff_dir = sample_dir / f"ch{signal_ch}"
+        clean_tiff_dir = sample_dir / f"ch{signal_ch}_preprocessed"
+        clean_zarr_path = sample_dir / f"ch{signal_ch}.zarr"
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.edge_signal_removal '
+            f'--input_dir "{raw_tiff_dir}" '
+            f'--label_dir "{warped_label_dir}" '
+            f'--output_dir "{clean_tiff_dir}" '
+            f'--edge_width_px {esr_cfg.get("edge_width_px", 20)} '
+            f'--suppression_weight {esr_cfg.get("suppression_weight", 0.8)} '
+            f'--brightness_pct {esr_cfg.get("brightness_pct", 90.0)} '
+            f'--smooth_sigma {esr_cfg.get("smooth_sigma", 5.0)} '
+            f'--min_area_px {esr_cfg.get("min_area_px", 50)} '
+            f'--max_workers {esr_cfg.get("max_workers", 8)} '
+            f'--preprocess_config "{config_path}" '
+            "--no_resume"
+        )
+        run_command(cmd, "Step 3: TIFF Preprocessing + Edge Signal Removal")
+        signal_tiff_dir = clean_tiff_dir
         if clean_zarr_path.exists():
-            print(f"Cleaned Zarr exists, skipping edge signal removal: {clean_zarr_path}")
-        else:
-            cmd = (
-                f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.edge_signal_removal '
-                f'--input_zarr "{original_zarr_path}" '
-                f'--label_zarr "{warped_label_zarr}" '
-                f'--output_zarr "{clean_zarr_path}" '
-                f'--edge_width_px {esr_cfg.get("edge_width_px", 20)} '
-                f'--suppression_weight {esr_cfg.get("suppression_weight", 0.8)} '
-                f'--brightness_pct {esr_cfg.get("brightness_pct", 90.0)} '
-                f'--smooth_sigma {esr_cfg.get("smooth_sigma", 5.0)} '
-                f'--slab_depth {esr_cfg.get("slab_depth", 32)}'
-            )
-            if esr_cfg.get("export_tiff", False):
-                tiff_out = esr_cfg.get("tiff_output") or str(sample_dir / f"ch{signal_ch}_clean_tiff")
-                cmd += f' --export_tiff "{tiff_out}"'
-            run_command(cmd, "Step 3: Edge Signal Removal")
-        zarr_path = clean_zarr_path
+            remove_path(clean_zarr_path)
+        zarr_path = ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg)
+    else:
+        signal_tiff_dir = ensure_signal_tiff_dir(sample_dir, signal_ch, preprocessing_cfg)
+        zarr_path = ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg)
 
     # ---- Step 4: 3D Tubular Enhancement (optional) ----
     te_cfg = preprocessing_cfg.get("tubular_enhancement", {})

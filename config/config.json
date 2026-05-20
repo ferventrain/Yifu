@@ -47,12 +47,13 @@
       "tile_grid_size": 8
     },
     "edge_signal_removal": {
-      "apply": false,
-      "edge_width_px": 20,
-      "suppression_weight": 0.8,
+      "apply": true,
+      "edge_width_px": 40,
+      "suppression_weight": 0.9,
       "brightness_pct": 90.0,
       "smooth_sigma": 5.0,
-      "export_tiff": false
+      "min_area_px": 50,
+      "max_workers": 8
     },
     "tubular_enhancement": {
       "apply": false,
@@ -117,11 +118,12 @@
       "dataset_name": "0",
       "patch_size": [256, 256, 256],
       "overlap": 0.25,
-      "batch_size": 4,
+      "batch_size": 16,
       "device": "auto",
       "foreground_class": 1,
       "probability_threshold": 0.5,
       "process_existing_only": false,
+      "skip_below_threshold": 100.0,
       "rerun_if_model_updated": true,
       "output_mode": "binary",
       "output_dtype": "uint8",

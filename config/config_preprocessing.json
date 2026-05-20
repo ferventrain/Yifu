@@ -56,7 +56,8 @@
       "suppression_weight": 0.8,
       "brightness_pct": 90.0,
       "smooth_sigma": 5.0,
-      "export_tiff": false
+      "min_area_px": 50,
+      "max_workers": 8
     },
     "tubular_enhancement": {
       "apply": false,

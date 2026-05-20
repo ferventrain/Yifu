@@ -52,7 +52,7 @@ def test_compute_sample_qc_metrics_uses_probability_uncertainty(tmp_path: Path):
 
 
 def test_compute_block_qc_metrics_emits_one_record_per_block(tmp_path: Path):
-    image = np.arange(64, dtype=np.uint16).reshape(4, 4, 4)
+    image = np.arange(64, dtype=np.uint16).reshape(4, 4, 4) + 100
     mask = np.zeros((4, 4, 4), dtype=np.uint8)
     mask[0:2, 0:2, 0:2] = 1
     prob = np.zeros((4, 4, 4), dtype=np.float32)
@@ -79,8 +79,28 @@ def test_compute_block_qc_metrics_emits_one_record_per_block(tmp_path: Path):
     assert records[0]["block_shape_zyx"] == "2,2,2"
 
 
+def test_compute_block_qc_metrics_skips_low_signal_blocks(tmp_path: Path):
+    image = np.zeros((2, 2, 4), dtype=np.uint16)
+    image[:, :, 2:4] = 150
+    mask = np.ones((2, 2, 4), dtype=np.uint8)
+
+    image_path = _write_zarr(tmp_path / "sample.zarr", image, chunks=(2, 2, 2))
+    mask_path = _write_zarr(tmp_path / "sample_mask.zarr", mask, chunks=(2, 2, 2))
+
+    records = compute_block_qc_metrics(
+        sample_id="sample",
+        image_zarr=image_path,
+        mask_zarr=mask_path,
+        chunk_size=(2, 2, 2),
+        skip_below_threshold=100.0,
+    )
+
+    assert len(records) == 1
+    assert records[0]["chunk_index"] == "0.0.1"
+
+
 def test_build_review_queue_ranks_uncertain_block_first(tmp_path: Path):
-    image = np.arange(64, dtype=np.uint16).reshape(4, 4, 4)
+    image = np.arange(64, dtype=np.uint16).reshape(4, 4, 4) + 100
     mask = np.zeros((4, 4, 4), dtype=np.uint8)
     mask[0:2, 0:2, 0:2] = 1
     mask[2:4, 2:4, 2:4] = 1

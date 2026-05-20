@@ -209,6 +209,7 @@ def compute_block_qc_metrics(
     uncertainty_high: float = 0.6,
     small_component_max_voxels: int = 32,
     skip_empty_blocks: bool = True,
+    skip_below_threshold: float | None = 100.0,
     workers: int = 32,
 ) -> list[dict[str, Any]]:
     import numpy as np
@@ -249,7 +250,7 @@ def compute_block_qc_metrics(
                 print("ERROR: --no_skip_empty_blocks not set but image_zarr (ch1_preprocessed.zarr) is missing", file=sys.stderr)
                 sys.exit(1)
             image_chunk = np.asarray(image_data[slices])
-            if float(image_chunk.max()) <= 240.0:
+            if skip_below_threshold is not None and float(image_chunk.max()) < float(skip_below_threshold):
                 return None
 
         uncertain_voxels = 0
@@ -562,6 +563,7 @@ def build_review_queue(
     small_component_max_voxels: int = 32,
     skip_missing: bool = False,
     skip_empty_blocks: bool = True,
+    skip_below_threshold: float | None = 100.0,
     workers: int = 32,
 ) -> list[dict[str, Any]]:
     metrics = []
@@ -588,6 +590,7 @@ def build_review_queue(
                 uncertainty_high=uncertainty_high,
                 small_component_max_voxels=small_component_max_voxels,
                 skip_empty_blocks=skip_empty_blocks,
+                skip_below_threshold=skip_below_threshold,
                 workers=workers,
             )
         )
@@ -699,6 +702,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--uncertainty_low", type=float, default=0.4)
     parser.add_argument("--uncertainty_high", type=float, default=0.6)
     parser.add_argument("--small_component_max_voxels", type=int, default=32)
+    parser.add_argument(
+        "--skip_below_threshold",
+        type=float,
+        default=100.0,
+        help="Skip blocks whose raw image max intensity is below this value; use a negative value to disable",
+    )
     parser.add_argument("--top_n", type=int, default=30)
     parser.add_argument("--max_per_large_grid", type=int, default=10)
     parser.add_argument("--large_grid_size", default="1024,1024,1024", help="Large grid size z,y,x (default 1024,1024,1024)")
@@ -747,6 +756,7 @@ def main() -> int:
             small_component_max_voxels=args.small_component_max_voxels,
             skip_missing=args.skip_missing,
             skip_empty_blocks=not args.no_skip_empty_blocks,
+            skip_below_threshold=None if args.skip_below_threshold < 0 else args.skip_below_threshold,
             workers=args.workers,
         )
         output_csv = Path(args.output_csv)

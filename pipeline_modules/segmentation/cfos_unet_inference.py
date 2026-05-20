@@ -170,6 +170,7 @@ def run_cfos_unet_inference(
     foreground_class: int = 1,
     probability_threshold: float = 0.5,
     process_existing_only: bool = False,
+    skip_below_threshold: float | None = 100.0,
     output_mode: str = "binary",
     output_dtype: str = "uint8",
     probability_dtype: str = "float16",
@@ -223,6 +224,7 @@ def run_cfos_unet_inference(
         )
 
     processed_regions = 0
+    skipped_regions = 0
     if process_existing_only:
         existing_indices = list_existing_chunk_indices(data_in)
         if not existing_indices:
@@ -247,6 +249,9 @@ def run_cfos_unet_inference(
     with torch_mod.inference_mode():
         for slices in tqdm(chunk_slices_iter, total=len(chunk_slices_iter), desc="cFos inference", unit="chunk"):
             volume_np = np.asarray(data_in[slices])
+            if skip_below_threshold is not None and float(volume_np.max()) < float(skip_below_threshold):
+                skipped_regions += 1
+                continue
             volume_np = normalize_volume(
                 volume_np,
                 low_pct=float(normalize_percentiles[0]),
@@ -258,9 +263,9 @@ def run_cfos_unet_inference(
                 torch_mod=torch_mod,
                 patch_size=inferred_patch_size,
                 overlap=float(overlap),
-            batch_size=int(batch_size),
-            device=model_device,
-        )
+                batch_size=int(batch_size),
+                device=model_device,
+            )
             probs = torch_mod.softmax(logits, dim=0)
             fg_probs = probs[int(foreground_class)].cpu().numpy()
             if output_mode == "multiclass":
@@ -283,6 +288,8 @@ def run_cfos_unet_inference(
         "chunks": list(inferred_chunk_size),
         "patch_size": list(inferred_patch_size),
         "processed_regions": processed_regions,
+        "skipped_regions": skipped_regions,
+        "skip_below_threshold": skip_below_threshold,
         "resolved_device": resolved_device,
         "num_classes": int(model_bundle["num_classes"]),
         "base_channels": int(model_bundle["base_channels"]),
@@ -307,6 +314,7 @@ def run_cfos_unet_inference(
             "foreground_class": foreground_class,
             "probability_threshold": probability_threshold,
             "process_existing_only": process_existing_only,
+            "skip_below_threshold": skip_below_threshold,
             "output_mode": output_mode,
             "output_dtype": output_dtype,
             "probability_dtype": probability_dtype,
@@ -335,6 +343,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--foreground_class", type=int, default=1, help="Foreground class index")
     parser.add_argument("--probability_threshold", type=float, default=0.5, help="Foreground probability threshold for binary output")
     parser.add_argument("--process_existing_only", action="store_true", help="Only process physically present input chunks")
+    parser.add_argument(
+        "--skip_below_threshold",
+        type=float,
+        default=100.0,
+        help="Skip chunks whose raw input max intensity is below this value; use a negative value to disable",
+    )
     parser.add_argument("--output_mode", choices=["binary", "multiclass"], default="binary")
     parser.add_argument("--output_dtype", default="uint8", help="numpy dtype for the output mask")
     parser.add_argument("--probability_dtype", default="float16", help="numpy dtype for optional probability output")
@@ -385,6 +399,7 @@ def main() -> int:
             foreground_class=args.foreground_class,
             probability_threshold=args.probability_threshold,
             process_existing_only=args.process_existing_only,
+            skip_below_threshold=None if args.skip_below_threshold < 0 else args.skip_below_threshold,
             output_mode=args.output_mode,
             output_dtype=args.output_dtype,
             probability_dtype=args.probability_dtype,

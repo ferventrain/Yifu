@@ -44,6 +44,7 @@
         "output_dtype": {"type": "string", "default": "uint8"},
         "probability_dtype": {"type": "string", "default": "float16"},
         "process_existing_only": {"type": "bool", "default": false},
+        "skip_below_threshold": {"type": "float|null", "default": 100.0},
         "chunk_size": {"type": "triplet_int|null", "default": null},
         "normalize_percentiles": {"type": "pair_float", "default": [1.0, 99.5]}
       },
@@ -79,6 +80,7 @@
         "uncertainty_low": {"type": "float", "default": 0.4},
         "uncertainty_high": {"type": "float", "default": 0.6},
         "small_component_max_voxels": {"type": "int", "default": 32},
+        "skip_below_threshold": {"type": "float|null", "default": 100.0},
         "top_n": {"type": "int", "default": 30},
         "max_per_large_grid": {"type": "int", "default": 10},
         "output_csv": {"type": "path", "default": "review_queue.csv"},

@@ -81,6 +81,7 @@ class CfosUNetInferenceCfg(_ModelMixin):
     foreground_class: int = 1
     probability_threshold: float = 0.5
     process_existing_only: bool = False
+    skip_below_threshold: float | None = 100.0
     rerun_if_model_updated: bool = False
     output_mode: str = "binary"
     output_dtype: str = "uint8"

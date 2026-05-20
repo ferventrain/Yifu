@@ -135,7 +135,8 @@ class EdgeSignalRemovalCfg(_ModelMixin):
     suppression_weight: float = 0.8
     brightness_pct: float = 90.0
     smooth_sigma: float = 5.0
-    export_tiff: bool = False
+    min_area_px: int = 50
+    max_workers: int = 8
 
 
 @dataclass(frozen=True)
