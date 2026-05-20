@@ -102,6 +102,7 @@
   },
   "segmentation": {
     "method": "threshold",
+    "export_mask_tiff": false,
     "cellpose": {
       "model": "cyto3",
       "diameter": 30.0,

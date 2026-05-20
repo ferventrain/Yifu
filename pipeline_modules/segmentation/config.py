@@ -76,7 +76,7 @@ class CfosUNetInferenceCfg(_ModelMixin):
     dataset_name: str = "0"
     patch_size: tuple[int, int, int] | None = None
     overlap: float = 0.25
-    batch_size: int = 1
+    batch_size: int = 4
     device: str = "auto"
     foreground_class: int = 1
     probability_threshold: float = 0.5
@@ -84,7 +84,7 @@ class CfosUNetInferenceCfg(_ModelMixin):
     rerun_if_model_updated: bool = False
     output_mode: str = "binary"
     output_dtype: str = "uint8"
-    probability_dtype: str = "float32"
+    probability_dtype: str = "float16"
     chunk_size: tuple[int, int, int] | None = None
     normalize_percentiles: tuple[float, float] = (1.0, 99.5)
 
@@ -105,6 +105,7 @@ class SegmentationCfg(_ModelMixin):
     """Top-level segmentation configuration."""
 
     method: str = "threshold"
+    export_mask_tiff: bool = False
     threshold: ThresholdSegmentationCfg = field(default_factory=ThresholdSegmentationCfg)
     cfos_unet: CfosUNetInferenceCfg = field(default_factory=CfosUNetInferenceCfg)
 
@@ -119,6 +120,7 @@ class SegmentationCfg(_ModelMixin):
             "type": "object",
             "properties": {
                 "method": {"type": "string", "enum": ["threshold", "cfos_unet", "cellpose"]},
+                "export_mask_tiff": {"type": "boolean", "default": False},
                 "threshold": {"type": "object"},
                 "cfos_unet": {"type": "object"},
             },

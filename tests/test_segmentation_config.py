@@ -30,6 +30,7 @@ def test_segmentation_cfg_accepts_cfos_unet_fields():
     )
     dumped = cfg.model_dump()
     assert dumped["method"] == "cfos_unet"
+    assert dumped["export_mask_tiff"] is False
     assert dumped["cfos_unet"]["checkpoint_path"] == "models/best_model.pt"
     assert dumped["cfos_unet"]["save_probability"] is True
     assert dumped["cfos_unet"]["probability_zarr"] == "sample/ch2_prob.zarr"

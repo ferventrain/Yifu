@@ -237,7 +237,7 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
             f'--probability_threshold {model_cfg.get("probability_threshold", 0.5)} '
             f'--output_mode "{model_cfg.get("output_mode", "binary")}" '
             f'--output_dtype "{model_cfg.get("output_dtype", "uint8")}" '
-            f'--probability_dtype "{model_cfg.get("probability_dtype", "float32")}"'
+            f'--probability_dtype "{model_cfg.get("probability_dtype", "float16")}"'
         )
         if probability_zarr_path:
             cmd += f' --probability_zarr "{probability_zarr_path}"'
@@ -258,6 +258,7 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
 def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     mask_zarr_path = sample_dir / f"ch{signal_ch}_mask.zarr"
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask"
+    export_mask_tiff = bool(seg_cfg.get("export_mask_tiff", False))
     probability_zarr_path = None
     force_rerun = False
     if seg_cfg["method"] == "cfos_unet":
@@ -269,13 +270,21 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
                 probability_zarr_path = sample_dir / probability_zarr_path
         elif model_cfg.get("save_probability", False):
             probability_zarr_path = sample_dir / f"ch{signal_ch}_prob.zarr"
-        force_rerun = cfos_unet_outputs_are_stale(model_cfg, [mask_zarr_path, mask_tiff_dir, probability_zarr_path])
+        freshness_outputs = [mask_zarr_path, probability_zarr_path]
+        if export_mask_tiff:
+            freshness_outputs.append(mask_tiff_dir)
+        force_rerun = cfos_unet_outputs_are_stale(model_cfg, freshness_outputs)
 
     probability_ready = probability_zarr_path is None or probability_zarr_path.exists()
     if force_rerun:
         print("cFos U-Net checkpoint is newer than existing segmentation outputs; rerunning segmentation.")
 
-    if not force_rerun and directory_has_files(mask_tiff_dir) and probability_ready:
+    if not force_rerun and mask_zarr_path.exists() and probability_ready:
+        print(f"Found existing mask Zarr at {mask_zarr_path}, skipping segmentation.")
+        if not export_mask_tiff:
+            return mask_zarr_path, mask_tiff_dir
+
+    if export_mask_tiff and not force_rerun and directory_has_files(mask_tiff_dir) and probability_ready:
         print(f"Found existing mask folder at {mask_tiff_dir}, skipping segmentation.")
         return mask_zarr_path, mask_tiff_dir
 
@@ -290,13 +299,15 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     if force_rerun and segmentation_ran and directory_has_files(mask_tiff_dir):
         remove_path(mask_tiff_dir)
 
-    if not directory_has_files(mask_tiff_dir):
+    if export_mask_tiff and not directory_has_files(mask_tiff_dir):
         export_cmd = (
             f'"{PYTHON_EXE}" -c "from pipeline_modules.segmentation '
             f'import export_zarr_to_tiff; '
             f"export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
         )
         run_command(export_cmd, "Step 2.2: Export Mask Zarr to TIFF")
+    elif not export_mask_tiff:
+        print("Skipping Step 2.2: Export Mask Zarr to TIFF (segmentation.export_mask_tiff=false).")
 
     return mask_zarr_path, mask_tiff_dir
 

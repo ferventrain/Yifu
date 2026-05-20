@@ -164,7 +164,7 @@ def run_cfos_unet_inference(
     dataset_name: str = "0",
     patch_size: tuple[int, int, int] | None = None,
     overlap: float = 0.25,
-    batch_size: int = 1,
+    batch_size: int = 4,
     device: str = "auto",
     gpu_ids: tuple[int, ...] | None = None,
     foreground_class: int = 1,
@@ -172,7 +172,7 @@ def run_cfos_unet_inference(
     process_existing_only: bool = False,
     output_mode: str = "binary",
     output_dtype: str = "uint8",
-    probability_dtype: str = "float32",
+    probability_dtype: str = "float16",
     chunk_size: tuple[int, int, int] | None = None,
     normalize_percentiles: tuple[float, float] = (1.0, 99.5),
 ) -> dict[str, Any]:
@@ -329,7 +329,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the input/output Zarr groups")
     parser.add_argument("--patch_size", default="", help="Override patch size as z,y,x")
     parser.add_argument("--overlap", type=float, default=0.25, help="Sliding-window overlap ratio")
-    parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size in number of tiles")
+    parser.add_argument("--batch_size", type=int, default=4, help="Inference batch size in number of tiles")
     parser.add_argument("--device", default="auto", help="auto / cpu / cuda")
     parser.add_argument("--gpu_ids", default="", help="Comma-separated GPU ids for DataParallel, e.g. 0,1")
     parser.add_argument("--foreground_class", type=int, default=1, help="Foreground class index")
@@ -337,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--process_existing_only", action="store_true", help="Only process physically present input chunks")
     parser.add_argument("--output_mode", choices=["binary", "multiclass"], default="binary")
     parser.add_argument("--output_dtype", default="uint8", help="numpy dtype for the output mask")
-    parser.add_argument("--probability_dtype", default="float32", help="numpy dtype for optional probability output")
+    parser.add_argument("--probability_dtype", default="float16", help="numpy dtype for optional probability output")
     parser.add_argument("--chunk_size", default="", help="Override output chunk size as z,y,x")
     parser.add_argument("--normalize_percentiles", default="1.0,99.5", help="Percentile pair low,high for normalization")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")

@@ -93,6 +93,7 @@
   },
   "segmentation": {
     "method": "cfos_unet",
+    "export_mask_tiff": false,
     "cellpose": {
       "model": "cyto3",
       "diameter": 30.0,
@@ -114,9 +115,9 @@
       "save_probability": true,
       "probability_zarr": "",
       "dataset_name": "0",
-      "patch_size": [128, 128, 128],
+      "patch_size": [256, 256, 256],
       "overlap": 0.25,
-      "batch_size": 1,
+      "batch_size": 4,
       "device": "auto",
       "foreground_class": 1,
       "probability_threshold": 0.5,
@@ -124,7 +125,7 @@
       "rerun_if_model_updated": true,
       "output_mode": "binary",
       "output_dtype": "uint8",
-      "probability_dtype": "float32",
+      "probability_dtype": "float16",
       "normalize_percentiles": [1.0, 99.5]
     }
   },
