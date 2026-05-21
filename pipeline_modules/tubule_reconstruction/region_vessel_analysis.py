@@ -139,6 +139,31 @@ def parse_region_list(text):
     return [item.strip() for item in items if str(item).strip()]
 
 
+def _load_input_resolution_xyz_from_config(config_path):
+    config_path = Path(config_path)
+    with open(config_path, "r", encoding="utf-8") as handle:
+        cfg = json.load(handle)
+    try:
+        resolution = cfg["input"]["resolution_xyz"]
+    except KeyError as exc:
+        raise ValueError(
+            f"Config file is missing input.resolution_xyz: {config_path}"
+        ) from exc
+    return tuple(float(v) for v in resolution)
+
+
+def _default_config_path():
+    candidate = Path(__file__).resolve().parents[2] / "config" / "config.json"
+    return candidate if candidate.exists() else None
+
+
+def _default_annotation_zarr_path(vertex_csv_path):
+    vertex_csv_path = Path(vertex_csv_path)
+    output_dir = vertex_csv_path.parent
+    sample_dir = output_dir.parent if output_dir.name == "tubule_reconstruction" else output_dir
+    return sample_dir / "upsampled_atlas_label.zarr"
+
+
 def sample_annotation_labels_at_points_um(
     points_zyx_um,
     annotation_zarr,
@@ -273,14 +298,19 @@ def _regional_summary(
 def analyze_regions_from_skeleton(
     vertex_csv_path,
     edge_csv_path,
-    annotation_zarr_path,
-    region_cfg_csv,
-    regions,
+    annotation_zarr_path=None,
+    region_cfg_csv=None,
+    regions=None,
     output_dir=None,
     annotation_dataset_name="0",
-    annotation_resolution_xyz=(25.0, 25.0, 25.0),
+    annotation_resolution_xyz=None,
+    config_path=None,
 ):
     """Compute per-region vessel parameters from existing skeleton CSV outputs."""
+    if region_cfg_csv is None:
+        raise ValueError("region_cfg_csv is required.")
+    if regions is None:
+        raise ValueError("regions is required.")
     region_queries = parse_region_list(regions)
     if not region_queries:
         raise ValueError("No regions provided.")
@@ -307,6 +337,25 @@ def analyze_regions_from_skeleton(
     missing_ecols = required_edge_cols - set(edge_table.columns)
     if missing_ecols:
         raise ValueError(f"Edge CSV is missing required columns: {sorted(missing_ecols)}")
+
+    if annotation_zarr_path is None:
+        annotation_zarr_path = _default_annotation_zarr_path(vertex_csv_path)
+    annotation_zarr_path = Path(annotation_zarr_path)
+    if not annotation_zarr_path.exists():
+        raise FileNotFoundError(
+            f"Annotation Zarr not found: {annotation_zarr_path}. "
+            "Pass --annotation_zarr explicitly or ensure sample_dir/upsampled_atlas_label.zarr exists."
+        )
+
+    if annotation_resolution_xyz is None:
+        if config_path is None:
+            config_path = _default_config_path()
+        if config_path is None:
+            raise ValueError(
+                "annotation_resolution_xyz was not provided and config/config.json was not found. "
+                "Pass --config or --annotation_resolution_xyz."
+            )
+        annotation_resolution_xyz = _load_input_resolution_xyz_from_config(config_path)
 
     annotation_zarr = open_zarr_dataset(annotation_zarr_path, dataset_name=annotation_dataset_name)
     if len(annotation_zarr.shape) != 3:
@@ -336,6 +385,7 @@ def analyze_regions_from_skeleton(
                 "regions": regions,
                 "annotation_dataset_name": annotation_dataset_name,
                 "annotation_resolution_xyz": annotation_resolution_xyz,
+                "config_path": str(config_path) if config_path is not None else None,
             },
             outputs=_output_files,
             started_at=_started_at,
@@ -455,9 +505,20 @@ def build_argparser():
     )
     parser.add_argument("--vertex_csv", required=True, help="Path to skeleton_vertices.csv")
     parser.add_argument("--edge_csv", required=True, help="Path to skeleton_edges.csv")
-    parser.add_argument("--annotation_zarr", required=True, help="Registered annotation label Zarr")
+    parser.add_argument(
+        "--annotation_zarr",
+        help=(
+            "Registered annotation label Zarr. Defaults to "
+            "<sample_dir>/upsampled_atlas_label.zarr when vertex_csv is in "
+            "<sample_dir>/tubule_reconstruction/."
+        ),
+    )
     parser.add_argument("--annotation_dataset_name", default="0", help="Dataset name inside annotation Zarr")
-    parser.add_argument("--annotation_resolution_xyz", default="25,25,25", help="Annotation voxel size in um as x,y,z")
+    parser.add_argument(
+        "--annotation_resolution_xyz",
+        help="Annotation voxel size in um as x,y,z. Defaults to input.resolution_xyz from --config.",
+    )
+    parser.add_argument("--config", help="Path to config.json; used for input.resolution_xyz by default")
     parser.add_argument("--cfg", required=True, help="Allen region CSV path")
     parser.add_argument(
         "--regions",
@@ -504,6 +565,7 @@ def main():
             output_dir=args.output_dir,
             annotation_dataset_name=args.annotation_dataset_name,
             annotation_resolution_xyz=args.annotation_resolution_xyz,
+            config_path=args.config,
         )
 
         summary_table = result["summary_table"]

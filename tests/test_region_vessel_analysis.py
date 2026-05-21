@@ -140,6 +140,39 @@ class TestAnalyzeRegionsFromSkeleton:
         assert result["summary_json_path"].exists()
         assert result["manifest_path"].exists()
 
+    def test_defaults_to_sample_label_zarr_and_config_resolution(
+        self, tmp_path, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_region_csv
+    ):
+        import shutil
+
+        sample_dir = tmp_path / "sample01"
+        tubule_dir = sample_dir / "tubule_reconstruction"
+        tubule_dir.mkdir(parents=True)
+        default_label_zarr = sample_dir / "upsampled_atlas_label.zarr"
+        shutil.copytree(tiny_annotation_zarr, default_label_zarr)
+
+        vertex_csv, edge_csv = tiny_skeleton_csvs
+        default_vertex_csv = tubule_dir / "skeleton_vertices.csv"
+        default_edge_csv = tubule_dir / "skeleton_edges.csv"
+        shutil.copy2(vertex_csv, default_vertex_csv)
+        shutil.copy2(edge_csv, default_edge_csv)
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            '{"input": {"resolution_xyz": [25.0, 25.0, 25.0]}}',
+            encoding="utf-8",
+        )
+
+        result = analyze_regions_from_skeleton(
+            vertex_csv_path=default_vertex_csv,
+            edge_csv_path=default_edge_csv,
+            region_cfg_csv=tiny_region_csv,
+            regions="RA",
+            output_dir=None,
+            config_path=config_path,
+        )
+        assert "summary_table" in result
+
     def test_empty_regions_raises(
         self, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_region_csv
     ):

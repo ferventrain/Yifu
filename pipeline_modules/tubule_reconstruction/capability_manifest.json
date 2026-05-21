@@ -89,12 +89,13 @@
       "inputs": {
         "vertex_csv_path":            {"type": "path", "required": true, "description": "skeleton_vertices.csv"},
         "edge_csv_path":              {"type": "path", "required": true, "description": "skeleton_edges.csv"},
-        "annotation_zarr_path":       {"type": "path", "required": true, "description": "Registered annotation label Zarr"},
+        "annotation_zarr_path":       {"type": "path|null", "default": null, "description": "Registered annotation label Zarr; defaults to sample_dir/upsampled_atlas_label.zarr"},
         "region_cfg_csv":             {"type": "path", "required": true, "description": "Allen region CSV"},
         "regions":                    {"type": "string|list[string]", "required": true, "description": "Comma/semicolon list of region queries (acronym, full name, or integer id)"},
         "output_dir":                 {"type": "path|null", "default": null, "description": "If set, write CSV/JSON + manifest here"},
         "annotation_dataset_name":    {"type": "string", "default": "0"},
-        "annotation_resolution_xyz":  {"type": "triplet_float_um", "default": [25.0, 25.0, 25.0]}
+        "annotation_resolution_xyz":  {"type": "triplet_float_um|null", "default": null, "description": "Defaults to input.resolution_xyz from config.json"},
+        "config_path":                {"type": "path|null", "default": null, "description": "Config JSON used to read input.resolution_xyz"}
       },
       "outputs": {
         "summary_table":      {"type": "DataFrame", "description": "In-memory pandas DataFrame with per-region metrics"},

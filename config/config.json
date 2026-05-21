@@ -78,8 +78,8 @@
   "registration": {
     "method": "ants",
     "mode": "atlas2image",
-    "atlas_path": "S:/Yifu/data/reference/atlas.tiff",
-    "annotation_path": "S:/Yifu/data/reference/atlas_label.tiff",
+    "atlas_path": "data/reference/atlas.tiff",
+    "annotation_path": "data/reference/atlas_label.tiff",
     "transform_type": "SyN",
     "allow_reflection": false,
     "save_upsampled_label": true,

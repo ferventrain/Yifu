@@ -92,7 +92,7 @@ class TestTubuleReconstructionCfg:
 class TestRegionVesselAnalysisCfg:
     def test_defaults(self):
         cfg = RegionVesselAnalysisCfg()
-        assert cfg.annotation_resolution_xyz == (25.0, 25.0, 25.0)
+        assert cfg.annotation_resolution_xyz == (1.0, 1.0, 1.0)
         assert cfg.regions == ()
 
     def test_regions_from_comma_string(self):

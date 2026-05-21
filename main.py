@@ -30,6 +30,14 @@ def load_config(config_path):
         return json.load(f)
 
 
+def resolve_project_path(path_value):
+    """Resolve a config path relative to the repository root."""
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return project_root / path
+
+
 def directory_has_files(path):
     return path.exists() and any(path.iterdir())
 
@@ -340,13 +348,15 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
     if requested_outputs_exist:
         print("Requested registration label outputs already exist. Skipping ANTs registration.")
     else:
+        atlas_path = resolve_project_path(reg_cfg["atlas_path"])
+        annotation_path = resolve_project_path(reg_cfg["annotation_path"])
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.registration.ANTs_registration '
             f'--sample_dir "{sample_dir}" '
             f'--signal_channel {signal_ch} '
             f'--register_channel {reg_ch} '
-            f'--atlas_image "{reg_cfg["atlas_path"]}" '
-            f'--atlas_label "{reg_cfg["annotation_path"]}" '
+            f'--atlas_image "{atlas_path}" '
+            f'--atlas_label "{annotation_path}" '
             f'--mode {MAIN_PIPELINE_REGISTRATION_MODE} '
             f'--save_registered_image '
             f'--save_transforms '

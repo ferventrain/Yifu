@@ -133,8 +133,8 @@ class RegionVesselAnalysisCfg(BaseModel):
 
     annotation_dataset_name: str = Field("0", description="Dataset name inside the annotation Zarr group")
     annotation_resolution_xyz: _Triplet = Field(
-        (25.0, 25.0, 25.0),
-        description="Annotation voxel size in um as (x, y, z); 25 um Allen CCF is (25, 25, 25)",
+        (1.0, 1.0, 1.0),
+        description="Annotation voxel size in um as (x, y, z); default should match config input.resolution_xyz",
     )
     regions: Tuple[str, ...] = Field(
         default_factory=tuple,
