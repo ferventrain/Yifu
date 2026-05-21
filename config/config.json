@@ -46,15 +46,6 @@
       "clip_limit": 2.0,
       "tile_grid_size": 8
     },
-    "edge_signal_removal": {
-      "apply": true,
-      "edge_width_px": 40,
-      "suppression_weight": 0.9,
-      "brightness_pct": 90.0,
-      "smooth_sigma": 5.0,
-      "min_area_px": 50,
-      "max_workers": 8
-    },
     "tubular_enhancement": {
       "apply": false,
       "method": "frangi",
@@ -90,7 +81,9 @@
     "atlas_path": "S:/Yifu/data/reference/atlas.tiff",
     "annotation_path": "S:/Yifu/data/reference/atlas_label.tiff",
     "transform_type": "SyN",
-    "allow_reflection": false
+    "allow_reflection": false,
+    "save_upsampled_label": true,
+    "save_upsampled_label_zarr": true
   },
   "segmentation": {
     "method": "cfos_unet",

@@ -31,6 +31,8 @@ class TestRegistrationCfg:
         assert cfg.transform_type == "SyN"
         assert cfg.allow_reflection is False
         assert cfg.save_registered_image is False
+        assert cfg.save_upsampled_label is True
+        assert cfg.save_upsampled_label_zarr is True
         assert cfg.upsample_method == "nearest"
         assert cfg.chunk_size == 50
 
@@ -46,12 +48,16 @@ class TestRegistrationCfg:
             "allow_reflection": False,
             "save_registered_image": True,
             "save_transforms": True,
+            "save_upsampled_label": False,
+            "save_upsampled_label_zarr": True,
             "upsample_method": "linear",
             "chunk_size": 100,
         }
         cfg = RegistrationCfg(**d)
         assert cfg.mode == "image2atlas"
         assert cfg.save_transforms is True
+        assert cfg.save_upsampled_label is False
+        assert cfg.save_upsampled_label_zarr is True
         assert cfg.chunk_size == 100
 
     def test_invalid_mode(self):

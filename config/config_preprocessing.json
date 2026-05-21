@@ -53,10 +53,14 @@
     "edge_signal_removal": {
       "apply": false,
       "edge_width_px": 20,
-      "suppression_weight": 0.8,
+      "prior_curve_scale": 1.15,
+      "prior_curve_smooth_sigma": 2.0,
+      "contour_min_object_area_px": 50,
+      "contour_morph_radius_px": 2,
+      "contour_dilation_px": 2,
       "brightness_pct": 90.0,
-      "smooth_sigma": 5.0,
       "min_area_px": 50,
+      "suppression_weight": 1.0,
       "max_workers": 8
     },
     "tubular_enhancement": {

@@ -12,9 +12,11 @@ import tifffile
 from tqdm import tqdm
 
 try:
+    from pipeline_modules.preprocessing.tiff_to_zarr import convert_tiff_to_zarr
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
 except ImportError:
+    convert_tiff_to_zarr = None  # type: ignore[assignment]
     PipelineError = None  # type: ignore[assignment,misc]
     ErrorCode = None  # type: ignore[assignment]
     write_run_manifest = None  # type: ignore[assignment]
@@ -119,6 +121,16 @@ class BidirectionalRegistration:
 
         logger.info("Source Resolution: %s", self.source_resolution)
         logger.info("Target Resolution: %s", self.atlas_resolution)
+        registration_config = getattr(self, "config", {})
+        if config_path and os.path.exists(config_path):
+            registration_config = full_config.get("registration", {})
+        self.save_upsampled_label = bool(registration_config.get("save_upsampled_label", True))
+        self.save_upsampled_label_zarr = bool(registration_config.get("save_upsampled_label_zarr", True))
+        self.zarr_chunk_size = tuple(
+            full_config.get("preprocessing", {})
+            .get("zarr", {})
+            .get("chunk_size", (128, 256, 256))
+        ) if config_path and os.path.exists(config_path) else (128, 256, 256)
         
         # Load Target Image (used for image2atlas warping)
         # Simplified: We don't load signal channel image by default to reduce dependencies
@@ -343,10 +355,35 @@ class BidirectionalRegistration:
                 # Upsample atlas label to original space
                 # Save once per sample so all signal channels can reuse the same atlas label
                 label_dir = self.sample_dir / "upsampled_atlas_label"
-                if label_dir.exists() and any(label_dir.iterdir()):
-                    logger.info("Upsampled atlas label already exists at %s. Skipping upsampling.", label_dir)
+                label_zarr = self.sample_dir / "upsampled_atlas_label.zarr"
+                need_tiff = self.save_upsampled_label or self.save_upsampled_label_zarr
+                if not need_tiff:
+                    logger.info(
+                        "Skipping upsampled atlas label output "
+                        "(registration.save_upsampled_label=false, save_upsampled_label_zarr=false)."
+                    )
                 else:
-                    self.upsample_label_chunked(results['warped_label'], str(label_dir))
+                    if label_dir.exists() and any(label_dir.iterdir()):
+                        logger.info("Upsampled atlas label already exists at %s. Skipping upsampling.", label_dir)
+                    else:
+                        self.upsample_label_chunked(results['warped_label'], str(label_dir))
+
+                    if self.save_upsampled_label_zarr:
+                        if label_zarr.exists():
+                            logger.info("Upsampled atlas label Zarr already exists at %s. Skipping conversion.", label_zarr)
+                        elif convert_tiff_to_zarr is None:
+                            raise RuntimeError("TIFF-to-Zarr conversion support is unavailable.")
+                        else:
+                            convert_tiff_to_zarr(
+                                label_dir,
+                                label_zarr,
+                                chunk_size=self.zarr_chunk_size,
+                                dataset_name="0",
+                            )
+
+                    if not self.save_upsampled_label and label_dir.exists():
+                        shutil.rmtree(label_dir)
+                        logger.info("Removed intermediate upsampled atlas label TIFF stack: %s", label_dir)
             else:
                 # Save warped mask (already in atlas space)
                 mask_dir = self.sample_dir / f"ch{self.signal_channel}_warped_mask"
@@ -488,6 +525,9 @@ def main():
             label_dir = sample_dir / "upsampled_atlas_label"
             if label_dir.exists():
                 _output_files.append(label_dir)
+            label_zarr = sample_dir / "upsampled_atlas_label.zarr"
+            if label_zarr.exists():
+                _output_files.append(label_zarr)
             write_run_manifest(
                 sample_dir,
                 module="registration.ANTs_registration",
@@ -498,6 +538,7 @@ def main():
                     "register_channel": args.register_channel,
                     "mode": args.mode,
                     "registration_type": args.registration_type,
+                    "config": args.config,
                 },
                 outputs=_output_files,
                 started_at=_started_at,

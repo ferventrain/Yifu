@@ -319,16 +319,26 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     return mask_zarr_path, mask_tiff_dir
 
 
-def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, config_path):
-    """Run ANTs registration and ensure label Zarr exists.
+def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg, config_path):
+    """Run ANTs registration and ensure requested label outputs exist.
 
     Returns (warped_label_tiff_dir, warped_label_zarr_path).
     """
     warped_label_dir = sample_dir / "upsampled_atlas_label"
     warped_label_zarr_path = sample_dir / "upsampled_atlas_label.zarr"
+    save_label_tiff = bool(reg_cfg.get("save_upsampled_label", True))
+    save_label_zarr = bool(reg_cfg.get("save_upsampled_label_zarr", True))
 
-    if directory_has_files(warped_label_dir):
-        print(f"Registration output exists at {warped_label_dir}. Skipping ANTs registration.")
+    if not save_label_tiff and not save_label_zarr:
+        print("Skipping atlas label outputs (registration save_upsampled_label/save_upsampled_label_zarr are both false).")
+        return None, None
+
+    requested_outputs_exist = (
+        (not save_label_tiff or directory_has_files(warped_label_dir))
+        and (not save_label_zarr or warped_label_zarr_path.exists())
+    )
+    if requested_outputs_exist:
+        print("Requested registration label outputs already exist. Skipping ANTs registration.")
     else:
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.registration.ANTs_registration '
@@ -344,18 +354,28 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, config_p
         )
         run_command(cmd, "Step 2: ANTs Registration (Atlas -> Image)")
 
-    # Ensure label Zarr for downstream modules
-    if not warped_label_zarr_path.exists():
+    # Ensure label Zarr for downstream modules when requested. Older registration
+    # runs may have produced only the TIFF stack.
+    if save_label_zarr and not warped_label_zarr_path.exists():
+        if not directory_has_files(warped_label_dir):
+            print(f"Error: Label Zarr requested, but TIFF stack is unavailable at {warped_label_dir}.")
+            sys.exit(1)
         run_tiff_to_zarr(
             warped_label_dir,
             warped_label_zarr_path,
-            (128, 256, 256),
+            zarr_cfg["chunk_size"],
             "Step 2.1: Convert Atlas Label TIFF to Zarr",
         )
-    else:
+    elif save_label_zarr:
         print(f"Label Zarr exists, skipping conversion: {warped_label_zarr_path}")
 
-    return warped_label_dir, warped_label_zarr_path
+    if not save_label_tiff and directory_has_files(warped_label_dir):
+        remove_path(warped_label_dir)
+
+    return (
+        warped_label_dir if save_label_tiff else None,
+        warped_label_zarr_path if save_label_zarr else None,
+    )
 
 
 def ensure_mask_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg):
@@ -476,28 +496,34 @@ def main():
     warped_label_dir = warped_label_zarr = None
     if not args.skip_registration:
         warped_label_dir, warped_label_zarr = ensure_registration_outputs(
-            sample_dir, signal_ch, reg_ch, reg_cfg, config_path,
+            sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg, config_path,
         )
 
     # ---- Step 3: TIFF preprocessing + optional edge signal removal ----
     esr_cfg = preprocessing_cfg.get("edge_signal_removal", {})
     edge_removal_enabled = esr_cfg.get("apply", False)
-    if edge_removal_enabled and warped_label_zarr:
+    if edge_removal_enabled and warped_label_dir:
         raw_tiff_dir = sample_dir / f"ch{signal_ch}"
+        contour_tiff_dir = sample_dir / "ch0"
+        prior_dir = sample_dir / "ch0_warped_image"
         clean_tiff_dir = sample_dir / f"ch{signal_ch}_preprocessed"
         clean_zarr_path = sample_dir / f"ch{signal_ch}.zarr"
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.edge_signal_removal '
             f'--input_dir "{raw_tiff_dir}" '
-            f'--label_dir "{warped_label_dir}" '
+            f'--contour_dir "{contour_tiff_dir}" '
             f'--output_dir "{clean_tiff_dir}" '
             f'--edge_width_px {esr_cfg.get("edge_width_px", 20)} '
-            f'--suppression_weight {esr_cfg.get("suppression_weight", 0.8)} '
+            f'--prior_dir "{prior_dir}" '
+            f'--prior_curve_scale {esr_cfg.get("prior_curve_scale", 1.15)} '
+            f'--prior_curve_smooth_sigma {esr_cfg.get("prior_curve_smooth_sigma", 2.0)} '
             f'--brightness_pct {esr_cfg.get("brightness_pct", 90.0)} '
-            f'--smooth_sigma {esr_cfg.get("smooth_sigma", 5.0)} '
+            f'--contour_min_object_area_px {esr_cfg.get("contour_min_object_area_px", 50)} '
+            f'--contour_morph_radius_px {esr_cfg.get("contour_morph_radius_px", 2)} '
+            f'--contour_dilation_px {esr_cfg.get("contour_dilation_px", 2)} '
             f'--min_area_px {esr_cfg.get("min_area_px", 50)} '
+            f'--suppression_weight {esr_cfg.get("suppression_weight", 1.0)} '
             f'--max_workers {esr_cfg.get("max_workers", 8)} '
-            f'--preprocess_config "{config_path}" '
             "--no_resume"
         )
         run_command(cmd, "Step 3: TIFF Preprocessing + Edge Signal Removal")

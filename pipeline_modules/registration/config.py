@@ -85,6 +85,14 @@ class RegistrationCfg(BaseModel):
     )
     save_registered_image: bool = Field(False, description="Save the warped image as TIFF + NIfTI")
     save_transforms: bool = Field(False, description="Copy forward/inverse transforms to sample_dir/transforms/")
+    save_upsampled_label: bool = Field(
+        True,
+        description="Save warped atlas annotation as sample-space TIFF stack: sample_dir/upsampled_atlas_label/",
+    )
+    save_upsampled_label_zarr: bool = Field(
+        True,
+        description="Also convert the sample-space atlas annotation to sample_dir/upsampled_atlas_label.zarr",
+    )
     upsample_method: str = Field("nearest", description="Interpolation for upsampling: nearest, linear, cubic, quintic")
     chunk_size: int = Field(50, ge=1, description="Chunk size (slices) for chunked label upsampling")
 

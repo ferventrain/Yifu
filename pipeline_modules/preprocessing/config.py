@@ -132,11 +132,16 @@ class ClaheCfg(_ModelMixin):
 class EdgeSignalRemovalCfg(_ModelMixin):
     apply: bool = False
     edge_width_px: int = 20
-    suppression_weight: float = 0.8
+    prior_curve_scale: float = 1.15
+    prior_curve_smooth_sigma: float = 2.0
+    contour_min_object_area_px: int = 50
+    contour_morph_radius_px: int = 2
+    contour_dilation_px: int = 2
     brightness_pct: float = 90.0
-    smooth_sigma: float = 5.0
     min_area_px: int = 50
+    suppression_weight: float = 1.0
     max_workers: int = 8
+    adaptive_block_size: int | None = None
 
 
 @dataclass(frozen=True)
