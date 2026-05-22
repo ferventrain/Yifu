@@ -436,6 +436,7 @@ def run_density_analysis(
 
     output_excel = sample_dir / f"density_results_ch{signal_ch}.xlsx"
     resolution_xyz_str = format_csv(resolution_xyz)
+    transforms_dir = sample_dir / "transforms"
 
     cmd = (
         f'"{PYTHON_EXE}" -m pipeline_modules.registration.region_signal_analysis_zarr_graph '
@@ -448,6 +449,7 @@ def run_density_analysis(
         f'--foreground_mode equal '
         f'--foreground_label 1 '
         f'--resolution_xyz "{resolution_xyz_str}" '
+        f'--transforms_dir "{transforms_dir}" '
         f'--pass1_workers 4'
     )
     run_command(cmd, "Step 6: Density Analysis")

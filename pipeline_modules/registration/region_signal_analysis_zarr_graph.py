@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 CONNECTIVITY_3D = np.ones((3, 3, 3), dtype=np.uint8)
 PAIR_DTYPE = np.dtype([("component", np.int64), ("region", np.int64)])
 ROOT_REGION_DTYPE = np.dtype([("root", np.int64), ("region", np.int64)])
+ROOT_REGION_HEMISPHERE_DTYPE = np.dtype([("root", np.int64), ("region", np.int64), ("hemisphere", np.int8)])
+LEFT_HEMISPHERE_ID = np.int8(0)
+RIGHT_HEMISPHERE_ID = np.int8(1)
+HEMISPHERE_NAMES = {
+    int(LEFT_HEMISPHERE_ID): "Left",
+    int(RIGHT_HEMISPHERE_ID): "Right",
+}
 FORWARD_BLOCK_OFFSETS = [
     (dz, dy, dx)
     for dz, dy, dx in product((-1, 0, 1), repeat=3)
@@ -65,6 +72,16 @@ def parse_args():
     parser.add_argument("--resolution_xyz", default="1,1,1", help="Voxel size in microns as x,y,z")
     parser.add_argument("--tmp_dir", default="", help="Temporary folder for block artifacts")
     parser.add_argument("--keep_tmp", action="store_true", help="Keep temporary block artifacts")
+    parser.add_argument(
+        "--transforms_dir",
+        default="",
+        help="Directory containing saved ANTs transforms. Used to detect left/right reflection.",
+    )
+    parser.add_argument(
+        "--transforms",
+        default="",
+        help="Comma-separated transform files. Overrides --transforms_dir for reflection detection.",
+    )
     parser.add_argument(
         "--pass1_workers",
         type=int,
@@ -99,6 +116,87 @@ def parse_resolution_xyz(resolution_text):
     if any(value <= 0 for value in resolution_xyz):
         raise ValueError(f"resolution_xyz values must be positive, got: {resolution_xyz}")
     return resolution_xyz
+
+
+def parse_transform_list(transforms_text):
+    return [Path(part.strip()) for part in str(transforms_text).split(",") if part.strip()]
+
+
+def resolve_transform_paths(transforms_dir, transforms):
+    explicit_paths = parse_transform_list(transforms)
+    if explicit_paths:
+        return explicit_paths
+
+    root = Path(transforms_dir) if str(transforms_dir).strip() else None
+    if root is None or not root.exists():
+        return []
+
+    return sorted(
+        [
+            path
+            for path in root.iterdir()
+            if path.is_file() and path.name.lower().startswith("fwd_")
+        ]
+    )
+
+
+def read_itk_affine_matrix(transform_path):
+    try:
+        text = Path(transform_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+    transform_line = ""
+    parameters_line = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Transform:"):
+            transform_line = stripped
+        elif stripped.startswith("Parameters:"):
+            parameters_line = stripped
+
+    if "AffineTransform" not in transform_line or not parameters_line:
+        return None
+
+    values = [float(value) for value in parameters_line.split(":", 1)[1].split()]
+    if len(values) < 12:
+        return None
+    return np.asarray(values[:9], dtype=np.float64).reshape(3, 3)
+
+
+def detect_left_right_swapped(transforms_dir="", transforms=""):
+    transform_paths = resolve_transform_paths(transforms_dir, transforms)
+    if not transform_paths:
+        logger.info("No transform files provided for left/right reflection detection; using atlas x orientation.")
+        return False
+
+    for transform_path in transform_paths:
+        matrix = read_itk_affine_matrix(transform_path)
+        if matrix is None:
+            continue
+
+        determinant = float(np.linalg.det(matrix))
+        x_axis_scale = float(matrix[0, 0])
+        swapped = x_axis_scale < 0
+        logger.info(
+            "Left/right reflection detection from %s: x_axis_scale=%.6g determinant=%.6g swapped=%s",
+            transform_path,
+            x_axis_scale,
+            determinant,
+            swapped,
+        )
+        return bool(swapped)
+
+    logger.info("No readable affine transform found for left/right reflection detection; using atlas x orientation.")
+    return False
+
+
+def hemisphere_ids_for_x_positions(x_positions, volume_width, left_right_swapped=False):
+    split_x = int(volume_width) / 2.0
+    hemisphere_ids = np.where(np.asarray(x_positions) < split_x, LEFT_HEMISPHERE_ID, RIGHT_HEMISPHERE_ID).astype(np.int8)
+    if left_right_swapped:
+        hemisphere_ids = np.where(hemisphere_ids == LEFT_HEMISPHERE_ID, RIGHT_HEMISPHERE_ID, LEFT_HEMISPHERE_ID).astype(np.int8)
+    return hemisphere_ids
 
 
 def open_zarr_dataset(path_like, dataset_name):
@@ -255,7 +353,7 @@ def build_region_row(node, aggregated_stats):
     signal_voxels = int(aggregated_stats["signal_voxels"])
     voxel_density = float(signal_voxels / total_voxels) if total_voxels > 0 else 0.0
 
-    return {
+    row = {
         "Name": build_display_name(node),
         "st_level": node.get("st_level"),
         "Total Voxels": total_voxels,
@@ -263,6 +361,43 @@ def build_region_row(node, aggregated_stats):
         "Voxel Density": voxel_density,
         "Signal Count": int(aggregated_stats["signal_count"]),
         "Sum Intensity": float(aggregated_stats["sum_intensity"]),
+    }
+    for hemisphere_id, hemisphere_name in HEMISPHERE_NAMES.items():
+        hemisphere_stats = aggregated_stats["hemispheres"].get(
+            hemisphere_id,
+            {
+                "total_voxels": 0,
+                "signal_voxels": 0,
+                "signal_count": 0,
+                "sum_intensity": 0.0,
+            },
+        )
+        hemisphere_total = int(hemisphere_stats["total_voxels"])
+        hemisphere_signal = int(hemisphere_stats["signal_voxels"])
+        row[f"{hemisphere_name} Total Voxels"] = hemisphere_total
+        row[f"{hemisphere_name} Signal Voxels"] = hemisphere_signal
+        row[f"{hemisphere_name} Voxel Density"] = (
+            float(hemisphere_signal / hemisphere_total) if hemisphere_total > 0 else 0.0
+        )
+        row[f"{hemisphere_name} Signal Count"] = int(hemisphere_stats["signal_count"])
+        row[f"{hemisphere_name} Sum Intensity"] = float(hemisphere_stats["sum_intensity"])
+    return row
+
+
+def empty_hemisphere_stats():
+    return {
+        int(LEFT_HEMISPHERE_ID): {
+            "total_voxels": 0,
+            "signal_voxels": 0,
+            "signal_count": 0,
+            "sum_intensity": 0.0,
+        },
+        int(RIGHT_HEMISPHERE_ID): {
+            "total_voxels": 0,
+            "signal_voxels": 0,
+            "signal_count": 0,
+            "sum_intensity": 0.0,
+        },
     }
 
 
@@ -275,6 +410,7 @@ def flatten_region_rows(region_tree, direct_stats):
             "signal_voxels": 0,
             "signal_count": 0,
             "sum_intensity": 0.0,
+            "hemispheres": empty_hemisphere_stats(),
         }
 
         label_id = get_region_label_id(node)
@@ -283,6 +419,20 @@ def flatten_region_rows(region_tree, direct_stats):
             aggregated["signal_voxels"] += int(direct_stats["region_signal_voxels"].get(label_id, 0))
             aggregated["signal_count"] += int(direct_stats["region_signal_counts"].get(label_id, 0))
             aggregated["sum_intensity"] += float(direct_stats["region_sum_intensity"].get(label_id, 0.0))
+            for hemisphere_id in HEMISPHERE_NAMES:
+                hemisphere_key = (label_id, hemisphere_id)
+                aggregated["hemispheres"][hemisphere_id]["total_voxels"] += int(
+                    direct_stats["total_region_voxels_by_hemisphere"].get(hemisphere_key, 0)
+                )
+                aggregated["hemispheres"][hemisphere_id]["signal_voxels"] += int(
+                    direct_stats["region_signal_voxels_by_hemisphere"].get(hemisphere_key, 0)
+                )
+                aggregated["hemispheres"][hemisphere_id]["signal_count"] += int(
+                    direct_stats["region_signal_counts_by_hemisphere"].get(hemisphere_key, 0)
+                )
+                aggregated["hemispheres"][hemisphere_id]["sum_intensity"] += float(
+                    direct_stats["region_sum_intensity_by_hemisphere"].get(hemisphere_key, 0.0)
+                )
 
         for child in node.get("children", []):
             child_aggregated = visit(child)
@@ -290,6 +440,11 @@ def flatten_region_rows(region_tree, direct_stats):
             aggregated["signal_voxels"] += child_aggregated["signal_voxels"]
             aggregated["signal_count"] += child_aggregated["signal_count"]
             aggregated["sum_intensity"] += child_aggregated["sum_intensity"]
+            for hemisphere_id in HEMISPHERE_NAMES:
+                aggregated["hemispheres"][hemisphere_id]["total_voxels"] += child_aggregated["hemispheres"][hemisphere_id]["total_voxels"]
+                aggregated["hemispheres"][hemisphere_id]["signal_voxels"] += child_aggregated["hemispheres"][hemisphere_id]["signal_voxels"]
+                aggregated["hemispheres"][hemisphere_id]["signal_count"] += child_aggregated["hemispheres"][hemisphere_id]["signal_count"]
+                aggregated["hemispheres"][hemisphere_id]["sum_intensity"] += child_aggregated["hemispheres"][hemisphere_id]["sum_intensity"]
 
         if label_id is not None and label_id > 0 and aggregated["total_voxels"] > 0:
             rows.append(build_region_row(node, aggregated))
@@ -318,7 +473,24 @@ def flush_rows_to_excel(rows, output_path):
         for level in unique_levels:
             level_frame = dataframe[dataframe["st_level"] == level].copy().reset_index(drop=True)
             export_frame = level_frame[
-                ["Name", "Total Voxels", "Signal Voxels", "Voxel Density", "Signal Count", "Sum Intensity"]
+                [
+                    "Name",
+                    "Total Voxels",
+                    "Signal Voxels",
+                    "Voxel Density",
+                    "Signal Count",
+                    "Sum Intensity",
+                    "Left Total Voxels",
+                    "Left Signal Voxels",
+                    "Left Voxel Density",
+                    "Left Signal Count",
+                    "Left Sum Intensity",
+                    "Right Total Voxels",
+                    "Right Signal Voxels",
+                    "Right Voxel Density",
+                    "Right Signal Count",
+                    "Right Sum Intensity",
+                ]
             ]
             export_frame.to_excel(writer, index=False, sheet_name=f"Level_{level}")
 
@@ -346,7 +518,7 @@ def build_binary_mask(mask_chunk, foreground_mode, foreground_label):
     return mask_chunk == foreground_label
 
 
-def aggregate_region_totals(total_region_voxels, label_chunk):
+def aggregate_region_totals(total_region_voxels, total_region_voxels_by_hemisphere, label_chunk, start, volume_shape, left_right_swapped):
     positive_labels = label_chunk[label_chunk > 0]
     if positive_labels.size == 0:
         return
@@ -354,6 +526,22 @@ def aggregate_region_totals(total_region_voxels, label_chunk):
     unique_labels, counts = np.unique(positive_labels, return_counts=True)
     for region_id, count in zip(unique_labels.tolist(), counts.tolist()):
         total_region_voxels[int(region_id)] = total_region_voxels.get(int(region_id), 0) + int(count)
+
+    x_positions = np.arange(int(start[2]), int(start[2]) + label_chunk.shape[2], dtype=np.int64)
+    x_hemisphere_ids = hemisphere_ids_for_x_positions(
+        x_positions,
+        volume_width=int(volume_shape[2]),
+        left_right_swapped=left_right_swapped,
+    )
+    hemisphere_chunk = np.broadcast_to(x_hemisphere_ids.reshape(1, 1, -1), label_chunk.shape)
+    valid_mask = label_chunk > 0
+    pair_values = np.empty(int(np.count_nonzero(valid_mask)), dtype=np.dtype([("region", np.int64), ("hemisphere", np.int8)]))
+    pair_values["region"] = label_chunk[valid_mask].astype(np.int64, copy=False)
+    pair_values["hemisphere"] = hemisphere_chunk[valid_mask].astype(np.int8, copy=False)
+    unique_pairs, pair_counts = np.unique(pair_values, return_counts=True)
+    for pair, count in zip(unique_pairs.tolist(), pair_counts.tolist()):
+        pair_key = (int(pair[0]), int(pair[1]))
+        total_region_voxels_by_hemisphere[pair_key] = total_region_voxels_by_hemisphere.get(pair_key, 0) + int(count)
 
 
 def compute_block_artifacts(
@@ -365,6 +553,8 @@ def compute_block_artifacts(
     foreground_label,
     next_component_id,
     boundary_mask_cache,
+    volume_shape,
+    left_right_swapped,
 ):
     binary_mask = build_binary_mask(mask_chunk, foreground_mode, foreground_label)
     local_labels, num_local_components = ndimage.label(binary_mask, structure=CONNECTIVITY_3D)
@@ -400,10 +590,21 @@ def compute_block_artifacts(
         valid_component_ids = component_chunk[valid_mask].astype(np.int64, copy=False)
         valid_region_ids = label_chunk[valid_mask].astype(np.int64, copy=False)
         valid_signal_values = signal_chunk[valid_mask].astype(np.float64, copy=False)
+        _, _, local_valid_x = np.nonzero(valid_mask)
+        valid_global_x = local_valid_x.astype(np.int64, copy=False) + int(start[2])
+        valid_hemisphere_ids = hemisphere_ids_for_x_positions(
+            valid_global_x,
+            volume_width=int(volume_shape[2]),
+            left_right_swapped=left_right_swapped,
+        )
 
-        pair_values = np.empty(valid_component_ids.size, dtype=PAIR_DTYPE)
+        pair_values = np.empty(
+            valid_component_ids.size,
+            dtype=np.dtype([("component", np.int64), ("region", np.int64), ("hemisphere", np.int8)]),
+        )
         pair_values["component"] = valid_component_ids
         pair_values["region"] = valid_region_ids
+        pair_values["hemisphere"] = valid_hemisphere_ids
         unique_pairs, inverse_index = np.unique(pair_values, return_inverse=True)
 
         pair_voxel_counts = np.zeros(unique_pairs.shape[0], dtype=np.int64)
@@ -414,9 +615,11 @@ def compute_block_artifacts(
 
         pair_component_ids = unique_pairs["component"].astype(np.int64, copy=False)
         pair_region_ids = unique_pairs["region"].astype(np.int64, copy=False)
+        pair_hemisphere_ids = unique_pairs["hemisphere"].astype(np.int8, copy=False)
     else:
         pair_component_ids = np.empty(0, dtype=np.int64)
         pair_region_ids = np.empty(0, dtype=np.int64)
+        pair_hemisphere_ids = np.empty(0, dtype=np.int8)
         pair_voxel_counts = np.empty(0, dtype=np.int64)
         pair_intensity_sums = np.empty(0, dtype=np.float64)
 
@@ -443,6 +646,7 @@ def compute_block_artifacts(
         "component_sizes": component_sizes,
         "pair_component_ids": pair_component_ids,
         "pair_region_ids": pair_region_ids,
+        "pair_hemisphere_ids": pair_hemisphere_ids,
         "pair_voxel_counts": pair_voxel_counts,
         "pair_intensity_sums": pair_intensity_sums,
         "boundary_z": boundary_z,
@@ -459,6 +663,7 @@ def save_block_artifact(artifact_path, artifact):
         component_sizes=artifact["component_sizes"],
         pair_component_ids=artifact["pair_component_ids"],
         pair_region_ids=artifact["pair_region_ids"],
+        pair_hemisphere_ids=artifact["pair_hemisphere_ids"],
         pair_voxel_counts=artifact["pair_voxel_counts"],
         pair_intensity_sums=artifact["pair_intensity_sums"],
         boundary_z=artifact["boundary_z"],
@@ -477,11 +682,13 @@ WORKER_MASK_ZARR = None
 WORKER_LABEL_ZARR = None
 WORKER_SIGNAL_ZARR = None
 WORKER_DATASET_NAME = None
+WORKER_LEFT_RIGHT_SWAPPED = False
 
 
-def init_pass1_worker(mask_zarr_path, label_zarr_path, signal_zarr_path, dataset_name):
-    global WORKER_MASK_ZARR, WORKER_LABEL_ZARR, WORKER_SIGNAL_ZARR, WORKER_DATASET_NAME
+def init_pass1_worker(mask_zarr_path, label_zarr_path, signal_zarr_path, dataset_name, left_right_swapped):
+    global WORKER_MASK_ZARR, WORKER_LABEL_ZARR, WORKER_SIGNAL_ZARR, WORKER_DATASET_NAME, WORKER_LEFT_RIGHT_SWAPPED
     WORKER_DATASET_NAME = dataset_name
+    WORKER_LEFT_RIGHT_SWAPPED = bool(left_right_swapped)
     WORKER_MASK_ZARR = open_zarr_dataset(mask_zarr_path, dataset_name)
     WORKER_LABEL_ZARR = open_zarr_dataset(label_zarr_path, dataset_name)
     WORKER_SIGNAL_ZARR = open_zarr_dataset(signal_zarr_path, dataset_name)
@@ -496,7 +703,15 @@ def process_block_spec_worker(block_spec, foreground_mode, foreground_label):
     signal_chunk = np.asarray(WORKER_SIGNAL_ZARR[z0:z1, y0:y1, x0:x1])
 
     total_region_voxels = {}
-    aggregate_region_totals(total_region_voxels, label_chunk)
+    total_region_voxels_by_hemisphere = {}
+    aggregate_region_totals(
+        total_region_voxels,
+        total_region_voxels_by_hemisphere,
+        label_chunk,
+        block_spec["start"],
+        WORKER_MASK_ZARR.shape,
+        WORKER_LEFT_RIGHT_SWAPPED,
+    )
 
     artifact = compute_block_artifacts(
         mask_chunk=mask_chunk,
@@ -507,18 +722,27 @@ def process_block_spec_worker(block_spec, foreground_mode, foreground_label):
         foreground_label=foreground_label,
         next_component_id=1,
         boundary_mask_cache={},
+        volume_shape=WORKER_MASK_ZARR.shape,
+        left_right_swapped=WORKER_LEFT_RIGHT_SWAPPED,
     )
 
     return {
         "block_spec": block_spec,
         "artifact": artifact,
         "total_region_voxels": total_region_voxels,
+        "total_region_voxels_by_hemisphere": total_region_voxels_by_hemisphere,
     }
 
 
 def merge_region_totals(target_totals, source_totals):
     for region_id, count in source_totals.items():
         target_totals[region_id] = target_totals.get(region_id, 0) + int(count)
+
+
+def merge_pair_totals(target_totals, source_totals):
+    for pair_key, count in source_totals.items():
+        normalized_key = (int(pair_key[0]), int(pair_key[1]))
+        target_totals[normalized_key] = target_totals.get(normalized_key, 0) + int(count)
 
 
 def apply_component_offset(artifact, component_offset):
@@ -546,6 +770,7 @@ def scan_blocks_and_write_artifacts(
     foreground_label,
     tmp_dir,
     pass1_workers,
+    left_right_swapped,
 ):
     logger.info("Pass 1/3: scanning blocks and writing block artifacts...")
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -553,6 +778,7 @@ def scan_blocks_and_write_artifacts(
     blocks_dir.mkdir(parents=True, exist_ok=True)
 
     total_region_voxels = {}
+    total_region_voxels_by_hemisphere = {}
     manifest = []
     next_component_id = 1
 
@@ -568,7 +794,14 @@ def scan_blocks_and_write_artifacts(
                 label_chunk = np.asarray(label_zarr[z0:z1, y0:y1, x0:x1])
                 signal_chunk = np.asarray(signal_zarr[z0:z1, y0:y1, x0:x1])
 
-                aggregate_region_totals(total_region_voxels, label_chunk)
+                aggregate_region_totals(
+                    total_region_voxels,
+                    total_region_voxels_by_hemisphere,
+                    label_chunk,
+                    block_spec["start"],
+                    mask_zarr.shape,
+                    left_right_swapped,
+                )
 
                 artifact = compute_block_artifacts(
                     mask_chunk=mask_chunk,
@@ -579,6 +812,8 @@ def scan_blocks_and_write_artifacts(
                     foreground_label=foreground_label,
                     next_component_id=next_component_id,
                     boundary_mask_cache=boundary_mask_cache,
+                    volume_shape=mask_zarr.shape,
+                    left_right_swapped=left_right_swapped,
                 )
                 next_component_id = artifact["next_component_id"]
 
@@ -612,7 +847,7 @@ def scan_blocks_and_write_artifacts(
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=int(pass1_workers),
                 initializer=init_pass1_worker,
-                initargs=(mask_zarr_path, label_zarr_path, signal_zarr_path, dataset_name),
+                initargs=(mask_zarr_path, label_zarr_path, signal_zarr_path, dataset_name, left_right_swapped),
             ) as executor:
                 future_to_block = {}
                 spec_iter = iter(all_block_specs)
@@ -642,6 +877,10 @@ def scan_blocks_and_write_artifacts(
                         block_spec = future_to_block.pop(future)
                         result = future.result()
                         merge_region_totals(total_region_voxels, result["total_region_voxels"])
+                        merge_pair_totals(
+                            total_region_voxels_by_hemisphere,
+                            result["total_region_voxels_by_hemisphere"],
+                        )
 
                         local_artifact = result["artifact"]
                         component_offset = next_component_id - 1
@@ -682,6 +921,11 @@ def scan_blocks_and_write_artifacts(
         "total_components": int(next_component_id - 1),
         "blocks": manifest,
         "total_region_voxels": {str(key): int(value) for key, value in total_region_voxels.items()},
+        "total_region_voxels_by_hemisphere": {
+            f"{int(key[0])}:{int(key[1])}": int(value)
+            for key, value in total_region_voxels_by_hemisphere.items()
+        },
+        "left_right_swapped": bool(left_right_swapped),
     }
 
     with open(tmp_dir / "manifest.json", "w", encoding="utf-8") as handle:
@@ -856,6 +1100,8 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
     region_pair_voxels = {}
     region_pair_intensity = {}
+    region_hemisphere_pair_voxels = {}
+    region_hemisphere_pair_intensity = {}
 
     with tqdm(total=len(manifest_payload["blocks"]), desc="Region collapse", unit="block") as progress_bar:
         for block in manifest_payload["blocks"]:
@@ -872,6 +1118,7 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
             kept_roots = root_ids[keep_mask].astype(np.int64, copy=False)
             kept_regions = arrays["pair_region_ids"][keep_mask].astype(np.int64, copy=False)
+            kept_hemispheres = arrays["pair_hemisphere_ids"][keep_mask].astype(np.int8, copy=False)
             kept_counts = arrays["pair_voxel_counts"][keep_mask].astype(np.int64, copy=False)
             kept_intensity = arrays["pair_intensity_sums"][keep_mask].astype(np.float64, copy=False)
 
@@ -891,11 +1138,42 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
                 region_pair_voxels[pair_key] = region_pair_voxels.get(pair_key, 0) + int(voxel_count)
                 region_pair_intensity[pair_key] = region_pair_intensity.get(pair_key, 0.0) + float(intensity_sum)
 
+            hemisphere_pair_values = np.empty(kept_roots.size, dtype=ROOT_REGION_HEMISPHERE_DTYPE)
+            hemisphere_pair_values["root"] = kept_roots
+            hemisphere_pair_values["region"] = kept_regions
+            hemisphere_pair_values["hemisphere"] = kept_hemispheres
+            unique_hemisphere_pairs, hemisphere_inverse_index = np.unique(
+                hemisphere_pair_values,
+                return_inverse=True,
+            )
+
+            merged_hemisphere_counts = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.int64)
+            np.add.at(merged_hemisphere_counts, hemisphere_inverse_index, kept_counts)
+
+            merged_hemisphere_intensity = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.float64)
+            np.add.at(merged_hemisphere_intensity, hemisphere_inverse_index, kept_intensity)
+
+            for pair, voxel_count, intensity_sum in zip(
+                unique_hemisphere_pairs.tolist(),
+                merged_hemisphere_counts.tolist(),
+                merged_hemisphere_intensity.tolist(),
+            ):
+                pair_key = (int(pair[0]), int(pair[1]), int(pair[2]))
+                region_hemisphere_pair_voxels[pair_key] = (
+                    region_hemisphere_pair_voxels.get(pair_key, 0) + int(voxel_count)
+                )
+                region_hemisphere_pair_intensity[pair_key] = (
+                    region_hemisphere_pair_intensity.get(pair_key, 0.0) + float(intensity_sum)
+                )
+
             progress_bar.update(1)
 
     region_signal_voxels = {}
     region_signal_counts = {}
     region_sum_intensity = {}
+    region_signal_voxels_by_hemisphere = {}
+    region_signal_counts_by_hemisphere = {}
+    region_sum_intensity_by_hemisphere = {}
 
     for (_, region_id), voxel_count in region_pair_voxels.items():
         region_signal_voxels[region_id] = region_signal_voxels.get(region_id, 0) + int(voxel_count)
@@ -903,6 +1181,21 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
     for (_, region_id), intensity_sum in region_pair_intensity.items():
         region_sum_intensity[region_id] = region_sum_intensity.get(region_id, 0.0) + float(intensity_sum)
+
+    for (_, region_id, hemisphere_id), voxel_count in region_hemisphere_pair_voxels.items():
+        pair_key = (int(region_id), int(hemisphere_id))
+        region_signal_voxels_by_hemisphere[pair_key] = (
+            region_signal_voxels_by_hemisphere.get(pair_key, 0) + int(voxel_count)
+        )
+        region_signal_counts_by_hemisphere[pair_key] = (
+            region_signal_counts_by_hemisphere.get(pair_key, 0) + 1
+        )
+
+    for (_, region_id, hemisphere_id), intensity_sum in region_hemisphere_pair_intensity.items():
+        pair_key = (int(region_id), int(hemisphere_id))
+        region_sum_intensity_by_hemisphere[pair_key] = (
+            region_sum_intensity_by_hemisphere.get(pair_key, 0.0) + float(intensity_sum)
+        )
 
     kept_components = int(np.count_nonzero((parent == np.arange(parent.shape[0], dtype=np.int64)) & kept_root_mask))
     kept_voxels = int(root_sizes[kept_root_mask].sum(dtype=np.int64))
@@ -914,12 +1207,20 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
     total_region_voxels = {
         int(key): int(value) for key, value in manifest_payload["total_region_voxels"].items()
     }
+    total_region_voxels_by_hemisphere = {}
+    for key, value in manifest_payload.get("total_region_voxels_by_hemisphere", {}).items():
+        region_id, hemisphere_id = str(key).split(":", 1)
+        total_region_voxels_by_hemisphere[(int(region_id), int(hemisphere_id))] = int(value)
 
     return {
         "total_region_voxels": total_region_voxels,
         "region_signal_voxels": region_signal_voxels,
         "region_signal_counts": region_signal_counts,
         "region_sum_intensity": region_sum_intensity,
+        "total_region_voxels_by_hemisphere": total_region_voxels_by_hemisphere,
+        "region_signal_voxels_by_hemisphere": region_signal_voxels_by_hemisphere,
+        "region_signal_counts_by_hemisphere": region_signal_counts_by_hemisphere,
+        "region_sum_intensity_by_hemisphere": region_sum_intensity_by_hemisphere,
     }
 
 
@@ -952,6 +1253,8 @@ def analyze_zarr_graph(
     tmp_dir,
     keep_tmp,
     pass1_workers,
+    transforms_dir="",
+    transforms="",
 ):
     _ = resolution_xyz
     mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name)
@@ -961,6 +1264,13 @@ def analyze_zarr_graph(
 
     block_shape = choose_block_shape(mask_zarr, label_zarr, signal_zarr, block_size)
     region_tree = load_region_tree(cfg_path)
+    left_right_swapped = detect_left_right_swapped(transforms_dir=transforms_dir, transforms=transforms)
+    logger.info(
+        "Hemisphere assignment: atlas/sample x < %.3f is Left, x >= %.3f is Right%s",
+        mask_zarr.shape[2] / 2.0,
+        mask_zarr.shape[2] / 2.0,
+        " after transform reflection swap" if left_right_swapped else "",
+    )
 
     tmp_root = Path(tmp_dir) if str(tmp_dir).strip() else Path(f"{output_path}_zarr_graph_tmp")
     if tmp_root.exists():
@@ -983,6 +1293,7 @@ def analyze_zarr_graph(
             foreground_label=foreground_label,
             tmp_dir=tmp_root,
             pass1_workers=pass1_workers,
+            left_right_swapped=left_right_swapped,
         )
         logger.info("Timing | Pass 1 scan: %.2fs", time.perf_counter() - pass1_start_time)
 
@@ -1054,6 +1365,8 @@ def main():
             tmp_dir=args.tmp_dir,
             keep_tmp=args.keep_tmp,
             pass1_workers=args.pass1_workers,
+            transforms_dir=args.transforms_dir,
+            transforms=args.transforms,
         )
 
         if write_run_manifest is not None:
@@ -1073,6 +1386,8 @@ def main():
                     "foreground_label": args.foreground_label,
                     "min_voxels": args.min_voxels,
                     "resolution_xyz": args.resolution_xyz,
+                    "transforms_dir": args.transforms_dir,
+                    "transforms": args.transforms,
                 },
                 outputs=[Path(args.output)],
                 started_at=_started_at,
