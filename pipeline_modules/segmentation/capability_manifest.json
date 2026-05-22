@@ -83,17 +83,17 @@
         "skip_below_threshold": {"type": "float|null", "default": 100.0},
         "top_n": {"type": "int", "default": 30},
         "max_per_large_grid": {"type": "int", "default": 10},
-        "output_csv": {"type": "path", "default": "review_queue.csv"},
-        "top_csv": {"type": "path|null", "default": null},
-        "preview_dir": {"type": "path|null", "default": null},
+        "output_csv": {"type": "path|null", "default": null, "description": "Defaults to sample_dir/review_queue.csv for single-sample runs"},
+        "top_csv": {"type": "path|null", "default": null, "description": "Defaults to sample_dir/top{top_n}_review_queue.csv for single-sample runs"},
+        "preview_dir": {"type": "path|null", "default": null, "description": "Defaults to sample_dir/top{top_n}_review_queue_previews for single-sample runs"},
         "skip_missing": {"type": "bool", "default": false}
       },
       "outputs": {
-        "output_csv": {"type": "path", "default": "review_queue.csv"},
-        "top_csv": {"type": "path", "default": "top30_review_queue.csv"},
-        "preview_dir": {"type": "dir", "default": "top30_review_queue_previews"},
-        "preview_image_tiffs": {"type": "dir", "default": "top30_review_queue_previews/image"},
-        "preview_mask_tiffs": {"type": "dir", "default": "top30_review_queue_previews/mask"}
+        "output_csv": {"type": "path", "default": "sample_dir/review_queue.csv"},
+        "top_csv": {"type": "path", "default": "sample_dir/top30_review_queue.csv"},
+        "preview_dir": {"type": "dir", "default": "sample_dir/top30_review_queue_previews"},
+        "preview_image_tiffs": {"type": "dir", "default": "sample_dir/top30_review_queue_previews/image"},
+        "preview_mask_tiffs": {"type": "dir", "default": "sample_dir/top30_review_queue_previews/mask"}
       }
     },
     {

@@ -1,0 +1,86 @@
+{
+  "schema_version": "1",
+  "module": "visualization",
+  "description": "Plotting and export utilities for density tables, atlas-region summaries, mask point clouds, brainrender inputs, and vessel renderings.",
+  "entrypoints": [
+    {
+      "id": "plot_coarse_region_metric",
+      "function": "pipeline_modules.visualization.coarse_region_metric_plot.generate_coarse_region_outputs",
+      "cli": "python pipeline_modules/visualization/coarse_region_metric_plot.py",
+      "description": "Summarize Level_* sheets from a per-region density Excel workbook into default coarse Allen brain regions, then save atlas-order and value-sorted bar plots.",
+      "prerequisites": [
+        "Input Excel must be produced by region_signal_analysis_zarr_graph.py or have compatible Level_* sheets",
+        "Level_* sheets must include a Name column and the selected metric column",
+        "Allen region CSV must be available; defaults to pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+      ],
+      "inputs": {
+        "input_excel": {
+          "type": "path",
+          "required": true,
+          "description": "Density/results Excel workbook, commonly sample_dir/density_results_chX.xlsx"
+        },
+        "cfg": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+          "description": "Allen region CSV containing id, name, and structure_id_path"
+        },
+        "metric": {
+          "type": "string",
+          "required": true,
+          "examples": ["Voxel Density", "Signal Count", "Signal Voxels", "Sum Intensity"],
+          "description": "Column from the Level_* sheets to aggregate and plot"
+        },
+        "title": {
+          "type": "string",
+          "required": true,
+          "description": "Figure title"
+        },
+        "ylabel": {
+          "type": "string|null",
+          "default": null,
+          "description": "Y-axis label; defaults to metric"
+        },
+        "output_prefix": {
+          "type": "path|null",
+          "default": null,
+          "description": "Output path prefix; defaults to input Excel path without suffix"
+        },
+        "figsize": {
+          "type": "width,height",
+          "default": "10.5,5.8"
+        },
+        "dpi": {
+          "type": "int",
+          "default": 300
+        }
+      },
+      "outputs": {
+        "coarse_region_stats_csv": {
+          "type": "path",
+          "description": "<output_prefix>_coarse_region_stats.csv"
+        },
+        "coarse_region_stats_xlsx": {
+          "type": "path",
+          "description": "<output_prefix>_coarse_region_stats.xlsx"
+        },
+        "atlas_order_bar_plot": {
+          "type": "path",
+          "description": "<output_prefix>_coarse_region_bar_atlas_order.png"
+        },
+        "sorted_bar_plot": {
+          "type": "path",
+          "description": "<output_prefix>_coarse_region_bar_sorted.png"
+        }
+      },
+      "common_commands": [
+        {
+          "description": "Plot coarse-region cFos voxel density for a sample directory containing density_results_ch1.xlsx",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\coarse_region_metric_plot.py --input_excel \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\density_results_ch1.xlsx\" --metric \"Voxel Density\" --title \"TBI cFos coarse region density\" --ylabel \"cFos voxel density\" --output_prefix \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\density_results_ch1_cfos_density\""
+        }
+      ],
+      "sample_layout": {
+        "density_results_xlsx": "sample_dir/density_results_chX.xlsx"
+      }
+    }
+  ]
+}

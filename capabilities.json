@@ -79,6 +79,20 @@
       "outputs_to": ["tubule_reconstruction_dir"]
     },
     {
+      "id": "visualization",
+      "path": "pipeline_modules/visualization",
+      "description": "Plotting and export utilities for density tables, atlas-region summaries, mask point clouds, brainrender inputs, and vessel renderings.",
+      "agent_native": true,
+      "capability_manifest": "pipeline_modules/visualization/capability_manifest.json",
+      "primary_scripts": [
+        "pipeline_modules/visualization/coarse_region_metric_plot.py",
+        "pipeline_modules/visualization/mask_zarr_to_atlas_points.py"
+      ],
+      "python_package": "pipeline_modules.visualization",
+      "inputs_from": ["density_results_xlsx", "mask_zarr", "atlas_label_zarr"],
+      "outputs_to": ["coarse_region_stats", "coarse_region_bar_plots", "atlas_points"]
+    },
+    {
       "id": "utils",
       "path": "pipeline_modules/utils",
       "description": "Shared utilities: SampleLayout (canonical path registry), PipelineError (structured errors), write_run_manifest.",

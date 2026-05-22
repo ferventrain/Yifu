@@ -18,6 +18,8 @@ The orchestration entrypoint is `main.py`, and the pipeline is driven by JSON co
 
 ## Common commands
 
+Project command-formatting rule: when giving the user shell commands, always provide each command as a single line so it can be pasted directly. Do not use line continuations, multi-line command blocks, or split arguments across lines unless the user explicitly asks for a formatted/multi-line version.
+
 ## Environment setup
 
 The repo defines its main environment in `environment.yml`.

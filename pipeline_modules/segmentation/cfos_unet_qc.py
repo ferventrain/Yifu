@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -609,6 +610,10 @@ def export_block_previews(
 
     preview_path = Path(preview_dir)
     preview_path.mkdir(parents=True, exist_ok=True)
+    for stale_dir in (preview_path / "image", preview_path / "mask"):
+        if stale_dir.exists():
+            for stale_tiff in stale_dir.glob("*.tiff"):
+                stale_tiff.unlink()
     image_cache: dict[str, Any] = {}
     mask_cache: dict[str, Any] = {}
 
@@ -684,6 +689,35 @@ def export_block_previews(
     return preview_path
 
 
+def _default_qc_output_dir(args: argparse.Namespace, records: list[dict[str, Any]]) -> Path:
+    if args.records_csv:
+        return Path(args.records_csv).resolve().parent
+    if args.sample_root:
+        return Path(args.sample_root)
+    if args.sample_dirs and len(args.sample_dirs) == 1:
+        return Path(args.sample_dirs[0])
+    if args.sample_dirs:
+        sample_dirs = [Path(path) for path in args.sample_dirs]
+        try:
+            return Path(os.path.commonpath([str(path) for path in sample_dirs]))
+        except Exception:
+            return sample_dirs[0].parent
+    if records:
+        mask_path = Path(str(records[0].get("mask_zarr", "")))
+        if mask_path.parent.name.endswith(".zarr"):
+            return mask_path.parent.parent
+        return mask_path.parent
+    return Path.cwd()
+
+
+def _resolve_qc_output_paths(args: argparse.Namespace, records: list[dict[str, Any]]) -> tuple[Path, Path, Path]:
+    output_dir = _default_qc_output_dir(args, records)
+    output_csv = Path(args.output_csv) if args.output_csv else output_dir / "review_queue.csv"
+    top_csv = Path(args.top_csv) if args.top_csv else output_dir / f"top{args.top_n}_review_queue.csv"
+    preview_dir = Path(args.preview_dir) if args.preview_dir else output_dir / f"top{args.top_n}_review_queue_previews"
+    return output_csv, top_csv, preview_dir
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rank worst cFos U-Net blocks for manual review")
     source = parser.add_mutually_exclusive_group(required=True)
@@ -711,7 +745,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_n", type=int, default=30)
     parser.add_argument("--max_per_large_grid", type=int, default=10)
     parser.add_argument("--large_grid_size", default="1024,1024,1024", help="Large grid size z,y,x (default 1024,1024,1024)")
-    parser.add_argument("--output_csv", default="review_queue.csv")
+    parser.add_argument("--output_csv", default="", help="Output CSV path (default: sample_dir/review_queue.csv)")
     parser.add_argument("--top_csv", default="", help="Optional separate CSV for the top-N rows")
     parser.add_argument("--preview_dir", default="", help="Optional directory for top-N block image and mask TIFF previews")
     parser.add_argument(
@@ -759,7 +793,7 @@ def main() -> int:
             skip_below_threshold=None if args.skip_below_threshold < 0 else args.skip_below_threshold,
             workers=args.workers,
         )
-        output_csv = Path(args.output_csv)
+        output_csv, top_csv, preview_dir = _resolve_qc_output_paths(args, records)
         parsed_chunk_size = _parse_triplet(args.chunk_size) or (256, 256, 256)
         parsed_large_grid_size = _parse_triplet(args.large_grid_size) or (1024, 1024, 1024)
         top_records = select_top_records(
@@ -769,8 +803,6 @@ def main() -> int:
             large_grid_size=parsed_large_grid_size,
             chunk_size=parsed_chunk_size,
         )
-        top_csv = Path(args.top_csv) if args.top_csv else output_csv.with_name(f"top{args.top_n}_{output_csv.name}")
-        preview_dir = Path(args.preview_dir) if args.preview_dir else top_csv.with_name(f"{top_csv.stem}_previews")
         export_block_previews(
             top_records,
             preview_dir,

@@ -8,6 +8,7 @@ import zarr
 
 from pipeline_modules.segmentation.cfos_unet_qc import (
     _records_from_sample_dirs,
+    _resolve_qc_output_paths,
     build_review_queue,
     compute_block_qc_metrics,
     compute_sample_qc_metrics,
@@ -143,6 +144,28 @@ def test_records_from_sample_dirs_infers_image_zarr(tmp_path: Path):
 
     assert records[0]["image_zarr"] == str(sample_dir / "ch2.zarr")
     assert records[0]["mask_zarr"] == str(sample_dir / "ch2_mask.zarr")
+
+
+def test_default_qc_outputs_go_under_single_sample_dir(tmp_path: Path):
+    import argparse
+
+    sample_dir = tmp_path / "mouse01"
+    sample_dir.mkdir()
+    args = argparse.Namespace(
+        records_csv=None,
+        sample_root=None,
+        sample_dirs=[str(sample_dir)],
+        output_csv="",
+        top_csv="",
+        preview_dir="",
+        top_n=30,
+    )
+
+    output_csv, top_csv, preview_dir = _resolve_qc_output_paths(args, [])
+
+    assert output_csv == sample_dir / "review_queue.csv"
+    assert top_csv == sample_dir / "top30_review_queue.csv"
+    assert preview_dir == sample_dir / "top30_review_queue_previews"
 
 
 
