@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from .kimimaro_reconstruction import (
     open_zarr_dataset,
@@ -189,24 +190,43 @@ def sample_annotation_labels_at_points_um(
         return labels
 
     clipped = voxel_indices[in_bounds]
+    chunk_grid = np.asarray(annotation_zarr.chunks, dtype=np.int64)
+    shape_arr = np.asarray(shape, dtype=np.int64)
+    chunk_ijk = clipped // chunk_grid
+    local_ijk = clipped - chunk_ijk * chunk_grid
+
+    df = pd.DataFrame({
+        "cz": chunk_ijk[:, 0], "cy": chunk_ijk[:, 1], "cx": chunk_ijk[:, 2],
+        "lz": local_ijk[:, 0], "ly": local_ijk[:, 1], "lx": local_ijk[:, 2],
+    })
+
     sampled = np.empty(len(clipped), dtype=np.int64)
-    # Point-by-point read keeps memory bounded; Zarr caches chunk reads.
-    for i, (z, y, x) in enumerate(clipped):
-        sampled[i] = int(annotation_zarr[int(z), int(y), int(x)])
+    for (cz, cy, cx), grp in df.groupby(["cz", "cy", "cx"], sort=False):
+        z0 = int(cz * chunk_grid[0])
+        y0 = int(cy * chunk_grid[1])
+        x0 = int(cx * chunk_grid[2])
+        chunk_data = np.asarray(
+            annotation_zarr[
+                z0 : min(z0 + int(chunk_grid[0]), int(shape_arr[0])),
+                y0 : min(y0 + int(chunk_grid[1]), int(shape_arr[1])),
+                x0 : min(x0 + int(chunk_grid[2]), int(shape_arr[2])),
+            ]
+        )
+        local = grp[["lz", "ly", "lx"]].to_numpy(dtype=np.int64)
+        sampled[grp.index.to_numpy()] = chunk_data[local[:, 0], local[:, 1], local[:, 2]]
+
     labels[in_bounds] = sampled
     return labels
 
 
 def _compute_degrees(edge_table):
-    degree_map = {}
     if edge_table.empty:
-        return degree_map
-    for row in edge_table.itertuples(index=False):
-        src_key = (int(row.skeleton_id), int(row.source_node))
-        tgt_key = (int(row.skeleton_id), int(row.target_node))
-        degree_map[src_key] = degree_map.get(src_key, 0) + 1
-        degree_map[tgt_key] = degree_map.get(tgt_key, 0) + 1
-    return degree_map
+        return pd.Series(dtype=np.int64)
+    all_nodes = pd.concat([
+        edge_table[["skeleton_id", "source_node"]].rename(columns={"source_node": "node_id"}),
+        edge_table[["skeleton_id", "target_node"]].rename(columns={"target_node": "node_id"}),
+    ])
+    return all_nodes.groupby(["skeleton_id", "node_id"], sort=False).size()
 
 
 def _regional_summary(
@@ -250,12 +270,13 @@ def _regional_summary(
     local_degrees = _compute_degrees(edges_in)
     num_branch_points = 0
     num_end_points = 0
-    for row in vertices_in.itertuples(index=False):
-        deg = local_degrees.get((int(row.skeleton_id), int(row.node_id)), 0)
-        if deg >= 3:
-            num_branch_points += 1
-        elif deg == 1:
-            num_end_points += 1
+    if not vertices_in.empty and not local_degrees.empty:
+        deg_values = local_degrees.reindex(
+            pd.MultiIndex.from_frame(vertices_in[["skeleton_id", "node_id"]]),
+            fill_value=0,
+        ).to_numpy(dtype=np.int64)
+        num_branch_points = int(np.sum(deg_values >= 3))
+        num_end_points = int(np.sum(deg_values == 1))
 
     skeleton_ids_in = set()
     if not vertices_in.empty:
@@ -263,17 +284,23 @@ def _regional_summary(
     if not edges_in.empty:
         skeleton_ids_in.update(edges_in["skeleton_id"].astype(int).tolist())
 
-    # Approximate vessel volume: sum over edges of length * pi * r_mean^2.
     vessel_volume_um3 = np.nan
-    if not edges_in.empty and radius_lookup:
-        volumes = []
-        for row in edges_in.itertuples(index=False):
-            r_src = radius_lookup.get((int(row.skeleton_id), int(row.source_node)), np.nan)
-            r_tgt = radius_lookup.get((int(row.skeleton_id), int(row.target_node)), np.nan)
-            if np.isfinite(r_src) and np.isfinite(r_tgt):
-                r_mean = 0.5 * (r_src + r_tgt)
-                volumes.append(float(row.edge_length_um) * np.pi * r_mean * r_mean)
-        vessel_volume_um3 = float(np.sum(volumes)) if volumes else 0.0
+    if not edges_in.empty and radius_lookup is not None and not radius_lookup.empty:
+        src_radii = radius_lookup.reindex(
+            pd.MultiIndex.from_frame(edges_in[["skeleton_id", "source_node"]]),
+            fill_value=np.nan,
+        ).to_numpy(dtype=np.float64)
+        tgt_radii = radius_lookup.reindex(
+            pd.MultiIndex.from_frame(edges_in[["skeleton_id", "target_node"]]),
+            fill_value=np.nan,
+        ).to_numpy(dtype=np.float64)
+        valid = np.isfinite(src_radii) & np.isfinite(tgt_radii)
+        if valid.any():
+            r_mean = 0.5 * (src_radii[valid] + tgt_radii[valid])
+            lengths = edges_in["edge_length_um"].to_numpy(dtype=np.float64)[valid]
+            vessel_volume_um3 = float(np.sum(lengths * np.pi * r_mean * r_mean))
+        else:
+            vessel_volume_um3 = 0.0
 
     return {
         "region_id": int(region_node["id"]),
@@ -301,6 +328,7 @@ def analyze_regions_from_skeleton(
     annotation_zarr_path=None,
     region_cfg_csv=None,
     regions=None,
+    region_groups=None,
     output_dir=None,
     annotation_dataset_name="0",
     annotation_resolution_xyz=None,
@@ -309,21 +337,48 @@ def analyze_regions_from_skeleton(
     """Compute per-region vessel parameters from existing skeleton CSV outputs."""
     if region_cfg_csv is None:
         raise ValueError("region_cfg_csv is required.")
-    if regions is None:
-        raise ValueError("regions is required.")
-    region_queries = parse_region_list(regions)
-    if not region_queries:
-        raise ValueError("No regions provided.")
+    if regions is None and region_groups is None:
+        raise ValueError("regions or region_groups is required.")
+    region_queries = parse_region_list(regions) if regions else []
+    if region_groups is not None:
+        if isinstance(region_groups, str):
+            candidate = region_groups.strip()
+            if Path(candidate).is_file():
+                with open(candidate, "r", encoding="utf-8") as fh:
+                    region_groups = json.load(fh)
+            else:
+                region_groups = json.loads(candidate)
+    if not region_queries and not region_groups:
+        raise ValueError("No regions or region groups provided.")
 
+    logger.info("Loading region tree from %s", region_cfg_csv)
     nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(region_cfg_csv)
+    if region_queries:
+        logger.info("Resolving %d region query(ies): %s", len(region_queries), region_queries)
     resolved = []
     for query in region_queries:
         node = resolve_region_query(query, nodes_by_id, acronym_to_ids, name_to_ids)
         subtree_ids = _collect_subtree_ids(node)
         resolved.append({"query": query, "node": node, "subtree_ids": subtree_ids})
+    if region_groups:
+        logger.info("Resolving %d region group(s): %s", len(region_groups), list(region_groups.keys()))
+        for group_name, sub_queries in region_groups.items():
+            merged_ids = set()
+            for sq in sub_queries:
+                node = resolve_region_query(str(sq), nodes_by_id, acronym_to_ids, name_to_ids)
+                merged_ids.update(_collect_subtree_ids(node))
+            resolved.append({
+                "query": group_name,
+                "node": {"id": -1, "acronym": group_name, "name": group_name},
+                "subtree_ids": sorted(merged_ids),
+            })
 
+    logger.info("Loading vertex CSV: %s", vertex_csv_path)
     vertex_table = pd.read_csv(vertex_csv_path)
+    logger.info("Loaded %d vertices", len(vertex_table))
+    logger.info("Loading edge CSV: %s", edge_csv_path)
     edge_table = pd.read_csv(edge_csv_path)
+    logger.info("Loaded %d edges", len(edge_table))
 
     required_vertex_cols = {"skeleton_id", "node_id", "z_um", "y_um", "x_um"}
     missing_vcols = required_vertex_cols - set(vertex_table.columns)
@@ -383,6 +438,7 @@ def analyze_regions_from_skeleton(
                 "annotation_zarr_path": str(annotation_zarr_path),
                 "region_cfg_csv": str(region_cfg_csv),
                 "regions": regions,
+                "region_groups": region_groups,
                 "annotation_dataset_name": annotation_dataset_name,
                 "annotation_resolution_xyz": annotation_resolution_xyz,
                 "config_path": str(config_path) if config_path is not None else None,
@@ -427,6 +483,7 @@ def _finalize_region_analysis(
         vertex_points = vertex_table[["z_um", "y_um", "x_um"]].to_numpy(dtype=np.float64)
     else:
         vertex_points = np.empty((0, 3), dtype=np.float64)
+    logger.info("Sampling annotation labels for %d vertices ...", len(vertex_points))
     vertex_labels = sample_annotation_labels_at_points_um(
         vertex_points, annotation_zarr, annotation_resolution_xyz
     )
@@ -437,17 +494,20 @@ def _finalize_region_analysis(
         midpoints = (src + tgt) / 2.0
     else:
         midpoints = np.empty((0, 3), dtype=np.float64)
+    logger.info("Sampling annotation labels for %d edge midpoints ...", len(midpoints))
     edge_labels = sample_annotation_labels_at_points_um(
         midpoints, annotation_zarr, annotation_resolution_xyz
     )
 
-    radius_lookup = {}
+    radius_lookup = None
     if "radius_um" in vertex_table.columns and not vertex_table.empty:
-        for row in vertex_table.itertuples(index=False):
-            radius_lookup[(int(row.skeleton_id), int(row.node_id))] = float(row.radius_um)
+        radius_lookup = vertex_table.drop_duplicates(
+            subset=["skeleton_id", "node_id"], keep="last"
+        ).set_index(["skeleton_id", "node_id"])["radius_um"]
 
     rows = []
-    for entry in resolved:
+    logger.info("Computing per-region vessel statistics ...")
+    for entry in tqdm(resolved, desc="Regions"):
         summary_row = _regional_summary(
             region_node=entry["node"],
             subtree_ids=entry["subtree_ids"],
@@ -522,8 +582,16 @@ def build_argparser():
     parser.add_argument("--cfg", required=True, help="Allen region CSV path")
     parser.add_argument(
         "--regions",
-        required=True,
         help="Comma/semicolon separated region queries (acronym, full name, or integer id)",
+    )
+    parser.add_argument(
+        "--region_groups",
+        help=(
+            "JSON dict mapping group name to list of region queries, "
+            "e.g. '{\"PFC\":[\"FRP\",\"ACA\",\"PL\",\"ILA\",\"ORB\",\"DP\"]}'. "
+            "Alternatively, pass a path to a .json file containing the dict. "
+            "All sub-regions of listed queries are merged into a single output row."
+        ),
     )
     parser.add_argument("--output_dir", required=True, help="Directory for summary CSV/JSON outputs")
     parser.add_argument(
@@ -562,6 +630,7 @@ def main():
             annotation_zarr_path=args.annotation_zarr,
             region_cfg_csv=args.cfg,
             regions=args.regions,
+            region_groups=args.region_groups,
             output_dir=args.output_dir,
             annotation_dataset_name=args.annotation_dataset_name,
             annotation_resolution_xyz=args.annotation_resolution_xyz,
