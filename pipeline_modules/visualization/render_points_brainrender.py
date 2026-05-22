@@ -60,20 +60,20 @@ ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "z": ("z", "ml", "lr", "mediolateral", "left_right", "left-right"),
 }
 COARSE_REGION_COLORS = [
-    "#4e79a7",
-    "#f28e2b",
-    "#e15759",
-    "#76b7b2",
-    "#59a14f",
-    "#edc948",
-    "#b07aa1",
-    "#ff9da7",
-    "#9c755f",
-    "#bab0ac",
-    "#1f77b4",
-    "#2ca02c",
-    "#d62728",
-    "#9467bd",
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#7F3C8D",
+    "#11A579",
+    "#3969AC",
+    "#F2B701",
+    "#E73F74",
+    "#80BA5A",
+    "#E68310",
+    "#008695",
 ]
 
 
@@ -540,6 +540,8 @@ def resolve_points_csv(args: argparse.Namespace) -> Path:
         args.atlas_image,
         "--atlas_name",
         args.atlas_name,
+        "--atlas_resolution_xyz",
+        args.atlas_resolution_xyz or "25,25,25",
         "--resolution_xyz",
         args.resolution_xyz,
         "--target_resolution_xyz",
@@ -699,6 +701,8 @@ def main() -> int:
         print(f"Filtered region {resolved_region} ({resolved_region_id}): kept {kept_points}/{total_points} points.")
     point_color: str | list[str] = args.point_color
     if args.color_by_coarse_region:
+        if args.point_alpha == parser.get_default("point_alpha"):
+            args.point_alpha = 0.9
         points, point_color, coarse_counts = coarse_region_colors_for_points(
             points,
             atlas_name=args.atlas_name,

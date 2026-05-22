@@ -39,6 +39,11 @@ from pipeline_modules.visualization.atlas_slice import (
     extract_atlas_slice,
 )
 
+try:
+    from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
+except ModuleNotFoundError:  # pragma: no cover - optional zarr support
+    open_zarr_dataset = None
+
 SVG_NS = "http://www.w3.org/2000/svg"
 ET.register_namespace("", SVG_NS)
 
@@ -61,12 +66,17 @@ def read_tiff_stack(path):
 
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
-    img = Image.open(path)
-    images = []
-    for i in range(img.n_frames):
-        img.seek(i)
-        images.append(np.array(img))
-    return np.array(images)
+    return np.asarray(tifffile.imread(str(path)))
+
+
+def read_volume(path, *, dataset_name: str = "0"):
+    path = Path(path)
+    if path.suffix.lower() == ".zarr":
+        if open_zarr_dataset is None:
+            raise ModuleNotFoundError("Zarr input requires pipeline_modules.segmentation.zarr_utils and zarr dependencies.")
+        print(f"Loading Zarr dataset '{dataset_name}': {path}")
+        return np.asarray(open_zarr_dataset(path, dataset_name=dataset_name)[:])
+    return read_tiff_stack(path)
 
 
 def downsample_mask(mask_array, config_path):
@@ -170,9 +180,25 @@ def _legacy_rgb_heat_volume(local_signal, edge, atlas_mask):
     return np.clip(heatimg, 0, 255).astype(np.uint8)
 
 
-def heatmap(save_img_path, edge_path, atlas_mask_path, save_path, alpha, sigma=1.5, resolution_cfg=None, transforms=None, reference=None):
+def heatmap(
+    save_img_path,
+    edge_path,
+    atlas_mask_path,
+    save_path,
+    alpha,
+    sigma=1.5,
+    resolution_cfg=None,
+    transforms=None,
+    reference=None,
+    dataset_name="0",
+    atlas_dataset_name="0",
+    edge_dataset_name="0",
+    normalize=False,
+    vmax=None,
+    scale_max=510.0,
+):
     print(f"Loading input mask: {save_img_path}")
-    img = read_tiff_stack(save_img_path)
+    img = read_volume(save_img_path, dataset_name=dataset_name)
 
     if resolution_cfg:
         img = downsample_mask(img, resolution_cfg)
@@ -180,15 +206,29 @@ def heatmap(save_img_path, edge_path, atlas_mask_path, save_path, alpha, sigma=1
         img = apply_registration(img, reference, transforms)
 
     print(f"Loading edge reference: {edge_path}")
-    edge = read_tiff_stack(edge_path)
+    edge = read_volume(edge_path, dataset_name=edge_dataset_name)
     print(f"Loading atlas mask: {atlas_mask_path}")
-    atlas_mask = read_tiff_stack(atlas_mask_path)
+    atlas_mask = read_volume(atlas_mask_path, dataset_name=atlas_dataset_name)
 
     if img.shape != atlas_mask.shape:
-        print(f"Warning: Shape mismatch. Input: {img.shape}, Atlas: {atlas_mask.shape}")
+        raise ValueError(
+            f"Input volume shape {img.shape} does not match atlas mask shape {atlas_mask.shape}. "
+            "Use an atlas-space mask/density volume, or warp/downsample the sample-space mask first."
+        )
+    if edge.shape != atlas_mask.shape:
+        raise ValueError(f"Edge volume shape {edge.shape} does not match atlas mask shape {atlas_mask.shape}")
 
     print(f"Processing volume shape: {img.shape}")
     local_signal = build_local_signal_volume(img, sigma=sigma, alpha=alpha, atlas_mask=atlas_mask)
+    max_signal = float(local_signal.max())
+    print(f"Local signal range before display scaling: min={float(local_signal.min()):.6g}, max={max_signal:.6g}")
+    if normalize:
+        display_vmax = float(vmax) if vmax is not None else max_signal
+        if display_vmax > 0:
+            local_signal = np.clip(local_signal / display_vmax, 0, 1) * float(scale_max)
+            print(f"Normalized local signal for display: vmax={display_vmax:.6g}, scale_max={float(scale_max):.6g}")
+        else:
+            print("Warning: local signal max is 0; skipping normalization.")
     heatimg = _legacy_rgb_heat_volume(local_signal, edge, atlas_mask)
 
     print(f"Saving heatmap to: {save_path}")
@@ -674,6 +714,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="Path to config.json for downsampling")
     parser.add_argument("--transforms", nargs="+", help="List of inverse transform files (Image -> Atlas)")
     parser.add_argument("--reference", help="Path to reference atlas image (for registration)")
+    parser.add_argument("--dataset-name", default="0", help="Dataset name when --input is a Zarr group")
+    parser.add_argument("--atlas-dataset-name", default="0", help="Dataset name when --atlas_mask is a Zarr group")
+    parser.add_argument("--edge-dataset-name", default="0", help="Dataset name when --edge is a Zarr group")
+    parser.add_argument("--normalize", action="store_true", help="Normalize stack local signal before RGB display scaling")
+    parser.add_argument("--display-vmax", type=float, default=None, help="Value mapped to --scale-max when --normalize is used")
+    parser.add_argument("--scale-max", type=float, default=510.0, help="Display scale maximum used by --normalize")
 
     parser.add_argument("--label", default=str(DEFAULT_ATLAS_LABEL), help="3D atlas label TIFF path")
     parser.add_argument("--plane", default="horizontal", choices=["coronal", "sagittal", "horizontal"], help="Atlas slice plane")
@@ -712,12 +758,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "stack":
             if not args.input or not args.output:
                 parser.error("--input and --output are required for --mode stack")
-            heatmap(args.input, args.edge, args.atlas_mask, args.output, args.alpha, args.sigma, args.config, args.transforms, args.reference)
+            heatmap(
+                args.input,
+                args.edge,
+                args.atlas_mask,
+                args.output,
+                args.alpha,
+                args.sigma,
+                args.config,
+                args.transforms,
+                args.reference,
+                args.dataset_name,
+                args.atlas_dataset_name,
+                args.edge_dataset_name,
+                args.normalize,
+                args.display_vmax,
+                args.scale_max,
+            )
             payload = {"mode": args.mode, "output": str(args.output)}
         elif args.mode == "atlas-slice":
             if not args.input or not args.output or args.coord is None:
                 parser.error("--input, --output, and --coord are required for --mode atlas-slice")
-            signal = read_tiff_stack(args.input).astype(np.float32)
+            signal = read_volume(args.input, dataset_name=args.dataset_name).astype(np.float32)
             labels = np.asarray(tifffile.memmap(str(args.label)))
             local_signal = build_local_signal_volume(signal, sigma=args.sigma, alpha=args.alpha, atlas_mask=labels, normalize=True)
             spec = AtlasSliceSpec(args.plane, args.coord_system, args.coord, args.atlas_resolution_um, parse_bregma_index(args.bregma_index))

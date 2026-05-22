@@ -122,6 +122,15 @@ def write_outputs(table: pd.DataFrame, summary: dict[str, Any], output_csv: str 
     return {"csv": output_path, "summary": summary_path}
 
 
+def write_volume_output(volume: np.ndarray, output_path: str | Path) -> Path:
+    import tifffile
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(path), volume, compression="lzw")
+    return path
+
+
 def resolve_sample_reference_nii(
     *,
     sample_dir: str | Path | None,
@@ -166,6 +175,7 @@ def accumulate_sample_grid(
     foreground_label: int,
     block_shape: tuple[int, int, int],
     min_voxels_per_point: int,
+    volume_mode: str,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
     shape = tuple(int(v) for v in arr.shape)
@@ -214,7 +224,8 @@ def accumulate_sample_grid(
                 accumulators[key] = accumulator
             accumulator.count += int(counts[idx])
 
-    volume = np.zeros(output_shape_zyx, dtype=np.uint8)
+    volume_dtype = np.float32 if volume_mode == "count" else np.uint8
+    volume = np.zeros(output_shape_zyx, dtype=volume_dtype)
     occupied_bins = 0
     for flat_key, accumulator in accumulators.items():
         if accumulator.count < min_voxels_per_point:
@@ -223,7 +234,10 @@ def accumulate_sample_grid(
         rem = flat_key % key_stride_z
         gy = rem // key_stride_y
         gx = rem % key_stride_y
-        volume[int(gz), int(gy), int(gx)] = 1
+        if volume_mode == "count":
+            volume[int(gz), int(gy), int(gx)] = float(accumulator.count)
+        else:
+            volume[int(gz), int(gy), int(gx)] = 1
         occupied_bins += 1
 
     summary = {
@@ -238,6 +252,7 @@ def accumulate_sample_grid(
         "clipped_voxels": clipped_voxels,
         "occupied_sample_bins": occupied_bins,
         "min_voxels_per_point": min_voxels_per_point,
+        "volume_mode": volume_mode,
     }
     return volume, summary
 
@@ -248,6 +263,8 @@ def warp_sample_grid_to_atlas(
     sample_reference_nii: str | Path,
     atlas_image: str | Path,
     transformlist: list[str],
+    interpolator: str,
+    binarize: bool,
 ) -> tuple[np.ndarray, tuple[float, float, float]]:
     sample_ref = ants.image_read(str(sample_reference_nii))
     atlas_ref = ants.image_read(str(atlas_image))
@@ -265,11 +282,13 @@ def warp_sample_grid_to_atlas(
         fixed=atlas_ref,
         moving=moving,
         transformlist=transformlist,
-        interpolator="nearestNeighbor",
+        interpolator=interpolator,
     )
-    atlas_volume_zyx = np.transpose(warped.numpy(), (2, 1, 0)) > 0
+    atlas_volume_zyx = np.transpose(warped.numpy(), (2, 1, 0))
+    if binarize:
+        atlas_volume_zyx = atlas_volume_zyx > 0
     atlas_resolution_xyz = tuple(float(v) for v in atlas_ref.spacing)
-    return atlas_volume_zyx.astype(np.uint8), atlas_resolution_xyz
+    return atlas_volume_zyx.astype(np.uint8 if binarize else np.float32), atlas_resolution_xyz
 
 
 def resolve_atlas_resolution_xyz(atlas_name: str, atlas_resolution_xyz: str) -> tuple[float, float, float]:
@@ -341,8 +360,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--foreground_label", type=int, default=1)
     parser.add_argument("--block_shape", default="", help="Optional block shape in z,y,x order.")
     parser.add_argument("--min_voxels_per_point", type=int, default=1)
+    parser.add_argument("--volume_mode", choices=("binary", "count"), default="binary", help="Output atlas volume values.")
     parser.add_argument("--max_points", type=int, default=150_000, help="Randomly keep N atlas voxels; 0 disables cap.")
     parser.add_argument("--output", default="", help="Output atlas-space CSV path.")
+    parser.add_argument("--output_volume", default="", help="Optional output atlas-space binary mask TIFF path.")
+    parser.add_argument("--skip_points", action="store_true", help="Skip CSV point export when only --output_volume is needed.")
     return parser
 
 
@@ -380,15 +402,21 @@ def main() -> int:
         foreground_label=args.foreground_label,
         block_shape=block_shape,
         min_voxels_per_point=args.min_voxels_per_point,
+        volume_mode=args.volume_mode,
     )
     atlas_volume, raw_atlas_spacing_xyz = warp_sample_grid_to_atlas(
         sample_volume,
         sample_reference_nii=sample_reference_nii,
         atlas_image=args.atlas_image,
         transformlist=transformlist,
+        interpolator="linear" if args.volume_mode == "count" else "nearestNeighbor",
+        binarize=args.volume_mode == "binary",
     )
-    atlas_resolution_xyz = resolve_atlas_resolution_xyz(args.atlas_name, args.atlas_resolution_xyz)
-    table = atlas_volume_to_points(atlas_volume, atlas_resolution_xyz=atlas_resolution_xyz, max_points=args.max_points)
+    if args.skip_points and not args.atlas_resolution_xyz.strip():
+        atlas_resolution_xyz = raw_atlas_spacing_xyz
+    else:
+        atlas_resolution_xyz = resolve_atlas_resolution_xyz(args.atlas_name, args.atlas_resolution_xyz)
+    exported_points = 0 if args.skip_points else None
 
     summary.update(
         {
@@ -400,12 +428,31 @@ def main() -> int:
             "atlas_shape_zyx": list(atlas_volume.shape),
             "raw_atlas_image_spacing_xyz": list(raw_atlas_spacing_xyz),
             "atlas_resolution_xyz": list(atlas_resolution_xyz),
-            "exported_points": int(len(table)),
+            "exported_points": exported_points,
             "max_points": int(args.max_points),
             "coordinate_space": "atlas",
             "duration_seconds": time.time() - started_at,
         }
     )
+
+    if args.output_volume:
+        volume_path = write_volume_output(atlas_volume, args.output_volume)
+        summary["output_volume"] = str(volume_path)
+
+    if args.skip_points:
+        if not args.output_volume:
+            raise ValueError("--skip_points requires --output_volume")
+        summary_path = Path(args.output_volume).with_suffix(".json")
+        summary["summary_json"] = str(summary_path)
+        with summary_path.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, ensure_ascii=False)
+        logger.info("Saved atlas-space mask volume to %s", args.output_volume)
+        logger.info("Saved summary to %s", summary_path)
+        return 0
+
+    table = atlas_volume_to_points(atlas_volume, atlas_resolution_xyz=atlas_resolution_xyz, max_points=args.max_points)
+    summary["exported_points"] = int(len(table))
+    summary["duration_seconds"] = time.time() - started_at
 
     output_csv = Path(args.output) if args.output else default_output_path(Path(mask_zarr_path))
     outputs = write_outputs(table, summary, output_csv)

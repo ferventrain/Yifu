@@ -745,9 +745,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_n", type=int, default=30)
     parser.add_argument("--max_per_large_grid", type=int, default=10)
     parser.add_argument("--large_grid_size", default="1024,1024,1024", help="Large grid size z,y,x (default 1024,1024,1024)")
-    parser.add_argument("--output_csv", default="", help="Output CSV path (default: sample_dir/review_queue.csv)")
-    parser.add_argument("--top_csv", default="", help="Optional separate CSV for the top-N rows")
-    parser.add_argument("--preview_dir", default="", help="Optional directory for top-N block image and mask TIFF previews")
+    parser.add_argument(
+        "--output_csv",
+        nargs="?",
+        const="",
+        default="",
+        help="Output CSV path (default: sample_dir/review_queue.csv)",
+    )
+    parser.add_argument(
+        "--top_csv",
+        nargs="?",
+        const="",
+        default="",
+        help="Optional separate CSV for the top-N rows",
+    )
+    parser.add_argument(
+        "--preview_dir",
+        nargs="?",
+        const="",
+        default="",
+        help="Optional directory for top-N block image and mask TIFF previews",
+    )
     parser.add_argument(
         "--skip_missing",
         action="store_true",
