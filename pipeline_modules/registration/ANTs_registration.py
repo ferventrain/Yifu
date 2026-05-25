@@ -124,6 +124,7 @@ class BidirectionalRegistration:
         registration_config = getattr(self, "config", {})
         if config_path and os.path.exists(config_path):
             registration_config = full_config.get("registration", {})
+        self.registration_config = registration_config
         self.save_upsampled_label = bool(registration_config.get("save_upsampled_label", True))
         self.save_upsampled_label_zarr = bool(registration_config.get("save_upsampled_label_zarr", True))
         self.zarr_chunk_size = tuple(
@@ -384,6 +385,20 @@ class BidirectionalRegistration:
                     if not self.save_upsampled_label and label_dir.exists():
                         shutil.rmtree(label_dir)
                         logger.info("Removed intermediate upsampled atlas label TIFF stack: %s", label_dir)
+
+                    if self.registration_config.get("save_upsampled_label_hemisphere_zarr", False):
+                        hemisphere_zarr = self.sample_dir / "atlas_label_hemisphere.zarr"
+                        if hemisphere_zarr.exists():
+                            logger.info("Hemisphere atlas label Zarr already exists at %s. Skipping conversion.", hemisphere_zarr)
+                        else:
+                            from pipeline_modules.registration.atlas_label_to_hemisphere import convert_atlas_label_to_hemisphere
+
+                            convert_atlas_label_to_hemisphere(
+                                label_dir,
+                                hemisphere_zarr,
+                                chunk_size=self.zarr_chunk_size,
+                                dataset_name="0",
+                            )
             else:
                 # Save warped mask (already in atlas space)
                 mask_dir = self.sample_dir / f"ch{self.signal_channel}_warped_mask"

@@ -89,6 +89,11 @@ class SampleLayout(BaseModel):
         """Warped atlas annotation label Zarr store."""
         return self.sample_dir / "upsampled_atlas_label.zarr"
 
+    @property
+    def atlas_label_hemisphere_zarr(self) -> Path:
+        """Warped atlas hemisphere label Zarr store."""
+        return self.sample_dir / "atlas_label_hemisphere.zarr"
+
     # ------------------------------------------------------------------
     # Registration outputs
     # ------------------------------------------------------------------
@@ -172,6 +177,7 @@ class SampleLayout(BaseModel):
         props = [
             "signal_tiff_dir", "signal_tiff_preprocessed_dir", "reg_tiff_dir",
             "signal_zarr", "mask_zarr", "atlas_label_zarr",
+            "atlas_label_hemisphere_zarr",
             "reg_downsample_dir", "reg_downsample_nii", "atlas_label_tiff_dir",
             "mask_tiff_dir", "density_results_xlsx",
             "tubule_reconstruction_dir", "tubule_branch_csv", "tubule_summary_json",

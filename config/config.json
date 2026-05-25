@@ -82,8 +82,9 @@
     "annotation_path": "data/reference/atlas_label.tiff",
     "transform_type": "SyN",
     "allow_reflection": false,
-    "save_upsampled_label": true,
-    "save_upsampled_label_zarr": true
+        "save_upsampled_label": false,
+        "save_upsampled_label_zarr": true,
+        "save_upsampled_label_hemisphere_zarr": false
   },
   "segmentation": {
     "method": "cfos_unet",
@@ -124,8 +125,9 @@
       "normalize_percentiles": [1.0, 99.5]
     }
   },
-  "analysis": {
-    "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
-    "output_format": "xlsx"
-  }
+    "analysis": {
+        "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+        "output_format": "xlsx",
+        "use_hemisphere_label": false
+    }
 }

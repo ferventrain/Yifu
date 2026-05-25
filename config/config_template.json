@@ -82,7 +82,8 @@
         "transform_type": "SyN",
         "allow_reflection": false,
         "save_upsampled_label": true,
-        "save_upsampled_label_zarr": true
+        "save_upsampled_label_zarr": true,
+        "save_upsampled_label_hemisphere_zarr": false
     },
     
     "segmentation": {
@@ -126,6 +127,7 @@
     
     "analysis": {
         "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
-        "output_format": "xlsx"
+        "output_format": "xlsx",
+        "use_hemisphere_label": false
     }
 }

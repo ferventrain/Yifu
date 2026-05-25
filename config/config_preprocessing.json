@@ -103,7 +103,8 @@
     "atlas_path": "s:/Yifu/Allen_brainatlas/atlas.tiff",
     "annotation_path": "s:/Yifu/Allen_brainatlas/atlas_label.tiff",
     "transform_type": "SyN",
-    "allow_reflection": false
+    "allow_reflection": false,
+    "save_upsampled_label_hemisphere_zarr": false
   },
   "segmentation": {
     "method": "threshold",
@@ -127,6 +128,7 @@
   },
   "analysis": {
     "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
-    "output_format": "xlsx"
+    "output_format": "xlsx",
+    "use_hemisphere_label": false
   }
 }

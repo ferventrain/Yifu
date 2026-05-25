@@ -33,6 +33,7 @@ class TestRegistrationCfg:
         assert cfg.save_registered_image is False
         assert cfg.save_upsampled_label is True
         assert cfg.save_upsampled_label_zarr is True
+        assert cfg.save_upsampled_label_hemisphere_zarr is False
         assert cfg.upsample_method == "nearest"
         assert cfg.chunk_size == 50
 
@@ -91,6 +92,7 @@ class TestAnalysisCfg:
         assert cfg.pass1_workers == 1
         assert cfg.block_size is None
         assert cfg.resolution_xyz == (1.0, 1.0, 1.0)
+        assert cfg.use_hemisphere_label is False
 
     def test_resolution_from_string(self):
         from pipeline_modules.registration.config import AnalysisCfg
@@ -160,6 +162,7 @@ class TestExportAndManifest:
         assert "analyze_zarr_graph" in entry_ids
         assert "check_region_coverage" in entry_ids
         assert "merge_atlas_regions" in entry_ids
+        assert "convert_atlas_label_to_hemisphere" not in entry_ids
 
 
 # ---------------------------------------------------------------------------

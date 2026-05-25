@@ -39,13 +39,73 @@ from pipeline_modules.visualization.atlas_slice import (
     extract_atlas_slice,
 )
 
-try:
-    from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
-except ModuleNotFoundError:  # pragma: no cover - optional zarr support
-    open_zarr_dataset = None
-
 SVG_NS = "http://www.w3.org/2000/svg"
 ET.register_namespace("", SVG_NS)
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def default_reference_dir() -> Path:
+    return project_root() / "data" / "reference"
+
+
+def load_json(path: str | Path) -> dict:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_sample_config(sample_dir: str | Path) -> Path:
+    sample_dir = Path(sample_dir)
+    candidates = [
+        sample_dir.parent / "config.json",
+        sample_dir.parent / "config" / "config.json",
+        project_root() / "config" / "config.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not find config.json near sample_dir: {sample_dir}")
+
+
+def default_sample_stack_output(sample_dir: str | Path) -> Path:
+    sample_dir = Path(sample_dir)
+    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_stack.tiff"
+
+
+def resolve_sample_stack_defaults(
+    sample_dir: str | Path,
+    *,
+    config_path: str | Path | None = None,
+) -> dict[str, object]:
+    sample_dir = Path(sample_dir)
+    cfg_path = Path(config_path) if config_path else resolve_sample_config(sample_dir)
+    cfg = load_json(cfg_path)
+    input_cfg = cfg.get("input", {})
+    preprocessing_cfg = cfg.get("preprocessing", {})
+
+    channels = input_cfg.get("channels", {})
+    signal_ch = f"ch{channels.get('signal', '1')}"
+    register_ch = f"ch{channels.get('registration', '0')}"
+    resolution_xyz = tuple(float(value) for value in input_cfg.get("resolution_xyz", (1.8, 1.8, 2.0)))
+    target_resolution_xyz = tuple(
+        float(value) for value in preprocessing_cfg.get("downsample", {}).get("target_resolution_xyz", (25.0, 25.0, 25.0))
+    )
+    return {
+        "config_path": cfg_path,
+        "signal_ch": signal_ch,
+        "register_ch": register_ch,
+        "resolution_xyz": resolution_xyz,
+        "target_resolution_xyz": target_resolution_xyz,
+        "mask_zarr": sample_dir / f"{signal_ch}_mask.zarr",
+        "sample_reference_nii": sample_dir / f"{register_ch}_downsample" / "volume.nii.gz",
+        "transforms_dir": sample_dir / "transforms",
+        "atlas_image": default_reference_dir() / "atlas.nii.gz",
+        "edge": default_reference_dir() / "atlas_edge.tiff",
+        "atlas_mask": default_reference_dir() / "atlas_label.tiff",
+        "output": default_sample_stack_output(sample_dir),
+    }
 
 
 def create_gaussian_kernel_3d(kernel_size=11, sigma=1.5):
@@ -72,67 +132,12 @@ def read_tiff_stack(path):
 def read_volume(path, *, dataset_name: str = "0"):
     path = Path(path)
     if path.suffix.lower() == ".zarr":
-        if open_zarr_dataset is None:
-            raise ModuleNotFoundError("Zarr input requires pipeline_modules.segmentation.zarr_utils and zarr dependencies.")
-        print(f"Loading Zarr dataset '{dataset_name}': {path}")
-        return np.asarray(open_zarr_dataset(path, dataset_name=dataset_name)[:])
+        _ = dataset_name
+        raise ValueError(
+            "Direct Zarr loading was removed to avoid materializing full-resolution volumes. "
+            "Use --mode sample-stack for sample-space mask Zarr inputs, or pass an atlas-space TIFF volume."
+        )
     return read_tiff_stack(path)
-
-
-def downsample_mask(mask_array, config_path):
-    if not os.path.exists(config_path):
-        print(f"Warning: Config not found at {config_path}. Skipping downsampling.")
-        return mask_array
-
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-
-    input_res = None
-    target_res = None
-    if "input" in cfg and "resolution_xyz" in cfg["input"]:
-        input_res = cfg["input"]["resolution_xyz"]
-    elif "source_resolution" in cfg:
-        input_res = cfg["source_resolution"]
-
-    if "preprocessing" in cfg and "downsample" in cfg["preprocessing"] and "target_resolution_xyz" in cfg["preprocessing"]["downsample"]:
-        target_res = cfg["preprocessing"]["downsample"]["target_resolution_xyz"]
-    elif "target_resolution" in cfg:
-        target_res = cfg["target_resolution"]
-
-    if input_res is None or target_res is None:
-        print("Warning: Could not find resolution settings in config. Skipping downsampling.")
-        return mask_array
-
-    factors = [s / t for s, t in zip(input_res, target_res)]
-    factors_zyx = factors[::-1]
-    print(f"Downsampling mask with factors (z,y,x): {factors_zyx}")
-    print(f"Original shape: {mask_array.shape}")
-    downsampled = ndimage.zoom(mask_array, factors_zyx, order=0)
-    downsampled = (downsampled > 0).astype(np.uint8) * 255
-    print(f"Downsampled shape: {downsampled.shape}")
-    return downsampled
-
-
-def apply_registration(mask_array, reference_path, transforms):
-    if ants is None:
-        raise ImportError("ANTsPy is required for --transforms registration but is not installed in this environment.")
-
-    print("\nApplying registration transforms...")
-    print(f"Reference: {reference_path}")
-    print(f"Transforms: {transforms}")
-
-    if not os.path.exists(reference_path):
-        raise FileNotFoundError(f"Reference image not found: {reference_path}")
-    fixed = ants.image_read(reference_path)
-    mask_ants_data = np.transpose(mask_array, (2, 1, 0)).astype("float32")
-    moving = ants.from_numpy(mask_ants_data, origin=[0, 0, 0], spacing=[1, 1, 1], direction=np.eye(3))
-    warped = ants.apply_transforms(
-        fixed=fixed,
-        moving=moving,
-        transformlist=transforms,
-        interpolator="nearestNeighbor",
-    )
-    return np.transpose(warped.numpy(), (2, 1, 0))
 
 
 def build_local_signal_volume(signal_volume, sigma=1.5, alpha=1.0, atlas_mask=None, kernel_size=11, normalize=False):
@@ -167,17 +172,25 @@ def build_local_signal_volume(signal_volume, sigma=1.5, alpha=1.0, atlas_mask=No
 
 
 def _legacy_rgb_heat_volume(local_signal, edge, atlas_mask):
-    heatimg = np.zeros(local_signal.shape, dtype=np.float32)
-    heatimg = np.array([heatimg, heatimg, heatimg]).transpose((1, 2, 3, 0))
-    edge_rgb = np.array([edge, edge, edge]).transpose((1, 2, 3, 0))
+    signal = np.asarray(local_signal, dtype=np.float32)
+    heatimg = np.zeros(signal.shape + (3,), dtype=np.uint8)
 
-    heatimg[..., 0][local_signal > 255] = local_signal[local_signal > 255] - 255
-    heatimg[..., 2][local_signal > 255] = 255
-    heatimg[..., 2][local_signal > 255 * 2] -= local_signal[local_signal > 255 * 2] - 255 * 2
-    heatimg[..., 2][local_signal <= 255] = local_signal[local_signal <= 255]
-    heatimg[edge_rgb != 0] = edge_rgb[edge_rgb != 0]
-    heatimg[atlas_mask == 0] = 0
-    return np.clip(heatimg, 0, 255).astype(np.uint8)
+    heatimg[..., 0] = np.clip(signal - 255.0, 0.0, 255.0).astype(np.uint8)
+    blue = np.where(signal <= 255.0, signal, 255.0)
+    over_blue = signal > 510.0
+    blue[over_blue] = 255.0 - (signal[over_blue] - 510.0)
+    heatimg[..., 2] = np.clip(blue, 0.0, 255.0).astype(np.uint8)
+
+    edge_values = np.asarray(edge)
+    edge_mask = edge_values != 0
+    if np.any(edge_mask):
+        edge_uint8 = np.clip(edge_values, 0, 255).astype(np.uint8)
+        heatimg[edge_mask, 0] = edge_uint8[edge_mask]
+        heatimg[edge_mask, 1] = edge_uint8[edge_mask]
+        heatimg[edge_mask, 2] = edge_uint8[edge_mask]
+
+    heatimg[np.asarray(atlas_mask) == 0] = 0
+    return heatimg
 
 
 def heatmap(
@@ -200,10 +213,42 @@ def heatmap(
     print(f"Loading input mask: {save_img_path}")
     img = read_volume(save_img_path, dataset_name=dataset_name)
 
-    if resolution_cfg:
-        img = downsample_mask(img, resolution_cfg)
-    if transforms and reference:
-        img = apply_registration(img, reference, transforms)
+    if resolution_cfg or transforms or reference:
+        raise ValueError(
+            "Legacy in-memory downsample/registration was removed. "
+            "Use --mode sample-stack to warp sample-space mask Zarr block-wise before rendering."
+        )
+
+    return render_heatmap_stack(
+        img,
+        edge_path=edge_path,
+        atlas_mask_path=atlas_mask_path,
+        save_path=save_path,
+        alpha=alpha,
+        sigma=sigma,
+        atlas_dataset_name=atlas_dataset_name,
+        edge_dataset_name=edge_dataset_name,
+        normalize=normalize,
+        vmax=vmax,
+        scale_max=scale_max,
+    )
+
+
+def render_heatmap_stack(
+    img,
+    *,
+    edge_path,
+    atlas_mask_path,
+    save_path,
+    alpha,
+    sigma=1.5,
+    atlas_dataset_name="0",
+    edge_dataset_name="0",
+    normalize=False,
+    vmax=None,
+    scale_max=510.0,
+):
+    img = np.asarray(img)
 
     print(f"Loading edge reference: {edge_path}")
     edge = read_volume(edge_path, dataset_name=edge_dataset_name)
@@ -235,6 +280,143 @@ def heatmap(
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(save_path, heatimg, compression="lzw")
     print("Done!")
+
+
+def generate_sample_stack_heatmap(
+    *,
+    sample_dir: str | Path | None,
+    signal_ch: str,
+    register_ch: str,
+    mask_zarr: str | Path | None,
+    dataset_name: str,
+    sample_reference_nii: str | Path | None,
+    atlas_image: str | Path,
+    transforms_dir: str | Path | None,
+    transforms: str,
+    resolution_xyz: str,
+    target_resolution_xyz: str,
+    foreground_mode: str,
+    foreground_label: int,
+    block_shape: str,
+    min_voxels_per_point: int,
+    volume_mode: str,
+    output_volume: str | Path | None,
+    edge_path: str | Path,
+    atlas_mask_path: str | Path,
+    output: str | Path,
+    alpha: float,
+    sigma: float,
+    atlas_dataset_name: str = "0",
+    edge_dataset_name: str = "0",
+    normalize: bool = False,
+    vmax: float | None = None,
+    scale_max: float = 510.0,
+) -> dict[str, object]:
+    if ants is None:
+        raise ImportError("ANTsPy is required for --mode sample-stack.")
+
+    from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
+        accumulate_sample_grid,
+        parse_block_shape,
+        parse_triplet,
+        resolve_inverse_transforms,
+        resolve_mask_zarr,
+        resolve_sample_reference_nii,
+        warp_sample_grid_to_atlas,
+        write_volume_output,
+    )
+    from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
+
+    print("Stage 1/4: resolve sample inputs")
+    sample_dir_value = sample_dir if sample_dir else None
+    mask_zarr_path = resolve_mask_zarr(
+        sample_dir=sample_dir_value,
+        signal_ch=signal_ch,
+        mask_zarr=mask_zarr,
+    )
+    sample_reference_path = resolve_sample_reference_nii(
+        sample_dir=sample_dir_value,
+        register_ch=register_ch,
+        sample_reference_nii=sample_reference_nii,
+    )
+    transforms_root = transforms_dir or str(Path(sample_reference_path).parents[1] / "transforms")
+    transformlist = resolve_inverse_transforms(transforms_root, transforms)
+    if not transformlist:
+        raise ValueError(f"No inverse transforms found under: {transforms_root}")
+
+    print(f"Using sample mask: {mask_zarr_path}")
+    print(f"Using sample reference: {sample_reference_path}")
+    print(f"Using transforms: {transformlist}")
+
+    sample_ref = ants.image_read(str(sample_reference_path))
+    sample_shape_zyx = tuple(int(value) for value in sample_ref.shape[::-1])
+    resolution = parse_triplet(resolution_xyz, name="resolution_xyz")
+    target_resolution = parse_triplet(target_resolution_xyz, name="target_resolution_xyz")
+
+    arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
+    fallback_block_shape = tuple(int(value) for value in (getattr(arr, "chunks", None) or arr.shape))
+    resolved_block_shape = parse_block_shape(block_shape, fallback_block_shape)
+
+    print("Stage 2/4: binning sample mask")
+    sample_volume, summary = accumulate_sample_grid(
+        mask_zarr_path,
+        resolution_xyz=resolution,
+        target_resolution_xyz=target_resolution,
+        output_shape_zyx=sample_shape_zyx,
+        dataset_name=dataset_name,
+        foreground_mode=foreground_mode,
+        foreground_label=foreground_label,
+        block_shape=resolved_block_shape,
+        min_voxels_per_point=min_voxels_per_point,
+        volume_mode=volume_mode,
+    )
+    print("Stage 3/4: warping binned volume into atlas space")
+    atlas_volume, raw_atlas_spacing_xyz = warp_sample_grid_to_atlas(
+        sample_volume,
+        sample_reference_nii=sample_reference_path,
+        atlas_image=atlas_image,
+        transformlist=transformlist,
+        interpolator="linear" if volume_mode == "count" else "nearestNeighbor",
+        binarize=volume_mode == "binary",
+    )
+
+    if output_volume:
+        print(f"Writing atlas-space volume to: {output_volume}")
+        volume_path = write_volume_output(atlas_volume, output_volume)
+        summary["output_volume"] = str(volume_path)
+
+    print("Stage 4/4: rendering heatmap")
+    render_heatmap_stack(
+        atlas_volume,
+        edge_path=edge_path,
+        atlas_mask_path=atlas_mask_path,
+        save_path=output,
+        alpha=alpha,
+        sigma=sigma,
+        atlas_dataset_name=atlas_dataset_name,
+        edge_dataset_name=edge_dataset_name,
+        normalize=normalize,
+        vmax=vmax,
+        scale_max=scale_max,
+    )
+
+    summary.update(
+        {
+            "success": True,
+            "mode": "sample-stack",
+            "sample_reference_nii": str(sample_reference_path),
+            "atlas_image": str(atlas_image),
+            "transformlist": transformlist,
+            "atlas_shape_zyx": list(atlas_volume.shape),
+            "raw_atlas_image_spacing_xyz": list(raw_atlas_spacing_xyz),
+            "heatmap_output": str(output),
+        }
+    )
+    summary_path = Path(output).with_suffix(".json")
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+    print(f"Saved summary to: {summary_path}")
+    return {"output": str(output), "summary": str(summary_path), "atlas_shape_zyx": list(atlas_volume.shape)}
 
 
 def _slice_signal_volume(local_signal_volume: np.ndarray, atlas_slice: AtlasSlice) -> np.ndarray:
@@ -702,24 +884,38 @@ def generate_prv_sample(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate 3D or atlas-slice signal heatmaps")
-    parser.add_argument("--mode", choices=["stack", "atlas-slice", "prv-sample"], default="stack")
+    parser.add_argument("--mode", choices=["stack", "sample-stack", "atlas-slice", "prv-sample"], default="stack")
     parser.add_argument("--input", help="Path to input mask/density image (TIFF stack or folder)")
     parser.add_argument("--output", help="Path to save output heatmap")
 
-    default_atlas_dir = Path(__file__).parent.parent / "Allen_brainatlas"
-    parser.add_argument("--edge", default=str(default_atlas_dir / "edge.tiff"), help="Path to edge reference image")
-    parser.add_argument("--atlas_mask", default=str(default_atlas_dir / "atlas_mask.tiff"), help="Path to atlas mask image")
+    parser.add_argument("--config", default="", help="Path to project config.json used to resolve sample defaults")
+    parser.add_argument("--edge", default="", help="Path to atlas-space edge reference image")
+    parser.add_argument("--atlas_mask", default="", help="Path to atlas-space brain mask/label image")
     parser.add_argument("--alpha", type=float, default=2.0, help="Intensity scaling factor")
     parser.add_argument("--sigma", type=float, default=2.0, help="Gaussian smoothing sigma")
-    parser.add_argument("--config", help="Path to config.json for downsampling")
-    parser.add_argument("--transforms", nargs="+", help="List of inverse transform files (Image -> Atlas)")
-    parser.add_argument("--reference", help="Path to reference atlas image (for registration)")
+    parser.add_argument("--transforms", default="", help="Comma-separated inverse transform paths in ANTs order for --mode sample-stack")
+    parser.add_argument("--reference", help=argparse.SUPPRESS)
     parser.add_argument("--dataset-name", default="0", help="Dataset name when --input is a Zarr group")
     parser.add_argument("--atlas-dataset-name", default="0", help="Dataset name when --atlas_mask is a Zarr group")
     parser.add_argument("--edge-dataset-name", default="0", help="Dataset name when --edge is a Zarr group")
     parser.add_argument("--normalize", action="store_true", help="Normalize stack local signal before RGB display scaling")
     parser.add_argument("--display-vmax", type=float, default=None, help="Value mapped to --scale-max when --normalize is used")
     parser.add_argument("--scale-max", type=float, default=510.0, help="Display scale maximum used by --normalize")
+
+    parser.add_argument("--sample-dir", default="", help="Sample directory for --mode sample-stack")
+    parser.add_argument("--signal-ch", default="ch1", help="Signal channel label for --mode sample-stack")
+    parser.add_argument("--register-ch", default="ch0", help="Registration channel label for --mode sample-stack")
+    parser.add_argument("--sample-reference-nii", default="", help="Downsampled sample NIfTI used for registration")
+    parser.add_argument("--atlas-image", default="", help="Atlas NIfTI used as fixed image")
+    parser.add_argument("--transforms-dir", default="", help="Directory containing inverse transforms")
+    parser.add_argument("--resolution-xyz", default="", help="Input mask voxel size in microns as x,y,z")
+    parser.add_argument("--target-resolution-xyz", default="", help="Sample grid voxel size in microns as x,y,z")
+    parser.add_argument("--foreground-mode", choices=("nonzero", "equal"), default="equal")
+    parser.add_argument("--foreground-label", type=int, default=1)
+    parser.add_argument("--block-shape", default="", help="Optional block shape in z,y,x order")
+    parser.add_argument("--min-voxels-per-point", type=int, default=1)
+    parser.add_argument("--volume-mode", choices=("binary", "count"), default="binary")
+    parser.add_argument("--output-volume", default="", help="Optional atlas-space volume TIFF written before heatmap rendering")
 
     parser.add_argument("--label", default=str(DEFAULT_ATLAS_LABEL), help="3D atlas label TIFF path")
     parser.add_argument("--plane", default="horizontal", choices=["coronal", "sagittal", "horizontal"], help="Atlas slice plane")
@@ -776,6 +972,39 @@ def main(argv: list[str] | None = None) -> int:
                 args.scale_max,
             )
             payload = {"mode": args.mode, "output": str(args.output)}
+        elif args.mode == "sample-stack":
+            if not args.sample_dir:
+                parser.error("--sample-dir is required for --mode sample-stack")
+            defaults = resolve_sample_stack_defaults(args.sample_dir, config_path=args.config or None)
+            payload = generate_sample_stack_heatmap(
+                sample_dir=args.sample_dir,
+                signal_ch=args.signal_ch or defaults["signal_ch"],
+                register_ch=args.register_ch or defaults["register_ch"],
+                mask_zarr=args.input or defaults["mask_zarr"],
+                dataset_name=args.dataset_name,
+                sample_reference_nii=args.sample_reference_nii or defaults["sample_reference_nii"],
+                atlas_image=args.atlas_image or defaults["atlas_image"],
+                transforms_dir=args.transforms_dir or defaults["transforms_dir"],
+                transforms=args.transforms,
+                resolution_xyz=args.resolution_xyz or defaults["resolution_xyz"],
+                target_resolution_xyz=args.target_resolution_xyz or defaults["target_resolution_xyz"],
+                foreground_mode=args.foreground_mode,
+                foreground_label=args.foreground_label,
+                block_shape=args.block_shape,
+                min_voxels_per_point=args.min_voxels_per_point,
+                volume_mode=args.volume_mode,
+                output_volume=args.output_volume or None,
+                edge_path=args.edge or defaults["edge"],
+                atlas_mask_path=args.atlas_mask or defaults["atlas_mask"],
+                output=args.output or defaults["output"],
+                alpha=args.alpha,
+                sigma=args.sigma,
+                atlas_dataset_name=args.atlas_dataset_name,
+                edge_dataset_name=args.edge_dataset_name,
+                normalize=args.normalize,
+                vmax=args.display_vmax,
+                scale_max=args.scale_max,
+            )
         elif args.mode == "atlas-slice":
             if not args.input or not args.output or args.coord is None:
                 parser.error("--input, --output, and --coord are required for --mode atlas-slice")

@@ -93,6 +93,10 @@ class RegistrationCfg(BaseModel):
         True,
         description="Also convert the sample-space atlas annotation to sample_dir/upsampled_atlas_label.zarr",
     )
+    save_upsampled_label_hemisphere_zarr: bool = Field(
+        False,
+        description="Also derive sample_dir/atlas_label_hemisphere.zarr for hemisphere-aware analysis",
+    )
     upsample_method: str = Field("nearest", description="Interpolation for upsampling: nearest, linear, cubic, quintic")
     chunk_size: int = Field(50, ge=1, description="Chunk size (slices) for chunked label upsampling")
 
@@ -141,6 +145,10 @@ class AnalysisCfg(BaseModel):
     flush_every: int = Field(25, ge=0, description="Rewrite Excel after every N rows (0 = only at end)")
     resolution_xyz: _Triplet = Field((1.0, 1.0, 1.0), description="Voxel size in um as (x, y, z)")
     pass1_workers: int = Field(1, ge=1, description="Worker processes for Pass 1 block scanning")
+    use_hemisphere_label: bool = Field(
+        False,
+        description="Use sample_dir/atlas_label_hemisphere.zarr for left/right analysis instead of x-midpoint splitting",
+    )
 
     @field_validator("foreground_mode")
     @classmethod
@@ -160,6 +168,11 @@ class AnalysisCfg(BaseModel):
         if value is None or value == "" or value == "None":
             return None
         return _coerce_int_triplet(value)
+
+    @field_validator("use_hemisphere_label")
+    @classmethod
+    def _validate_use_hemisphere_label(cls, value: bool) -> bool:
+        return bool(value)
 
 
 # ---------------------------------------------------------------------------

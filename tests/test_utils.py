@@ -158,6 +158,10 @@ class TestSampleLayout:
         layout = SampleLayout(sample_dir=tmp_path, signal_ch="ch2")
         assert layout.density_results_xlsx.name == f"{tmp_path.name}_density_result.xlsx"
 
+    def test_atlas_label_hemisphere_zarr(self, tmp_path):
+        layout = SampleLayout(sample_dir=tmp_path)
+        assert layout.atlas_label_hemisphere_zarr == tmp_path / "atlas_label_hemisphere.zarr"
+
     def test_require_exists_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             SampleLayout(sample_dir=tmp_path / "nonexistent", require_exists=True)

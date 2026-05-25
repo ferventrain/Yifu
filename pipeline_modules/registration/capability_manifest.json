@@ -24,12 +24,14 @@
         "save_transforms":     {"type": "bool", "default": false},
         "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack"},
         "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr"},
+        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr"},
         "config":              {"type": "path|null", "default": null, "description": "Path to main config.json for resolution info"},
         "density_cfg":         {"type": "path|null", "default": null}
       },
       "outputs": {
         "upsampled_atlas_label": {"type": "dir", "description": "sample_dir/upsampled_atlas_label (TIFF stack)"},
         "upsampled_atlas_label_zarr": {"type": "path", "optional": true, "description": "sample_dir/upsampled_atlas_label.zarr"},
+        "atlas_label_hemisphere_zarr": {"type": "path", "optional": true, "description": "sample_dir/atlas_label_hemisphere.zarr"},
         "warped_mask_dir":       {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_mask (image2atlas mode)"},
         "warped_image_dir":      {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_image (if save_registered_image)"},
         "transforms_dir":        {"type": "dir", "optional": true, "description": "sample_dir/transforms (if save_transforms)"},
@@ -60,7 +62,8 @@
         "resolution_xyz":       {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
         "tmp_dir":              {"type": "path|null", "default": null},
         "keep_tmp":             {"type": "bool", "default": false},
-        "pass1_workers":        {"type": "int", "default": 1}
+        "pass1_workers":        {"type": "int", "default": 1},
+        "hemisphere_zarr_path":  {"type": "path|null", "default": null, "description": "Optional hemisphere Zarr for left/right stats"}
       },
       "outputs": {
         "excel_path":    {"type": "path", "description": "Per-region signal statistics Excel workbook"},

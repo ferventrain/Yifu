@@ -417,18 +417,16 @@ def run_density_analysis(
     zarr_path,
     mask_zarr_path,
     warped_label_zarr_path,
+    hemisphere_zarr_path,
     zarr_cfg,
     density_cfg_path,
     resolution_xyz,
 ):
-    warped_label_dir = sample_dir / "upsampled_atlas_label"
-
-    if not directory_has_files(warped_label_dir):
-        print(f"Error: Warped label folder not found at {warped_label_dir}. Registration failed?")
-        sys.exit(1)
-
     if not warped_label_zarr_path.exists():
         print(f"Error: Label Zarr not found at {warped_label_zarr_path}.")
+        sys.exit(1)
+    if hemisphere_zarr_path and not hemisphere_zarr_path.exists():
+        print(f"Error: Hemisphere Zarr not found at {hemisphere_zarr_path}.")
         sys.exit(1)
 
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask"
@@ -436,7 +434,6 @@ def run_density_analysis(
 
     output_excel = sample_dir / f"{sample_dir.name}_density_result.xlsx"
     resolution_xyz_str = format_csv(resolution_xyz)
-    transforms_dir = sample_dir / "transforms"
 
     cmd = (
         f'"{PYTHON_EXE}" -m pipeline_modules.registration.region_signal_analysis_zarr_graph '
@@ -449,9 +446,10 @@ def run_density_analysis(
         f'--foreground_mode equal '
         f'--foreground_label 1 '
         f'--resolution_xyz "{resolution_xyz_str}" '
-        f'--transforms_dir "{transforms_dir}" '
         f'--pass1_workers 4'
     )
+    if hemisphere_zarr_path:
+        cmd += f' --hemisphere_zarr "{hemisphere_zarr_path}"'
     run_command(cmd, "Step 6: Density Analysis")
 
 
@@ -494,7 +492,9 @@ def main():
     zarr_cfg = preprocessing_cfg["zarr"]
     seg_cfg = cfg["segmentation"]
     reg_cfg = cfg["registration"]
-    density_cfg_path = resolve_density_cfg_path(cfg["analysis"])
+    analysis_cfg = cfg["analysis"]
+    density_cfg_path = resolve_density_cfg_path(analysis_cfg)
+    use_hemisphere_label = bool(analysis_cfg.get("use_hemisphere_label", False))
 
     # ---- Step 1: Registration downsample ----
     ensure_registration_downsample(
@@ -506,10 +506,29 @@ def main():
 
     # ---- Step 2: ANTs Registration (atlas label for edge removal) ----
     warped_label_dir = warped_label_zarr = None
+    hemisphere_label_zarr = None
+    if use_hemisphere_label and not bool(reg_cfg.get("save_upsampled_label_hemisphere_zarr", False)):
+        print(
+            "Error: analysis.use_hemisphere_label=true requires "
+            "registration.save_upsampled_label_hemisphere_zarr=true."
+        )
+        sys.exit(1)
     if not args.skip_registration:
         warped_label_dir, warped_label_zarr = ensure_registration_outputs(
             sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg, config_path,
         )
+        if use_hemisphere_label:
+            hemisphere_label_zarr = sample_dir / "atlas_label_hemisphere.zarr"
+    else:
+        zarr_path_candidate = sample_dir / "upsampled_atlas_label.zarr"
+        dir_path_candidate = sample_dir / "upsampled_atlas_label"
+        if zarr_path_candidate.exists():
+            warped_label_zarr = zarr_path_candidate
+        hemisphere_candidate = sample_dir / "atlas_label_hemisphere.zarr"
+        if use_hemisphere_label and hemisphere_candidate.exists():
+            hemisphere_label_zarr = hemisphere_candidate
+        if directory_has_files(dir_path_candidate):
+            warped_label_dir = dir_path_candidate
 
     # ---- Step 3: TIFF preprocessing + optional edge signal removal ----
     esr_cfg = preprocessing_cfg.get("edge_signal_removal", {})
@@ -584,6 +603,7 @@ def main():
             zarr_path,
             mask_zarr_path,
             warped_label_zarr,
+            hemisphere_label_zarr,
             zarr_cfg,
             density_cfg_path,
             cfg["input"]["resolution_xyz"],
