@@ -139,11 +139,28 @@ def resolve_transform_paths(transforms_dir, transforms):
     )
 
 
+def read_ants_affine_matrix(transform_path):
+    try:
+        import ants
+    except ImportError:
+        return None
+
+    try:
+        transform = ants.read_transform(str(transform_path))
+    except Exception:
+        return None
+
+    parameters = np.asarray(transform.parameters, dtype=np.float64)
+    if parameters.size < 9:
+        return None
+    return parameters[:9].reshape(3, 3)
+
+
 def read_itk_affine_matrix(transform_path):
     try:
         text = Path(transform_path).read_text(encoding="utf-8", errors="ignore")
     except OSError:
-        return None
+        text = ""
 
     transform_line = ""
     parameters_line = ""
@@ -155,11 +172,11 @@ def read_itk_affine_matrix(transform_path):
             parameters_line = stripped
 
     if "AffineTransform" not in transform_line or not parameters_line:
-        return None
+        return read_ants_affine_matrix(transform_path)
 
     values = [float(value) for value in parameters_line.split(":", 1)[1].split()]
     if len(values) < 12:
-        return None
+        return read_ants_affine_matrix(transform_path)
     return np.asarray(values[:9], dtype=np.float64).reshape(3, 3)
 
 
@@ -190,16 +207,15 @@ def detect_left_right_swapped(transforms_dir="", transforms=""):
     return False
 
 
-def hemisphere_ids_for_x_positions(x_positions, volume_width, left_right_swapped=False):
-    split_x = int(volume_width) / 2.0
+def hemisphere_ids_for_x_positions(x_positions, split_x, left_right_swapped=False):
     hemisphere_ids = np.where(np.asarray(x_positions) < split_x, LEFT_HEMISPHERE_ID, RIGHT_HEMISPHERE_ID).astype(np.int8)
     if left_right_swapped:
         hemisphere_ids = np.where(hemisphere_ids == LEFT_HEMISPHERE_ID, RIGHT_HEMISPHERE_ID, LEFT_HEMISPHERE_ID).astype(np.int8)
     return hemisphere_ids
 
 
-def iter_hemisphere_x_slices(start_x, width, volume_width, left_right_swapped=False):
-    split_index = int(np.ceil(int(volume_width) / 2.0))
+def iter_hemisphere_x_slices(start_x, width, split_x, left_right_swapped=False):
+    split_index = int(np.ceil(float(split_x)))
     local_left_stop = min(max(split_index - int(start_x), 0), int(width))
 
     left_id = RIGHT_HEMISPHERE_ID if left_right_swapped else LEFT_HEMISPHERE_ID
@@ -262,6 +278,32 @@ def choose_block_shape(mask_zarr, label_zarr, signal_zarr, requested_block_shape
         return block_shape
 
     raise ValueError("Could not infer block size from Zarr chunks; please provide --block_size")
+
+
+def compute_label_x_split(label_zarr, block_shape):
+    min_x = None
+    max_x = None
+    volume_shape = tuple(int(value) for value in label_zarr.shape)
+    for block_spec in iter_block_specs(volume_shape, block_shape):
+        z0, y0, x0 = block_spec["start"]
+        z1, y1, x1 = block_spec["stop"]
+        label_chunk = np.asarray(label_zarr[z0:z1, y0:y1, x0:x1])
+        if not np.any(label_chunk > 0):
+            continue
+
+        _, _, local_x = np.nonzero(label_chunk > 0)
+        chunk_min_x = int(local_x.min()) + int(x0)
+        chunk_max_x = int(local_x.max()) + int(x0)
+        min_x = chunk_min_x if min_x is None else min(min_x, chunk_min_x)
+        max_x = chunk_max_x if max_x is None else max(max_x, chunk_max_x)
+
+    if min_x is None or max_x is None:
+        fallback_split = volume_shape[2] / 2.0
+        logger.warning("No positive atlas labels found; falling back to volume x midpoint %.3f", fallback_split)
+        return fallback_split, None, None
+
+    split_x = (float(min_x) + float(max_x) + 1.0) / 2.0
+    return split_x, int(min_x), int(max_x)
 
 
 def iter_block_specs(volume_shape, block_shape):
@@ -550,7 +592,7 @@ def add_bincounts_to_dict(target, labels, weights=None):
             target[int(region_id)] = target.get(int(region_id), 0.0) + float(value)
 
 
-def aggregate_region_totals(total_region_voxels, total_region_voxels_by_hemisphere, label_chunk, start, volume_shape, left_right_swapped):
+def aggregate_region_totals(total_region_voxels, total_region_voxels_by_hemisphere, label_chunk, start, split_x, left_right_swapped):
     positive_labels = label_chunk[label_chunk > 0]
     if positive_labels.size == 0:
         return
@@ -560,7 +602,7 @@ def aggregate_region_totals(total_region_voxels, total_region_voxels_by_hemisphe
     for x_slice, hemisphere_id in iter_hemisphere_x_slices(
         start_x=start[2],
         width=label_chunk.shape[2],
-        volume_width=volume_shape[2],
+        split_x=split_x,
         left_right_swapped=left_right_swapped,
     ):
         hemisphere_labels = label_chunk[:, :, x_slice]
@@ -581,14 +623,14 @@ def aggregate_signal_by_hemisphere(
     start,
     foreground_mode,
     foreground_label,
-    volume_shape,
+    split_x,
     left_right_swapped,
 ):
     binary_mask = build_binary_mask(mask_chunk, foreground_mode, foreground_label)
     for x_slice, hemisphere_id in iter_hemisphere_x_slices(
         start_x=start[2],
         width=label_chunk.shape[2],
-        volume_width=volume_shape[2],
+        split_x=split_x,
         left_right_swapped=left_right_swapped,
     ):
         hemi_label = label_chunk[:, :, x_slice]
@@ -739,12 +781,14 @@ WORKER_LABEL_ZARR = None
 WORKER_SIGNAL_ZARR = None
 WORKER_DATASET_NAME = None
 WORKER_LEFT_RIGHT_SWAPPED = False
+WORKER_LABEL_X_SPLIT = None
 
 
-def init_pass1_worker(mask_zarr_path, label_zarr_path, signal_zarr_path, dataset_name, left_right_swapped):
-    global WORKER_MASK_ZARR, WORKER_LABEL_ZARR, WORKER_SIGNAL_ZARR, WORKER_DATASET_NAME, WORKER_LEFT_RIGHT_SWAPPED
+def init_pass1_worker(mask_zarr_path, label_zarr_path, signal_zarr_path, dataset_name, left_right_swapped, label_x_split):
+    global WORKER_MASK_ZARR, WORKER_LABEL_ZARR, WORKER_SIGNAL_ZARR, WORKER_DATASET_NAME, WORKER_LEFT_RIGHT_SWAPPED, WORKER_LABEL_X_SPLIT
     WORKER_DATASET_NAME = dataset_name
     WORKER_LEFT_RIGHT_SWAPPED = bool(left_right_swapped)
+    WORKER_LABEL_X_SPLIT = float(label_x_split)
     WORKER_MASK_ZARR = open_zarr_dataset(mask_zarr_path, dataset_name)
     WORKER_LABEL_ZARR = open_zarr_dataset(label_zarr_path, dataset_name)
     WORKER_SIGNAL_ZARR = open_zarr_dataset(signal_zarr_path, dataset_name)
@@ -767,7 +811,7 @@ def process_block_spec_worker(block_spec, foreground_mode, foreground_label):
         total_region_voxels_by_hemisphere,
         label_chunk,
         block_spec["start"],
-        WORKER_MASK_ZARR.shape,
+        WORKER_LABEL_X_SPLIT,
         WORKER_LEFT_RIGHT_SWAPPED,
     )
     aggregate_signal_by_hemisphere(
@@ -779,7 +823,7 @@ def process_block_spec_worker(block_spec, foreground_mode, foreground_label):
         block_spec["start"],
         foreground_mode,
         foreground_label,
-        WORKER_MASK_ZARR.shape,
+        WORKER_LABEL_X_SPLIT,
         WORKER_LEFT_RIGHT_SWAPPED,
     )
 
@@ -843,6 +887,7 @@ def scan_blocks_and_write_artifacts(
     tmp_dir,
     pass1_workers,
     left_right_swapped,
+    label_x_split,
 ):
     logger.info("Pass 1/3: scanning blocks and writing block artifacts...")
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -873,7 +918,7 @@ def scan_blocks_and_write_artifacts(
                     total_region_voxels_by_hemisphere,
                     label_chunk,
                     block_spec["start"],
-                    mask_zarr.shape,
+                    label_x_split,
                     left_right_swapped,
                 )
                 aggregate_signal_by_hemisphere(
@@ -885,7 +930,7 @@ def scan_blocks_and_write_artifacts(
                     block_spec["start"],
                     foreground_mode,
                     foreground_label,
-                    mask_zarr.shape,
+                    label_x_split,
                     left_right_swapped,
                 )
 
@@ -933,7 +978,14 @@ def scan_blocks_and_write_artifacts(
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=int(pass1_workers),
                 initializer=init_pass1_worker,
-                initargs=(mask_zarr_path, label_zarr_path, signal_zarr_path, dataset_name, left_right_swapped),
+                initargs=(
+                    mask_zarr_path,
+                    label_zarr_path,
+                    signal_zarr_path,
+                    dataset_name,
+                    left_right_swapped,
+                    label_x_split,
+                ),
             ) as executor:
                 future_to_block = {}
                 spec_iter = iter(all_block_specs)
@@ -1029,6 +1081,7 @@ def scan_blocks_and_write_artifacts(
             for key, value in region_sum_intensity_by_hemisphere.items()
         },
         "left_right_swapped": bool(left_right_swapped),
+        "label_x_split": float(label_x_split),
     }
 
     with open(tmp_dir / "manifest.json", "w", encoding="utf-8") as handle:
@@ -1329,10 +1382,16 @@ def analyze_zarr_graph(
     block_shape = choose_block_shape(mask_zarr, label_zarr, signal_zarr, block_size)
     region_tree = load_region_tree(cfg_path)
     left_right_swapped = detect_left_right_swapped(transforms_dir=transforms_dir, transforms=transforms)
+    label_x_split, label_min_x, label_max_x = compute_label_x_split(label_zarr, block_shape)
+    if label_min_x is None or label_max_x is None:
+        label_range_text = "fallback volume extent"
+    else:
+        label_range_text = f"atlas label nonzero x range [{label_min_x}, {label_max_x}]"
     logger.info(
-        "Hemisphere assignment: atlas/sample x < %.3f is Left, x >= %.3f is Right%s",
-        mask_zarr.shape[2] / 2.0,
-        mask_zarr.shape[2] / 2.0,
+        "Hemisphere assignment: %s, split x < %.3f is Left, x >= %.3f is Right%s",
+        label_range_text,
+        label_x_split,
+        label_x_split,
         " after transform reflection swap" if left_right_swapped else "",
     )
 
@@ -1358,6 +1417,7 @@ def analyze_zarr_graph(
             tmp_dir=tmp_root,
             pass1_workers=pass1_workers,
             left_right_swapped=left_right_swapped,
+            label_x_split=label_x_split,
         )
         logger.info("Timing | Pass 1 scan: %.2fs", time.perf_counter() - pass1_start_time)
 

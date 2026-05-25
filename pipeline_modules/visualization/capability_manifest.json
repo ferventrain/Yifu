@@ -17,7 +17,7 @@
         "input_excel": {
           "type": "path",
           "required": true,
-          "description": "Density/results Excel workbook, commonly sample_dir/density_results_chX.xlsx"
+          "description": "Density/results Excel workbook, commonly sample_dir/<sample_dir_name>_density_result.xlsx"
         },
         "cfg": {
           "type": "path",
@@ -27,7 +27,12 @@
         "metric": {
           "type": "string",
           "required": true,
-          "examples": ["Voxel Density", "Signal Count", "Signal Voxels", "Sum Intensity"],
+          "examples": [
+            "Voxel Density",
+            "Signal Count",
+            "Signal Voxels",
+            "Sum Intensity"
+          ],
           "description": "Column from the Level_* sheets to aggregate and plot"
         },
         "title": {
@@ -74,13 +79,85 @@
       },
       "common_commands": [
         {
-          "description": "Plot coarse-region cFos voxel density for a sample directory containing density_results_ch1.xlsx",
-          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\coarse_region_metric_plot.py --input_excel \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\density_results_ch1.xlsx\" --metric \"Voxel Density\" --title \"TBI cFos coarse region density\" --ylabel \"cFos voxel density\" --output_prefix \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\density_results_ch1_cfos_density\""
+          "description": "Plot coarse-region cFos voxel density for a sample directory containing <sample_dir_name>_density_result.xlsx",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\coarse_region_metric_plot.py --input_excel \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\tbi_density_result.xlsx\" --metric \"Voxel Density\" --title \"TBI cFos coarse region density\" --ylabel \"cFos voxel density\" --output_prefix \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\tbi_cfos_density\""
         }
       ],
       "sample_layout": {
-        "density_results_xlsx": "sample_dir/density_results_chX.xlsx"
+        "density_results_xlsx": "sample_dir/<sample_dir_name>_density_result.xlsx"
       }
+    },
+    {
+      "id": "plot_group_density_coarse_regions",
+      "function": "pipeline_modules.visualization.group_density_coarse_region_bar.generate_group_density_plot",
+      "cli": "python pipeline_modules/visualization/group_density_coarse_region_bar.py",
+      "description": "Find density Excel workbooks in direct child sample folders, summarize them into default coarse Allen brain regions, and draw grouped bar plots comparing samples.",
+      "prerequisites": [
+        "Each direct child folder under root_dir is treated as a sample_dir",
+        "Each sample_dir should contain at least one *.xlsx file with density in the filename",
+        "Density workbooks must contain Level_* sheets with Name and selected metric columns"
+      ],
+      "inputs": {
+        "root_dir": {
+          "type": "dir",
+          "required": true,
+          "description": "Folder containing sample_dir child folders"
+        },
+        "cfg": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        },
+        "metric": {
+          "type": "string",
+          "default": "Voxel Density",
+          "examples": [
+            "Voxel Density",
+            "Left Voxel Density",
+            "Right Voxel Density",
+            "Signal Voxels"
+          ]
+        },
+        "title": {
+          "type": "string|null",
+          "default": null
+        },
+        "ylabel": {
+          "type": "string|null",
+          "default": null
+        },
+        "output_prefix": {
+          "type": "path|null",
+          "default": null
+        },
+        "figsize": {
+          "type": "width,height",
+          "default": "13.5,6.8"
+        },
+        "dpi": {
+          "type": "int",
+          "default": 300
+        }
+      },
+      "outputs": {
+        "group_stats_csv": {
+          "type": "path",
+          "description": "<output_prefix>_coarse_region_group_stats.csv"
+        },
+        "group_stats_xlsx": {
+          "type": "path",
+          "description": "<output_prefix>_coarse_region_group_stats.xlsx"
+        },
+        "grouped_bar_plot": {
+          "type": "path",
+          "description": "<output_prefix>_coarse_region_group_bar.png"
+        }
+      },
+      "common_commands": [
+        {
+          "description": "Compare coarse-region voxel density across all sample folders under a root folder",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\group_density_coarse_region_bar.py --root_dir \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\" --metric \"Voxel Density\" --title \"Coarse-region cFos density\" --ylabel \"Voxel density\""
+        }
+      ]
     }
   ]
 }

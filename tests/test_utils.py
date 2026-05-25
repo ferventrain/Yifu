@@ -154,9 +154,9 @@ class TestSampleLayout:
         assert layout.tubule_edge_csv.name == "skeleton_edges.csv"
         assert layout.tubule_run_manifest.name == "_run_manifest.json"
 
-    def test_density_xlsx_uses_signal_ch(self, tmp_path):
+    def test_density_xlsx_uses_sample_dir_name(self, tmp_path):
         layout = SampleLayout(sample_dir=tmp_path, signal_ch="ch2")
-        assert layout.density_results_xlsx.name == "density_results_ch2.xlsx"
+        assert layout.density_results_xlsx.name == f"{tmp_path.name}_density_result.xlsx"
 
     def test_require_exists_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
