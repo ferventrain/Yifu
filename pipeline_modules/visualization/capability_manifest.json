@@ -158,6 +158,86 @@
           "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\group_density_coarse_region_bar.py --root_dir \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\" --metric \"Voxel Density\" --title \"Coarse-region cFos density\" --ylabel \"Voxel density\""
         }
       ]
+    },
+    {
+      "id": "render_signal_heatmap",
+      "function": "pipeline_modules.visualization.heatmap.generate_sample_stack_heatmap",
+      "cli": "python pipeline_modules/visualization/heatmap.py",
+      "description": "Warp a sample-space mask into atlas space, cache the atlas-space volume/points, and render 3D or 2D heatmaps.",
+      "prerequisites": [
+        "sample_dir should contain <signal_ch>_mask.zarr, <register_ch>_downsample/volume.nii.gz, and transforms/",
+        "Atlas reference files should exist under data/reference/",
+        "For repeated runs, the cached atlas-space volume can be reused from sample_dir/visualization/<sample>_heatmap3d_volume.tiff"
+      ],
+      "inputs": {
+        "sample_dir": {
+          "type": "dir",
+          "required": false,
+          "description": "Sample directory used by --mode sample-stack. Most defaults are resolved from here."
+        },
+        "mode": {
+          "type": "string",
+          "default": "sample-stack",
+          "examples": ["sample-stack", "stack", "atlas-slice"]
+        },
+        "input": {
+          "type": "path|null",
+          "default": null,
+          "description": "Atlas-space TIFF volume for --mode stack/atlas-slice, or explicit mask_zarr for --mode sample-stack"
+        },
+        "output": {
+          "type": "path|null",
+          "default": null,
+          "description": "Output heatmap path. sample-stack defaults to sample_dir/visualization/<sample>_heatmap3d_stack.tiff"
+        },
+        "sigma": {
+          "type": "float",
+          "default": 1.0,
+          "description": "3D Gaussian smoothing strength for signal rendering. For broader, more continuous cFos-style heatmaps, sigma around 10 can produce the desired effect."
+        },
+        "alpha": {
+          "type": "float",
+          "default": 2.0,
+          "description": "Signal intensity scaling factor after smoothing"
+        },
+        "display_vmax": {
+          "type": "float|null",
+          "default": null,
+          "description": "Optional normalization ceiling used with --normalize to brighten or compress the heatmap range"
+        }
+      },
+      "outputs": {
+        "heatmap_stack_tiff": {
+          "type": "path",
+          "description": "sample_dir/visualization/<sample>_heatmap3d_stack.tiff"
+        },
+        "cached_atlas_volume_tiff": {
+          "type": "path",
+          "description": "sample_dir/visualization/<sample>_heatmap3d_volume.tiff"
+        },
+        "atlas_points_csv": {
+          "type": "path",
+          "description": "sample_dir/visualization/points.csv"
+        },
+        "summary_json": {
+          "type": "path",
+          "description": "Heatmap summary JSON written next to the output heatmap"
+        }
+      },
+      "common_commands": [
+        {
+          "description": "Generate a cached atlas-space volume plus 3D heatmap from a sample directory",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\heatmap.py --mode sample-stack --sample-dir \"S:\\Arivis_Analysis\\sample01\""
+        },
+        {
+          "description": "Render a broader, redder 3D heatmap using stronger smoothing",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\heatmap.py --mode stack --input \"S:\\Arivis_Analysis\\sample01\\visualization\\sample01_heatmap3d_volume.tiff\" --output \"S:\\Arivis_Analysis\\sample01\\visualization\\sample01_heatmap3d_sigma10.tiff\" --edge \"S:\\Yifu\\data\\reference\\atlas_edge.tiff\" --atlas_mask \"S:\\Yifu\\data\\reference\\atlas_label.tiff\" --normalize --sigma 10 --display-vmax 0.25"
+        },
+        {
+          "description": "Render a 2D coronal AP slice from the cached atlas-space volume",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\heatmap.py --mode atlas-slice --input \"S:\\Arivis_Analysis\\sample01\\visualization\\sample01_heatmap3d_volume.tiff\" --label \"S:\\Yifu\\data\\reference\\atlas_label.tiff\" --plane coronal --coord-system index --coord 216 --output \"S:\\Arivis_Analysis\\sample01\\visualization\\ap_216.png\" --sigma 10"
+        }
+      ]
     }
   ]
 }

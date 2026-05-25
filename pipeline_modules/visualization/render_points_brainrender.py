@@ -6,6 +6,7 @@ import argparse
 import configparser
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -504,6 +505,15 @@ def default_points_csv_for_sample(sample_dir: str | Path, signal_ch: str) -> Pat
     return Path(sample_dir) / "visualization" / "points.csv"
 
 
+def default_heatmap_volume_for_sample(sample_dir: str | Path) -> Path:
+    sample_dir = Path(sample_dir)
+    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_volume.tiff"
+
+
+def default_reference_atlas_image() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "reference" / "atlas_label.tiff"
+
+
 def resolve_points_csv(args: argparse.Namespace) -> Path:
     if args.points_csv:
         return Path(args.points_csv)
@@ -516,14 +526,44 @@ def resolve_points_csv(args: argparse.Namespace) -> Path:
         print(f"Using existing atlas-space points CSV: {points_csv}")
         return points_csv
 
+    cached_volume = default_heatmap_volume_for_sample(sample_dir)
+    if cached_volume.exists() and not args.force_warp:
+        print(f"Generating atlas-space points CSV from cached volume: {cached_volume}")
+        from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
+            atlas_volume_to_points,
+            write_outputs,
+        )
+        import tifffile
+
+        atlas_volume = tifffile.imread(str(cached_volume))
+        atlas_resolution = parse_triplet(args.atlas_resolution_xyz or "25,25,25")
+        table = atlas_volume_to_points(atlas_volume, atlas_resolution_xyz=atlas_resolution, max_points=150_000)
+        write_outputs(
+            table,
+            {
+                "source_volume": str(cached_volume),
+                "atlas_resolution_xyz": list(atlas_resolution),
+                "exported_points": int(len(table)),
+                "coordinate_space": "atlas",
+            },
+            points_csv,
+        )
+        return points_csv
+
     mask_zarr = sample_dir / f"{args.signal_ch}_mask.zarr"
     sample_reference = sample_dir / f"{args.register_ch}_downsample" / "volume.nii.gz"
-    command = [
-        "micromamba",
-        "run",
-        "-n",
-        args.warp_env,
-        "python",
+    output_volume = default_heatmap_volume_for_sample(sample_dir)
+    if args.warp_with_micromamba:
+        command = [
+            "micromamba",
+            "run",
+            "-n",
+            args.warp_env,
+            "python",
+        ]
+    else:
+        command = [sys.executable]
+    command.extend([
         "-m",
         "pipeline_modules.visualization.warp_mask_zarr_to_atlas_points",
         "--sample_dir",
@@ -552,12 +592,17 @@ def resolve_points_csv(args: argparse.Namespace) -> Path:
         str(args.foreground_label),
         "--output",
         str(points_csv),
-    ]
+        "--output_volume",
+        str(output_volume),
+    ])
     print(f"Generating atlas-space points CSV: {points_csv}")
     try:
         subprocess.run(command, cwd=Path(__file__).resolve().parents[2], check=True)
     except FileNotFoundError as exc:
-        raise RuntimeError("Could not find micromamba. Pass --points_csv or generate the points CSV first.") from exc
+        raise RuntimeError(
+            "Could not start the point-generation command. "
+            "Pass --points_csv if you already generated points, or use --warp_with_micromamba only when micromamba is on PATH."
+        ) from exc
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Failed to generate atlas-space points CSV with exit code {exc.returncode}.") from exc
 
@@ -576,7 +621,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--register_ch", default="ch0", help="Registration channel label used with --sample_dir.")
     parser.add_argument("--force_warp", action="store_true", help="Regenerate atlas-space points even if the CSV already exists.")
     parser.add_argument("--warp_env", default="yifu", help=argparse.SUPPRESS)
-    parser.add_argument("--atlas_image", default="S:\\Yifu\\data\\reference\\atlas.nii.gz", help=argparse.SUPPRESS)
+    parser.add_argument("--warp_with_micromamba", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--atlas_image", default=str(default_reference_atlas_image()), help=argparse.SUPPRESS)
     parser.add_argument("--resolution_xyz", default="1.8,1.8,2.0", help=argparse.SUPPRESS)
     parser.add_argument("--target_resolution_xyz", default="25,25,25", help=argparse.SUPPRESS)
     parser.add_argument("--foreground_mode", choices=("nonzero", "equal"), default="equal", help=argparse.SUPPRESS)

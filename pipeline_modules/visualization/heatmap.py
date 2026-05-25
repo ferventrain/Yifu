@@ -74,6 +74,15 @@ def default_sample_stack_output(sample_dir: str | Path) -> Path:
     return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_stack.tiff"
 
 
+def default_sample_stack_volume(sample_dir: str | Path) -> Path:
+    sample_dir = Path(sample_dir)
+    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_volume.tiff"
+
+
+def default_sample_points_csv(sample_dir: str | Path) -> Path:
+    return Path(sample_dir) / "visualization" / "points.csv"
+
+
 def resolve_sample_stack_defaults(
     sample_dir: str | Path,
     *,
@@ -101,14 +110,16 @@ def resolve_sample_stack_defaults(
         "mask_zarr": sample_dir / f"{signal_ch}_mask.zarr",
         "sample_reference_nii": sample_dir / f"{register_ch}_downsample" / "volume.nii.gz",
         "transforms_dir": sample_dir / "transforms",
-        "atlas_image": default_reference_dir() / "atlas.nii.gz",
+        "atlas_image": default_reference_dir() / "atlas_label.tiff",
         "edge": default_reference_dir() / "atlas_edge.tiff",
         "atlas_mask": default_reference_dir() / "atlas_label.tiff",
         "output": default_sample_stack_output(sample_dir),
+        "output_volume": default_sample_stack_volume(sample_dir),
+        "points_csv": default_sample_points_csv(sample_dir),
     }
 
 
-def create_gaussian_kernel_3d(kernel_size=11, sigma=1.5):
+def create_gaussian_kernel_3d(kernel_size=7, sigma=1.0):
     ax = np.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
     xx, yy, zz = np.meshgrid(ax, ax, ax)
     kernel = np.exp(-(xx**2 + yy**2 + zz**2) / (2 * sigma**2))
@@ -140,7 +151,7 @@ def read_volume(path, *, dataset_name: str = "0"):
     return read_tiff_stack(path)
 
 
-def build_local_signal_volume(signal_volume, sigma=1.5, alpha=1.0, atlas_mask=None, kernel_size=11, normalize=False):
+def build_local_signal_volume(signal_volume, sigma=1.0, alpha=1.0, atlas_mask=None, kernel_size=7, normalize=False):
     volume = np.asarray(signal_volume, dtype=np.float32).copy()
     if atlas_mask is not None:
         mask = np.asarray(atlas_mask) > 0
@@ -199,7 +210,7 @@ def heatmap(
     atlas_mask_path,
     save_path,
     alpha,
-    sigma=1.5,
+    sigma=1.0,
     resolution_cfg=None,
     transforms=None,
     reference=None,
@@ -241,7 +252,7 @@ def render_heatmap_stack(
     atlas_mask_path,
     save_path,
     alpha,
-    sigma=1.5,
+    sigma=1.0,
     atlas_dataset_name="0",
     edge_dataset_name="0",
     normalize=False,
@@ -317,11 +328,14 @@ def generate_sample_stack_heatmap(
 
     from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
         accumulate_sample_grid,
+        atlas_volume_to_points,
         parse_block_shape,
         parse_triplet,
         resolve_inverse_transforms,
         resolve_mask_zarr,
         resolve_sample_reference_nii,
+        resolve_atlas_resolution_xyz,
+        write_outputs,
         warp_sample_grid_to_atlas,
         write_volume_output,
     )
@@ -348,42 +362,70 @@ def generate_sample_stack_heatmap(
     print(f"Using sample reference: {sample_reference_path}")
     print(f"Using transforms: {transformlist}")
 
-    sample_ref = ants.image_read(str(sample_reference_path))
-    sample_shape_zyx = tuple(int(value) for value in sample_ref.shape[::-1])
-    resolution = parse_triplet(resolution_xyz, name="resolution_xyz")
-    target_resolution = parse_triplet(target_resolution_xyz, name="target_resolution_xyz")
+    cached_volume_path = Path(output_volume) if output_volume else default_sample_stack_volume(sample_dir)
+    points_csv_path = default_sample_points_csv(sample_dir)
+    summary: dict[str, object] = {
+        "success": True,
+        "mode": "sample-stack",
+        "sample_reference_nii": str(sample_reference_path),
+        "atlas_image": str(atlas_image),
+        "transformlist": transformlist,
+        "cached_volume_path": str(cached_volume_path),
+    }
 
-    arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
-    fallback_block_shape = tuple(int(value) for value in (getattr(arr, "chunks", None) or arr.shape))
-    resolved_block_shape = parse_block_shape(block_shape, fallback_block_shape)
+    if cached_volume_path.exists():
+        print(f"Using cached atlas-space volume: {cached_volume_path}")
+        atlas_volume = read_tiff_stack(cached_volume_path)
+        raw_atlas_spacing_xyz = tuple()
+        summary["cache_hit"] = True
+    else:
+        sample_ref = ants.image_read(str(sample_reference_path))
+        sample_shape_zyx = tuple(int(value) for value in sample_ref.shape[::-1])
+        resolution = parse_triplet(resolution_xyz, name="resolution_xyz")
+        target_resolution = parse_triplet(target_resolution_xyz, name="target_resolution_xyz")
 
-    print("Stage 2/4: binning sample mask")
-    sample_volume, summary = accumulate_sample_grid(
-        mask_zarr_path,
-        resolution_xyz=resolution,
-        target_resolution_xyz=target_resolution,
-        output_shape_zyx=sample_shape_zyx,
-        dataset_name=dataset_name,
-        foreground_mode=foreground_mode,
-        foreground_label=foreground_label,
-        block_shape=resolved_block_shape,
-        min_voxels_per_point=min_voxels_per_point,
-        volume_mode=volume_mode,
-    )
-    print("Stage 3/4: warping binned volume into atlas space")
-    atlas_volume, raw_atlas_spacing_xyz = warp_sample_grid_to_atlas(
-        sample_volume,
-        sample_reference_nii=sample_reference_path,
-        atlas_image=atlas_image,
-        transformlist=transformlist,
-        interpolator="linear" if volume_mode == "count" else "nearestNeighbor",
-        binarize=volume_mode == "binary",
-    )
+        arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
+        fallback_block_shape = tuple(int(value) for value in (getattr(arr, "chunks", None) or arr.shape))
+        resolved_block_shape = parse_block_shape(block_shape, fallback_block_shape)
 
-    if output_volume:
-        print(f"Writing atlas-space volume to: {output_volume}")
-        volume_path = write_volume_output(atlas_volume, output_volume)
-        summary["output_volume"] = str(volume_path)
+        print("Stage 2/4: binning sample mask")
+        sample_volume, summary = accumulate_sample_grid(
+            mask_zarr_path,
+            resolution_xyz=resolution,
+            target_resolution_xyz=target_resolution,
+            output_shape_zyx=sample_shape_zyx,
+            dataset_name=dataset_name,
+            foreground_mode=foreground_mode,
+            foreground_label=foreground_label,
+            block_shape=resolved_block_shape,
+            min_voxels_per_point=min_voxels_per_point,
+            volume_mode=volume_mode,
+        )
+        print("Stage 3/4: warping binned volume into atlas space")
+        atlas_volume, raw_atlas_spacing_xyz = warp_sample_grid_to_atlas(
+            sample_volume,
+            sample_reference_nii=sample_reference_path,
+            atlas_image=atlas_image,
+            transformlist=transformlist,
+            interpolator="linear" if volume_mode == "count" else "nearestNeighbor",
+            binarize=volume_mode == "binary",
+        )
+
+        print(f"Writing cached atlas-space volume to: {cached_volume_path}")
+        cached_volume_path.parent.mkdir(parents=True, exist_ok=True)
+        write_volume_output(atlas_volume, cached_volume_path)
+        summary["cache_hit"] = False
+        summary["output_volume"] = str(cached_volume_path)
+
+    if points_csv_path.exists() and summary.get("cache_hit"):
+        print(f"Using cached atlas-space points CSV: {points_csv_path}")
+    else:
+        print(f"Writing atlas-space points CSV to: {points_csv_path}")
+        atlas_resolution_xyz = resolve_atlas_resolution_xyz("", "25,25,25")
+        table = atlas_volume_to_points(atlas_volume, atlas_resolution_xyz=atlas_resolution_xyz, max_points=150_000)
+        point_outputs = write_outputs(table, summary, points_csv_path)
+        summary["points_csv"] = str(point_outputs["csv"])
+        summary["exported_points"] = int(len(table))
 
     print("Stage 4/4: rendering heatmap")
     render_heatmap_stack(
@@ -402,13 +444,8 @@ def generate_sample_stack_heatmap(
 
     summary.update(
         {
-            "success": True,
-            "mode": "sample-stack",
-            "sample_reference_nii": str(sample_reference_path),
-            "atlas_image": str(atlas_image),
-            "transformlist": transformlist,
             "atlas_shape_zyx": list(atlas_volume.shape),
-            "raw_atlas_image_spacing_xyz": list(raw_atlas_spacing_xyz),
+            "raw_atlas_image_spacing_xyz": list(raw_atlas_spacing_xyz) if raw_atlas_spacing_xyz else [],
             "heatmap_output": str(output),
         }
     )
@@ -452,7 +489,7 @@ def _render_local_slice_array(
     cmap = _colormap_by_name(cmap_name).copy()
     cmap.set_bad((1, 1, 1, 0))
     masked_signal = np.ma.masked_where((label_slice <= 0) | (signal_slice <= vmin), signal_slice)
-    image = ax.imshow(masked_signal, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="bilinear")
+    image = ax.imshow(masked_signal, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
     region_lines = _label_contour_lines(label_slice, smoothing=1.4)
     if region_lines and line_width > 0:
@@ -906,7 +943,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signal-ch", default="ch1", help="Signal channel label for --mode sample-stack")
     parser.add_argument("--register-ch", default="ch0", help="Registration channel label for --mode sample-stack")
     parser.add_argument("--sample-reference-nii", default="", help="Downsampled sample NIfTI used for registration")
-    parser.add_argument("--atlas-image", default="", help="Atlas NIfTI used as fixed image")
+    parser.add_argument("--atlas-image", default="", help="Atlas fixed image; defaults to data/reference/atlas_label.tiff")
     parser.add_argument("--transforms-dir", default="", help="Directory containing inverse transforms")
     parser.add_argument("--resolution-xyz", default="", help="Input mask voxel size in microns as x,y,z")
     parser.add_argument("--target-resolution-xyz", default="", help="Sample grid voxel size in microns as x,y,z")
@@ -978,8 +1015,8 @@ def main(argv: list[str] | None = None) -> int:
             defaults = resolve_sample_stack_defaults(args.sample_dir, config_path=args.config or None)
             payload = generate_sample_stack_heatmap(
                 sample_dir=args.sample_dir,
-                signal_ch=args.signal_ch or defaults["signal_ch"],
-                register_ch=args.register_ch or defaults["register_ch"],
+                signal_ch=defaults["signal_ch"],
+                register_ch=defaults["register_ch"],
                 mask_zarr=args.input or defaults["mask_zarr"],
                 dataset_name=args.dataset_name,
                 sample_reference_nii=args.sample_reference_nii or defaults["sample_reference_nii"],
