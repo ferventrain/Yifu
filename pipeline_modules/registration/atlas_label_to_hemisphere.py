@@ -12,6 +12,10 @@ import numpy as np
 import tifffile
 from tqdm import tqdm
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 try:
     from pipeline_modules.preprocessing.tiff_to_zarr import convert_tiff_to_zarr
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
@@ -275,22 +279,23 @@ def convert_atlas_label_to_hemisphere(
         "dtype": "uint8",
         "chunk_size": list(chunk_size),
     }
-    manifest_path = write_run_manifest(
-        output_path,
-        module="registration",
-        entrypoint="convert_atlas_label_to_hemisphere",
-        inputs={
-            "input": str(input_path),
-            "input_kind": input_kind,
-            "output_zarr": str(output_path),
-            "dataset_name": dataset_name,
-            "chunk_size": chunk_size,
-        },
-        outputs=[output_path],
-        started_at=started_at,
-        extra=result,
-    )
-    result["manifest_path"] = str(manifest_path)
+    if write_run_manifest is not None:
+        manifest_path = write_run_manifest(
+            output_path,
+            module="registration",
+            entrypoint="convert_atlas_label_to_hemisphere",
+            inputs={
+                "input": str(input_path),
+                "input_kind": input_kind,
+                "output_zarr": str(output_path),
+                "dataset_name": dataset_name,
+                "chunk_size": chunk_size,
+            },
+            outputs=[output_path],
+            started_at=started_at,
+            extra=result,
+        )
+        result["manifest_path"] = str(manifest_path)
     return result
 
 
@@ -326,14 +331,29 @@ def main() -> int:
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
-    except PipelineError as exc:
-        print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)
-        return exc.exit_code
     except Exception as exc:  # pragma: no cover
+        if PipelineError is not None and isinstance(exc, PipelineError):
+            print(json.dumps(exc.to_dict(), ensure_ascii=False), file=sys.stderr)
+            return exc.exit_code
         logger.exception("Unhandled hemisphere conversion error: %s", exc)
-        wrapped = PipelineError(ErrorCode.INTERNAL_ERROR, "Unhandled hemisphere conversion error", {"error": str(exc)})
-        print(json.dumps(wrapped.to_dict(), ensure_ascii=False), file=sys.stderr)
-        return wrapped.exit_code
+        if PipelineError is not None and ErrorCode is not None:
+            wrapped = PipelineError(ErrorCode.INTERNAL_ERROR, "Unhandled hemisphere conversion error", {"error": str(exc)})
+            print(json.dumps(wrapped.to_dict(), ensure_ascii=False), file=sys.stderr)
+            return wrapped.exit_code
+        print(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "INTERNAL_ERROR",
+                        "message": "Unhandled hemisphere conversion error",
+                        "context": {"error": str(exc)},
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 5
 
 
 if __name__ == "__main__":

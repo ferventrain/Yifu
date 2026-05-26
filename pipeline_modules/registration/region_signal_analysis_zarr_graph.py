@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 CONNECTIVITY_3D = np.ones((3, 3, 3), dtype=np.uint8)
 PAIR_DTYPE = np.dtype([("component", np.int64), ("region", np.int64)])
 ROOT_REGION_DTYPE = np.dtype([("root", np.int64), ("region", np.int64)])
+PAIR_HEMISPHERE_DTYPE = np.dtype(
+    [("component", np.int64), ("region", np.int64), ("hemisphere", np.int8)]
+)
+ROOT_REGION_HEMISPHERE_DTYPE = np.dtype(
+    [("root", np.int64), ("region", np.int64), ("hemisphere", np.int8)]
+)
 # Must match atlas_label_to_hemisphere.py: 0=background, 1=left, 2=right.
 LEFT_HEMISPHERE_ID = np.int8(1)
 RIGHT_HEMISPHERE_ID = np.int8(2)
@@ -347,6 +353,7 @@ def empty_hemisphere_stats():
 
 def flatten_region_rows(region_tree, direct_stats):
     rows = []
+    hemisphere_enabled = "total_region_voxels_by_hemisphere" in direct_stats
 
     def visit(node):
         aggregated = {
@@ -354,7 +361,7 @@ def flatten_region_rows(region_tree, direct_stats):
             "signal_voxels": 0,
             "signal_count": 0,
             "sum_intensity": 0.0,
-            "has_hemisphere": bool(node.get("is_bilateral", False)),
+            "has_hemisphere": hemisphere_enabled and bool(node.get("is_bilateral", False)),
         }
 
         label_id = get_region_label_id(node)
@@ -363,7 +370,7 @@ def flatten_region_rows(region_tree, direct_stats):
             aggregated["signal_voxels"] += int(direct_stats["region_signal_voxels"].get(label_id, 0))
             aggregated["signal_count"] += int(direct_stats["region_signal_counts"].get(label_id, 0))
             aggregated["sum_intensity"] += float(direct_stats["region_sum_intensity"].get(label_id, 0.0))
-            if "total_region_voxels_by_hemisphere" in direct_stats:
+            if hemisphere_enabled and node.get("is_bilateral", False):
                 aggregated["hemispheres"] = empty_hemisphere_stats()
                 aggregated["has_hemisphere"] = True
                 for hemisphere_id in HEMISPHERE_NAMES:
@@ -388,7 +395,7 @@ def flatten_region_rows(region_tree, direct_stats):
             aggregated["signal_count"] += child_aggregated["signal_count"]
             aggregated["sum_intensity"] += child_aggregated["sum_intensity"]
             aggregated["has_hemisphere"] = aggregated["has_hemisphere"] or bool(child_aggregated.get("has_hemisphere", False))
-            if "hemispheres" in child_aggregated:
+            if hemisphere_enabled and "hemispheres" in child_aggregated:
                 if "hemispheres" not in aggregated:
                     aggregated["hemispheres"] = empty_hemisphere_stats()
                 for hemisphere_id in HEMISPHERE_NAMES:
@@ -572,6 +579,7 @@ def compute_block_artifacts(
     next_component_id,
     boundary_mask_cache,
     volume_shape,
+    hemisphere_chunk=None,
 ):
     binary_mask = build_binary_mask(mask_chunk, foreground_mode, foreground_label)
     local_labels, num_local_components = ndimage.label(binary_mask, structure=CONNECTIVITY_3D)
@@ -588,6 +596,11 @@ def compute_block_artifacts(
             "pair_region_ids": empty_int64,
             "pair_voxel_counts": empty_int64,
             "pair_intensity_sums": empty_float64,
+            "hemisphere_pair_component_ids": empty_int64,
+            "hemisphere_pair_region_ids": empty_int64,
+            "hemisphere_pair_hemisphere_ids": np.empty(0, dtype=np.int8),
+            "hemisphere_pair_voxel_counts": empty_int64,
+            "hemisphere_pair_intensity_sums": empty_float64,
             "boundary_z": empty_int64,
             "boundary_y": empty_int64,
             "boundary_x": empty_int64,
@@ -627,6 +640,42 @@ def compute_block_artifacts(
         pair_voxel_counts = np.empty(0, dtype=np.int64)
         pair_intensity_sums = np.empty(0, dtype=np.float64)
 
+    if hemisphere_chunk is not None:
+        hemisphere_valid_mask = valid_mask & (hemisphere_chunk > 0)
+    else:
+        hemisphere_valid_mask = np.zeros(component_chunk.shape, dtype=bool)
+
+    if np.any(hemisphere_valid_mask):
+        valid_component_ids = component_chunk[hemisphere_valid_mask].astype(np.int64, copy=False)
+        valid_region_ids = label_chunk[hemisphere_valid_mask].astype(np.int64, copy=False)
+        valid_hemisphere_ids = hemisphere_chunk[hemisphere_valid_mask].astype(np.int8, copy=False)
+        valid_signal_values = signal_chunk[hemisphere_valid_mask].astype(np.float64, copy=False)
+
+        hemisphere_pair_values = np.empty(valid_component_ids.size, dtype=PAIR_HEMISPHERE_DTYPE)
+        hemisphere_pair_values["component"] = valid_component_ids
+        hemisphere_pair_values["region"] = valid_region_ids
+        hemisphere_pair_values["hemisphere"] = valid_hemisphere_ids
+        unique_hemisphere_pairs, hemisphere_inverse_index = np.unique(
+            hemisphere_pair_values,
+            return_inverse=True,
+        )
+
+        hemisphere_pair_voxel_counts = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.int64)
+        np.add.at(hemisphere_pair_voxel_counts, hemisphere_inverse_index, 1)
+
+        hemisphere_pair_intensity_sums = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.float64)
+        np.add.at(hemisphere_pair_intensity_sums, hemisphere_inverse_index, valid_signal_values)
+
+        hemisphere_pair_component_ids = unique_hemisphere_pairs["component"].astype(np.int64, copy=False)
+        hemisphere_pair_region_ids = unique_hemisphere_pairs["region"].astype(np.int64, copy=False)
+        hemisphere_pair_hemisphere_ids = unique_hemisphere_pairs["hemisphere"].astype(np.int8, copy=False)
+    else:
+        hemisphere_pair_component_ids = np.empty(0, dtype=np.int64)
+        hemisphere_pair_region_ids = np.empty(0, dtype=np.int64)
+        hemisphere_pair_hemisphere_ids = np.empty(0, dtype=np.int8)
+        hemisphere_pair_voxel_counts = np.empty(0, dtype=np.int64)
+        hemisphere_pair_intensity_sums = np.empty(0, dtype=np.float64)
+
     block_shape = tuple(int(size) for size in mask_chunk.shape)
     boundary_mask = boundary_mask_cache.setdefault(block_shape, build_boundary_mask(block_shape))
     boundary_foreground_mask = boundary_mask & (component_chunk > 0)
@@ -652,6 +701,11 @@ def compute_block_artifacts(
         "pair_region_ids": pair_region_ids,
         "pair_voxel_counts": pair_voxel_counts,
         "pair_intensity_sums": pair_intensity_sums,
+        "hemisphere_pair_component_ids": hemisphere_pair_component_ids,
+        "hemisphere_pair_region_ids": hemisphere_pair_region_ids,
+        "hemisphere_pair_hemisphere_ids": hemisphere_pair_hemisphere_ids,
+        "hemisphere_pair_voxel_counts": hemisphere_pair_voxel_counts,
+        "hemisphere_pair_intensity_sums": hemisphere_pair_intensity_sums,
         "boundary_z": boundary_z,
         "boundary_y": boundary_y,
         "boundary_x": boundary_x,
@@ -668,6 +722,11 @@ def save_block_artifact(artifact_path, artifact):
         pair_region_ids=artifact["pair_region_ids"],
         pair_voxel_counts=artifact["pair_voxel_counts"],
         pair_intensity_sums=artifact["pair_intensity_sums"],
+        hemisphere_pair_component_ids=artifact["hemisphere_pair_component_ids"],
+        hemisphere_pair_region_ids=artifact["hemisphere_pair_region_ids"],
+        hemisphere_pair_hemisphere_ids=artifact["hemisphere_pair_hemisphere_ids"],
+        hemisphere_pair_voxel_counts=artifact["hemisphere_pair_voxel_counts"],
+        hemisphere_pair_intensity_sums=artifact["hemisphere_pair_intensity_sums"],
         boundary_z=artifact["boundary_z"],
         boundary_y=artifact["boundary_y"],
         boundary_x=artifact["boundary_x"],
@@ -740,6 +799,7 @@ def process_block_spec_worker(block_spec, foreground_mode, foreground_label):
         next_component_id=1,
         boundary_mask_cache={},
         volume_shape=WORKER_MASK_ZARR.shape,
+        hemisphere_chunk=hemisphere_chunk,
     )
 
     return {
@@ -768,7 +828,12 @@ def apply_component_offset(artifact, component_offset):
         return artifact
 
     remapped = dict(artifact)
-    for key in ("component_ids", "pair_component_ids", "boundary_component_ids"):
+    for key in (
+        "component_ids",
+        "pair_component_ids",
+        "hemisphere_pair_component_ids",
+        "boundary_component_ids",
+    ):
         values = remapped[key]
         if values.size > 0:
             remapped[key] = values + np.int64(component_offset)
@@ -846,6 +911,7 @@ def scan_blocks_and_write_artifacts(
                     next_component_id=next_component_id,
                     boundary_mask_cache=boundary_mask_cache,
                     volume_shape=mask_zarr.shape,
+                    hemisphere_chunk=hemisphere_chunk,
                 )
                 next_component_id = artifact["next_component_id"]
 
@@ -1154,6 +1220,8 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
     region_pair_voxels = {}
     region_pair_intensity = {}
+    region_hemisphere_pair_voxels = {}
+    region_hemisphere_pair_intensity = {}
     with tqdm(total=len(manifest_payload["blocks"]), desc="Region collapse", unit="block") as progress_bar:
         for block in manifest_payload["blocks"]:
             arrays = load_block_arrays(block["artifact_path"])
@@ -1188,12 +1256,59 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
                 region_pair_voxels[pair_key] = region_pair_voxels.get(pair_key, 0) + int(voxel_count)
                 region_pair_intensity[pair_key] = region_pair_intensity.get(pair_key, 0.0) + float(intensity_sum)
 
+            if arrays.get("hemisphere_pair_component_ids", np.empty(0, dtype=np.int64)).size > 0:
+                hemisphere_root_ids = parent[arrays["hemisphere_pair_component_ids"]]
+                hemisphere_keep_mask = kept_root_mask[hemisphere_root_ids]
+                if np.any(hemisphere_keep_mask):
+                    kept_hemisphere_roots = hemisphere_root_ids[hemisphere_keep_mask].astype(np.int64, copy=False)
+                    kept_hemisphere_regions = arrays["hemisphere_pair_region_ids"][hemisphere_keep_mask].astype(np.int64, copy=False)
+                    kept_hemisphere_ids = arrays["hemisphere_pair_hemisphere_ids"][hemisphere_keep_mask].astype(np.int8, copy=False)
+                    kept_hemisphere_counts = arrays["hemisphere_pair_voxel_counts"][hemisphere_keep_mask].astype(np.int64, copy=False)
+                    kept_hemisphere_intensity = arrays["hemisphere_pair_intensity_sums"][hemisphere_keep_mask].astype(np.float64, copy=False)
+
+                    hemisphere_pair_values = np.empty(
+                        kept_hemisphere_roots.size,
+                        dtype=ROOT_REGION_HEMISPHERE_DTYPE,
+                    )
+                    hemisphere_pair_values["root"] = kept_hemisphere_roots
+                    hemisphere_pair_values["region"] = kept_hemisphere_regions
+                    hemisphere_pair_values["hemisphere"] = kept_hemisphere_ids
+                    unique_hemisphere_pairs, hemisphere_inverse_index = np.unique(
+                        hemisphere_pair_values,
+                        return_inverse=True,
+                    )
+
+                    merged_hemisphere_counts = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.int64)
+                    np.add.at(merged_hemisphere_counts, hemisphere_inverse_index, kept_hemisphere_counts)
+
+                    merged_hemisphere_intensity = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.float64)
+                    np.add.at(
+                        merged_hemisphere_intensity,
+                        hemisphere_inverse_index,
+                        kept_hemisphere_intensity,
+                    )
+
+                    for pair, voxel_count, intensity_sum in zip(
+                        unique_hemisphere_pairs.tolist(),
+                        merged_hemisphere_counts.tolist(),
+                        merged_hemisphere_intensity.tolist(),
+                    ):
+                        pair_key = (int(pair[0]), int(pair[1]), int(pair[2]))
+                        region_hemisphere_pair_voxels[pair_key] = (
+                            region_hemisphere_pair_voxels.get(pair_key, 0) + int(voxel_count)
+                        )
+                        region_hemisphere_pair_intensity[pair_key] = (
+                            region_hemisphere_pair_intensity.get(pair_key, 0.0) + float(intensity_sum)
+                        )
+
             progress_bar.update(1)
 
     region_signal_voxels = {}
     region_signal_counts = {}
     region_sum_intensity = {}
+    region_signal_voxels_by_hemisphere = {}
     region_signal_counts_by_hemisphere = {}
+    region_sum_intensity_by_hemisphere = {}
 
     for (_, region_id), voxel_count in region_pair_voxels.items():
         region_signal_voxels[region_id] = region_signal_voxels.get(region_id, 0) + int(voxel_count)
@@ -1201,6 +1316,21 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
     for (_, region_id), intensity_sum in region_pair_intensity.items():
         region_sum_intensity[region_id] = region_sum_intensity.get(region_id, 0.0) + float(intensity_sum)
+
+    for (_, region_id, hemisphere_id), voxel_count in region_hemisphere_pair_voxels.items():
+        pair_key = (int(region_id), int(hemisphere_id))
+        region_signal_voxels_by_hemisphere[pair_key] = (
+            region_signal_voxels_by_hemisphere.get(pair_key, 0) + int(voxel_count)
+        )
+        region_signal_counts_by_hemisphere[pair_key] = (
+            region_signal_counts_by_hemisphere.get(pair_key, 0) + 1
+        )
+
+    for (_, region_id, hemisphere_id), intensity_sum in region_hemisphere_pair_intensity.items():
+        pair_key = (int(region_id), int(hemisphere_id))
+        region_sum_intensity_by_hemisphere[pair_key] = (
+            region_sum_intensity_by_hemisphere.get(pair_key, 0.0) + float(intensity_sum)
+        )
 
     kept_components = int(np.count_nonzero((parent == np.arange(parent.shape[0], dtype=np.int64)) & kept_root_mask))
     kept_voxels = int(root_sizes[kept_root_mask].sum(dtype=np.int64))
@@ -1217,19 +1347,10 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
         for key, value in manifest_payload.get("total_region_voxels_by_hemisphere", {}).items():
             region_id, hemisphere_id = str(key).split(":", 1)
             total_region_voxels_by_hemisphere[(int(region_id), int(hemisphere_id))] = int(value)
-        region_signal_voxels_by_hemisphere = {}
-        for key, value in manifest_payload.get("region_signal_voxels_by_hemisphere", {}).items():
-            region_id, hemisphere_id = str(key).split(":", 1)
-            region_signal_voxels_by_hemisphere[(int(region_id), int(hemisphere_id))] = int(value)
-        region_sum_intensity_by_hemisphere = {}
-        for key, value in manifest_payload.get("region_sum_intensity_by_hemisphere", {}).items():
-            region_id, hemisphere_id = str(key).split(":", 1)
-            region_sum_intensity_by_hemisphere[(int(region_id), int(hemisphere_id))] = float(value)
-        for pair_key, voxel_count in region_signal_voxels_by_hemisphere.items():
-            region_signal_counts_by_hemisphere[pair_key] = 1 if int(voxel_count) > 0 else 0
     else:
         total_region_voxels_by_hemisphere = {}
         region_signal_voxels_by_hemisphere = {}
+        region_signal_counts_by_hemisphere = {}
         region_sum_intensity_by_hemisphere = {}
 
     return {

@@ -160,6 +160,88 @@
       ]
     },
     {
+      "id": "plot_top_level7_density_ratio",
+      "function": "pipeline_modules.visualization.top_level7_density_ratio.generate_top_level_ratio_plot",
+      "cli": "python pipeline_modules/visualization/top_level7_density_ratio.py",
+      "description": "Find density Excel workbooks in exactly two child sample folders, compare Level_6 count metrics, and plot the top absolute log(A/B) region differences.",
+      "prerequisites": [
+        "root_dir must contain exactly two child sample_dir folders with density Excel workbooks",
+        "Density workbooks must contain a Level_6 sheet with Name and selected metric columns"
+      ],
+      "inputs": {
+        "root_dir": {
+          "type": "dir",
+          "required": true,
+          "description": "Folder containing exactly two sample_dir child folders"
+        },
+        "metric": {
+          "type": "string",
+          "default": "Signal Count",
+          "examples": ["Signal Count", "Signal Voxels", "Sum Intensity"]
+        },
+        "level": {
+          "type": "int",
+          "default": 6
+        },
+        "top_n": {
+          "type": "int",
+          "default": 10
+        },
+        "pseudocount": {
+          "type": "float",
+          "default": 1.0,
+          "description": "Added to both counts before computing log ratio"
+        },
+        "min_count": {
+          "type": "float",
+          "default": 100.0,
+          "description": "Minimum combined count across both samples required before ranking"
+        },
+        "rank_by": {
+          "type": "string",
+          "default": "weighted_log_ratio",
+          "choices": ["weighted_log_ratio", "abs_log_ratio", "abs_count_diff"],
+          "description": "Ranking score for selecting top regions; weighted_log_ratio uses abs(log_ratio) * log1p(countA + countB)"
+        },
+        "output_prefix": {
+          "type": "path|null",
+          "default": null
+        },
+        "title": {
+          "type": "string|null",
+          "default": null
+        },
+        "figsize": {
+          "type": "width,height",
+          "default": "12,6.2"
+        },
+        "dpi": {
+          "type": "int",
+          "default": 300
+        }
+      },
+      "outputs": {
+        "ratio_csv": {
+          "type": "path",
+          "description": "<output_prefix>_level6_ratio_top.csv"
+        },
+        "ratio_xlsx": {
+          "type": "path",
+          "description": "<output_prefix>_level6_ratio_top.xlsx"
+        },
+        "ratio_plot": {
+          "type": "path",
+          "description": "<output_prefix>_level6_ratio_top10.png"
+        }
+      },
+      "common_commands": [
+        {
+          "description": "Compare top Level_6 signal-count differences between two sample folders",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\top_level7_density_ratio.py --root_dir \"S:\\Arivis_Analysis\\two_samples\""
+        }
+      ]
+    },
+    {
       "id": "render_signal_heatmap",
       "function": "pipeline_modules.visualization.heatmap.generate_sample_stack_heatmap",
       "cli": "python pipeline_modules/visualization/heatmap.py",
