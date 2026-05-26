@@ -34,8 +34,9 @@ logger = logging.getLogger(__name__)
 CONNECTIVITY_3D = np.ones((3, 3, 3), dtype=np.uint8)
 PAIR_DTYPE = np.dtype([("component", np.int64), ("region", np.int64)])
 ROOT_REGION_DTYPE = np.dtype([("root", np.int64), ("region", np.int64)])
-LEFT_HEMISPHERE_ID = np.int8(0)
-RIGHT_HEMISPHERE_ID = np.int8(1)
+# Must match atlas_label_to_hemisphere.py: 0=background, 1=left, 2=right.
+LEFT_HEMISPHERE_ID = np.int8(1)
+RIGHT_HEMISPHERE_ID = np.int8(2)
 HEMISPHERE_NAMES = {
     int(LEFT_HEMISPHERE_ID): "Left",
     int(RIGHT_HEMISPHERE_ID): "Right",
