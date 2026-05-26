@@ -99,11 +99,14 @@ def build_level_ratio_table(
     metric: str = "Signal Count",
     level: int = 6,
     pseudocount: float = 1.0,
+    min_count: float = 100.0,
     top_n: int = 10,
     rank_by: str = "weighted_log_ratio",
 ) -> pd.DataFrame:
     if pseudocount < 0:
         raise ValueError("pseudocount must be >= 0")
+    if min_count < 0:
+        raise ValueError("min_count must be >= 0")
     if top_n <= 0:
         raise ValueError("top_n must be positive")
     if rank_by not in RANK_BY_CHOICES:
@@ -119,6 +122,7 @@ def build_level_ratio_table(
     merged["abs_count_diff"] = (merged["count_a"].astype(float) - merged["count_b"].astype(float)).abs()
     merged["total_count"] = merged["count_a"].astype(float) + merged["count_b"].astype(float)
     merged["weighted_log_ratio"] = merged["abs_log_ratio"] * np.log1p(merged["total_count"])
+    merged = merged[merged["total_count"] >= float(min_count)].copy()
     merged["rank_by"] = rank_by
     merged = merged.sort_values([rank_by, "Name"], ascending=[False, True], kind="stable").reset_index(drop=True)
     return merged.head(top_n).copy()
@@ -195,6 +199,7 @@ def generate_top_level_ratio_plot(
     level: int = 6,
     top_n: int = 10,
     pseudocount: float = 1.0,
+    min_count: float = 100.0,
     rank_by: str = "weighted_log_ratio",
     output_prefix: str | Path | None = None,
     title: str | None = None,
@@ -212,6 +217,7 @@ def generate_top_level_ratio_plot(
         metric=metric,
         level=level,
         pseudocount=pseudocount,
+        min_count=min_count,
         top_n=top_n,
         rank_by=rank_by,
     )
@@ -243,6 +249,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top_n", type=int, default=10, help="Number of largest absolute differences to plot")
     parser.add_argument("--pseudocount", type=float, default=1.0, help="Added to both counts before log ratio")
     parser.add_argument(
+        "--min_count",
+        type=float,
+        default=100.0,
+        help="Minimum combined count across both samples required before ranking. Default: 100",
+    )
+    parser.add_argument(
         "--rank_by",
         choices=RANK_BY_CHOICES,
         default="weighted_log_ratio",
@@ -264,6 +276,7 @@ def main() -> int:
             level=args.level,
             top_n=args.top_n,
             pseudocount=args.pseudocount,
+            min_count=args.min_count,
             rank_by=args.rank_by,
             output_prefix=args.output_prefix,
             title=args.title,

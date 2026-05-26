@@ -192,6 +192,11 @@
           "default": 1.0,
           "description": "Added to both counts before computing log ratio"
         },
+        "min_count": {
+          "type": "float",
+          "default": 100.0,
+          "description": "Minimum combined count across both samples required before ranking"
+        },
         "rank_by": {
           "type": "string",
           "default": "weighted_log_ratio",
