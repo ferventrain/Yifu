@@ -347,6 +347,7 @@ def empty_hemisphere_stats():
 
 def flatten_region_rows(region_tree, direct_stats):
     rows = []
+    hemisphere_enabled = "total_region_voxels_by_hemisphere" in direct_stats
 
     def visit(node):
         aggregated = {
@@ -354,7 +355,7 @@ def flatten_region_rows(region_tree, direct_stats):
             "signal_voxels": 0,
             "signal_count": 0,
             "sum_intensity": 0.0,
-            "has_hemisphere": bool(node.get("is_bilateral", False)),
+            "has_hemisphere": hemisphere_enabled and bool(node.get("is_bilateral", False)),
         }
 
         label_id = get_region_label_id(node)
@@ -363,7 +364,7 @@ def flatten_region_rows(region_tree, direct_stats):
             aggregated["signal_voxels"] += int(direct_stats["region_signal_voxels"].get(label_id, 0))
             aggregated["signal_count"] += int(direct_stats["region_signal_counts"].get(label_id, 0))
             aggregated["sum_intensity"] += float(direct_stats["region_sum_intensity"].get(label_id, 0.0))
-            if "total_region_voxels_by_hemisphere" in direct_stats:
+            if hemisphere_enabled and node.get("is_bilateral", False):
                 aggregated["hemispheres"] = empty_hemisphere_stats()
                 aggregated["has_hemisphere"] = True
                 for hemisphere_id in HEMISPHERE_NAMES:
@@ -388,7 +389,7 @@ def flatten_region_rows(region_tree, direct_stats):
             aggregated["signal_count"] += child_aggregated["signal_count"]
             aggregated["sum_intensity"] += child_aggregated["sum_intensity"]
             aggregated["has_hemisphere"] = aggregated["has_hemisphere"] or bool(child_aggregated.get("has_hemisphere", False))
-            if "hemispheres" in child_aggregated:
+            if hemisphere_enabled and "hemispheres" in child_aggregated:
                 if "hemispheres" not in aggregated:
                     aggregated["hemispheres"] = empty_hemisphere_stats()
                 for hemisphere_id in HEMISPHERE_NAMES:
