@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import json
 import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -48,18 +50,30 @@ _prepare_brainrender_runtime()
 
 from brainrender import Scene, settings  # noqa: E402
 from brainrender.actors import Points  # noqa: E402
+from brainrender.camera import check_camera_param, get_camera_params  # noqa: E402
 from brainglobe_atlasapi.bg_atlas import BrainGlobeAtlas  # noqa: E402
 from brainglobe_atlasapi.list_atlases import get_downloaded_atlases  # noqa: E402
 from pipeline_modules.visualization.coarse_region_metric_plot import DEFAULT_REGION_IDS  # noqa: E402
 
 
 DEFAULT_OUTPUT = "brainrender_points.png"
+DEFAULT_REGION_GROUPS = Path(__file__).resolve().parents[2] / "config" / "region_groups.json"
+DEFAULT_CAMERA_VIEW_ARG = "__default__"
+DEFAULT_CAMERA_VIEW_FILENAME = "{sample_name}_brainrender_view.json"
 DEFAULT_COLUMNS = ("x", "y", "z")
 ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "x": ("x", "ap", "anterior_posterior", "anteriorposterior"),
     "y": ("y", "dv", "dorsal_ventral", "dorsoventral"),
     "z": ("z", "ml", "lr", "mediolateral", "left_right", "left-right"),
 }
+@dataclass(frozen=True)
+class RegionGroup:
+    name: str
+    acronyms: tuple[str, ...]
+    color: str | None = None
+    description: str = ""
+
+
 COARSE_REGION_COLORS = [
     "#0072B2",
     "#D55E00",
@@ -428,6 +442,284 @@ def summarize_points(points: np.ndarray) -> str:
     )
 
 
+def parse_group_names(value: str) -> list[str] | None:
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    return parts or None
+
+
+def parse_group_colors(value: str, count: int) -> list[str]:
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if not parts:
+        return [COARSE_REGION_COLORS[index % len(COARSE_REGION_COLORS)] for index in range(count)]
+    if len(parts) != count:
+        raise ValueError(f"Expected {count} group colors, got {len(parts)}.")
+    return parts
+
+
+def load_region_groups(path: str | Path) -> dict[str, RegionGroup]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Region groups JSON not found: {path}")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Region groups JSON must be an object, got: {type(payload).__name__}")
+
+    groups: dict[str, RegionGroup] = {}
+    for index, (name, spec) in enumerate(payload.items()):
+        if isinstance(spec, list):
+            acronyms = tuple(str(item).strip() for item in spec if str(item).strip())
+            color = COARSE_REGION_COLORS[index % len(COARSE_REGION_COLORS)]
+            description = ""
+        elif isinstance(spec, dict):
+            raw_acronyms = spec.get("acronyms", [])
+            if not isinstance(raw_acronyms, list):
+                raise ValueError(f"Group {name!r} acronyms must be a list.")
+            acronyms = tuple(str(item).strip() for item in raw_acronyms if str(item).strip())
+            color = str(spec.get("color") or COARSE_REGION_COLORS[index % len(COARSE_REGION_COLORS)])
+            description = str(spec.get("description") or "")
+        else:
+            raise ValueError(f"Group {name!r} must be a list of acronyms or an object with acronyms.")
+        if not acronyms:
+            raise ValueError(f"Group {name!r} has no atlas acronyms.")
+        groups[str(name)] = RegionGroup(name=str(name), acronyms=acronyms, color=color, description=description)
+    return groups
+
+
+def select_region_groups(
+    groups: dict[str, RegionGroup],
+    group_names: list[str] | None,
+    group_colors: list[str] | None = None,
+) -> list[RegionGroup]:
+    if group_names is None:
+        selected = list(groups.values())
+    else:
+        missing = [name for name in group_names if name not in groups]
+        if missing:
+            raise KeyError(f"Unknown region group(s): {missing}. Available: {sorted(groups)}")
+        selected = [groups[name] for name in group_names]
+    if group_colors is None:
+        return selected
+    return [
+        RegionGroup(name=group.name, acronyms=group.acronyms, color=color, description=group.description)
+        for group, color in zip(selected, group_colors)
+    ]
+
+
+def group_region_ids(
+    atlas: BrainGlobeAtlas,
+    groups: list[RegionGroup],
+    *,
+    include_descendants: bool,
+) -> dict[str, set[int]]:
+    ids_by_group: dict[str, set[int]] = {}
+    for group in groups:
+        ids: set[int] = set()
+        for acronym in group.acronyms:
+            region_id = resolve_region_id(atlas, acronym, None)
+            if region_id is None:
+                continue
+            ids.update(descendant_region_ids(atlas, region_id, include_descendants))
+        ids_by_group[group.name] = ids
+    return ids_by_group
+
+
+def filter_points_to_groups(
+    points: np.ndarray,
+    *,
+    atlas_name: str,
+    atlas_resolution: tuple[float, float, float] | None,
+    groups: list[RegionGroup],
+    include_descendants: bool,
+) -> tuple[np.ndarray, dict[str, int], int]:
+    atlas = BrainGlobeAtlas(atlas_name, check_latest=False)
+    ids_by_group = group_region_ids(atlas, groups, include_descendants=include_descendants)
+    union_ids = set().union(*ids_by_group.values()) if ids_by_group else set()
+
+    annotation = atlas.annotation
+    resolution = np.asarray(atlas_resolution or atlas.resolution, dtype=np.float64)
+    indices = np.floor(points / resolution[None, :]).astype(np.int64)
+    in_bounds = (
+        (indices[:, 0] >= 0)
+        & (indices[:, 0] < annotation.shape[0])
+        & (indices[:, 1] >= 0)
+        & (indices[:, 1] < annotation.shape[1])
+        & (indices[:, 2] >= 0)
+        & (indices[:, 2] < annotation.shape[2])
+    )
+    inside = np.zeros(len(points), dtype=bool)
+    labels = annotation[indices[in_bounds, 0], indices[in_bounds, 1], indices[in_bounds, 2]]
+    inside[in_bounds] = np.isin(labels, list(union_ids))
+    filtered = points[inside]
+
+    counts: dict[str, int] = {}
+    if len(filtered) > 0:
+        filtered_indices = np.floor(filtered / resolution[None, :]).astype(np.int64)
+        filtered_labels = annotation[
+            filtered_indices[:, 0], filtered_indices[:, 1], filtered_indices[:, 2]
+        ]
+        for group in groups:
+            counts[group.name] = int(np.count_nonzero(np.isin(filtered_labels, list(ids_by_group[group.name]))))
+    else:
+        counts = {group.name: 0 for group in groups}
+    return filtered, counts, int(len(points))
+
+
+def filter_points_to_single_group(
+    points: np.ndarray,
+    *,
+    atlas_name: str,
+    atlas_resolution: tuple[float, float, float] | None,
+    group: RegionGroup,
+    include_descendants: bool,
+) -> tuple[np.ndarray, int, int]:
+    filtered, counts, total = filter_points_to_groups(
+        points,
+        atlas_name=atlas_name,
+        atlas_resolution=atlas_resolution,
+        groups=[group],
+        include_descendants=include_descendants,
+    )
+    kept = counts.get(group.name, 0)
+    return filtered, kept, total
+
+
+def color_points_by_groups(
+    points: np.ndarray,
+    *,
+    atlas_name: str,
+    atlas_resolution: tuple[float, float, float] | None,
+    groups: list[RegionGroup],
+    include_descendants: bool,
+    drop_unassigned: bool,
+) -> tuple[np.ndarray, list[str], dict[str, int]]:
+    atlas = BrainGlobeAtlas(atlas_name, check_latest=False)
+    labels = point_annotation_labels(points, atlas=atlas, atlas_resolution=atlas_resolution)
+    ids_by_group = group_region_ids(atlas, groups, include_descendants=include_descendants)
+    color_by_group = {group.name: group.color or "#9a9a9a" for group in groups}
+
+    colors: list[str] = []
+    assigned = np.zeros(len(points), dtype=bool)
+    counts: dict[str, int] = {group.name: 0 for group in groups}
+
+    for index, label in enumerate(labels):
+        label_id = int(label)
+        matched_group: str | None = None
+        if label_id > 0:
+            for group in groups:
+                if label_id in ids_by_group[group.name]:
+                    matched_group = group.name
+                    break
+        if matched_group is None:
+            colors.append("#9a9a9a")
+            continue
+        colors.append(str(color_by_group[matched_group]))
+        assigned[index] = True
+        counts[matched_group] += 1
+
+    if drop_unassigned:
+        points = points[assigned]
+        colors = [color for color, keep in zip(colors, assigned) if keep]
+        counts = {name: count for name, count in counts.items() if count > 0}
+    else:
+        counts = {name: count for name, count in counts.items() if count > 0}
+    return points, colors, counts
+
+
+def load_camera_view(path: str | Path) -> dict:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Camera view JSON not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Camera view JSON must be an object, got: {type(payload).__name__}")
+    return check_camera_param(payload)
+
+
+def save_camera_view(path: str | Path, params: dict, *, name: str | None = None) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(params)
+    if name:
+        payload["name"] = name
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def resolve_camera(camera_preset: str, camera_view: str, *, sample_dir: Path | None) -> str | dict:
+    camera_path = resolve_camera_view_path(camera_view, sample_dir)
+    if camera_path is not None:
+        return load_camera_view(camera_path)
+    return camera_preset
+
+
+def infer_sample_dir(*, sample_dir: str, points_csv: Path) -> Path | None:
+    if sample_dir.strip():
+        return Path(sample_dir).resolve()
+    csv_path = points_csv.resolve()
+    if csv_path.parent.name.lower() == "visualization":
+        return csv_path.parent.parent
+    return None
+
+
+def default_camera_view_path(sample_dir: Path) -> Path:
+    sample_dir = sample_dir.resolve()
+    return sample_dir / "visualization" / DEFAULT_CAMERA_VIEW_FILENAME.format(sample_name=sample_dir.name)
+
+
+def resolve_camera_view_path(value: str, sample_dir: Path | None) -> Path | None:
+    if not value:
+        return None
+    if value == DEFAULT_CAMERA_VIEW_ARG:
+        if sample_dir is None:
+            raise ValueError(
+                "Could not infer sample_dir for the default camera view path. "
+                "Pass --sample_dir, or use --points_csv located under sample_dir/visualization/."
+            )
+        return default_camera_view_path(sample_dir)
+    return Path(value)
+
+
+def install_camera_export_hook(scene: Scene, output_path: str | Path) -> None:
+    """Register a vedo KeyPress callback to save the current camera on V."""
+    output_path = Path(output_path)
+    original_render = scene.render
+
+    def render(*args, **kwargs):
+        if scene.plotter is None:
+            scene._get_plotter()
+        plotter = scene.plotter
+
+        def on_key_press(evt) -> None:
+            if str(getattr(evt, "keypress", "")).lower() != "v":
+                return
+            params = get_camera_params(scene=scene)
+            saved = save_camera_view(output_path, params, name=output_path.stem)
+            print(f"Saved camera view to: {saved}")
+            print("Reuse with: --camera_view", saved)
+
+        original_show = plotter.show
+
+        def show_with_hook(*show_args, **show_kwargs):
+            original_init = plotter.initialize_interactor
+
+            def init_with_hook(*init_args, **init_kwargs):
+                original_init(*init_args, **init_kwargs)
+                plotter.add_callback("KeyPress", on_key_press)
+
+            plotter.initialize_interactor = init_with_hook
+            try:
+                return original_show(*show_args, **show_kwargs)
+            finally:
+                plotter.initialize_interactor = original_init
+                plotter.show = original_show
+
+        plotter.show = show_with_hook
+        return original_render(*args, **kwargs)
+
+    scene.render = render
+
+
 def render_points_scene(
     points: np.ndarray,
     *,
@@ -447,6 +739,7 @@ def render_points_scene(
     region_color: str,
     region_silhouette: bool,
     hemisphere: str,
+    region_groups: list[RegionGroup] | None = None,
 ) -> Scene:
     scene = Scene(
         root=root,
@@ -458,7 +751,23 @@ def render_points_scene(
     if whole_brain_silhouette and not root:
         print("--whole_brain_silhouette keeps the standard transparent whole-brain mesh; ignoring --no_root.")
 
-    if region_mesh or region_mesh_id is not None:
+    if region_groups:
+        atlas = BrainGlobeAtlas(atlas_name, check_latest=False)
+        for group in region_groups:
+            mesh_color = group.color or region_color or None
+            for acronym in group.acronyms:
+                resolved_id = resolve_region_id(atlas, acronym, None)
+                if resolved_id is None:
+                    continue
+                scene.add_brain_region(
+                    region_acronym(atlas, resolved_id),
+                    alpha=region_alpha,
+                    color=mesh_color,
+                    silhouette=region_silhouette,
+                    hemisphere=hemisphere,
+                    force=True,
+                )
+    elif region_mesh or region_mesh_id is not None:
         atlas = BrainGlobeAtlas(atlas_name, check_latest=False)
         resolved_id = resolve_region_id(atlas, region_mesh, region_mesh_id)
         if resolved_id is None:
@@ -492,12 +801,27 @@ def resolve_output_path(csv_path: Path, output: str | None) -> Path:
 
 
 def resolve_render_output_path(args: argparse.Namespace, points_csv: Path) -> Path | None:
+    if args.screenshot_per_group:
+        return None
     if not args.output:
         return None
     output = Path(args.output)
     if args.sample_dir and not output.is_absolute() and output.parent == Path("."):
         return Path(args.sample_dir) / "visualization" / output
     return resolve_output_path(points_csv, args.output)
+
+
+def resolve_output_dir(args: argparse.Namespace, points_csv: Path, sample_dir: Path | None) -> Path:
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    elif args.output:
+        output_dir = Path(args.output).parent
+    elif sample_dir is not None:
+        output_dir = sample_dir / "visualization" / "brainrender"
+    else:
+        output_dir = points_csv.parent / "brainrender"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
 
 
 def default_points_csv_for_sample(sample_dir: str | Path, signal_ch: str) -> Path:
@@ -514,6 +838,47 @@ def default_reference_atlas_image() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "reference" / "atlas_label.tiff"
 
 
+def default_mask_atlas_volume_for_sample(sample_dir: str | Path, signal_ch: str) -> Path:
+    return Path(sample_dir) / "visualization" / f"{signal_ch}_mask_atlas_volume.tiff"
+
+
+def default_mask_atlas_volume_meta_for_sample(sample_dir: str | Path, signal_ch: str) -> Path:
+    return Path(sample_dir) / "visualization" / f"{signal_ch}_mask_atlas_volume.json"
+
+
+def generate_points_csv_from_atlas_volume(
+    *,
+    atlas_volume_path: Path,
+    atlas_resolution_xyz: tuple[float, float, float],
+    points_csv: Path,
+    source_label: str,
+) -> Path:
+    from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
+        atlas_volume_to_points,
+        write_outputs,
+    )
+    import tifffile
+
+    atlas_volume = tifffile.imread(str(atlas_volume_path))
+    table = atlas_volume_to_points(
+        atlas_volume,
+        atlas_resolution_xyz=atlas_resolution_xyz,
+        max_points=150_000,
+    )
+    write_outputs(
+        table,
+        {
+            "source_volume": str(atlas_volume_path),
+            "atlas_resolution_xyz": list(atlas_resolution_xyz),
+            "exported_points": int(len(table)),
+            "coordinate_space": "atlas",
+        },
+        points_csv,
+    )
+    print(f"Generated atlas-space points CSV from {source_label}: {points_csv} ({len(table)} points)")
+    return points_csv
+
+
 def resolve_points_csv(args: argparse.Namespace) -> Path:
     if args.points_csv:
         return Path(args.points_csv)
@@ -527,6 +892,20 @@ def resolve_points_csv(args: argparse.Namespace) -> Path:
         return points_csv
 
     cached_volume = default_heatmap_volume_for_sample(sample_dir)
+    mask_atlas_volume = default_mask_atlas_volume_for_sample(sample_dir, args.signal_ch)
+    mask_atlas_meta = default_mask_atlas_volume_meta_for_sample(sample_dir, args.signal_ch)
+    if mask_atlas_volume.exists() and mask_atlas_meta.exists() and not args.force_warp:
+        meta = json.loads(mask_atlas_meta.read_text(encoding="utf-8"))
+        atlas_resolution = tuple(float(value) for value in meta.get("atlas_resolution_xyz", (25.0, 25.0, 25.0)))
+        if len(atlas_resolution) != 3:
+            raise ValueError(f"Invalid atlas_resolution_xyz in {mask_atlas_meta}: {atlas_resolution}")
+        return generate_points_csv_from_atlas_volume(
+            atlas_volume_path=mask_atlas_volume,
+            atlas_resolution_xyz=atlas_resolution,
+            points_csv=points_csv,
+            source_label=str(mask_atlas_volume),
+        )
+
     if cached_volume.exists() and not args.force_warp:
         print(f"Generating atlas-space points CSV from cached volume: {cached_volume}")
         from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
@@ -615,7 +994,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Render atlas-space punctate signals as colored points inside a transparent standard brain."
     )
-    parser.add_argument("--points_csv", default="", help="CSV containing atlas-space point coordinates.")
+    parser.add_argument("--points_csv", default="", help="Atlas-space point CSV. With --sample_dir, defaults to sample_dir/visualization/points.csv.")
     parser.add_argument("--sample_dir", default="", help="Sample root directory. If passed, points are generated automatically.")
     parser.add_argument("--signal_ch", default="ch1", help="Signal channel label used with --sample_dir.")
     parser.add_argument("--register_ch", default="ch0", help="Registration channel label used with --sample_dir.")
@@ -689,11 +1068,83 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--root_alpha", type=float, default=0.12, help="Brain transparency from 0 to 1.")
     parser.add_argument("--background", default="white", help="Background color.")
     parser.add_argument("--camera", default="three_quarters", help="brainrender camera preset name.")
+    parser.add_argument(
+        "--camera_view",
+        nargs="?",
+        const=DEFAULT_CAMERA_VIEW_ARG,
+        default="",
+        metavar="PATH",
+        help="Load camera JSON. Omit PATH to use sample_dir/visualization/{sample}_brainrender_view.json.",
+    )
+    parser.add_argument(
+        "--export_camera_view",
+        nargs="?",
+        const=DEFAULT_CAMERA_VIEW_ARG,
+        default="",
+        metavar="PATH",
+        help="Interactive export. Omit PATH to save to sample_dir/visualization/{sample}_brainrender_view.json.",
+    )
+    parser.add_argument(
+        "--region_groups",
+        default="",
+        help=f"JSON file defining named atlas region groups (default: {DEFAULT_REGION_GROUPS}).",
+    )
+    parser.add_argument(
+        "--group_names",
+        default="",
+        help="Comma-separated subset of region group names to render (default: all groups in JSON).",
+    )
+    parser.add_argument(
+        "--group_colors",
+        default="",
+        help="Comma-separated colors overriding group colors for the selected groups.",
+    )
+    parser.add_argument(
+        "--filter_points_by_group",
+        action="store_true",
+        help="Keep only points inside the selected region groups.",
+    )
+    parser.add_argument(
+        "--color_points_by_group",
+        action="store_true",
+        help="Color points by the selected region groups.",
+    )
+    parser.add_argument(
+        "--drop_unassigned_group_points",
+        action="store_true",
+        help="When using --color_points_by_group, drop points outside the selected groups.",
+    )
+    parser.add_argument(
+        "--screenshot_per_group",
+        action="store_true",
+        help="Save one PNG per selected region group using the same camera view.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="",
+        help="Output directory for --screenshot_per_group (default: sample visualization/brainrender).",
+    )
     parser.add_argument("--title", default="", help="Optional scene title.")
     parser.add_argument("--output", default="", help="PNG output path. If omitted, opens an interactive viewer.")
     parser.add_argument("--screenshot_scale", type=int, default=2, help="Screenshot scale factor when --output is used.")
     parser.add_argument("--show_axes", action="store_true", help="Show atlas coordinate axes.")
     return parser
+
+
+def save_scene_screenshot(
+    scene: Scene,
+    output_path: Path,
+    *,
+    camera: str | dict,
+    screenshot_scale: int,
+) -> str:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scene.screenshots_folder = output_path.parent
+    return scene.screenshot(
+        name=output_path.name,
+        scale=screenshot_scale,
+        camera=camera,
+    )
 
 
 def main() -> int:
@@ -734,6 +1185,8 @@ def main() -> int:
             raise ValueError(f"All {total_points} points were outside the atlas annotation mask.")
         print(f"Filtered atlas mask: kept {kept_points}/{total_points} points inside brain.")
     if requested_region or args.region_id is not None:
+        if args.filter_points_by_group or args.color_points_by_group or args.screenshot_per_group:
+            raise ValueError("Use either --only_region or region-group options, not both.")
         points, kept_points, total_points, resolved_region_id, resolved_region = filter_points_to_region(
             points,
             atlas_name=args.atlas_name,
@@ -745,7 +1198,41 @@ def main() -> int:
         if len(points) == 0:
             raise ValueError(f"All {total_points} points were outside region {resolved_region} ({resolved_region_id}).")
         print(f"Filtered region {resolved_region} ({resolved_region_id}): kept {kept_points}/{total_points} points.")
+
+    use_region_groups = bool(
+        args.region_groups
+        or args.group_names
+        or args.filter_points_by_group
+        or args.color_points_by_group
+        or args.screenshot_per_group
+    )
+    selected_groups: list[RegionGroup] = []
+    if use_region_groups:
+        groups_path = Path(args.region_groups) if args.region_groups else DEFAULT_REGION_GROUPS
+        all_groups = load_region_groups(groups_path)
+        group_names = parse_group_names(args.group_names)
+        group_colors = parse_group_colors(args.group_colors, len(group_names or all_groups)) if args.group_colors else None
+        selected_groups = select_region_groups(all_groups, group_names, group_colors)
+        print(
+            "Region groups: "
+            + ", ".join(f"{group.name}({','.join(group.acronyms)})" for group in selected_groups)
+        )
+        if args.filter_points_by_group or args.screenshot_per_group:
+            points, group_counts, total_points = filter_points_to_groups(
+                points,
+                atlas_name=args.atlas_name,
+                atlas_resolution=atlas_resolution,
+                groups=selected_groups,
+                include_descendants=not args.no_region_descendants,
+            )
+            if len(points) == 0:
+                raise ValueError(f"All {total_points} points were outside the selected region groups.")
+            summary = ", ".join(f"{name}:{count}" for name, count in group_counts.items())
+            print(f"Filtered region groups: kept {len(points)}/{total_points} points. Per group: {summary}")
+
     point_color: str | list[str] = args.point_color
+    if args.color_by_coarse_region and args.color_points_by_group:
+        raise ValueError("Use either --color_by_coarse_region or --color_points_by_group, not both.")
     if args.color_by_coarse_region:
         if args.point_alpha == parser.get_default("point_alpha"):
             args.point_alpha = 0.9
@@ -763,23 +1250,95 @@ def main() -> int:
             for region_id, count in sorted(coarse_counts.items(), key=lambda item: DEFAULT_REGION_IDS.index(item[0]))
         )
         print(f"Colored by coarse region groups: {summary}")
+    elif args.color_points_by_group:
+        if not selected_groups:
+            raise ValueError("--color_points_by_group requires --region_groups or --group_names.")
+        if args.point_alpha == parser.get_default("point_alpha"):
+            args.point_alpha = 0.9
+        points, point_color, group_counts = color_points_by_groups(
+            points,
+            atlas_name=args.atlas_name,
+            atlas_resolution=atlas_resolution,
+            groups=selected_groups,
+            include_descendants=not args.no_region_descendants,
+            drop_unassigned=args.drop_unassigned_group_points,
+        )
+        if len(points) == 0:
+            raise ValueError("No points remained after region-group coloring/filtering.")
+        summary = ", ".join(f"{name}:{count}" for name, count in group_counts.items())
+        print(f"Colored by region groups: {summary}")
     print(f"Loaded {resolved_units} coordinates. Render point bounds: {summarize_points(points)}")
 
+    sample_dir = infer_sample_dir(sample_dir=args.sample_dir, points_csv=points_csv)
+    camera = resolve_camera(args.camera, args.camera_view, sample_dir=sample_dir)
+    export_camera_path = resolve_camera_view_path(args.export_camera_view, sample_dir)
+    if export_camera_path is not None:
+        print(f"Camera view path: {export_camera_path}")
     output_path = resolve_render_output_path(args, points_csv)
-    if output_path is not None:
-        configure_brainrender(
-            background=args.background,
-            root_alpha=args.root_alpha,
-            show_axes=args.show_axes,
-            offscreen=True,
-        )
-    else:
-        configure_brainrender(
-            background=args.background,
-            root_alpha=args.root_alpha,
-            show_axes=args.show_axes,
-            offscreen=False,
-        )
+    interactive_mode = output_path is None and not args.screenshot_per_group
+    if export_camera_path is not None:
+        interactive_mode = True
+    if args.screenshot_per_group and export_camera_path is not None:
+        raise ValueError("Use either --export_camera_view or --screenshot_per_group, not both.")
+
+    configure_brainrender(
+        background=args.background,
+        root_alpha=args.root_alpha,
+        show_axes=args.show_axes,
+        offscreen=not interactive_mode,
+    )
+
+    region_groups_for_mesh = selected_groups if selected_groups else None
+    if region_groups_for_mesh and requested_region_mesh:
+        print("Using --region_groups meshes; ignoring --show_region.")
+        requested_region_mesh = ""
+
+    if args.screenshot_per_group:
+        if not selected_groups:
+            raise ValueError("--screenshot_per_group requires --region_groups or --group_names.")
+        output_dir = resolve_output_dir(args, points_csv, sample_dir)
+        base_points = points
+        for group in selected_groups:
+            group_points, kept, total = filter_points_to_single_group(
+                base_points,
+                atlas_name=args.atlas_name,
+                atlas_resolution=atlas_resolution,
+                group=group,
+                include_descendants=not args.no_region_descendants,
+            )
+            if len(group_points) == 0:
+                print(f"Skipping {group.name}: no points inside group ({total} input points).")
+                continue
+            scene = render_points_scene(
+                group_points,
+                atlas_name=args.atlas_name,
+                point_radius=args.point_radius,
+                point_color=group.color or args.point_color,
+                point_alpha=args.point_alpha,
+                root_alpha=args.root_alpha,
+                title=args.title or group.name,
+                background=args.background,
+                show_axes=args.show_axes,
+                root=not hide_whole_brain,
+                whole_brain_silhouette=False,
+                region_mesh="",
+                region_mesh_id=None,
+                region_alpha=args.region_alpha,
+                region_color=args.region_color,
+                region_silhouette=region_silhouette,
+                hemisphere=args.hemisphere,
+                region_groups=[group],
+            )
+            output_file = output_dir / f"{group.name}_brainrender.png"
+            saved_path = save_scene_screenshot(
+                scene,
+                output_file,
+                camera=camera,
+                screenshot_scale=args.screenshot_scale,
+            )
+            scene.close()
+            print(f"Saved {group.name}: {kept}/{total} points -> {saved_path}")
+        return 0
 
     scene = render_points_scene(
         points,
@@ -799,20 +1358,30 @@ def main() -> int:
         region_color=args.region_color,
         region_silhouette=region_silhouette,
         hemisphere=args.hemisphere,
+        region_groups=region_groups_for_mesh,
     )
 
+    if export_camera_path is not None:
+        install_camera_export_hook(scene, export_camera_path)
+        print(
+            "Camera export mode: adjust the view, press V to save "
+            f"{export_camera_path}, Shift+C to print camera dict, Q/Esc to close."
+        )
+        scene.render(interactive=True, camera=camera)
+        print("Closed brainrender point viewer.")
+        return 0
+
     if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        scene.screenshots_folder = output_path.parent
-        saved_path = scene.screenshot(
-            name=output_path.name,
-            scale=args.screenshot_scale,
-            camera=args.camera,
+        saved_path = save_scene_screenshot(
+            scene,
+            output_path,
+            camera=camera,
+            screenshot_scale=args.screenshot_scale,
         )
         scene.close()
         print(f"Saved brainrender point visualization to: {saved_path}")
     else:
-        scene.render(interactive=True, camera=args.camera)
+        scene.render(interactive=True, camera=camera)
         print("Closed brainrender point viewer.")
 
     return 0

@@ -1,0 +1,42 @@
+{
+  "PFC": {
+    "acronyms": ["FRP", "ACA", "PL", "ILA", "ORB", "DP"],
+    "color": "#4cc9f0",
+    "description": "Prefrontal cortex (medial/orbital/cingulate frontal); ACA overlap with ACC group is intentional"
+  },
+  "dlPFC": {
+    "acronyms": ["PL", "ACAd", "ORBl"],
+    "color": "#0072B2",
+    "description": "Dorsolateral PFC homolog in mouse (prelimbic + dorsal ACA + lateral orbital)"
+  },
+  "vmPFC": {
+    "acronyms": ["ILA", "ACAv", "ORBm", "FRP"],
+    "color": "#D55E00",
+    "description": "Ventromedial PFC homolog in mouse (infralimbic + ventral ACA + medial orbital + frontal pole)"
+  },
+  "HIP": {
+    "acronyms": ["HIP"],
+    "color": "#009E73",
+    "description": "Hippocampal region (CA, DG, subiculum, etc.)"
+  },
+  "AMY": {
+    "acronyms": ["BLA", "BMA", "LA", "PA", "CEA", "MEA", "AAA", "IA", "COA", "PAA"],
+    "color": "#CC79A7",
+    "description": "Amygdalar nuclei including cortical amygdala (COA, PAA)"
+  },
+  "ACC": {
+    "acronyms": ["ACA"],
+    "color": "#E69F00",
+    "description": "Anterior cingulate cortex; may overlap PFC group points"
+  },
+  "NAc": {
+    "acronyms": ["ACB"],
+    "color": "#56B4E9",
+    "description": "Nucleus accumbens"
+  },
+  "LHb": {
+    "acronyms": ["LH"],
+    "color": "#7F3C8D",
+    "description": "Lateral habenula"
+  }
+}

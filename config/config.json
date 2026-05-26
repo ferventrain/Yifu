@@ -84,7 +84,7 @@
     "allow_reflection": false,
         "save_upsampled_label": false,
         "save_upsampled_label_zarr": true,
-        "save_upsampled_label_hemisphere_zarr": false
+        "save_upsampled_label_hemisphere_zarr": true
   },
   "segmentation": {
     "method": "cfos_unet",
