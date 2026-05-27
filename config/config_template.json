@@ -46,7 +46,8 @@
         },
         "edge_signal_removal": {
             "apply": false,
-            "edge_width_px": 20,
+            "inward_px": 50,
+            "outward_px": 0,
             "prior_curve_scale": 1.15,
             "prior_curve_smooth_sigma": 2.0,
             "contour_min_object_area_px": 50,

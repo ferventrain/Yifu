@@ -48,7 +48,7 @@ These run at Steps 3-4 and are independent CLI modules:
 ```json
 "edge_signal_removal": {
   "apply": true/false,
-  "edge_width_px": 20,
+  "inward_px": 50,
   "suppression_weight": 0.8,
   "brightness_pct": 90.0,
   "smooth_sigma": 5.0

@@ -131,7 +131,8 @@ class ClaheCfg(_ModelMixin):
 @dataclass(frozen=True)
 class EdgeSignalRemovalCfg(_ModelMixin):
     apply: bool = False
-    edge_width_px: int = 20
+    inward_px: int = 50
+    outward_px: int = 0
     prior_curve_scale: float = 1.15
     prior_curve_smooth_sigma: float = 2.0
     contour_min_object_area_px: int = 50

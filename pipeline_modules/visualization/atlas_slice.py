@@ -98,9 +98,15 @@ WHITE_ORANGE_RED_BLACK_CMAP = LinearSegmentedColormap.from_list(
 WHITE_BLUE_RED_CMAP = LinearSegmentedColormap.from_list(
     "white_blue_red",
     [
-        (0.0, "#ffffff"),
-        (0.42, "#2f6fff"),
-        (1.0, "#e31a1c"),
+        (0.000, "#000000"),
+        (0.125, "#1e094f"),
+        (0.250, "#3f0761"),
+        (0.375, "#71176e"),
+        (0.500, "#bd334e"),
+        (0.625, "#e04f31"),
+        (0.750, "#f98b0e"),
+        (0.875, "#ebf377"),
+        (1.000, "#ffffff"),
     ],
 )
 
@@ -462,7 +468,7 @@ def _add_segments(
         return
     collection = LineCollection(
         segments,
-        colors="black",
+        colors="white",
         linewidths=linewidth,
         alpha=alpha,
         antialiaseds=True,
@@ -526,7 +532,7 @@ def _add_lines(
         return
     collection = LineCollection(
         lines,
-        colors="black",
+        colors="white",
         linewidths=linewidth,
         alpha=alpha,
         antialiaseds=True,
@@ -622,8 +628,8 @@ def _render_svg(
     brain_d_paths: list[str],
     region_d_paths: list[str],
     *,
-    line_width: float = 0.5,
-    brain_outline_width: float = 1.0,
+    line_width: float = 0.3,
+    brain_outline_width: float = 0.3,
 ) -> Path:
     root = ET.Element(f"{{{SVG_NS}}}svg", {
         "width": str(width),
@@ -633,12 +639,12 @@ def _render_svg(
     ET.SubElement(root, f"{{{SVG_NS}}}rect", {
         "x": "0", "y": "0",
         "width": str(width), "height": str(height),
-        "fill": "white",
+        "fill": "black",
     })
 
     g = ET.SubElement(root, f"{{{SVG_NS}}}g", {
         "fill": "none",
-        "stroke": "black",
+        "stroke": "white",
         "stroke-linecap": "butt",
         "stroke-linejoin": "miter",
         "vector-effect": "non-scaling-stroke",
@@ -669,8 +675,8 @@ def render_atlas_slice_heatmap(
     atlas_heatmap: AtlasSliceHeatmap,
     output_path: str | Path,
     *,
-    line_width: float = 0.12,
-    brain_outline_width: float = 0.28,
+    line_width: float = 0.3,
+    brain_outline_width: float = 0.3,
     colorbar_width: int = 48,
     colorbar_padding: int = 14,
     font_size: int = 9,
@@ -695,7 +701,7 @@ def render_atlas_slice_heatmap(
     ET.SubElement(root, f"{{{SVG_NS}}}rect", {
         "x": "0", "y": "0",
         "width": str(total_width), "height": str(height),
-        "fill": "white",
+        "fill": "black",
     })
 
     defs = ET.SubElement(root, f"{{{SVG_NS}}}defs")
@@ -734,7 +740,7 @@ def render_atlas_slice_heatmap(
 
     outline_group = ET.SubElement(root, f"{{{SVG_NS}}}g", {
         "fill": "none",
-        "stroke": "black",
+        "stroke": "white",
         "stroke-linecap": "round",
         "stroke-linejoin": "round",
         "vector-effect": "non-scaling-stroke",
@@ -758,12 +764,12 @@ def render_atlas_slice_heatmap(
         "width": str(bar_width),
         "height": str(bar_height),
         "fill": "url(#colorbar-gradient)",
-        "stroke": "black",
+        "stroke": "white",
         "stroke-width": "0.8",
     })
 
     text_group = ET.SubElement(root, f"{{{SVG_NS}}}g", {
-        "fill": "black",
+        "fill": "white",
         "font-size": str(font_size),
         "font-family": "Arial, Helvetica, sans-serif",
     })
@@ -800,8 +806,8 @@ def render_atlas_slice(
     output_path: str | Path,
     *,
     dpi: int = 300,
-    line_width: float = 0.12,
-    brain_outline_width: float = 0.28,
+    line_width: float = 0.3,
+    brain_outline_width: float = 0.3,
     contour_smoothing: float = 1.8,
     show_regions: bool = True,
 ) -> Path:
@@ -851,8 +857,8 @@ def render_atlas_slice(
         figsize = (max(long_side * aspect, 1.0), long_side)
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
     ax.imshow(np.ones((height, width), dtype=np.uint8), cmap="gray", vmin=0, vmax=1, interpolation="nearest")
 
     brain_mask = image > 0
@@ -867,7 +873,7 @@ def render_atlas_slice(
     ax.set_axis_off()
     ax.set_xlim(-0.5, width - 0.5)
     ax.set_ylim(height - 0.5, -0.5)
-    fig.savefig(output_path, dpi=dpi, facecolor="white", bbox_inches="tight", pad_inches=0)
+    fig.savefig(output_path, dpi=dpi, facecolor="black", bbox_inches="tight", pad_inches=0)
     plt.close(fig)
     return output_path
 

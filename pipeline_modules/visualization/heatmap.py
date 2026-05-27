@@ -182,15 +182,40 @@ def build_local_signal_volume(signal_volume, sigma=1.0, alpha=1.0, atlas_mask=No
     return local_signal
 
 
+_HEATMAP_CMAP_STOPS = [
+    (0.000, np.array([0x00, 0x00, 0x00])),
+    (0.125, np.array([0x1e, 0x09, 0x4f])),
+    (0.250, np.array([0x3f, 0x07, 0x61])),
+    (0.375, np.array([0x71, 0x17, 0x6e])),
+    (0.500, np.array([0xbd, 0x33, 0x4e])),
+    (0.625, np.array([0xe0, 0x4f, 0x31])),
+    (0.750, np.array([0xf9, 0x8b, 0x0e])),
+    (0.875, np.array([0xeb, 0xf3, 0x77])),
+    (1.000, np.array([0xff, 0xff, 0xff])),
+]
+
+
+def _build_heatmap_lut(num_entries: int = 256) -> np.ndarray:
+    positions = np.array([pos for pos, _ in _HEATMAP_CMAP_STOPS])
+    colors = np.array([color for _, color in _HEATMAP_CMAP_STOPS], dtype=np.float32)
+    lut = np.zeros((num_entries, 3), dtype=np.float32)
+    x = np.linspace(0.0, 1.0, num_entries)
+    for channel in range(3):
+        lut[:, channel] = np.interp(x, positions, colors[:, channel])
+    return np.round(lut).astype(np.uint8)
+
+
 def _legacy_rgb_heat_volume(local_signal, edge, atlas_mask):
     signal = np.asarray(local_signal, dtype=np.float32)
-    heatimg = np.zeros(signal.shape + (3,), dtype=np.uint8)
+    max_val = signal.max()
+    if max_val > 0:
+        normalized = np.clip(signal / max_val, 0.0, 1.0)
+    else:
+        normalized = signal
 
-    heatimg[..., 0] = np.clip(signal - 255.0, 0.0, 255.0).astype(np.uint8)
-    blue = np.where(signal <= 255.0, signal, 255.0)
-    over_blue = signal > 510.0
-    blue[over_blue] = 255.0 - (signal[over_blue] - 510.0)
-    heatimg[..., 2] = np.clip(blue, 0.0, 255.0).astype(np.uint8)
+    lut = _build_heatmap_lut()
+    idx = (normalized * (len(lut) - 1)).astype(np.int32)
+    heatimg = lut[idx]
 
     edge_values = np.asarray(edge)
     edge_mask = edge_values != 0
@@ -483,11 +508,11 @@ def _render_local_slice_array(
     long_side = 6.2
     figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
 
     cmap = _colormap_by_name(cmap_name).copy()
-    cmap.set_bad((1, 1, 1, 0))
+    cmap.set_bad((0, 0, 0, 0))
     masked_signal = np.ma.masked_where((label_slice <= 0) | (signal_slice <= vmin), signal_slice)
     image = ax.imshow(masked_signal, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
@@ -498,9 +523,9 @@ def _render_local_slice_array(
         ax.add_collection(
             LineCollection(
                 region_lines,
-                colors="black",
+                colors="white",
                 linewidths=line_width,
-                alpha=0.55,
+                alpha=0.95,
                 antialiaseds=True,
                 capstyle="round",
                 joinstyle="round",
@@ -514,7 +539,7 @@ def _render_local_slice_array(
         ax.add_collection(
             LineCollection(
                 brain_lines,
-                colors="black",
+                colors="white",
                 linewidths=brain_outline_width,
                 alpha=0.95,
                 antialiaseds=True,
@@ -527,13 +552,14 @@ def _render_local_slice_array(
     ax.set_xlim(-0.5, width - 0.5)
     ax.set_ylim(height - 0.5, -0.5)
     cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
-    cbar.ax.tick_params(labelsize=7, length=2, width=0.6)
+    cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors="white")
     cbar.outline.set_linewidth(0.6)
-    cbar.set_label(colorbar_label, fontsize=8, labelpad=6)
+    cbar.outline.set_edgecolor("white")
+    cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color="white")
 
     fig.tight_layout(pad=0.08)
     buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=dpi, facecolor="white", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(buffer, format="png", dpi=dpi, facecolor="black", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     buffer.seek(0)
     return np.asarray(Image.open(buffer).convert("RGBA"))
@@ -549,8 +575,8 @@ def render_local_signal_atlas_slice(
     vmin: float = 0.0,
     vmax: float | None = None,
     dpi: int = 300,
-    line_width: float = 0.16,
-    brain_outline_width: float = 0.42,
+    line_width: float = 0.3,
+    brain_outline_width: float = 0.3,
     colorbar_label: str = "Signal Intensity",
 ) -> Path:
     atlas_slice = extract_atlas_slice(label_path, spec)
@@ -604,7 +630,7 @@ def _write_raster_svg_with_vector_outlines(
     height, width = rendered_rgba.shape[:2]
 
     root = ET.Element(f"{{{SVG_NS}}}svg", {"width": str(width), "height": str(height), "viewBox": f"0 0 {width} {height}"})
-    ET.SubElement(root, f"{{{SVG_NS}}}rect", {"x": "0", "y": "0", "width": str(width), "height": str(height), "fill": "white"})
+    ET.SubElement(root, f"{{{SVG_NS}}}rect", {"x": "0", "y": "0", "width": str(width), "height": str(height), "fill": "black"})
     ET.SubElement(
         root,
         f"{{{SVG_NS}}}image",
@@ -911,8 +937,8 @@ def generate_prv_sample(
                     vmin=0.0,
                     vmax=1.0,
                     dpi=dpi,
-                    line_width=0.12,
-                    brain_outline_width=0.36,
+                    line_width=0.3,
+                    brain_outline_width=0.3,
                     colorbar_label="Signal Intensity",
                 )
             )

@@ -41,8 +41,12 @@ def _list_tiff_files(path: Path) -> list[Path]:
     return files
 
 
-def _edge_mask_2d(label_img: np.ndarray, edge_width_px: int) -> np.ndarray:
-    """Create a 2D edge band around the brain boundary."""
+def _edge_mask_2d(label_img: np.ndarray, inward_px: int, outward_px: int = 0) -> np.ndarray:
+    """Create a 2D edge band around the brain boundary.
+
+    *inward_px* controls how many pixels to erode into the brain from its boundary.
+    *outward_px* controls how many pixels to dilate outside the brain boundary.
+    """
     from scipy import ndimage as ndi
 
     if label_img.ndim > 2:
@@ -51,13 +55,10 @@ def _edge_mask_2d(label_img: np.ndarray, edge_width_px: int) -> np.ndarray:
         raise ValueError(f"Expected a 2D label slice, got shape {label_img.shape}")
 
     brain = label_img.astype(bool)
-    if not brain.any() or edge_width_px <= 0:
+    if not brain.any() or (inward_px <= 0 and outward_px <= 0):
         return np.zeros_like(brain, dtype=np.float32)
 
-    inward_px = edge_width_px // 2
-    outward_px = edge_width_px - inward_px
     struct = ndi.generate_binary_structure(2, 1)
-
     eroded = (
         ndi.binary_erosion(brain, structure=struct, iterations=inward_px)
         if inward_px > 0
@@ -105,7 +106,8 @@ def _clean_slice(
     image: np.ndarray,
     label_img: np.ndarray,
     *,
-    edge_width_px: int,
+    inward_px: int = 50,
+    outward_px: int = 0,
     suppression_weight: float,
     brightness_pct: float,
     smooth_sigma: float,
@@ -117,7 +119,7 @@ def _clean_slice(
         raise ValueError(f"Expected a 2D signal slice, got shape {image.shape}")
 
     dtype_in = image.dtype
-    edge_mask = _edge_mask_2d(label_img, edge_width_px=edge_width_px)
+    edge_mask = _edge_mask_2d(label_img, inward_px=inward_px, outward_px=outward_px)
     suppress_mask = _compute_suppression_mask_2d(
         image,
         edge_mask,
@@ -160,7 +162,8 @@ def remove_edge_signal(
     label_dir: str | Path,
     output_dir: str | Path,
     *,
-    edge_width_px: int = 20,
+    inward_px: int = 50,
+    outward_px: int = 0,
     suppression_weight: float = 0.8,
     brightness_pct: float = 90.0,
     smooth_sigma: float = 5.0,
@@ -189,7 +192,8 @@ def remove_edge_signal(
 
     output_path.mkdir(parents=True, exist_ok=True)
     cfg = {
-        "edge_width_px": edge_width_px,
+        "inward_px": inward_px,
+        "outward_px": outward_px,
         "suppression_weight": suppression_weight,
         "brightness_pct": brightness_pct,
         "smooth_sigma": smooth_sigma,
@@ -245,7 +249,8 @@ def remove_edge_signal(
         "processed_files": processed,
         "skipped_existing": skipped_existing,
         "failed_files": failed,
-        "edge_width_px": edge_width_px,
+        "inward_px": inward_px,
+        "outward_px": outward_px,
         "suppression_weight": suppression_weight,
         "brightness_pct": brightness_pct,
         "smooth_sigma": smooth_sigma,
@@ -263,8 +268,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input_dir", required=True, help="Input signal TIFF folder")
     parser.add_argument("--label_dir", required=True, help="Warped atlas label TIFF folder")
     parser.add_argument("--output_dir", required=True, help="Output cleaned TIFF folder")
-    parser.add_argument("--edge_width_px", type=int, default=20,
-                        help="Pixel width of the brain edge band (default: 20)")
+    parser.add_argument("--inward_px", type=int, default=50,
+                        help="Pixels to erode inward from brain boundary (default: 50)")
+    parser.add_argument("--outward_px", type=int, default=0,
+                        help="Pixels to dilate outward from brain boundary (default: 0)")
     parser.add_argument("--suppression_weight", type=float, default=0.8,
                         help="Blend weight 0~1 (default: 0.8)")
     parser.add_argument("--brightness_pct", type=float, default=90.0,
@@ -290,7 +297,8 @@ def main() -> int:
         args.input_dir,
         args.label_dir,
         args.output_dir,
-        edge_width_px=args.edge_width_px,
+        inward_px=args.inward_px,
+        outward_px=args.outward_px,
         suppression_weight=args.suppression_weight,
         brightness_pct=args.brightness_pct,
         smooth_sigma=args.smooth_sigma,
