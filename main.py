@@ -440,6 +440,24 @@ def ensure_mask_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg):
     run_tiff_to_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg["chunk_size"], "5.1 Convert mask TIFF to Zarr")
 
 
+def ensure_hemisphere_label_zarr(warped_label_zarr_path, hemisphere_zarr_path, zarr_cfg):
+    if hemisphere_zarr_path.exists():
+        print(f"Hemisphere label Zarr exists, skipping conversion: {hemisphere_zarr_path}")
+        return
+
+    if not warped_label_zarr_path or not warped_label_zarr_path.exists():
+        print(f"Error: Cannot create hemisphere Zarr because label Zarr is unavailable: {warped_label_zarr_path}")
+        sys.exit(1)
+
+    cmd = (
+        f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
+        f'--input "{warped_label_zarr_path}" '
+        f'--output "{hemisphere_zarr_path}" '
+        f'--chunk_size "{format_csv(zarr_cfg["chunk_size"])}"'
+    )
+    run_command(cmd, "Step 2.3: Convert Atlas Label Zarr to Hemisphere Zarr")
+
+
 def run_density_analysis(
     sample_dir,
     signal_ch,
@@ -559,6 +577,11 @@ def main():
             hemisphere_label_zarr = hemisphere_candidate
         if directory_has_files(dir_path_candidate):
             warped_label_dir = dir_path_candidate
+
+    if use_hemisphere_label:
+        hemisphere_label_zarr = sample_dir / "atlas_label_hemisphere.zarr"
+        if warped_label_zarr:
+            ensure_hemisphere_label_zarr(warped_label_zarr, hemisphere_label_zarr, zarr_cfg)
 
     print_step(3, "Signal preprocessing and Zarr conversion")
     esr_cfg = preprocessing_cfg.get("edge_signal_removal", {})
