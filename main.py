@@ -10,17 +10,41 @@ sys.path.append(str(project_root))
 PYTHON_EXE = sys.executable
 
 MAIN_PIPELINE_REGISTRATION_MODE = "atlas2image"
+PIPELINE_STEP_COUNT = 5
 
 
-def run_command(cmd, desc):
+def print_pipeline_banner(sample_dir, config_path):
+    print("\n" + "=" * 60)
+    print("LSFM Pipeline")
+    print(f"  Sample : {sample_dir}")
+    print(f"  Config : {config_path}")
+    print("=" * 60)
+
+
+def print_step(step_num, title):
+    print(f"\n{'─' * 60}")
+    print(f"Step {step_num}/{PIPELINE_STEP_COUNT}: {title}")
+    print("─" * 60)
+
+
+def print_skip(reason):
+    print(f"  SKIP: {reason}")
+
+
+def print_note(message):
+    print(f"  NOTE: {message}")
+
+
+def run_command(cmd, desc, *, show_command=True):
     """Run a shell command and print output."""
-    print(f"\n{'=' * 20} {desc} {'=' * 20}")
-    print(f"Command: {cmd}")
+    print(f"\n  >> {desc}")
+    if show_command:
+        print(f"     Command: {cmd}")
 
     try:
         subprocess.run(cmd, shell=True, check=True)
     except subprocess.CalledProcessError as exc:
-        print(f"Error executing step: {exc}")
+        print(f"  ERROR: command failed ({exc})")
         sys.exit(1)
 
 
@@ -163,7 +187,7 @@ def ensure_signal_tiff_dir(sample_dir, signal_ch, preprocessing_cfg, *, output_d
             sys.exit(1)
         current_signal_tiff_dir = enhanced_dir
     else:
-        print("No preprocessing enhancement steps enabled, using raw TIFF directly.")
+        print_note("No TIFF enhancement steps enabled; using raw signal channel.")
 
     return current_signal_tiff_dir
 
@@ -172,13 +196,13 @@ def ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg):
     zarr_path = sample_dir / f"ch{signal_ch}.zarr"
 
     if zarr_path.exists():
-        print(f"Zarr file exists, skipping conversion: {zarr_path}")
+        print_skip(f"Signal Zarr already exists: {zarr_path}")
     else:
         run_tiff_to_zarr(
             signal_tiff_dir,
             zarr_path,
             zarr_cfg["chunk_size"],
-            "Step 1.1: Convert Signal TIFF to Zarr",
+            "3.3 Convert signal TIFF to Zarr",
         )
 
     return zarr_path
@@ -189,12 +213,12 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
     reg_nifti_path = reg_downsample_dir / "volume.nii.gz"
 
     if reg_nifti_path.exists():
-        print(f"Registration downsample exists, skipping: {reg_nifti_path}")
+        print_skip(f"Registration downsample already exists: {reg_nifti_path}")
         return
 
     try:
         factor_str = calculate_downsample_factor_str(input_res, target_res)
-        print(f"Calculated downsample factors (z,y,x): {factor_str} from config")
+        print_note(f"Downsample factors (z,y,x): {factor_str}")
     except ValueError as exc:
         print(f"Error calculating downsample factors from config: {exc}")
         sys.exit(1)
@@ -204,7 +228,7 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
         f'--input_folder "{sample_dir / f"ch{reg_ch}"}" '
         f'--factor "{factor_str}"'
     )
-    run_command(cmd, "Step 1.2: Downsample Registration Channel")
+    run_command(cmd, "1.1 Downsample registration channel")
 
 
 def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_zarr_path=None):
@@ -292,24 +316,22 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
 
     probability_ready = probability_zarr_path is None or probability_zarr_path.exists()
     if force_rerun:
-        print("cFos U-Net checkpoint is newer than existing segmentation outputs; rerunning segmentation.")
+        print_note("cFos U-Net checkpoint is newer than existing outputs; rerunning segmentation.")
 
     if not force_rerun and mask_zarr_path.exists() and probability_ready:
-        print(f"Found existing mask Zarr at {mask_zarr_path}, skipping segmentation.")
+        print_skip(f"Mask Zarr already exists: {mask_zarr_path}")
         if not export_mask_tiff:
             return mask_zarr_path, mask_tiff_dir
 
     if export_mask_tiff and not force_rerun and directory_has_files(mask_tiff_dir) and probability_ready:
-        print(f"Found existing mask folder at {mask_tiff_dir}, skipping segmentation.")
+        print_skip(f"Mask TIFF folder already exists: {mask_tiff_dir}")
         return mask_zarr_path, mask_tiff_dir
 
     segmentation_ran = False
     if force_rerun or not mask_zarr_path.exists() or not probability_ready:
         seg_cmd = build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_zarr_path)
-        run_command(seg_cmd, f'Step 2.1: Segmentation ({seg_cfg["method"]})')
+        run_command(seg_cmd, f'4.1 Segmentation ({seg_cfg["method"]})')
         segmentation_ran = True
-    else:
-        print(f"Found existing mask Zarr at {mask_zarr_path}, skipping segmentation.")
 
     if force_rerun and segmentation_ran and directory_has_files(mask_tiff_dir):
         remove_path(mask_tiff_dir)
@@ -320,9 +342,9 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
             f'import export_zarr_to_tiff; '
             f"export_zarr_to_tiff(r'{mask_zarr_path}', r'{mask_tiff_dir}')\""
         )
-        run_command(export_cmd, "Step 2.2: Export Mask Zarr to TIFF")
+        run_command(export_cmd, "4.2 Export mask Zarr to TIFF")
     elif not export_mask_tiff:
-        print("Skipping Step 2.2: Export Mask Zarr to TIFF (segmentation.export_mask_tiff=false).")
+        print_skip("Mask TIFF export disabled (segmentation.export_mask_tiff=false).")
 
     return mask_zarr_path, mask_tiff_dir
 
@@ -338,7 +360,7 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
     save_label_zarr = bool(reg_cfg.get("save_upsampled_label_zarr", True))
 
     if not save_label_tiff and not save_label_zarr:
-        print("Skipping atlas label outputs (registration save_upsampled_label/save_upsampled_label_zarr are both false).")
+        print_skip("Atlas label outputs disabled (save_upsampled_label and save_upsampled_label_zarr are both false).")
         return None, None
 
     requested_outputs_exist = (
@@ -346,7 +368,7 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
         and (not save_label_zarr or warped_label_zarr_path.exists())
     )
     if requested_outputs_exist:
-        print("Requested registration label outputs already exist. Skipping ANTs registration.")
+        print_skip("Registration label outputs already exist.")
     else:
         atlas_path = resolve_project_path(reg_cfg["atlas_path"])
         annotation_path = resolve_project_path(reg_cfg["annotation_path"])
@@ -362,7 +384,7 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
             f'--save_transforms '
             f'--config "{config_path}"'
         )
-        run_command(cmd, "Step 2: ANTs Registration (Atlas -> Image)")
+        run_command(cmd, "2.1 ANTs registration (atlas → image)")
 
     # Ensure label Zarr for downstream modules when requested. Older registration
     # runs may have produced only the TIFF stack.
@@ -374,10 +396,29 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
             warped_label_dir,
             warped_label_zarr_path,
             zarr_cfg["chunk_size"],
-            "Step 2.1: Convert Atlas Label TIFF to Zarr",
+            "2.2 Convert atlas label TIFF to Zarr",
         )
     elif save_label_zarr:
-        print(f"Label Zarr exists, skipping conversion: {warped_label_zarr_path}")
+        print_skip(f"Atlas label Zarr already exists: {warped_label_zarr_path}")
+
+    save_hemisphere_zarr = bool(reg_cfg.get("save_upsampled_label_hemisphere_zarr", False))
+    hemisphere_zarr_path = sample_dir / "atlas_label_hemisphere.zarr"
+    if save_hemisphere_zarr and not hemisphere_zarr_path.exists():
+        hemisphere_input = warped_label_zarr_path if warped_label_zarr_path.exists() else warped_label_dir
+        if not Path(hemisphere_input).exists():
+            print(f"Error: Hemisphere Zarr requested, but atlas label input is unavailable at {hemisphere_input}.")
+            sys.exit(1)
+        chunk_str = format_csv(zarr_cfg["chunk_size"])
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
+            f'--input "{hemisphere_input}" '
+            f'--output "{hemisphere_zarr_path}" '
+            f'--chunk_size "{chunk_str}" '
+            f'--dataset_name "0"'
+        )
+        run_command(cmd, "2.3 Convert atlas label to hemisphere Zarr")
+    elif save_hemisphere_zarr:
+        print_skip(f"Hemisphere Zarr already exists: {hemisphere_zarr_path}")
 
     if not save_label_tiff and directory_has_files(warped_label_dir):
         remove_path(warped_label_dir)
@@ -396,19 +437,7 @@ def ensure_mask_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg):
         print(f"Error: Mask Zarr not found at {mask_zarr_path}, and mask TIFF folder is unavailable.")
         sys.exit(1)
 
-    run_tiff_to_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg["chunk_size"], "Step 4.0: Convert Mask TIFF to Zarr")
-
-
-def ensure_label_zarr(warped_label_dir, warped_label_zarr_path, zarr_cfg):
-    if warped_label_zarr_path.exists():
-        return
-
-    run_tiff_to_zarr(
-        warped_label_dir,
-        warped_label_zarr_path,
-        zarr_cfg["chunk_size"],
-        "Step 4.1: Convert Registered Label TIFF to Zarr",
-    )
+    run_tiff_to_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg["chunk_size"], "5.1 Convert mask TIFF to Zarr")
 
 
 def run_density_analysis(
@@ -450,12 +479,12 @@ def run_density_analysis(
     )
     if hemisphere_zarr_path:
         cmd += f' --hemisphere_zarr "{hemisphere_zarr_path}"'
-    run_command(cmd, "Step 6: Density Analysis")
+    run_command(cmd, "5.2 Region density analysis")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LSFM main pipeline: preprocessing -> registration -> edge removal -> tubular enhancement -> segmentation -> analysis"
+        description="LSFM main pipeline: preprocessing -> registration -> edge removal -> segmentation -> analysis"
     )
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     parser.add_argument("--sample_dir", help="Root directory of the sample")
@@ -482,9 +511,9 @@ def main():
         print("Please run with --config path/to/config.json or generate one from template.")
         sys.exit(1)
 
-    print(f"Loading config: {config_path}")
     cfg = load_config(config_path)
     sample_dir = Path(args.sample_dir)
+    print_pipeline_banner(sample_dir, config_path)
 
     signal_ch = cfg["input"]["channels"]["signal"]
     reg_ch = cfg["input"]["channels"]["registration"]
@@ -496,7 +525,7 @@ def main():
     density_cfg_path = resolve_density_cfg_path(analysis_cfg)
     use_hemisphere_label = bool(analysis_cfg.get("use_hemisphere_label", False))
 
-    # ---- Step 1: Registration downsample ----
+    print_step(1, "Registration channel downsample")
     ensure_registration_downsample(
         sample_dir,
         reg_ch,
@@ -504,7 +533,7 @@ def main():
         preprocessing_cfg["downsample"]["target_resolution_xyz"],
     )
 
-    # ---- Step 2: ANTs Registration (atlas label for edge removal) ----
+    print_step(2, "Atlas registration and label outputs")
     warped_label_dir = warped_label_zarr = None
     hemisphere_label_zarr = None
     if use_hemisphere_label and not bool(reg_cfg.get("save_upsampled_label_hemisphere_zarr", False)):
@@ -520,6 +549,7 @@ def main():
         if use_hemisphere_label:
             hemisphere_label_zarr = sample_dir / "atlas_label_hemisphere.zarr"
     else:
+        print_skip("Registration skipped (--skip_registration).")
         zarr_path_candidate = sample_dir / "upsampled_atlas_label.zarr"
         dir_path_candidate = sample_dir / "upsampled_atlas_label"
         if zarr_path_candidate.exists():
@@ -530,7 +560,7 @@ def main():
         if directory_has_files(dir_path_candidate):
             warped_label_dir = dir_path_candidate
 
-    # ---- Step 3: TIFF preprocessing + optional edge signal removal ----
+    print_step(3, "Signal preprocessing and Zarr conversion")
     esr_cfg = preprocessing_cfg.get("edge_signal_removal", {})
     edge_removal_enabled = esr_cfg.get("apply", False)
     if edge_removal_enabled and warped_label_dir:
@@ -558,46 +588,23 @@ def main():
             f'--max_workers {esr_cfg.get("max_workers", 8)} '
             "--no_resume"
         )
-        run_command(cmd, "Step 3: TIFF Preprocessing + Edge Signal Removal")
+        run_command(cmd, "3.2 Edge signal removal")
         signal_tiff_dir = clean_tiff_dir
         if clean_zarr_path.exists():
             remove_path(clean_zarr_path)
         zarr_path = ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg)
     else:
+        if edge_removal_enabled:
+            print_note("Edge signal removal enabled, but atlas label TIFF is unavailable; using standard preprocessing.")
+        print_note("3.1 TIFF preprocessing/enhancement")
         signal_tiff_dir = ensure_signal_tiff_dir(sample_dir, signal_ch, preprocessing_cfg)
         zarr_path = ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg)
 
-    # ---- Step 4: 3D Tubular Enhancement (optional) ----
-    te_cfg = preprocessing_cfg.get("tubular_enhancement", {})
-    if te_cfg.get("apply", False):
-        enhanced_zarr_path = sample_dir / f"ch{signal_ch}_enhanced.zarr"
-        if enhanced_zarr_path.exists():
-            print(f"Enhanced Zarr exists, skipping tubular enhancement: {enhanced_zarr_path}")
-        else:
-            sigmas_str = format_csv(te_cfg["sigmas"])
-            cmd = (
-                f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.tubular_enhancement '
-                f'--input_zarr "{zarr_path}" '
-                f'--output_zarr "{enhanced_zarr_path}" '
-                f'--method {te_cfg.get("method", "frangi")} '
-                f'--sigmas "{sigmas_str}" '
-                f'--slab_depth {te_cfg.get("slab_depth", 32)}'
-            )
-            if te_cfg.get("black_ridges", False):
-                cmd += " --black_ridges"
-            if te_cfg.get("output_dtype"):
-                cmd += f' --output_dtype {te_cfg["output_dtype"]}'
-            if te_cfg.get("export_tiff", False):
-                tiff_out = te_cfg.get("tiff_output") or str(sample_dir / f"ch{signal_ch}_enhanced_tiff")
-                cmd += f' --export_tiff "{tiff_out}"'
-            run_command(cmd, "Step 4: 3D Tubular Enhancement")
-        zarr_path = enhanced_zarr_path
-
-    # ---- Step 5: Segmentation ----
+    print_step(4, "Segmentation")
     mask_zarr_path, _ = ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg)
 
-    # ---- Step 6: Density Analysis ----
     if warped_label_zarr:
+        print_step(5, "Region density analysis")
         run_density_analysis(
             sample_dir,
             signal_ch,
@@ -609,10 +616,13 @@ def main():
             density_cfg_path,
             cfg["input"]["resolution_xyz"],
         )
+    else:
+        print_step(5, "Region density analysis")
+        print_skip("Density analysis skipped (atlas label Zarr unavailable).")
 
-    print("\n" + "=" * 50)
-    print("PIPELINE COMPLETED SUCCESSFULLY")
-    print("=" * 50)
+    print("\n" + "=" * 60)
+    print("Pipeline completed successfully.")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

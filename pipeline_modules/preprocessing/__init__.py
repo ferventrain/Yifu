@@ -10,7 +10,6 @@ from .config import (
     RollingBallCfg,
     ScatteringRemovalCfg,
     TophatCfg,
-    TubularEnhancementCfg,
     ZarrCfg,
     export_json_schema,
     layout_for_sample,
@@ -46,17 +45,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional runtime depend
         raise ModuleNotFoundError(f"downsample support is unavailable: {_downsample_import_error}")
 
 try:
-    from .tubular_enhancement import enhance_tubular_zarr, export_to_tiff
-except ModuleNotFoundError as exc:  # pragma: no cover - optional runtime dependency missing
-    _tubular_import_error = str(exc)
-
-    def enhance_tubular_zarr(*args, **kwargs):  # type: ignore[no-redef]
-        raise ModuleNotFoundError(f"tubular enhancement support is unavailable: {_tubular_import_error}")
-
-    def export_to_tiff(*args, **kwargs):  # type: ignore[no-redef]
-        raise ModuleNotFoundError(f"tubular enhancement support is unavailable: {_tubular_import_error}")
-
-try:
     from .tiff_to_zarr import convert_tiff_to_zarr
 except ModuleNotFoundError as exc:  # pragma: no cover - optional runtime dependency missing
     _tiff_to_zarr_import_error = str(exc)
@@ -84,13 +72,10 @@ __all__ = [
     "RollingBallCfg",
     "ScatteringRemovalCfg",
     "TophatCfg",
-    "TubularEnhancementCfg",
     "ZarrCfg",
     "apply_processing_steps",
     "convert_tiff_to_zarr",
     "downsample_folder",
-    "enhance_tubular_zarr",
-    "export_to_tiff",
     "export_json_schema",
     "layout_for_sample",
     "load_capability_manifest",

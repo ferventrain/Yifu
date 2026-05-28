@@ -24,7 +24,7 @@
         "save_transforms":     {"type": "bool", "default": false},
         "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack"},
         "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr"},
-        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr"},
+        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr. Required when analysis.use_hemisphere_label=true in main.py config."},
         "config":              {"type": "path|null", "default": null, "description": "Path to main config.json for resolution info"},
         "density_cfg":         {"type": "path|null", "default": null}
       },
@@ -42,10 +42,11 @@
       "id": "analyze_zarr_graph",
       "function": "pipeline_modules.registration.region_signal_analysis_zarr_graph.analyze_zarr_graph",
       "cli": "python pipeline_modules/registration/region_signal_analysis_zarr_graph.py",
-      "description": "Zarr-native 3-pass block-graph analysis: scan blocks, stitch boundaries, collapse into per-region object statistics and export Excel.",
+      "description": "Zarr-native 3-pass block-graph analysis: scan blocks, stitch boundaries, collapse into per-region object statistics and export Excel. When --hemisphere_zarr is provided (or main.py passes sample_dir/atlas_label_hemisphere.zarr because analysis.use_hemisphere_label=true), every region gets Left/Right metric columns based on the hemisphere label Zarr.",
       "prerequisites": [
         "Mask Zarr, label Zarr, and signal Zarr must exist and share the same shape",
-        "Allen region CSV must be available"
+        "Allen region CSV must be available",
+        "For left/right stats, provide --hemisphere_zarr or enable registration.save_upsampled_label_hemisphere_zarr plus analysis.use_hemisphere_label in config.json"
       ],
       "inputs": {
         "mask_zarr_path":       {"type": "path", "required": true},
@@ -66,8 +67,28 @@
         "hemisphere_zarr_path":  {"type": "path|null", "default": null, "description": "Optional hemisphere Zarr for left/right stats"}
       },
       "outputs": {
-        "excel_path":    {"type": "path", "description": "Per-region signal statistics Excel workbook"},
+        "excel_path":    {"type": "path", "description": "Per-region signal statistics Excel workbook; may include Left/Right Total Voxels, Left/Right Signal Voxels, Left/Right Voxel Density, Left/Right Signal Count, Left/Right Sum Intensity when hemisphere_zarr is used"},
         "manifest_path": {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
+      "id": "convert_atlas_label_to_hemisphere",
+      "function": "pipeline_modules.registration.atlas_label_to_hemisphere.convert_atlas_label_to_hemisphere",
+      "cli": "python pipeline_modules/registration/atlas_label_to_hemisphere.py",
+      "description": "Convert a sample-space atlas label Zarr or TIFF stack into a hemisphere label Zarr (0=background, 1=left, 2=right). Called automatically during registration when save_upsampled_label_hemisphere_zarr=true.",
+      "prerequisites": [
+        "Input must be sample_dir/upsampled_atlas_label.zarr or sample_dir/upsampled_atlas_label/ TIFF stack"
+      ],
+      "inputs": {
+        "input":         {"type": "path", "required": true, "description": "Input atlas label .zarr or TIFF folder"},
+        "output":        {"type": "path", "required": true, "description": "Output hemisphere .zarr path, commonly sample_dir/atlas_label_hemisphere.zarr"},
+        "chunk_size":    {"type": "triplet_int", "default": [256, 256, 256]},
+        "compressor":    {"type": "string", "default": "default", "choices": ["default", "none"]},
+        "dataset_name":  {"type": "string", "default": "0"}
+      },
+      "outputs": {
+        "hemisphere_zarr": {"type": "path", "description": "sample_dir/atlas_label_hemisphere.zarr"},
+        "manifest_path":   {"type": "path", "description": "_run_manifest.json"}
       }
     },
     {
@@ -129,6 +150,7 @@
       "reg_downsample_nii":    "SampleLayout.reg_downsample_nii",
       "atlas_label_zarr":      "SampleLayout.atlas_label_zarr",
       "atlas_label_tiff_dir":  "SampleLayout.atlas_label_tiff_dir",
+      "atlas_label_hemisphere_zarr": "sample_dir/atlas_label_hemisphere.zarr",
       "mask_zarr":             "SampleLayout.mask_zarr",
       "signal_zarr":           "SampleLayout.signal_zarr",
       "density_results_xlsx":  "SampleLayout.density_results_xlsx"

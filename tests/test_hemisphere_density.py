@@ -11,6 +11,7 @@ from pipeline_modules.registration.region_signal_analysis_zarr_graph import (
     aggregate_region_totals,
     aggregate_signal_by_hemisphere,
     compute_block_artifacts,
+    flatten_region_rows,
     save_block_artifact,
 )
 
@@ -110,3 +111,68 @@ def test_final_region_stats_counts_multiple_components_per_hemisphere(tmp_path):
     assert stats["region_signal_counts_by_hemisphere"][(10, int(RIGHT_HEMISPHERE_ID))] == 1
     assert stats["region_signal_voxels_by_hemisphere"][(10, int(LEFT_HEMISPHERE_ID))] == 2
     assert stats["region_sum_intensity_by_hemisphere"][(10, int(LEFT_HEMISPHERE_ID))] == 12.0
+
+
+def test_hemisphere_rows_include_all_regions():
+    region_tree = {
+        "id": 1,
+        "name": "root,root",
+        "st_level": 0,
+        "children": [
+            {
+                "id": 10,
+                "name": "paired child,PAIR",
+                "st_level": 1,
+                "children": [],
+            },
+            {
+                "id": 20,
+                "name": "midline child,MID",
+                "st_level": 1,
+                "children": [],
+            },
+        ],
+    }
+    direct_stats = {
+        "total_region_voxels": {1: 0, 10: 10, 20: 90},
+        "region_signal_voxels": {10: 4, 20: 45},
+        "region_signal_counts": {10: 2, 20: 9},
+        "region_sum_intensity": {10: 40.0, 20: 900.0},
+        "total_region_voxels_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 6,
+            (10, int(RIGHT_HEMISPHERE_ID)): 4,
+            (20, int(LEFT_HEMISPHERE_ID)): 90,
+        },
+        "region_signal_voxels_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 2,
+            (10, int(RIGHT_HEMISPHERE_ID)): 2,
+            (20, int(LEFT_HEMISPHERE_ID)): 45,
+        },
+        "region_signal_counts_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 1,
+            (10, int(RIGHT_HEMISPHERE_ID)): 1,
+            (20, int(LEFT_HEMISPHERE_ID)): 9,
+        },
+        "region_sum_intensity_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 15.0,
+            (10, int(RIGHT_HEMISPHERE_ID)): 25.0,
+            (20, int(LEFT_HEMISPHERE_ID)): 900.0,
+        },
+    }
+
+    rows = flatten_region_rows(region_tree, direct_stats)
+    rows_by_name = {row["Name"]: row for row in rows}
+
+    root_row = rows_by_name["root,root"]
+    assert root_row["Total Voxels"] == 100
+    assert root_row["Left Total Voxels"] == 96
+    assert root_row["Right Total Voxels"] == 4
+
+    paired_row = rows_by_name["paired child,PAIR"]
+    assert paired_row["Left Total Voxels"] == 6
+    assert paired_row["Right Total Voxels"] == 4
+
+    midline_row = rows_by_name["midline child,MID"]
+    assert midline_row["Total Voxels"] == 90
+    assert midline_row["Left Total Voxels"] == 90
+    assert midline_row["Right Total Voxels"] == 0

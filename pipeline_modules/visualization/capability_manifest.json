@@ -320,6 +320,377 @@
           "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\heatmap.py --mode atlas-slice --input \"S:\\Arivis_Analysis\\sample01\\visualization\\sample01_heatmap3d_volume.tiff\" --label \"S:\\Yifu\\data\\reference\\atlas_label.tiff\" --plane coronal --coord-system index --coord 216 --output \"S:\\Arivis_Analysis\\sample01\\visualization\\ap_216.png\" --sigma 10"
         }
       ]
+    },
+    {
+      "id": "warp_mask_to_atlas_points",
+      "function": "pipeline_modules.visualization.warp_mask_zarr_to_atlas_points.main",
+      "cli": "python pipeline_modules/visualization/warp_mask_zarr_to_atlas_points.py",
+      "description": "Warp a sample-space mask Zarr into Allen atlas space and export atlas-space point CSV (and optional binary atlas TIFF volume). Used by render_points_brainrender.py and heatmap.py when cached atlas outputs are missing.",
+      "prerequisites": [
+        "sample_dir should contain <signal_ch>_mask.zarr, <register_ch>_downsample/volume.nii.gz, and registration transforms",
+        "Atlas reference image must match the registration atlas",
+        "Run in the yifu/registration environment (ANTsPy required)"
+      ],
+      "inputs": {
+        "sample_dir": { "type": "dir", "required": false, "description": "Sample root; resolves mask_zarr and transforms when explicit paths are omitted" },
+        "signal_ch": { "type": "string", "default": "ch0" },
+        "register_ch": { "type": "string", "default": "ch0" },
+        "mask_zarr": { "type": "path|null", "default": null },
+        "atlas_image": { "type": "path", "required": true },
+        "atlas_name": { "type": "string", "default": "allen_mouse_25um" },
+        "resolution_xyz": { "type": "triplet_float_um", "required": true, "description": "Input mask voxel size in microns as x,y,z" },
+        "target_resolution_xyz": { "type": "triplet_float_um", "default": [25.0, 25.0, 25.0] },
+        "foreground_mode": { "type": "string", "default": "nonzero", "choices": ["nonzero", "equal"] },
+        "foreground_label": { "type": "int", "default": 1 },
+        "max_points": { "type": "int", "default": 150000, "description": "Random cap on exported atlas points; 0 disables cap" },
+        "output": { "type": "path|null", "default": null, "description": "Atlas-space CSV; defaults to sample_dir/visualization/points.csv" },
+        "output_volume": { "type": "path|null", "default": null, "description": "Optional atlas-space binary mask TIFF" },
+        "skip_points": { "type": "bool", "default": false }
+      },
+      "outputs": {
+        "atlas_points_csv": { "type": "path", "description": "sample_dir/visualization/points.csv" },
+        "atlas_volume_tiff": { "type": "path", "optional": true, "description": "Optional atlas-space mask TIFF when --output_volume is set" },
+        "summary_json": { "type": "path", "optional": true, "description": "Metadata JSON written next to atlas volume export" }
+      },
+      "sample_layout": {
+        "mask_zarr": "sample_dir/<signal_ch>_mask.zarr",
+        "atlas_points_csv": "sample_dir/visualization/points.csv"
+      },
+      "guide": {
+        "summary": "Warp sample-space mask Zarr to Allen atlas space and export points.csv. Called automatically by render_points_brainrender when cached atlas outputs are missing.",
+        "environment": "yifu (ANTsPy required)",
+        "points_csv_fallback_order": [
+          "Use existing sample_dir/visualization/points.csv if present",
+          "Convert {signal_ch}_mask_atlas_volume.tiff + JSON if cached",
+          "Convert {sample_name}_heatmap3d_volume.tiff if cached",
+          "Run this script from mask zarr (full warp)"
+        ]
+      }
+    },
+    {
+      "id": "render_points_brainrender",
+      "function": "pipeline_modules.visualization.render_points_brainrender.main",
+      "cli": "python pipeline_modules/visualization/render_points_brainrender.py",
+      "description": "Render atlas-space punctate signals as colored spheres inside a transparent Allen standard brain. Supports custom region-group meshes, interactive camera export, and per-group batch screenshots.",
+      "prerequisites": [
+        "Atlas-space points CSV must exist or be generatable via --sample_dir",
+        "BrainGlobe atlas allen_mouse_25um must be downloaded in the napari/brainrender environment",
+        "On Windows, set PYTHONPATH to the repo root before running",
+        "Default region groups: config/region_groups.json"
+      ],
+      "inputs": {
+        "sample_dir": { "type": "dir", "required": false, "description": "Sample root; auto-resolves points.csv and default output paths under sample_dir/visualization/" },
+        "points_csv": { "type": "path|null", "default": null, "description": "Atlas-space point CSV; defaults to sample_dir/visualization/points.csv when --sample_dir is set" },
+        "signal_ch": { "type": "string", "default": "ch1" },
+        "register_ch": { "type": "string", "default": "ch0" },
+        "force_warp": { "type": "bool", "default": false, "description": "Regenerate atlas-space points even if CSV exists" },
+        "atlas_name": { "type": "string", "default": "allen_mouse_25um" },
+        "region_groups": { "type": "path", "default": "config/region_groups.json", "description": "Named atlas region groups with acronyms and colors" },
+        "group_names": { "type": "csv_string|null", "default": null, "examples": ["PFC,HIP,AMY,ACC,NAc,LHb"] },
+        "group_colors": { "type": "csv_string|null", "default": null },
+        "color_points_by_group": { "type": "bool", "default": false },
+        "filter_points_by_group": { "type": "bool", "default": false },
+        "drop_unassigned_group_points": { "type": "bool", "default": false },
+        "screenshot_per_group": { "type": "bool", "default": false, "description": "Save one PNG per selected group using the same camera" },
+        "output_dir": { "type": "path|null", "default": null, "description": "Output directory for --screenshot_per_group; defaults to sample_dir/visualization/brainrender" },
+        "camera_view": { "type": "path|null", "default": null, "description": "Load camera JSON; omit path to use sample_dir/visualization/{sample}_brainrender_view.json" },
+        "export_camera_view": { "type": "path|null", "default": null, "description": "Interactive camera export mode; press V in viewer to save JSON" },
+        "point_radius": { "type": "float", "default": 40.0 },
+        "point_color": { "type": "string", "default": "#ff4d6d" },
+        "point_alpha": { "type": "float", "default": 0.95 },
+        "root_alpha": { "type": "float", "default": 0.12 },
+        "hemisphere": { "type": "string", "default": "both", "choices": ["both", "left", "right"] },
+        "camera": { "type": "string", "default": "three_quarters" },
+        "output": { "type": "path|null", "default": null, "description": "Single PNG output; omit to open interactive viewer" },
+        "screenshot_scale": { "type": "int", "default": 2 },
+        "title": { "type": "string|null", "default": null },
+        "background": { "type": "string", "default": "white" },
+        "show_axes": { "type": "bool", "default": false }
+      },
+      "outputs": {
+        "points_csv": { "type": "path", "description": "sample_dir/visualization/points.csv" },
+        "camera_view_json": { "type": "path", "optional": true, "description": "sample_dir/visualization/{sample}_brainrender_view.json" },
+        "group_png": { "type": "path", "optional": true, "description": "sample_dir/visualization/brainrender/{GROUP}_brainrender.png when --screenshot_per_group is used" },
+        "single_png": { "type": "path", "optional": true, "description": "Explicit --output PNG path" }
+      },
+      "common_commands": [
+        {
+          "description": "Step 1 — interactive preview with region-group mesh and point coloring",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; micromamba run -n napari python pipeline_modules/visualization/render_points_brainrender.py --sample_dir \"S:\\Arivis_Analysis\\YF2026030302_wangzhinao\\nao_1\" --group_names \"PFC,HIP,AMY,ACC,NAc,LHb\" --color_points_by_group --filter_points_by_group"
+        },
+        {
+          "description": "Step 2 — interactively save fixed camera view (press V in viewer)",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; micromamba run -n napari python pipeline_modules/visualization/render_points_brainrender.py --sample_dir \"S:\\Arivis_Analysis\\YF2026030302_wangzhinao\\nao_1\" --group_names \"PFC\" --color_points_by_group --export_camera_view"
+        },
+        {
+          "description": "Step 3 — batch screenshot one PNG per region group using saved camera view",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; micromamba run -n napari python pipeline_modules/visualization/render_points_brainrender.py --sample_dir \"S:\\Arivis_Analysis\\YF2026030302_wangzhinao\\nao_1\" --group_names \"PFC,HIP,AMY,ACC,NAc,LHb\" --screenshot_per_group --camera_view"
+        },
+        {
+          "description": "Single PNG output (non per-group)",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; micromamba run -n napari python pipeline_modules/visualization/render_points_brainrender.py --sample_dir \"S:\\Arivis_Analysis\\sample01\" --group_names \"PFC,HIP\" --color_points_by_group --output brainrender_preview.png --camera_view"
+        },
+        {
+          "description": "Show single Allen region mesh only",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; micromamba run -n napari python pipeline_modules/visualization/render_points_brainrender.py --sample_dir \"S:\\Arivis_Analysis\\sample01\" --show_region \"HIP\" --only_region \"HIP\""
+        },
+        {
+          "description": "Render from external atlas-space CSV without sample_dir",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; micromamba run -n napari python pipeline_modules/visualization/render_points_brainrender.py --points_csv \"S:\\path\\to\\atlas_points.csv\" --columns \"x,y,z\" --point_radius 40 --root_alpha 0.12"
+        }
+      ],
+      "guide": {
+        "summary": "在 Allen 标准脑（allen_mouse_25um）中，把 atlas 空间的 punctate 荧光信号显示为透明脑内的彩色点。支持自定义脑区分组 mesh、交互式保存固定视角、按脑区组批量出图。不在 main.py 默认流程中；坐标必须在 atlas 空间（µm）。",
+        "environments": {
+          "brainrender_render": "napari",
+          "points_auto_generation": "yifu"
+        },
+        "setup": {
+          "pythonpath_windows": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'",
+          "check_atlas_downloaded": "micromamba run -n napari python -c \"from brainglobe_atlasapi.list_atlases import get_downloaded_atlases; print(get_downloaded_atlases())\"",
+          "required_atlas": "allen_mouse_25um"
+        },
+        "recommended_usage": "只传 --sample_dir；换样本时只改 sample_dir 即可。",
+        "default_output_paths": {
+          "points_csv": "{sample_dir}/visualization/points.csv",
+          "points_json": "{sample_dir}/visualization/points.json",
+          "camera_view_json": "{sample_dir}/visualization/{sample_name}_brainrender_view.json",
+          "group_png_dir": "{sample_dir}/visualization/brainrender/{GROUP}_brainrender.png"
+        },
+        "sample_prerequisites": [
+          "ch0/ or registration channel TIFF",
+          "ch0_downsample/volume.nii.gz",
+          "signal channel Zarr and mask Zarr",
+          "upsampled_atlas_label.zarr",
+          "visualization/points.csv or generatable atlas-space volume"
+        ],
+        "points_csv_auto_generation": {
+          "trigger": "--sample_dir set and visualization/points.csv missing (or --force_warp)",
+          "order": [
+            "{signal_ch}_mask_atlas_volume.tiff + JSON (default signal_ch=ch1)",
+            "{sample_name}_heatmap3d_volume.tiff",
+            "warp_mask_zarr_to_atlas_points from mask zarr"
+          ],
+          "reuse_existing": "If points.csv exists, reuse unless --force_warp"
+        },
+        "region_groups": {
+          "config_path": "config/region_groups.json",
+          "custom_config": "--region_groups S:\\Yifu\\config\\my_groups.json",
+          "json_formats": [
+            "Full: {\"PFC\": {\"acronyms\": [...], \"color\": \"#4cc9f0\", \"description\": \"...\"}}",
+            "Short: {\"PFC\": [\"FRP\", \"ACA\", \"PL\", \"ILA\", \"ORB\", \"DP\"]}"
+          ],
+          "default_groups": [
+            {"name": "PFC", "acronyms": ["FRP", "ACA", "PL", "ILA", "ORB", "DP"], "note": "含 ACA，与 ACC 组故意重叠"},
+            {"name": "dlPFC", "acronyms": ["PL", "ACAd", "ORBl"], "note": "背外侧 PFC 小鼠同源近似"},
+            {"name": "vmPFC", "acronyms": ["ILA", "ACAv", "ORBm", "FRP"], "note": "腹内侧 PFC 小鼠同源近似"},
+            {"name": "HIP", "acronyms": ["HIP"]},
+            {"name": "AMY", "acronyms": ["BLA", "BMA", "LA", "PA", "CEA", "MEA", "AAA", "IA", "COA", "PAA"]},
+            {"name": "ACC", "acronyms": ["ACA"], "note": "与 PFC 重叠 intentional"},
+            {"name": "NAc", "acronyms": ["ACB"]},
+            {"name": "LHb", "acronyms": ["LH"]}
+          ]
+        },
+        "workflow": [
+          {"step": 1, "action": "交互预览 + 按组着色", "flags": "--color_points_by_group --filter_points_by_group", "note": "不加 --color_points_by_group 时所有点为默认红色 #ff4d6d"},
+          {"step": 2, "action": "交互保存固定视角", "flags": "--export_camera_view", "note": "按 V 保存 JSON；此步骤不生成按组 PNG"},
+          {"step": 3, "action": "同视角按组批量截图", "flags": "--screenshot_per_group --camera_view", "note": "第一组 mesh 加载可能较慢（1-3 分钟正常）"}
+        ],
+        "keyboard_shortcuts": {
+          "V": "保存视角到 sample_dir/visualization/{sample}_brainrender_view.json",
+          "Shift+C": "在终端打印相机参数",
+          "S": "当前窗口截图（brainrender 默认）",
+          "Q_or_Esc": "关闭窗口"
+        },
+        "camera_view_json_format": {
+          "required_fields": ["pos", "viewup", "clipping_range"],
+          "example": {
+            "pos": [-29176, 70303, 15030],
+            "focal_point": [7830, 4296, -5694],
+            "viewup": [-1, 0, 0],
+            "distance": 78459,
+            "clipping_range": [61887, 99152],
+            "name": "nao_1_brainrender_view"
+          }
+        },
+        "mutually_exclusive_color_modes": [
+          "--color_points_by_group (region_groups.json)",
+          "--color_by_coarse_region (wb coarse regions from coarse_region_metric_plot)"
+        ],
+        "powershell_notes": [
+          "--group_names 必须加引号，否则逗号会拆成多个参数，例如 --group_names \"PFC,HIP,AMY\""
+        ],
+        "faq": [
+          {"issue": "全是红点", "fix": "加上 --color_points_by_group"},
+          {"issue": "按 V 没反应 / Step 3 报 Camera view JSON not found", "fix": "重新跑 --export_camera_view，确认终端出现 Saved camera view to:，或检查 visualization/{sample}_brainrender_view.json"},
+          {"issue": "unrecognized arguments: HIP AMY", "fix": "PowerShell 中 --group_names 未加引号"},
+          {"issue": "ModuleNotFoundError: pipeline_modules", "fix": "设置 PYTHONPATH=S:\\Yifu 并在仓库根目录运行"},
+          {"issue": "ModuleNotFoundError: brainrender", "fix": "必须在 napari 环境运行，不能用 yifu"},
+          {"issue": "Atlas not downloaded", "fix": "在 napari 环境下载 Allen atlas，或复制 ~/.brainglobe 缓存"},
+          {"issue": "ACC 与 PFC 点数重叠", "fix": "设计如此，两组都含 ACA；按组截图时各组独立过滤"}
+        ],
+        "pipeline_relation": "依赖 registration（transforms）、segmentation（mask zarr）、atlas warp 后的体积或 points.csv。脚本内部自动推断坐标单位/轴序。"
+      },
+      "sample_layout": {
+        "points_csv": "sample_dir/visualization/points.csv",
+        "camera_view_json": "sample_dir/visualization/{sample_name}_brainrender_view.json",
+        "group_png_dir": "sample_dir/visualization/brainrender/"
+      }
+    },
+    {
+      "id": "summarize_region_group_signal_count",
+      "function": "pipeline_modules.visualization.region_group_signal_count.summarize_sample_region_group_signal_count",
+      "cli": "python pipeline_modules/visualization/region_group_signal_count.py",
+      "description": "Summarize a density Excel workbook into configured atlas region groups (default config/region_groups.json), aggregating a chosen metric such as Signal Count.",
+      "prerequisites": [
+        "sample_dir must contain a density Excel workbook, commonly <sample_dir_name>_density_result.xlsx",
+        "Region groups JSON and Allen region CSV must be available"
+      ],
+      "inputs": {
+        "sample_dir": { "type": "dir", "required": true },
+        "groups_json": { "type": "path", "default": "config/region_groups.json" },
+        "cfg": { "type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV" },
+        "metric": { "type": "string", "default": "Signal Count", "examples": ["Signal Count", "Signal Voxels", "Voxel Density", "Left Signal Count", "Right Signal Count"] },
+        "input_excel": { "type": "path|null", "default": null },
+        "output_prefix": { "type": "path|null", "default": null, "description": "Defaults to sample_dir/<sample_dir_name>" }
+      },
+      "outputs": {
+        "region_group_signal_count_csv": { "type": "path", "description": "<output_prefix>_region_group_signal_count.csv" },
+        "region_group_signal_count_xlsx": { "type": "path", "description": "<output_prefix>_region_group_signal_count.xlsx" }
+      },
+      "common_commands": [
+        {
+          "description": "Summarize Signal Count for default region groups in a sample directory",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\region_group_signal_count.py --sample_dir \"S:\\Arivis_Analysis\\sample01\""
+        }
+      ],
+      "sample_layout": {
+        "density_results_xlsx": "sample_dir/<sample_dir_name>_density_result.xlsx"
+      }
+    },
+    {
+      "id": "render_vessels_pyvista",
+      "function": "pipeline_modules.visualization.render_vessels_pyvista.main",
+      "cli": "python pipeline_modules/visualization/render_vessels_pyvista.py",
+      "description": "Render kimimaro SWC skeleton branches as smooth 3D spline curves colored by mean vessel diameter, with optional branch-point spheres.",
+      "prerequisites": [
+        "Input must be a directory of .swc files from kimimaro_reconstruction.py --save_swc",
+        "Run in an environment with pyvista and matplotlib"
+      ],
+      "inputs": {
+        "swc_dir": { "type": "dir", "required": true },
+        "max_files": { "type": "int", "default": 0, "description": "Limit loaded SWC files; 0 means all" },
+        "spline_factor": { "type": "int", "default": 12 },
+        "smooth_window": { "type": "int", "default": 5 },
+        "min_spacing": { "type": "float", "default": 1.0, "description": "Minimum control-point spacing in microns" },
+        "line_width": { "type": "float", "default": 5.0 },
+        "branch_point_size": { "type": "float", "default": 2.0 },
+        "color_mode": { "type": "string", "default": "diameter", "choices": ["diameter", "solid", "branch"] },
+        "branch_color": { "type": "string", "default": "#0072b2" },
+        "colormap": { "type": "string", "default": "bright" },
+        "background": { "type": "string", "default": "dark", "choices": ["dark", "paper", "black", "white"] },
+        "diameter_clip_percentiles": { "type": "pair_float", "default": [2.0, 98.0] },
+        "output": { "type": "path|null", "default": null, "description": "Save screenshot instead of opening interactive viewer" },
+        "dpi": { "type": "int", "default": 300 },
+        "window_size": { "type": "width,height", "default": "1920,1080" },
+        "camera": { "type": "string", "default": "iso", "choices": ["iso", "xy", "xz", "yz"] },
+        "parallel_projection": { "type": "bool", "default": false },
+        "save_on_close": { "type": "path|null", "default": null, "description": "Interactive mode: press S in viewer to save current view" }
+      },
+      "outputs": {
+        "render_png": { "type": "path", "optional": true, "description": "Screenshot path when --output is set" }
+      },
+      "common_commands": [
+        {
+          "description": "Quick interactive preview of SWC skeleton branches",
+          "powershell": "micromamba run -n yifu python S:\\Yifu\\pipeline_modules\\visualization\\render_vessels_pyvista.py --swc_dir \"S:\\sample\\tubule_reconstruction\\swc\""
+        },
+        {
+          "description": "Publication-quality screenshot",
+          "powershell": "micromamba run -n yifu python S:\\Yifu\\pipeline_modules\\visualization\\render_vessels_pyvista.py --swc_dir \"S:\\sample\\tubule_reconstruction\\swc\" --output \"S:\\sample\\tubule_reconstruction\\vessels_render.png\" --spline_factor 20 --smooth_window 7 --min_spacing 2.0 --line_width 5 --dpi 300"
+        }
+      ],
+      "guide": {
+        "summary": "Render SWC skeleton files as smooth 3D branch curves with red branch-point spheres. Each branch between two non-degree-2 nodes is a smooth spline colored by mean vessel diameter, with a lower-right colorbar.",
+        "input": {
+          "format": "Directory of .swc files (one per skeleton/connected component)",
+          "source": "kimimaro_reconstruction.py --save_swc",
+          "swc_line_format": "id type x y z radius parent"
+        },
+        "pipeline_position": "binary mask Zarr → kimimaro_reconstruction.py --save_skeleton --save_swc → swc/ → render_vessels_pyvista.py --swc_dir swc/",
+        "smoothing_pipeline": [
+          {"stage": 1, "name": "min_spacing filter", "description": "Remove control points closer than min_spacing um; eliminates redundant dense vertices"},
+          {"stage": 2, "name": "moving-average smooth", "description": "Sliding window (smooth_window) on interior points; endpoints preserved"},
+          {"stage": 3, "name": "spline interpolation", "description": "pv.Spline through cleaned points; n = len(points) * spline_factor"}
+        ],
+        "recommended_settings": [
+          {"scenario": "Quick preview", "flags": "--spline_factor 12 --smooth_window 5 --min_spacing 1.0"},
+          {"scenario": "Publication quality", "flags": "--spline_factor 20 --smooth_window 7 --min_spacing 2.0 --line_width 5"},
+          {"scenario": "Very noisy skeleton", "flags": "--spline_factor 20 --smooth_window 11 --min_spacing 3.0"},
+          {"scenario": "Save to file", "flags": "add --output render.png --dpi 300"}
+        ],
+        "output_modes": {
+          "interactive": "Default — PyVista 3D viewer; rotate/zoom with mouse. Press S to save view when save_on_close/interactive_output set.",
+          "file": "--output path.png saves screenshot and exits"
+        },
+        "dependencies": ["pyvista", "numpy", "matplotlib"],
+        "notes": [
+          "SWC radius values control branch color only; visual tube width is uniform via --line_width",
+          "Branch points = nodes with more than one child in SWC tree",
+          "Each SWC file = one skeleton; branch IDs globally unique across loaded files",
+          "For best results run kimimaro_reconstruction.py with --prune_spurs_max_length_um 5.0"
+        ]
+      }
+    },
+    {
+      "id": "plot_vessel_diameter_histogram",
+      "function": "pipeline_modules.visualization.vessel_diameter_histogram.main",
+      "cli": "python pipeline_modules/visualization/vessel_diameter_histogram.py",
+      "description": "Generate a publication-ready vessel diameter histogram from kimimaro vessel_branch_metrics.csv (diameter_um = mean_radius_um * 2).",
+      "prerequisites": [
+        "Input CSV must contain mean_radius_um, typically from kimimaro_reconstruction.py region/branch metrics export"
+      ],
+      "inputs": {
+        "branch_csv": { "type": "path", "required": true, "description": "vessel_branch_metrics.csv path" },
+        "output": { "type": "path|null", "default": null, "description": "Defaults to vessel_diameter_histogram.png next to the CSV" },
+        "bins": { "type": "int", "default": 24 },
+        "dpi": { "type": "int", "default": 300 },
+        "title": { "type": "string", "default": "Vessel Diameter Distribution" },
+        "xlabel": { "type": "string", "default": "Vessel diameter (um)" },
+        "ylabel": { "type": "string", "default": "Section count" },
+        "figsize": { "type": "width,height", "default": "8.4,5.6" },
+        "xlim": { "type": "min,max|null", "default": null }
+      },
+      "outputs": {
+        "histogram_png": { "type": "path", "description": "vessel_diameter_histogram.png or explicit --output path" }
+      },
+      "common_commands": [
+        {
+          "description": "Default histogram next to branch metrics CSV",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\vessel_diameter_histogram.py --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\""
+        },
+        {
+          "description": "Explicit output path and figure options",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\vessel_diameter_histogram.py --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --output \"S:\\sample\\tubule_reconstruction\\vessel_diameter_histogram.png\" --bins 28 --dpi 300 --figsize 8.4,5.6"
+        }
+      ],
+      "guide": {
+        "summary": "Generate a publication-ready vessel diameter histogram from kimimaro branch metrics CSV.",
+        "input": {
+          "file": "vessel_branch_metrics.csv",
+          "required_column": "mean_radius_um",
+          "diameter_formula": "diameter_um = mean_radius_um * 2",
+          "filtering": "NaN, inf, and <= 0 values are dropped automatically"
+        },
+        "default_output": "vessel_diameter_histogram.png next to the input CSV",
+        "figure_contents": [
+          "White-background publication layout with restrained bio-journal palette",
+          "Histogram of branch mean vessel diameter",
+          "Thin count outline on top of bars",
+          "Mean and median reference lines",
+          "Summary box with n, mean, median, std, min, max"
+        ]
+      }
     }
   ]
 }

@@ -79,6 +79,34 @@ def default_sample_stack_volume(sample_dir: str | Path) -> Path:
     return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_volume.tiff"
 
 
+def default_sample_stack_colorbar(sample_dir: str | Path) -> Path:
+    sample_dir = Path(sample_dir)
+    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_colorbar.png"
+
+
+def atlas_bin_volume_mm3(target_resolution_xyz: tuple[float, float, float]) -> float:
+    res_x, res_y, res_z = target_resolution_xyz
+    return float(res_x / 1000.0) * float(res_y / 1000.0) * float(res_z / 1000.0)
+
+
+def counts_to_density_volume(
+    atlas_volume: np.ndarray,
+    *,
+    target_resolution_xyz: tuple[float, float, float],
+    volume_mode: str,
+) -> np.ndarray:
+    volume = np.asarray(atlas_volume, dtype=np.float32)
+    if volume_mode != "count":
+        raise ValueError(
+            "Signal density in count/volume requires --volume-mode count. "
+            f"Got volume_mode={volume_mode!r}."
+        )
+    bin_volume_mm3 = atlas_bin_volume_mm3(target_resolution_xyz)
+    if bin_volume_mm3 <= 0:
+        raise ValueError(f"Invalid atlas bin volume: {bin_volume_mm3} mm³")
+    return volume / bin_volume_mm3
+
+
 def default_sample_points_csv(sample_dir: str | Path) -> Path:
     return Path(sample_dir) / "visualization" / "points.csv"
 
@@ -205,6 +233,77 @@ def _build_heatmap_lut(num_entries: int = 256) -> np.ndarray:
     return np.round(lut).astype(np.uint8)
 
 
+def _matplotlib_cmap_from_heatmap_lut():
+    from matplotlib.colors import ListedColormap
+
+    lut = _build_heatmap_lut() / 255.0
+    return ListedColormap(lut)
+
+
+def _resolve_density_range(
+    density_signal: np.ndarray,
+    atlas_mask: np.ndarray,
+    *,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> tuple[float, float]:
+    brain = np.asarray(atlas_mask) > 0
+    values = np.asarray(density_signal, dtype=np.float32)[brain]
+    positive = values[values > 0]
+    resolved_min = 0.0 if vmin is None else float(vmin)
+    if vmax is not None:
+        resolved_max = float(vmax)
+    elif positive.size:
+        resolved_max = float(np.percentile(positive, 99.5))
+    else:
+        resolved_max = float(values.max()) if values.size else 1.0
+    if resolved_max <= resolved_min:
+        resolved_max = resolved_min + 1e-6
+    return resolved_min, resolved_max
+
+
+def save_density_colorbar(
+    output_path: str | Path,
+    *,
+    vmin: float,
+    vmax: float,
+    unit_label: str = "count/mm³",
+    dpi: int = 150,
+) -> Path:
+    from matplotlib.colors import Normalize
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(1.35, 4.8), dpi=dpi)
+    fig.patch.set_facecolor("white")
+    cmap = _matplotlib_cmap_from_heatmap_lut()
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    colorbar = fig.colorbar(
+        matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap),
+        cax=ax,
+        orientation="vertical",
+    )
+    colorbar.set_label(unit_label, fontsize=11, labelpad=10)
+    colorbar.ax.tick_params(labelsize=9, length=4, width=0.8)
+    colorbar.set_ticks([vmin, vmax])
+    colorbar.set_ticklabels([f"{vmin:.4g}", f"{vmax:.4g}"])
+    fig.tight_layout(pad=0.2)
+    fig.savefig(output_path, dpi=dpi, facecolor="white", bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    return output_path
+
+
+def _load_cached_volume_mode(cached_volume_path: Path) -> str | None:
+    meta_path = cached_volume_path.with_suffix(".json")
+    if not meta_path.exists():
+        return None
+    try:
+        return str(load_json(meta_path).get("volume_mode", "")).strip() or None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _legacy_rgb_heat_volume(local_signal, edge, atlas_mask):
     signal = np.asarray(local_signal, dtype=np.float32)
     max_val = signal.max()
@@ -245,6 +344,13 @@ def heatmap(
     normalize=False,
     vmax=None,
     scale_max=510.0,
+    target_resolution_xyz=None,
+    volume_mode="binary",
+    save_colorbar=True,
+    colorbar_output=None,
+    colorbar_unit="count/mm³",
+    density_vmin=None,
+    density_vmax=None,
 ):
     print(f"Loading input mask: {save_img_path}")
     img = read_volume(save_img_path, dataset_name=dataset_name)
@@ -267,6 +373,13 @@ def heatmap(
         normalize=normalize,
         vmax=vmax,
         scale_max=scale_max,
+        target_resolution_xyz=target_resolution_xyz,
+        volume_mode=volume_mode,
+        save_colorbar=save_colorbar,
+        colorbar_output=colorbar_output,
+        colorbar_unit=colorbar_unit,
+        density_vmin=density_vmin,
+        density_vmax=density_vmax,
     )
 
 
@@ -283,7 +396,14 @@ def render_heatmap_stack(
     normalize=False,
     vmax=None,
     scale_max=510.0,
-):
+    target_resolution_xyz: tuple[float, float, float] | None = None,
+    volume_mode: str = "binary",
+    save_colorbar: bool = True,
+    colorbar_output: str | Path | None = None,
+    colorbar_unit: str = "count/mm³",
+    density_vmin: float | None = None,
+    density_vmax: float | None = None,
+) -> dict[str, float | str | None]:
     img = np.asarray(img)
 
     print(f"Loading edge reference: {edge_path}")
@@ -300,22 +420,68 @@ def render_heatmap_stack(
         raise ValueError(f"Edge volume shape {edge.shape} does not match atlas mask shape {atlas_mask.shape}")
 
     print(f"Processing volume shape: {img.shape}")
-    local_signal = build_local_signal_volume(img, sigma=sigma, alpha=alpha, atlas_mask=atlas_mask)
+    if target_resolution_xyz is None:
+        density_input = np.asarray(img, dtype=np.float32)
+    else:
+        density_input = counts_to_density_volume(
+            img,
+            target_resolution_xyz=target_resolution_xyz,
+            volume_mode=volume_mode,
+        )
+        bin_volume_mm3 = atlas_bin_volume_mm3(target_resolution_xyz)
+        print(
+            f"Converted atlas counts to signal density using bin volume "
+            f"{bin_volume_mm3:.6g} mm³ ({colorbar_unit})"
+        )
+
+    local_signal = build_local_signal_volume(density_input, sigma=sigma, alpha=alpha, atlas_mask=atlas_mask)
+    density_signal = local_signal / max(float(alpha), 1e-12)
+    resolved_density_min, resolved_density_max = _resolve_density_range(
+        density_signal,
+        atlas_mask,
+        vmin=density_vmin,
+        vmax=density_vmax if density_vmax is not None else vmax,
+    )
+    print(
+        "Smoothed signal density range inside atlas mask: "
+        f"min={resolved_density_min:.6g}, max={resolved_density_max:.6g} {colorbar_unit}"
+    )
+
+    display_signal = local_signal
     max_signal = float(local_signal.max())
     print(f"Local signal range before display scaling: min={float(local_signal.min()):.6g}, max={max_signal:.6g}")
     if normalize:
         display_vmax = float(vmax) if vmax is not None else max_signal
         if display_vmax > 0:
-            local_signal = np.clip(local_signal / display_vmax, 0, 1) * float(scale_max)
+            display_signal = np.clip(local_signal / display_vmax, 0, 1) * float(scale_max)
             print(f"Normalized local signal for display: vmax={display_vmax:.6g}, scale_max={float(scale_max):.6g}")
         else:
             print("Warning: local signal max is 0; skipping normalization.")
-    heatimg = _legacy_rgb_heat_volume(local_signal, edge, atlas_mask)
+    heatimg = _legacy_rgb_heat_volume(display_signal, edge, atlas_mask)
 
     print(f"Saving heatmap to: {save_path}")
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(save_path, heatimg, compression="lzw")
+
+    colorbar_path = None
+    if save_colorbar:
+        colorbar_path = Path(colorbar_output) if colorbar_output else save_path.with_name(f"{save_path.stem}_colorbar.png")
+        save_density_colorbar(
+            colorbar_path,
+            vmin=resolved_density_min,
+            vmax=resolved_density_max,
+            unit_label=colorbar_unit,
+        )
+        print(f"Saved density colorbar to: {colorbar_path}")
+
     print("Done!")
+    return {
+        "density_min": resolved_density_min,
+        "density_max": resolved_density_max,
+        "density_unit": colorbar_unit,
+        "colorbar_output": str(colorbar_path) if colorbar_path else None,
+    }
 
 
 def generate_sample_stack_heatmap(
@@ -347,6 +513,11 @@ def generate_sample_stack_heatmap(
     normalize: bool = False,
     vmax: float | None = None,
     scale_max: float = 510.0,
+    save_colorbar: bool = True,
+    colorbar_output: str | Path | None = None,
+    colorbar_unit: str = "count/mm³",
+    density_vmin: float | None = None,
+    density_vmax: float | None = None,
 ) -> dict[str, object]:
     if ants is None:
         raise ImportError("ANTsPy is required for --mode sample-stack.")
@@ -389,6 +560,10 @@ def generate_sample_stack_heatmap(
 
     cached_volume_path = Path(output_volume) if output_volume else default_sample_stack_volume(sample_dir)
     points_csv_path = default_sample_points_csv(sample_dir)
+    if isinstance(target_resolution_xyz, tuple):
+        target_resolution = tuple(float(value) for value in target_resolution_xyz)
+    else:
+        target_resolution = parse_triplet(target_resolution_xyz, name="target_resolution_xyz")
     summary: dict[str, object] = {
         "success": True,
         "mode": "sample-stack",
@@ -396,9 +571,20 @@ def generate_sample_stack_heatmap(
         "atlas_image": str(atlas_image),
         "transformlist": transformlist,
         "cached_volume_path": str(cached_volume_path),
+        "volume_mode": volume_mode,
+        "target_resolution_xyz": list(target_resolution),
+        "density_unit": colorbar_unit,
     }
 
-    if cached_volume_path.exists():
+    cached_mode = _load_cached_volume_mode(cached_volume_path)
+    use_cached_volume = cached_volume_path.exists() and (cached_mode is None or cached_mode == volume_mode)
+    if cached_volume_path.exists() and cached_mode is not None and cached_mode != volume_mode:
+        print(
+            f"Cached atlas volume uses volume_mode={cached_mode!r}; "
+            f"recomputing with requested volume_mode={volume_mode!r}."
+        )
+
+    if use_cached_volume:
         print(f"Using cached atlas-space volume: {cached_volume_path}")
         atlas_volume = read_tiff_stack(cached_volume_path)
         raw_atlas_spacing_xyz = tuple()
@@ -407,7 +593,6 @@ def generate_sample_stack_heatmap(
         sample_ref = ants.image_read(str(sample_reference_path))
         sample_shape_zyx = tuple(int(value) for value in sample_ref.shape[::-1])
         resolution = parse_triplet(resolution_xyz, name="resolution_xyz")
-        target_resolution = parse_triplet(target_resolution_xyz, name="target_resolution_xyz")
 
         arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
         fallback_block_shape = tuple(int(value) for value in (getattr(arr, "chunks", None) or arr.shape))
@@ -439,8 +624,21 @@ def generate_sample_stack_heatmap(
         print(f"Writing cached atlas-space volume to: {cached_volume_path}")
         cached_volume_path.parent.mkdir(parents=True, exist_ok=True)
         write_volume_output(atlas_volume, cached_volume_path)
+        volume_meta_path = cached_volume_path.with_suffix(".json")
+        with volume_meta_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "volume_mode": volume_mode,
+                    "target_resolution_xyz": list(target_resolution),
+                    "output_volume": str(cached_volume_path),
+                },
+                handle,
+                indent=2,
+                ensure_ascii=False,
+            )
         summary["cache_hit"] = False
         summary["output_volume"] = str(cached_volume_path)
+        summary["volume_meta"] = str(volume_meta_path)
 
     if points_csv_path.exists() and summary.get("cache_hit"):
         print(f"Using cached atlas-space points CSV: {points_csv_path}")
@@ -453,7 +651,12 @@ def generate_sample_stack_heatmap(
         summary["exported_points"] = int(len(table))
 
     print("Stage 4/4: rendering heatmap")
-    render_heatmap_stack(
+    resolved_colorbar_output = (
+        Path(colorbar_output)
+        if colorbar_output
+        else default_sample_stack_colorbar(sample_dir)
+    )
+    render_stats = render_heatmap_stack(
         atlas_volume,
         edge_path=edge_path,
         atlas_mask_path=atlas_mask_path,
@@ -465,6 +668,13 @@ def generate_sample_stack_heatmap(
         normalize=normalize,
         vmax=vmax,
         scale_max=scale_max,
+        target_resolution_xyz=target_resolution,
+        volume_mode=volume_mode,
+        save_colorbar=save_colorbar,
+        colorbar_output=resolved_colorbar_output,
+        colorbar_unit=colorbar_unit,
+        density_vmin=density_vmin,
+        density_vmax=density_vmax,
     )
 
     summary.update(
@@ -472,6 +682,9 @@ def generate_sample_stack_heatmap(
             "atlas_shape_zyx": list(atlas_volume.shape),
             "raw_atlas_image_spacing_xyz": list(raw_atlas_spacing_xyz) if raw_atlas_spacing_xyz else [],
             "heatmap_output": str(output),
+            "density_min": render_stats["density_min"],
+            "density_max": render_stats["density_max"],
+            "colorbar_output": render_stats["colorbar_output"],
         }
     )
     summary_path = Path(output).with_suffix(".json")
@@ -964,6 +1177,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalize", action="store_true", help="Normalize stack local signal before RGB display scaling")
     parser.add_argument("--display-vmax", type=float, default=None, help="Value mapped to --scale-max when --normalize is used")
     parser.add_argument("--scale-max", type=float, default=510.0, help="Display scale maximum used by --normalize")
+    parser.add_argument("--save-colorbar", dest="save_colorbar", action="store_true", default=True, help="Save a density colorbar PNG alongside stack heatmaps")
+    parser.add_argument("--no-colorbar", dest="save_colorbar", action="store_false", help="Do not write a density colorbar PNG")
+    parser.add_argument("--colorbar-output", default="", help="Optional colorbar PNG path")
+    parser.add_argument("--colorbar-unit", default="count/mm³", help="Unit label shown on the density colorbar")
+    parser.add_argument("--density-vmin", type=float, default=None, help="Minimum signal density shown on the colorbar")
+    parser.add_argument("--density-vmax", type=float, default=None, help="Maximum signal density shown on the colorbar")
 
     parser.add_argument("--sample-dir", default="", help="Sample directory for --mode sample-stack")
     parser.add_argument("--signal-ch", default="ch1", help="Signal channel label for --mode sample-stack")
@@ -1017,7 +1236,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "stack":
             if not args.input or not args.output:
                 parser.error("--input and --output are required for --mode stack")
-            heatmap(
+            target_resolution = None
+            if args.target_resolution_xyz:
+                target_resolution = _parse_triplet(args.target_resolution_xyz)
+            render_stats = heatmap(
                 args.input,
                 args.edge,
                 args.atlas_mask,
@@ -1033,8 +1255,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.normalize,
                 args.display_vmax,
                 args.scale_max,
+                target_resolution,
+                args.volume_mode,
+                args.save_colorbar,
+                args.colorbar_output or None,
+                args.colorbar_unit,
+                args.density_vmin,
+                args.density_vmax,
             )
-            payload = {"mode": args.mode, "output": str(args.output)}
+            payload = {"mode": args.mode, "output": str(args.output), **render_stats}
         elif args.mode == "sample-stack":
             if not args.sample_dir:
                 parser.error("--sample-dir is required for --mode sample-stack")
@@ -1067,6 +1296,11 @@ def main(argv: list[str] | None = None) -> int:
                 normalize=args.normalize,
                 vmax=args.display_vmax,
                 scale_max=args.scale_max,
+                save_colorbar=args.save_colorbar,
+                colorbar_output=args.colorbar_output or None,
+                colorbar_unit=args.colorbar_unit,
+                density_vmin=args.density_vmin,
+                density_vmax=args.density_vmax,
             )
         elif args.mode == "atlas-slice":
             if not args.input or not args.output or args.coord is None:

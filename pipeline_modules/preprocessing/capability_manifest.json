@@ -1,7 +1,7 @@
 {
   "schema_version": "1",
   "module": "preprocessing",
-  "description": "Config-driven TIFF preprocessing, registration-channel downsampling, and TIFF-to-Zarr conversion.",
+  "description": "Config-driven TIFF preprocessing, registration-channel downsampling, TIFF-to-Zarr conversion, edge-signal removal, and mask upsampling.",
   "entrypoints": [
     {
       "id": "run_preprocessing",
@@ -68,6 +68,69 @@
         "output_dir": { "type": "dir", "description": "Downsampled TIFF stack directory" },
         "nifti_path": { "type": "path", "description": "volume.nii.gz" },
         "manifest_path": { "type": "path", "description": "_run_manifest.json" }
+      }
+    },
+    {
+      "id": "remove_edge_signal",
+      "function": "pipeline_modules.preprocessing.edge_signal_removal.remove_edge_signal",
+      "cli": "python pipeline_modules/preprocessing/edge_signal_removal.py",
+      "description": "Suppress bright sheet-like edge noise in signal TIFF stacks using a warped atlas label mask. Wired into main.py when preprocessing.edge_signal_removal.apply=true (requires registration label).",
+      "prerequisites": [
+        "Signal TIFF directory and warped atlas label TIFF directory must exist with matching slice counts",
+        "Usually runs after registration produces sample_dir/upsampled_atlas_label/"
+      ],
+      "inputs": {
+        "input_dir": { "type": "path", "required": true, "description": "Signal TIFF folder, commonly sample_dir/<signal_ch>/" },
+        "label_dir": { "type": "path", "required": true, "description": "Warped atlas label TIFF folder, commonly sample_dir/upsampled_atlas_label/" },
+        "output_dir": { "type": "path", "required": true, "description": "Cleaned TIFF folder or downstream Zarr input" },
+        "inward_px": { "type": "int", "default": 50 },
+        "outward_px": { "type": "int", "default": 0 },
+        "suppression_weight": { "type": "float", "default": 0.8 },
+        "brightness_pct": { "type": "float", "default": 90.0 },
+        "smooth_sigma": { "type": "float", "default": 5.0 },
+        "min_area_px": { "type": "int", "default": 50 },
+        "max_workers": { "type": "int", "default": 8 },
+        "no_resume": { "type": "bool", "default": false }
+      },
+      "outputs": {
+        "output_dir": { "type": "dir", "description": "Cleaned TIFF stack directory" },
+        "manifest_path": { "type": "path", "description": "_run_manifest.json" }
+      }
+    },
+    {
+      "id": "upsample_mask_zarr",
+      "function": "pipeline_modules.preprocessing.upsample_mask.main",
+      "cli": "python pipeline_modules/preprocessing/upsample_mask.py",
+      "description": "Nearest-neighbour upsample a downsampled mask Zarr back to full-resolution shape guided by a full-resolution signal Zarr.",
+      "inputs": {
+        "input_mask_zarr": { "type": "path", "required": true },
+        "output_mask_zarr": { "type": "path", "required": true },
+        "full_res_zarr": { "type": "path", "required": true },
+        "chunk_size": { "type": "triplet_int", "default": [128, 256, 256] }
+      },
+      "outputs": {
+        "output_mask_zarr": { "type": "dir" }
+      }
+    },
+    {
+      "id": "channel_subtraction",
+      "function": "pipeline_modules.preprocessing.channel_subtraction.process_channel_subtraction",
+      "cli": "python pipeline_modules/preprocessing/channel_subtraction.py",
+      "description": "Parallel subtract a background channel from a target channel in TIFF stacks for autofluorescence removal. Also available through run_preprocessing when preprocessing.channel_subtraction is configured.",
+      "inputs": {
+        "path": { "type": "path", "required": true, "description": "Root path containing channel folders" },
+        "bg_channel": { "type": "string", "default": "ch0" },
+        "workers": { "type": "int|null", "default": null },
+        "compression": { "type": "string", "default": "lzw", "choices": ["lzw", "none", "zlib"] },
+        "weight": { "type": "float", "default": 1.0 },
+        "adaptive": { "type": "bool", "default": false },
+        "save_plots": { "type": "bool", "default": false },
+        "sample_ratio": { "type": "float", "default": 0.005 },
+        "min_samples": { "type": "int", "default": 10 },
+        "max_samples": { "type": "int", "default": 50 }
+      },
+      "outputs": {
+        "subtracted_tiff_dir": { "type": "dir", "description": "Per-channel subtracted TIFF output folders under the sample root" }
       }
     }
   ],

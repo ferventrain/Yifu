@@ -6,13 +6,14 @@
     {
       "id": "preprocessing",
       "path": "pipeline_modules/preprocessing",
-      "description": "TIFF-to-Zarr conversion, downsampling, and optional contrast enhancement.",
+      "description": "TIFF-to-Zarr conversion, downsampling, optional contrast enhancement, and edge-signal removal.",
       "agent_native": true,
       "capability_manifest": "pipeline_modules/preprocessing/capability_manifest.json",
       "primary_scripts": [
         "pipeline_modules/preprocessing/preprocessor.py",
         "pipeline_modules/preprocessing/tiff_to_zarr.py",
-        "pipeline_modules/preprocessing/downsample.py"
+        "pipeline_modules/preprocessing/downsample.py",
+        "pipeline_modules/preprocessing/edge_signal_removal.py"
       ],
       "python_package": "pipeline_modules.preprocessing",
       "config_models": {
@@ -25,11 +26,12 @@
     {
       "id": "registration",
       "path": "pipeline_modules/registration",
-      "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
+      "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, hemisphere label derivation, region voxel-coverage checking, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
       "agent_native": true,
       "capability_manifest": "pipeline_modules/registration/capability_manifest.json",
       "primary_scripts": [
         "pipeline_modules/registration/ANTs_registration.py",
+        "pipeline_modules/registration/atlas_label_to_hemisphere.py",
         "pipeline_modules/registration/region_signal_analysis_zarr_graph.py",
         "pipeline_modules/registration/check_region_coverage_zarr.py",
         "pipeline_modules/registration/merge_atlas_regions.py"
@@ -40,7 +42,7 @@
         "AnalysisCfg": "pipeline_modules.registration.config.AnalysisCfg"
       },
       "inputs_from": ["signal_zarr", "mask_zarr", "reg_downsample_nii"],
-      "outputs_to": ["atlas_label_zarr", "atlas_label_tiff_dir", "density_results_xlsx"]
+      "outputs_to": ["atlas_label_zarr", "atlas_label_tiff_dir", "atlas_label_hemisphere_zarr", "density_results_xlsx"]
     },
     {
       "id": "segmentation",
@@ -86,11 +88,25 @@
       "capability_manifest": "pipeline_modules/visualization/capability_manifest.json",
       "primary_scripts": [
         "pipeline_modules/visualization/coarse_region_metric_plot.py",
-        "pipeline_modules/visualization/mask_zarr_to_atlas_points.py"
+        "pipeline_modules/visualization/group_density_coarse_region_bar.py",
+        "pipeline_modules/visualization/top_level7_density_ratio.py",
+        "pipeline_modules/visualization/region_group_signal_count.py",
+        "pipeline_modules/visualization/warp_mask_zarr_to_atlas_points.py",
+        "pipeline_modules/visualization/render_points_brainrender.py",
+        "pipeline_modules/visualization/heatmap.py",
+        "pipeline_modules/visualization/render_vessels_pyvista.py",
+        "pipeline_modules/visualization/vessel_diameter_histogram.py"
       ],
       "python_package": "pipeline_modules.visualization",
       "inputs_from": ["density_results_xlsx", "mask_zarr", "atlas_label_zarr"],
-      "outputs_to": ["coarse_region_stats", "coarse_region_bar_plots", "atlas_points"]
+      "outputs_to": [
+        "coarse_region_stats",
+        "coarse_region_bar_plots",
+        "atlas_points",
+        "region_group_signal_count",
+        "brainrender_view_json",
+        "brainrender_group_pngs"
+      ]
     },
     {
       "id": "utils",

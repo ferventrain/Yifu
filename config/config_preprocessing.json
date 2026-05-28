@@ -64,18 +64,6 @@
       "suppression_weight": 1.0,
       "max_workers": 8
     },
-    "tubular_enhancement": {
-      "apply": false,
-      "method": "frangi",
-      "sigmas": [
-        1,
-        2,
-        4,
-        8
-      ],
-      "black_ridges": false,
-      "export_tiff": false
-    },
     "downsample": {
       "target_resolution_xyz": [
         25.0,

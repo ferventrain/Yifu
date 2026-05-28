@@ -8,7 +8,7 @@
       2.0
     ],
     "channels": {
-      "signal": "2",
+      "signal": "1",
       "registration": "0"
     }
   },
@@ -45,13 +45,6 @@
       "apply": false,
       "clip_limit": 2.0,
       "tile_grid_size": 8
-    },
-    "tubular_enhancement": {
-      "apply": false,
-      "method": "frangi",
-      "sigmas": [1, 2, 4, 8],
-      "black_ridges": false,
-      "export_tiff": false
     },
     "downsample": {
       "target_resolution_xyz": [
