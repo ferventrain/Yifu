@@ -1189,6 +1189,98 @@ def build_root_sizes(manifest_payload, parent):
     return root_sizes
 
 
+def choose_majority_hemisphere(left_voxels, right_voxels):
+    if left_voxels <= 0 and right_voxels <= 0:
+        raise ValueError("Cannot choose a majority hemisphere from zero voxels.")
+    if left_voxels >= right_voxels:
+        return int(LEFT_HEMISPHERE_ID)
+    return int(RIGHT_HEMISPHERE_ID)
+
+
+def choose_majority_region(region_voxels):
+    if not region_voxels:
+        raise ValueError("Cannot choose a majority region from zero voxels.")
+    best_voxels = max(region_voxels.values())
+    tied_regions = [int(region_id) for region_id, count in region_voxels.items() if count == best_voxels]
+    return min(tied_regions)
+
+
+def collapse_component_stats_by_majority(
+    *,
+    region_pair_voxels=None,
+    region_pair_intensity=None,
+    region_hemisphere_pair_voxels=None,
+    region_hemisphere_pair_intensity=None,
+    assign_hemisphere=False,
+):
+    """Assign each connected object to one brain region and optionally one hemisphere."""
+    component_regions = {}
+    component_hemispheres = {}
+    component_intensity = {}
+
+    if assign_hemisphere and region_hemisphere_pair_voxels:
+        for (root_id, region_id, hemisphere_id), voxel_count in region_hemisphere_pair_voxels.items():
+            root_key = int(root_id)
+            region_map = component_regions.setdefault(root_key, {})
+            region_map[int(region_id)] = region_map.get(int(region_id), 0) + int(voxel_count)
+            hemi_map = component_hemispheres.setdefault(root_key, {})
+            hemi_map[int(hemisphere_id)] = hemi_map.get(int(hemisphere_id), 0) + int(voxel_count)
+        for (root_id, _region_id, _hemisphere_id), intensity_sum in region_hemisphere_pair_intensity.items():
+            root_key = int(root_id)
+            component_intensity[root_key] = component_intensity.get(root_key, 0.0) + float(intensity_sum)
+    else:
+        for (root_id, region_id), voxel_count in (region_pair_voxels or {}).items():
+            root_key = int(root_id)
+            region_map = component_regions.setdefault(root_key, {})
+            region_map[int(region_id)] = region_map.get(int(region_id), 0) + int(voxel_count)
+        for (root_id, _region_id), intensity_sum in (region_pair_intensity or {}).items():
+            root_key = int(root_id)
+            component_intensity[root_key] = component_intensity.get(root_key, 0.0) + float(intensity_sum)
+
+    region_signal_voxels = {}
+    region_signal_counts = {}
+    region_sum_intensity = {}
+    region_signal_voxels_by_hemisphere = {}
+    region_signal_counts_by_hemisphere = {}
+    region_sum_intensity_by_hemisphere = {}
+
+    for root_id, region_map in component_regions.items():
+        chosen_region = choose_majority_region(region_map)
+        total_voxels = sum(int(count) for count in region_map.values())
+        total_intensity = float(component_intensity.get(root_id, 0.0))
+
+        region_signal_voxels[chosen_region] = region_signal_voxels.get(chosen_region, 0) + total_voxels
+        region_signal_counts[chosen_region] = region_signal_counts.get(chosen_region, 0) + 1
+        region_sum_intensity[chosen_region] = region_sum_intensity.get(chosen_region, 0.0) + total_intensity
+
+        if assign_hemisphere:
+            hemi_map = component_hemispheres.get(root_id, {})
+            left_voxels = int(hemi_map.get(int(LEFT_HEMISPHERE_ID), 0))
+            right_voxels = int(hemi_map.get(int(RIGHT_HEMISPHERE_ID), 0))
+            chosen_hemisphere = choose_majority_hemisphere(left_voxels, right_voxels)
+            pair_key = (chosen_region, chosen_hemisphere)
+            region_signal_voxels_by_hemisphere[pair_key] = (
+                region_signal_voxels_by_hemisphere.get(pair_key, 0) + total_voxels
+            )
+            region_signal_counts_by_hemisphere[pair_key] = (
+                region_signal_counts_by_hemisphere.get(pair_key, 0) + 1
+            )
+            region_sum_intensity_by_hemisphere[pair_key] = (
+                region_sum_intensity_by_hemisphere.get(pair_key, 0.0) + total_intensity
+            )
+
+    result = {
+        "region_signal_voxels": region_signal_voxels,
+        "region_signal_counts": region_signal_counts,
+        "region_sum_intensity": region_sum_intensity,
+    }
+    if assign_hemisphere:
+        result["region_signal_voxels_by_hemisphere"] = region_signal_voxels_by_hemisphere
+        result["region_signal_counts_by_hemisphere"] = region_signal_counts_by_hemisphere
+        result["region_sum_intensity_by_hemisphere"] = region_sum_intensity_by_hemisphere
+    return result
+
+
 def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels):
     logger.info("Pass 3/3b: collapsing merged objects into per-region statistics...")
     kept_root_mask = root_sizes >= int(min_voxels)
@@ -1279,34 +1371,26 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
             progress_bar.update(1)
 
-    region_signal_voxels = {}
-    region_signal_counts = {}
-    region_sum_intensity = {}
-    region_signal_voxels_by_hemisphere = {}
-    region_signal_counts_by_hemisphere = {}
-    region_sum_intensity_by_hemisphere = {}
-
-    for (_, region_id), voxel_count in region_pair_voxels.items():
-        region_signal_voxels[region_id] = region_signal_voxels.get(region_id, 0) + int(voxel_count)
-        region_signal_counts[region_id] = region_signal_counts.get(region_id, 0) + 1
-
-    for (_, region_id), intensity_sum in region_pair_intensity.items():
-        region_sum_intensity[region_id] = region_sum_intensity.get(region_id, 0.0) + float(intensity_sum)
-
-    for (_, region_id, hemisphere_id), voxel_count in region_hemisphere_pair_voxels.items():
-        pair_key = (int(region_id), int(hemisphere_id))
-        region_signal_voxels_by_hemisphere[pair_key] = (
-            region_signal_voxels_by_hemisphere.get(pair_key, 0) + int(voxel_count)
+    assign_hemisphere = bool(region_hemisphere_pair_voxels)
+    if assign_hemisphere:
+        collapsed_stats = collapse_component_stats_by_majority(
+            region_hemisphere_pair_voxels=region_hemisphere_pair_voxels,
+            region_hemisphere_pair_intensity=region_hemisphere_pair_intensity,
+            assign_hemisphere=True,
         )
-        region_signal_counts_by_hemisphere[pair_key] = (
-            region_signal_counts_by_hemisphere.get(pair_key, 0) + 1
+    else:
+        collapsed_stats = collapse_component_stats_by_majority(
+            region_pair_voxels=region_pair_voxels,
+            region_pair_intensity=region_pair_intensity,
+            assign_hemisphere=False,
         )
 
-    for (_, region_id, hemisphere_id), intensity_sum in region_hemisphere_pair_intensity.items():
-        pair_key = (int(region_id), int(hemisphere_id))
-        region_sum_intensity_by_hemisphere[pair_key] = (
-            region_sum_intensity_by_hemisphere.get(pair_key, 0.0) + float(intensity_sum)
-        )
+    region_signal_voxels = collapsed_stats["region_signal_voxels"]
+    region_signal_counts = collapsed_stats["region_signal_counts"]
+    region_sum_intensity = collapsed_stats["region_sum_intensity"]
+    region_signal_voxels_by_hemisphere = collapsed_stats.get("region_signal_voxels_by_hemisphere", {})
+    region_signal_counts_by_hemisphere = collapsed_stats.get("region_signal_counts_by_hemisphere", {})
+    region_sum_intensity_by_hemisphere = collapsed_stats.get("region_sum_intensity_by_hemisphere", {})
 
     kept_components = int(np.count_nonzero((parent == np.arange(parent.shape[0], dtype=np.int64)) & kept_root_mask))
     kept_voxels = int(root_sizes[kept_root_mask].sum(dtype=np.int64))
