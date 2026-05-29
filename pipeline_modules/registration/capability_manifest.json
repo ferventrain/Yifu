@@ -46,7 +46,7 @@
       "prerequisites": [
         "Mask Zarr, label Zarr, and signal Zarr must exist and share the same shape",
         "Allen region CSV must be available",
-        "For left/right stats, provide --hemisphere_zarr or enable registration.save_upsampled_label_hemisphere_zarr plus analysis.use_hemisphere_label in config.json"
+        "For left/right stats, provide --hemisphere_zarr or enable registration.save_upsampled_label_hemisphere_zarr plus analysis.use_hemisphere_label in config.json. Each connected signal object is assigned to the brain region and hemisphere where it has the most voxels (ties go to the smaller region id and to Left)."
       ],
       "inputs": {
         "mask_zarr_path":       {"type": "path", "required": true},
