@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 try:
     from typing import Annotated
@@ -97,6 +97,10 @@ class RegistrationCfg(BaseModel):
         False,
         description="Also derive sample_dir/atlas_label_hemisphere.zarr for hemisphere-aware analysis",
     )
+    flip_atlas: List[bool] = Field(
+        [False, False, False],
+        description="Flip atlas before registration: [flip_x, flip_y, flip_z]",
+    )
     upsample_method: str = Field("nearest", description="Interpolation for upsampling: nearest, linear, cubic, quintic")
     chunk_size: int = Field(50, ge=1, description="Chunk size (slices) for chunked label upsampling")
 
@@ -110,7 +114,7 @@ class RegistrationCfg(BaseModel):
     @field_validator("transform_type")
     @classmethod
     def _validate_transform(cls, v: str) -> str:
-        allowed = {"Rigid", "Affine", "SyN", "SyNRA"}
+        allowed = {"Rigid", "Affine", "SyN", "SyNRA", "ElasticSyN"}
         if v not in allowed:
             raise ValueError(f"transform_type must be one of {allowed}, got '{v}'")
         return v
