@@ -8,7 +8,7 @@
       2.0
     ],
     "channels": {
-      "signal": "2",
+      "signal": "1",
       "registration": "0"
     }
   },
@@ -78,7 +78,7 @@
     "flip_atlas": [false, false, false],
         "save_upsampled_label": false,
         "save_upsampled_label_zarr": true,
-        "save_upsampled_label_hemisphere_zarr": true
+        "save_upsampled_label_hemisphere_zarr": false
   },
   "segmentation": {
     "method": "cfos_unet",
@@ -122,6 +122,6 @@
     "analysis": {
         "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
         "output_format": "xlsx",
-        "use_hemisphere_label": true
+        "use_hemisphere_label": false
     }
 }

@@ -129,7 +129,7 @@ class SampleLayout(BaseModel):
     @property
     def density_results_xlsx(self) -> Path:
         """Region density statistics Excel workbook."""
-        return self.sample_dir / f"{self.sample_dir.name}_density_result.xlsx"
+        return self.sample_dir / f"sample_{self.signal_ch}_result.xlsx"
 
     # ------------------------------------------------------------------
     # Tubule reconstruction outputs

@@ -32,15 +32,11 @@ def find_density_excel(sample_dir: str | Path) -> Path:
     if not sample_dir.exists() or not sample_dir.is_dir():
         raise NotADirectoryError(f"Sample directory not found: {sample_dir}")
 
-    exact = sample_dir / f"{sample_dir.name}_density_result.xlsx"
-    if exact.exists():
-        return exact
-
     matches = sorted(
         [
             path
             for path in sample_dir.glob("*.xlsx")
-            if "density" in path.name.lower()
+            if path.name.lower().endswith("_result.xlsx")
             and not path.name.startswith("~$")
             and "coarse_region" not in path.name.lower()
             and "level_ratio" not in path.name.lower()

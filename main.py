@@ -481,7 +481,7 @@ def run_density_analysis(
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask"
     ensure_mask_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg)
 
-    output_excel = sample_dir / f"{sample_dir.name}_density_result.xlsx"
+    output_excel = sample_dir / f"sample_ch{signal_ch}_result.xlsx"
     resolution_xyz_str = format_csv(resolution_xyz)
 
     cmd = (

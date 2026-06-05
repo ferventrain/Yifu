@@ -22,7 +22,10 @@ import pandas as pd
 from tqdm import tqdm
 
 from .kimimaro_reconstruction import (
+    _branch_table_from_tables,
+    iter_all_chunk_indices,
     open_zarr_dataset,
+    parse_resolution_xyz,
     resolution_xyz_to_zyx,
 )
 
@@ -48,7 +51,10 @@ def _parse_acronym_text(acronym_text):
 
 
 def _parse_structure_id_path(path_text):
-    values = ast.literal_eval(str(path_text))
+    text = str(path_text).strip()
+    if text.startswith("/") and text.endswith("/"):
+        return [int(v) for v in text.strip("/").split("/") if v]
+    values = ast.literal_eval(text)
     return [int(v) for v in values]
 
 
@@ -165,6 +171,21 @@ def _default_annotation_zarr_path(vertex_csv_path):
     return sample_dir / "upsampled_atlas_label.zarr"
 
 
+def _default_mask_zarr_path(vertex_csv_path):
+    vertex_csv_path = Path(vertex_csv_path)
+    output_dir = vertex_csv_path.parent
+    sample_dir = output_dir.parent if output_dir.name == "tubule_reconstruction" else output_dir
+    candidates = sorted(sample_dir.glob("*_mask.zarr"))
+    if len(candidates) == 1:
+        return candidates[0]
+    preferred = sample_dir / "ch1_mask.zarr"
+    return preferred if preferred.exists() else sample_dir / "ch0_mask.zarr"
+
+
+def _default_branch_csv_path(vertex_csv_path):
+    return Path(vertex_csv_path).parent / "vessel_branch_metrics.csv"
+
+
 def sample_annotation_labels_at_points_um(
     points_zyx_um,
     annotation_zarr,
@@ -229,14 +250,120 @@ def _compute_degrees(edge_table):
     return all_nodes.groupby(["skeleton_id", "node_id"], sort=False).size()
 
 
+def _finite_values(table, column):
+    if table.empty or column not in table.columns:
+        return np.empty(0, dtype=np.float64)
+    values = table[column].to_numpy(dtype=np.float64)
+    return values[np.isfinite(values)]
+
+
+def _branch_to_branch_mask(branch_table):
+    if branch_table.empty:
+        return np.zeros(0, dtype=bool)
+    if "is_branch_to_branch" in branch_table.columns:
+        return branch_table["is_branch_to_branch"].fillna(False).astype(bool).to_numpy()
+    if {"start_degree", "end_degree"}.issubset(branch_table.columns):
+        return (
+            (branch_table["start_degree"].to_numpy(dtype=np.float64) >= 3)
+            & (branch_table["end_degree"].to_numpy(dtype=np.float64) >= 3)
+        )
+    return np.ones(len(branch_table), dtype=bool)
+
+
+def _attach_branch_midpoints(branch_table, vertex_table):
+    if branch_table.empty:
+        table = branch_table.copy()
+        for col in ("mid_z_um", "mid_y_um", "mid_x_um"):
+            table[col] = pd.Series(dtype=np.float64)
+        return table
+    required = {"skeleton_id", "start_node", "end_node"}
+    if not required.issubset(branch_table.columns):
+        raise ValueError(f"Branch CSV is missing required columns: {sorted(required - set(branch_table.columns))}")
+
+    coords = vertex_table.drop_duplicates(
+        subset=["skeleton_id", "node_id"], keep="last"
+    ).set_index(["skeleton_id", "node_id"])[["z_um", "y_um", "x_um"]]
+
+    table = branch_table.copy()
+    start_index = pd.MultiIndex.from_frame(
+        table[["skeleton_id", "start_node"]].rename(columns={"start_node": "node_id"})
+    )
+    end_index = pd.MultiIndex.from_frame(
+        table[["skeleton_id", "end_node"]].rename(columns={"end_node": "node_id"})
+    )
+    start_coords = coords.reindex(start_index).to_numpy(dtype=np.float64)
+    end_coords = coords.reindex(end_index).to_numpy(dtype=np.float64)
+    midpoints = (start_coords + end_coords) / 2.0
+    table["mid_z_um"] = midpoints[:, 0]
+    table["mid_y_um"] = midpoints[:, 1]
+    table["mid_x_um"] = midpoints[:, 2]
+    return table
+
+
+def _compute_region_mask_volumes(
+    mask_zarr,
+    annotation_zarr,
+    resolved,
+    resolution_xyz,
+    foreground_label=1,
+):
+    if mask_zarr is None:
+        return {entry["query"]: {"mask_voxels": None, "vessel_volume_um3": np.nan} for entry in resolved}
+    if tuple(mask_zarr.shape) != tuple(annotation_zarr.shape):
+        raise ValueError(
+            f"Mask and annotation Zarr shapes must match for direct region volume statistics: "
+            f"mask={mask_zarr.shape}, annotation={annotation_zarr.shape}"
+        )
+
+    subtree_by_query = {
+        entry["query"]: np.asarray([int(v) for v in entry["subtree_ids"]], dtype=np.int64)
+        for entry in resolved
+    }
+    voxel_counts = {entry["query"]: 0 for entry in resolved}
+
+    chunks = tuple(int(v) for v in getattr(mask_zarr, "chunks", mask_zarr.shape))
+    for chunk_index in tqdm(
+        list(iter_all_chunk_indices(mask_zarr.shape, chunks)),
+        desc="Region mask volume",
+    ):
+        slices = tuple(
+            slice(
+                int(chunk_index[axis]) * chunks[axis],
+                min((int(chunk_index[axis]) + 1) * chunks[axis], int(mask_zarr.shape[axis])),
+            )
+            for axis in range(3)
+        )
+        mask_chunk = np.asarray(mask_zarr[slices])
+        if foreground_label is None:
+            vessel_mask = mask_chunk > 0
+        else:
+            vessel_mask = mask_chunk == foreground_label
+        if not np.any(vessel_mask):
+            continue
+        label_chunk = np.asarray(annotation_zarr[slices])
+        vessel_labels = label_chunk[vessel_mask]
+        for query, subtree_ids in subtree_by_query.items():
+            voxel_counts[query] += int(np.isin(vessel_labels, subtree_ids).sum())
+
+    voxel_volume = float(np.prod(tuple(float(v) for v in resolution_xyz)))
+    return {
+        query: {
+            "mask_voxels": int(count),
+            "vessel_volume_um3": float(count * voxel_volume),
+        }
+        for query, count in voxel_counts.items()
+    }
+
+
 def _regional_summary(
     region_node,
     subtree_ids,
     vertex_table,
     edge_table,
     vertex_labels,
-    edge_labels,
-    radius_lookup,
+    branch_table,
+    branch_labels,
+    volume_stats,
 ):
     subtree_list = [int(v) for v in subtree_ids]
 
@@ -244,92 +371,61 @@ def _regional_summary(
         vertex_mask = np.zeros(len(vertex_table), dtype=bool)
     else:
         vertex_mask = np.isin(vertex_labels, subtree_list)
-    if edge_table.empty or edge_labels.size == 0:
-        edge_mask = np.zeros(len(edge_table), dtype=bool)
-    else:
-        edge_mask = np.isin(edge_labels, subtree_list)
-
     vertices_in = vertex_table.loc[vertex_mask] if vertex_mask.any() else vertex_table.iloc[0:0]
-    edges_in = edge_table.loc[edge_mask] if edge_mask.any() else edge_table.iloc[0:0]
 
-    edge_lengths = (
-        edges_in["edge_length_um"].to_numpy(dtype=np.float64)
-        if not edges_in.empty
-        else np.empty(0, dtype=np.float64)
-    )
-    total_length_um = float(edge_lengths.sum()) if edge_lengths.size else 0.0
-    mean_edge_length_um = float(edge_lengths.mean()) if edge_lengths.size else 0.0
-
-    if "radius_um" in vertices_in.columns and not vertices_in.empty:
-        radius_values = vertices_in["radius_um"].to_numpy(dtype=np.float64)
-        valid_radii = radius_values[np.isfinite(radius_values)]
-    else:
-        valid_radii = np.empty(0, dtype=np.float64)
-
-    # Degrees computed from edges whose midpoint also lies in the region.
-    local_degrees = _compute_degrees(edges_in)
+    # Degrees are computed from the full graph, then counted for vertices that lie in the region.
+    local_degrees = _compute_degrees(edge_table)
     num_branch_points = 0
-    num_end_points = 0
     if not vertices_in.empty and not local_degrees.empty:
         deg_values = local_degrees.reindex(
             pd.MultiIndex.from_frame(vertices_in[["skeleton_id", "node_id"]]),
             fill_value=0,
         ).to_numpy(dtype=np.int64)
         num_branch_points = int(np.sum(deg_values >= 3))
-        num_end_points = int(np.sum(deg_values == 1))
 
-    skeleton_ids_in = set()
-    if not vertices_in.empty:
-        skeleton_ids_in.update(vertices_in["skeleton_id"].astype(int).tolist())
-    if not edges_in.empty:
-        skeleton_ids_in.update(edges_in["skeleton_id"].astype(int).tolist())
+    if branch_table.empty or branch_labels.size == 0:
+        branches_in = branch_table.iloc[0:0]
+    else:
+        branch_region_mask = np.isin(branch_labels, subtree_list)
+        branches_in = branch_table.loc[branch_region_mask] if branch_region_mask.any() else branch_table.iloc[0:0]
 
-    vessel_volume_um3 = np.nan
-    if not edges_in.empty and radius_lookup is not None and not radius_lookup.empty:
-        src_radii = radius_lookup.reindex(
-            pd.MultiIndex.from_frame(edges_in[["skeleton_id", "source_node"]]),
-            fill_value=np.nan,
-        ).to_numpy(dtype=np.float64)
-        tgt_radii = radius_lookup.reindex(
-            pd.MultiIndex.from_frame(edges_in[["skeleton_id", "target_node"]]),
-            fill_value=np.nan,
-        ).to_numpy(dtype=np.float64)
-        valid = np.isfinite(src_radii) & np.isfinite(tgt_radii)
-        if valid.any():
-            r_mean = 0.5 * (src_radii[valid] + tgt_radii[valid])
-            lengths = edges_in["edge_length_um"].to_numpy(dtype=np.float64)[valid]
-            vessel_volume_um3 = float(np.sum(lengths * np.pi * r_mean * r_mean))
-        else:
-            vessel_volume_um3 = 0.0
+    path_lengths = (
+        branches_in.loc[_branch_to_branch_mask(branches_in), "branch_length_um"].to_numpy(dtype=np.float64)
+        if "branch_length_um" in branches_in.columns
+        else np.empty(0, dtype=np.float64)
+    )
+    path_lengths = path_lengths[np.isfinite(path_lengths)]
+    tortuosities = _finite_values(branches_in, "tortuosity")
+    branch_depths = _finite_values(branches_in, "branch_depth")
 
     return {
         "region_id": int(region_node["id"]),
         "region_acronym": region_node["acronym"],
         "region_name": region_node["name"],
         "num_subtree_ids": int(len(subtree_list)),
-        "num_vertices": int(len(vertices_in)),
-        "num_edges": int(len(edges_in)),
-        "num_skeletons": int(len(skeleton_ids_in)),
         "num_branch_points": int(num_branch_points),
-        "num_end_points": int(num_end_points),
-        "total_length_um": total_length_um,
-        "mean_edge_length_um": mean_edge_length_um,
-        "mean_radius_um": float(valid_radii.mean()) if valid_radii.size else np.nan,
-        "median_radius_um": float(np.median(valid_radii)) if valid_radii.size else np.nan,
-        "min_radius_um": float(valid_radii.min()) if valid_radii.size else np.nan,
-        "max_radius_um": float(valid_radii.max()) if valid_radii.size else np.nan,
-        "approx_vessel_volume_um3": vessel_volume_um3,
+        "branch_point_path_length_sum_um": float(path_lengths.sum()) if path_lengths.size else 0.0,
+        "branch_point_path_length_mean_um": float(path_lengths.mean()) if path_lengths.size else np.nan,
+        "branch_point_path_length_sd_um": float(path_lengths.std(ddof=1)) if path_lengths.size > 1 else np.nan,
+        "mask_voxels": volume_stats.get("mask_voxels"),
+        "vessel_volume_um3": volume_stats.get("vessel_volume_um3", np.nan),
+        "mean_tortuosity": float(tortuosities.mean()) if tortuosities.size else np.nan,
+        "mean_branch_depth": float(branch_depths.mean()) if branch_depths.size else np.nan,
     }
 
 
 def analyze_regions_from_skeleton(
     vertex_csv_path,
     edge_csv_path,
+    branch_csv_path=None,
+    mask_zarr_path=None,
     annotation_zarr_path=None,
     region_cfg_csv=None,
     regions=None,
     region_groups=None,
     output_dir=None,
+    mask_dataset_name="0",
+    foreground_label=1,
     annotation_dataset_name="0",
     annotation_resolution_xyz=None,
     config_path=None,
@@ -380,6 +476,17 @@ def analyze_regions_from_skeleton(
     edge_table = pd.read_csv(edge_csv_path)
     logger.info("Loaded %d edges", len(edge_table))
 
+    if branch_csv_path is None:
+        default_branch_csv_path = _default_branch_csv_path(vertex_csv_path)
+        branch_csv_path = default_branch_csv_path if default_branch_csv_path.exists() else None
+    if branch_csv_path is not None and Path(branch_csv_path).exists():
+        logger.info("Loading branch CSV: %s", branch_csv_path)
+        branch_table = pd.read_csv(branch_csv_path)
+    else:
+        logger.info("Branch CSV not provided/found; reconstructing branch metrics from vertex/edge tables")
+        branch_table = _branch_table_from_tables(vertex_table, edge_table)
+    logger.info("Loaded %d branch paths", len(branch_table))
+
     required_vertex_cols = {"skeleton_id", "node_id", "z_um", "y_um", "x_um"}
     missing_vcols = required_vertex_cols - set(vertex_table.columns)
     if missing_vcols:
@@ -411,19 +518,35 @@ def analyze_regions_from_skeleton(
                 "Pass --config or --annotation_resolution_xyz."
             )
         annotation_resolution_xyz = _load_input_resolution_xyz_from_config(config_path)
+    annotation_resolution_xyz = parse_resolution_xyz(annotation_resolution_xyz)
 
     annotation_zarr = open_zarr_dataset(annotation_zarr_path, dataset_name=annotation_dataset_name)
     if len(annotation_zarr.shape) != 3:
         raise ValueError(f"Annotation Zarr must be 3D, got shape={annotation_zarr.shape}")
 
+    if mask_zarr_path is None:
+        mask_zarr_path = _default_mask_zarr_path(vertex_csv_path)
+    mask_zarr_path = Path(mask_zarr_path)
+    if not mask_zarr_path.exists():
+        raise FileNotFoundError(
+            f"Mask Zarr not found: {mask_zarr_path}. "
+            "Pass --mask_zarr explicitly or ensure sample_dir/<signal_ch>_mask.zarr exists."
+        )
+    mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=mask_dataset_name)
+    if len(mask_zarr.shape) != 3:
+        raise ValueError(f"Mask Zarr must be 3D, got shape={mask_zarr.shape}")
+
     _started_at = time.time()
     result = _finalize_region_analysis(
         vertex_table=vertex_table,
         edge_table=edge_table,
+        branch_table=branch_table,
+        mask_zarr=mask_zarr,
         annotation_zarr=annotation_zarr,
         annotation_resolution_xyz=annotation_resolution_xyz,
         resolved=resolved,
         output_dir=output_dir,
+        foreground_label=foreground_label,
     )
 
     if output_dir is not None and write_run_manifest is not None:
@@ -435,10 +558,14 @@ def analyze_regions_from_skeleton(
             inputs={
                 "vertex_csv_path": str(vertex_csv_path),
                 "edge_csv_path": str(edge_csv_path),
+                "branch_csv_path": str(branch_csv_path) if branch_csv_path is not None else None,
+                "mask_zarr_path": str(mask_zarr_path),
                 "annotation_zarr_path": str(annotation_zarr_path),
                 "region_cfg_csv": str(region_cfg_csv),
                 "regions": regions,
                 "region_groups": region_groups,
+                "mask_dataset_name": mask_dataset_name,
+                "foreground_label": foreground_label,
                 "annotation_dataset_name": annotation_dataset_name,
                 "annotation_resolution_xyz": annotation_resolution_xyz,
                 "config_path": str(config_path) if config_path is not None else None,
@@ -456,28 +583,27 @@ _SUMMARY_COLUMN_ORDER = [
     "region_acronym",
     "region_name",
     "num_subtree_ids",
-    "num_skeletons",
-    "num_vertices",
-    "num_edges",
     "num_branch_points",
-    "num_end_points",
-    "total_length_um",
-    "mean_edge_length_um",
-    "mean_radius_um",
-    "median_radius_um",
-    "min_radius_um",
-    "max_radius_um",
-    "approx_vessel_volume_um3",
+    "branch_point_path_length_sum_um",
+    "branch_point_path_length_mean_um",
+    "branch_point_path_length_sd_um",
+    "mask_voxels",
+    "vessel_volume_um3",
+    "mean_tortuosity",
+    "mean_branch_depth",
 ]
 
 
 def _finalize_region_analysis(
     vertex_table,
     edge_table,
+    branch_table,
+    mask_zarr,
     annotation_zarr,
     annotation_resolution_xyz,
     resolved,
     output_dir,
+    foreground_label=1,
 ):
     if not vertex_table.empty:
         vertex_points = vertex_table[["z_um", "y_um", "x_um"]].to_numpy(dtype=np.float64)
@@ -488,22 +614,27 @@ def _finalize_region_analysis(
         vertex_points, annotation_zarr, annotation_resolution_xyz
     )
 
-    if not edge_table.empty:
-        src = edge_table[["source_z_um", "source_y_um", "source_x_um"]].to_numpy(dtype=np.float64)
-        tgt = edge_table[["target_z_um", "target_y_um", "target_x_um"]].to_numpy(dtype=np.float64)
-        midpoints = (src + tgt) / 2.0
+    branch_table = _attach_branch_midpoints(branch_table, vertex_table)
+    if not branch_table.empty:
+        midpoints = branch_table[["mid_z_um", "mid_y_um", "mid_x_um"]].to_numpy(dtype=np.float64)
+        finite_midpoints = np.all(np.isfinite(midpoints), axis=1)
     else:
+        finite_midpoints = np.zeros(0, dtype=bool)
         midpoints = np.empty((0, 3), dtype=np.float64)
-    logger.info("Sampling annotation labels for %d edge midpoints ...", len(midpoints))
-    edge_labels = sample_annotation_labels_at_points_um(
-        midpoints, annotation_zarr, annotation_resolution_xyz
-    )
+    logger.info("Sampling annotation labels for %d branch path midpoints ...", int(finite_midpoints.sum()))
+    branch_labels = np.zeros(len(branch_table), dtype=np.int64)
+    if finite_midpoints.any():
+        branch_labels[finite_midpoints] = sample_annotation_labels_at_points_um(
+            midpoints[finite_midpoints], annotation_zarr, annotation_resolution_xyz
+        )
 
-    radius_lookup = None
-    if "radius_um" in vertex_table.columns and not vertex_table.empty:
-        radius_lookup = vertex_table.drop_duplicates(
-            subset=["skeleton_id", "node_id"], keep="last"
-        ).set_index(["skeleton_id", "node_id"])["radius_um"]
+    volume_stats_by_query = _compute_region_mask_volumes(
+        mask_zarr=mask_zarr,
+        annotation_zarr=annotation_zarr,
+        resolved=resolved,
+        resolution_xyz=annotation_resolution_xyz,
+        foreground_label=foreground_label,
+    )
 
     rows = []
     logger.info("Computing per-region vessel statistics ...")
@@ -514,8 +645,9 @@ def _finalize_region_analysis(
             vertex_table=vertex_table,
             edge_table=edge_table,
             vertex_labels=vertex_labels,
-            edge_labels=edge_labels,
-            radius_lookup=radius_lookup,
+            branch_table=branch_table,
+            branch_labels=branch_labels,
+            volume_stats=volume_stats_by_query.get(entry["query"], {}),
         )
         summary_row["query"] = entry["query"]
         rows.append(summary_row)
@@ -565,6 +697,24 @@ def build_argparser():
     )
     parser.add_argument("--vertex_csv", required=True, help="Path to skeleton_vertices.csv")
     parser.add_argument("--edge_csv", required=True, help="Path to skeleton_edges.csv")
+    parser.add_argument(
+        "--branch_csv",
+        help="Path to vessel_branch_metrics.csv. Defaults to vertex_csv directory/vessel_branch_metrics.csv.",
+    )
+    parser.add_argument(
+        "--mask_zarr",
+        help=(
+            "Binary vessel mask Zarr for direct volume statistics. Defaults to "
+            "<sample_dir>/<signal_ch>_mask.zarr when vertex_csv is in "
+            "<sample_dir>/tubule_reconstruction/."
+        ),
+    )
+    parser.add_argument("--mask_dataset_name", default="0", help="Dataset name inside mask Zarr")
+    parser.add_argument(
+        "--foreground_label",
+        default="1",
+        help="Mask voxel value treated as vessel foreground. Use empty string to treat any nonzero value as foreground.",
+    )
     parser.add_argument(
         "--annotation_zarr",
         help=(
@@ -627,11 +777,15 @@ def main():
         result = analyze_regions_from_skeleton(
             vertex_csv_path=args.vertex_csv,
             edge_csv_path=args.edge_csv,
+            branch_csv_path=args.branch_csv,
+            mask_zarr_path=args.mask_zarr,
             annotation_zarr_path=args.annotation_zarr,
             region_cfg_csv=args.cfg,
             regions=args.regions,
             region_groups=args.region_groups,
             output_dir=args.output_dir,
+            mask_dataset_name=args.mask_dataset_name,
+            foreground_label=None if str(args.foreground_label).strip() == "" else int(args.foreground_label),
             annotation_dataset_name=args.annotation_dataset_name,
             annotation_resolution_xyz=args.annotation_resolution_xyz,
             config_path=args.config,

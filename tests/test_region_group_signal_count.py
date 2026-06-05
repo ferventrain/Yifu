@@ -39,7 +39,7 @@ def write_region_csv(tmp_path):
 
 
 def write_density_excel(sample_dir):
-    excel_path = sample_dir / f"{sample_dir.name}_density_result.xlsx"
+    excel_path = sample_dir / f"{sample_dir.name}_result.xlsx"
     with pd.ExcelWriter(excel_path) as writer:
         pd.DataFrame(
             {

@@ -132,6 +132,19 @@ class RegionVesselAnalysisCfg(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     annotation_dataset_name: str = Field("0", description="Dataset name inside the annotation Zarr group")
+    mask_dataset_name: str = Field("0", description="Dataset name inside the binary vessel mask Zarr group")
+    foreground_label: Optional[int] = Field(
+        1,
+        description="Mask voxel value treated as vessel foreground; None treats any nonzero value as foreground",
+    )
+    branch_csv_path: Optional[Path] = Field(
+        None,
+        description="Optional vessel_branch_metrics.csv path; defaults to skeleton CSV directory",
+    )
+    mask_zarr_path: Optional[Path] = Field(
+        None,
+        description="Optional binary vessel mask Zarr path; defaults to sample_dir/<signal_ch>_mask.zarr",
+    )
     annotation_resolution_xyz: _Triplet = Field(
         (1.0, 1.0, 1.0),
         description="Annotation voxel size in um as (x, y, z); default should match config input.resolution_xyz",

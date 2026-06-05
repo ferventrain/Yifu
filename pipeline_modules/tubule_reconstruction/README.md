@@ -1,4 +1,4 @@
-# 血管网络重建模块
+﻿# 血管网络重建模块
 
 本目录用于从已经完成分割的血管 `binary mask zarr` 中重建血管骨架，并输出分支级和全局级血管网络参数。
 
@@ -193,7 +193,7 @@
 - `vessel_branch_metrics.csv`
   每一条血管分支的长度、半径、曲折度、branch depth、terminal branch 标记等指标
 - `vessel_network_summary.json`
-  整个样本的血管网络汇总指标，包括 branch point count、end point count 等
+  整个样本的血管网络汇总指标，包括 branch point count、branch point 间 path length 统计、mask vessel volume、mean tortuosity 和 mean branch depth
 - `skeleton_vertices.csv`
   骨架节点坐标表，包含每个节点的 `z_um / y_um / x_um / radius_um`
 - `skeleton_edges.csv`
@@ -339,14 +339,14 @@ kimimaro view path/to/output/swc/skeleton_000000.swc
 | `query` | 用户输入的原始查询字符串 |
 | `region_id / region_acronym / region_name` | 解析到的脑区 |
 | `num_subtree_ids` | 子树节点数（包括自身） |
-| `num_skeletons` | 落入该脑区的骨架 id 数 |
-| `num_vertices / num_edges` | 该脑区内的顶点 / 边数 |
-| `num_branch_points` | 脑区内度 ≥ 3 的顶点数（仅基于脑区内的边重算度） |
-| `num_end_points` | 脑区内度 = 1 的顶点数 |
-| `total_length_um` | 脑区内所有 edge_length 之和 |
-| `mean_edge_length_um` | 脑区内 edge_length 均值 |
-| `mean_radius_um / median_radius_um / min_radius_um / max_radius_um` | 脑区内顶点 `radius_um` 的统计（跳过 NaN） |
-| `approx_vessel_volume_um3` | ∑ edge_length · π · r̄²，其中 r̄ 为边两端 radius 均值（骨架近似体积，不等同 mask 的真实体积） |
+| `num_branch_points` | 脑区内度 >= 3 的 branch point 数 |
+| `branch_point_path_length_sum_um` | 两个 branch point 之间 path 长度之和 |
+| `branch_point_path_length_mean_um` | 两个 branch point 之间 path 长度均值 |
+| `branch_point_path_length_sd_um` | 两个 branch point 之间 path 长度 SD |
+| `mask_voxels` | 该脑区内 vessel mask 前景体素数 |
+| `vessel_volume_um3` | 直接用 mask voxel count * voxel volume 得到的血管体积 |
+| `mean_tortuosity` | 该脑区内 branch path 的 tortuosity 均值 |
+| `mean_branch_depth` | 该脑区内 branch depth 均值 |
 
 ### 命令行用法
 
@@ -354,6 +354,8 @@ kimimaro view path/to/output/swc/skeleton_000000.swc
 python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis `
   --vertex_csv out/skeleton_vertices.csv `
   --edge_csv out/skeleton_edges.csv `
+  --branch_csv out/vessel_branch_metrics.csv `
+  --mask_zarr sample/ch1_mask.zarr `
   --annotation_zarr registered/annotation.zarr `
   --annotation_dataset_name 0 `
   --annotation_resolution_xyz 25,25,25 `
@@ -365,6 +367,8 @@ python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis `
 参数说明：
 
 - `--vertex_csv / --edge_csv`：前置重建步骤的 skeleton 输出（必须用 `--save_skeleton` 跑过）
+- `--branch_csv`：前置重建步骤的 `vessel_branch_metrics.csv`；不提供时会尝试从 skeleton 表重建 branch path 统计
+- `--mask_zarr / --mask_dataset_name / --foreground_label`：用于直接按 mask 体素统计血管 volume
 - `--annotation_zarr / --annotation_dataset_name`：registered annotation label 的 Zarr 路径与内部 dataset 名
 - `--annotation_resolution_xyz`：annotation 体素物理尺寸，单位 μm，顺序 `x,y,z`。25 μm Allen CCF 写 `25,25,25`
 - `--cfg`：Allen region CSV
@@ -379,6 +383,8 @@ from pipeline_modules.tubule_reconstruction import analyze_regions_from_skeleton
 result = analyze_regions_from_skeleton(
     vertex_csv_path="out/skeleton_vertices.csv",
     edge_csv_path="out/skeleton_edges.csv",
+    branch_csv_path="out/vessel_branch_metrics.csv",
+    mask_zarr_path="sample/ch1_mask.zarr",
     annotation_zarr_path="registered/annotation.zarr",
     region_cfg_csv="pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
     regions=["CTX", "Hippocampal formation", 315],
@@ -459,3 +465,4 @@ pytest tests/test_utils.py tests/test_tubule_config.py tests/test_region_vessel_
 ```
 
 测试覆盖：`SampleLayout`、`PipelineError`/`ErrorCode`、`write_run_manifest`、Pydantic 配置模型、`analyze_regions_from_skeleton` 端到端 smoke test（全部使用合成数据，不依赖 GPU / kimimaro）。
+

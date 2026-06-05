@@ -80,7 +80,7 @@
       "id": "analyze_regions_from_skeleton",
       "function": "pipeline_modules.tubule_reconstruction.region_vessel_analysis.analyze_regions_from_skeleton",
       "cli": "python pipeline_modules/tubule_reconstruction/region_vessel_analysis.py",
-      "description": "Compute per-brain-region vessel parameters by sampling an Allen-style annotation label Zarr at skeleton vertex / edge positions.",
+      "description": "Compute per-brain-region vessel parameters from skeleton branch paths plus direct binary-mask vessel volume.",
       "prerequisites": [
         "skeleton_vertices.csv and skeleton_edges.csv must exist (outputs of analyze_binary_mask_zarr[_chunkwise] with save_skeleton=true)",
         "Registered annotation label Zarr must exist (e.g. SampleLayout.atlas_label_zarr)",
@@ -89,10 +89,14 @@
       "inputs": {
         "vertex_csv_path":            {"type": "path", "required": true, "description": "skeleton_vertices.csv"},
         "edge_csv_path":              {"type": "path", "required": true, "description": "skeleton_edges.csv"},
+        "branch_csv_path":            {"type": "path|null", "default": null, "description": "vessel_branch_metrics.csv; defaults to skeleton CSV directory"},
+        "mask_zarr_path":             {"type": "path|null", "default": null, "description": "Binary vessel mask Zarr for direct volume statistics; defaults to sample_dir/<signal_ch>_mask.zarr"},
         "annotation_zarr_path":       {"type": "path|null", "default": null, "description": "Registered annotation label Zarr; defaults to sample_dir/upsampled_atlas_label.zarr"},
         "region_cfg_csv":             {"type": "path", "required": true, "description": "Allen region CSV"},
         "regions":                    {"type": "string|list[string]", "required": true, "description": "Comma/semicolon list of region queries (acronym, full name, or integer id)"},
         "output_dir":                 {"type": "path|null", "default": null, "description": "If set, write CSV/JSON + manifest here"},
+        "mask_dataset_name":          {"type": "string", "default": "0"},
+        "foreground_label":           {"type": "int|null", "default": 1, "description": "Mask value treated as vessel foreground; null means any nonzero value"},
         "annotation_dataset_name":    {"type": "string", "default": "0"},
         "annotation_resolution_xyz":  {"type": "triplet_float_um|null", "default": null, "description": "Defaults to input.resolution_xyz from config.json"},
         "config_path":                {"type": "path|null", "default": null, "description": "Config JSON used to read input.resolution_xyz"}

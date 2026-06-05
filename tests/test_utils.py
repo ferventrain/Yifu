@@ -156,7 +156,7 @@ class TestSampleLayout:
 
     def test_density_xlsx_uses_sample_dir_name(self, tmp_path):
         layout = SampleLayout(sample_dir=tmp_path, signal_ch="ch2")
-        assert layout.density_results_xlsx.name == f"{tmp_path.name}_density_result.xlsx"
+        assert layout.density_results_xlsx.name == f"sample_ch2_result.xlsx"
 
     def test_atlas_label_hemisphere_zarr(self, tmp_path):
         layout = SampleLayout(sample_dir=tmp_path)

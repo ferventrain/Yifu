@@ -689,6 +689,12 @@ def compute_block_artifacts(
     }
 
 
+def block_has_foreground(mask_chunk, foreground_mode, foreground_label):
+    if foreground_mode == "nonzero":
+        return bool(np.any(mask_chunk > 0))
+    return bool(np.any(mask_chunk == foreground_label))
+
+
 def save_block_artifact(artifact_path, artifact):
     np.savez(
         artifact_path,
@@ -738,8 +744,8 @@ def process_block_spec_worker(block_spec, foreground_mode, foreground_label):
     z1, y1, x1 = block_spec["stop"]
 
     mask_chunk = np.asarray(WORKER_MASK_ZARR[z0:z1, y0:y1, x0:x1])
+    has_foreground = block_has_foreground(mask_chunk, foreground_mode, foreground_label)
     label_chunk = np.asarray(WORKER_LABEL_ZARR[z0:z1, y0:y1, x0:x1])
-    signal_chunk = np.asarray(WORKER_SIGNAL_ZARR[z0:z1, y0:y1, x0:x1])
     hemisphere_chunk = None
     if WORKER_HEMISPHERE_ZARR is not None:
         hemisphere_chunk = np.asarray(WORKER_HEMISPHERE_ZARR[z0:z1, y0:y1, x0:x1])
@@ -754,16 +760,28 @@ def process_block_spec_worker(block_spec, foreground_mode, foreground_label):
         label_chunk,
         hemisphere_chunk,
     )
-    aggregate_signal_by_hemisphere(
-        region_signal_voxels_by_hemisphere,
-        region_sum_intensity_by_hemisphere,
-        mask_chunk,
-        label_chunk,
-        signal_chunk,
-        foreground_mode,
-        foreground_label,
-        hemisphere_chunk,
-    )
+    if not has_foreground:
+        return {
+            "block_spec": block_spec,
+            "artifact": None,
+            "total_region_voxels": total_region_voxels,
+            "total_region_voxels_by_hemisphere": total_region_voxels_by_hemisphere,
+            "region_signal_voxels_by_hemisphere": region_signal_voxels_by_hemisphere,
+            "region_sum_intensity_by_hemisphere": region_sum_intensity_by_hemisphere,
+        }
+
+    signal_chunk = np.asarray(WORKER_SIGNAL_ZARR[z0:z1, y0:y1, x0:x1])
+    if hemisphere_chunk is not None:
+        aggregate_signal_by_hemisphere(
+            region_signal_voxels_by_hemisphere,
+            region_sum_intensity_by_hemisphere,
+            mask_chunk,
+            label_chunk,
+            signal_chunk,
+            foreground_mode,
+            foreground_label,
+            hemisphere_chunk,
+        )
 
     artifact = compute_block_artifacts(
         mask_chunk=mask_chunk,
@@ -854,8 +872,8 @@ def scan_blocks_and_write_artifacts(
                 z1, y1, x1 = block_spec["stop"]
 
                 mask_chunk = np.asarray(mask_zarr[z0:z1, y0:y1, x0:x1])
+                has_foreground = block_has_foreground(mask_chunk, foreground_mode, foreground_label)
                 label_chunk = np.asarray(label_zarr[z0:z1, y0:y1, x0:x1])
-                signal_chunk = np.asarray(signal_zarr[z0:z1, y0:y1, x0:x1])
                 hemisphere_chunk = None
                 if use_hemisphere_label:
                     hemisphere_chunk = np.asarray(hemisphere_zarr[z0:z1, y0:y1, x0:x1])
@@ -866,16 +884,34 @@ def scan_blocks_and_write_artifacts(
                     label_chunk,
                     hemisphere_chunk,
                 )
-                aggregate_signal_by_hemisphere(
-                    region_signal_voxels_by_hemisphere,
-                    region_sum_intensity_by_hemisphere,
-                    mask_chunk,
-                    label_chunk,
-                    signal_chunk,
-                    foreground_mode,
-                    foreground_label,
-                    hemisphere_chunk,
-                )
+                if not has_foreground:
+                    manifest.append(
+                        {
+                            "block_id": int(block_spec["block_id"]),
+                            "grid_index": list(block_spec["grid_index"]),
+                            "start": list(block_spec["start"]),
+                            "stop": list(block_spec["stop"]),
+                            "artifact_path": "",
+                            "component_count": 0,
+                            "boundary_count": 0,
+                        }
+                    )
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(components=0, boundary_voxels=0, refresh=False)
+                    continue
+
+                signal_chunk = np.asarray(signal_zarr[z0:z1, y0:y1, x0:x1])
+                if hemisphere_chunk is not None:
+                    aggregate_signal_by_hemisphere(
+                        region_signal_voxels_by_hemisphere,
+                        region_sum_intensity_by_hemisphere,
+                        mask_chunk,
+                        label_chunk,
+                        signal_chunk,
+                        foreground_mode,
+                        foreground_label,
+                        hemisphere_chunk,
+                    )
 
                 artifact = compute_block_artifacts(
                     mask_chunk=mask_chunk,
@@ -972,6 +1008,22 @@ def scan_blocks_and_write_artifacts(
                             )
 
                         local_artifact = result["artifact"]
+                        if local_artifact is None:
+                            manifest.append(
+                                {
+                                    "block_id": int(block_spec["block_id"]),
+                                    "grid_index": list(block_spec["grid_index"]),
+                                    "start": list(block_spec["start"]),
+                                    "stop": list(block_spec["stop"]),
+                                    "artifact_path": "",
+                                    "component_count": 0,
+                                    "boundary_count": 0,
+                                }
+                            )
+                            progress_bar.update(1)
+                            progress_bar.set_postfix(components=0, boundary_voxels=0, refresh=False)
+                            continue
+
                         component_offset = next_component_id - 1
                         artifact = apply_component_offset(local_artifact, component_offset)
                         next_component_id += int(local_artifact["num_local_components"])
@@ -1131,6 +1183,10 @@ def stitch_block_boundaries(manifest_payload):
 
     with tqdm(total=len(manifest_payload["blocks"]), desc="Boundary stitch", unit="block") as progress_bar:
         for block in manifest_payload["blocks"]:
+            if not block.get("artifact_path"):
+                progress_bar.update(1)
+                continue
+
             grid_index = tuple(block["grid_index"])
             arrays_a = None
 
@@ -1141,7 +1197,7 @@ def stitch_block_boundaries(manifest_payload):
                     grid_index[2] + delta[2],
                 )
                 neighbor_block = block_lookup.get(neighbor_index)
-                if neighbor_block is None:
+                if neighbor_block is None or not neighbor_block.get("artifact_path"):
                     continue
 
                 if arrays_a is None:
@@ -1180,6 +1236,10 @@ def build_root_sizes(manifest_payload, parent):
 
     with tqdm(total=len(manifest_payload["blocks"]), desc="Root sizes", unit="block") as progress_bar:
         for block in manifest_payload["blocks"]:
+            if not block.get("artifact_path"):
+                progress_bar.update(1)
+                continue
+
             arrays = load_block_arrays(block["artifact_path"])
             if arrays["component_ids"].size > 0:
                 root_ids = parent[arrays["component_ids"]]
@@ -1281,17 +1341,270 @@ def collapse_component_stats_by_majority(
     return result
 
 
+def merge_root_region_arrays(root_chunks, region_chunks, count_chunks, intensity_chunks):
+    if not root_chunks:
+        empty_int64 = np.empty(0, dtype=np.int64)
+        empty_float64 = np.empty(0, dtype=np.float64)
+        return empty_int64, empty_int64, empty_int64, empty_float64
+
+    roots = np.concatenate(root_chunks).astype(np.int64, copy=False)
+    regions = np.concatenate(region_chunks).astype(np.int64, copy=False)
+    counts = np.concatenate(count_chunks).astype(np.int64, copy=False)
+    intensities = np.concatenate(intensity_chunks).astype(np.float64, copy=False)
+    if roots.size == 0:
+        return roots, regions, counts, intensities
+
+    pair_values = np.empty(roots.size, dtype=ROOT_REGION_DTYPE)
+    pair_values["root"] = roots
+    pair_values["region"] = regions
+    unique_pairs, inverse_index = np.unique(pair_values, return_inverse=True)
+
+    merged_counts = np.zeros(unique_pairs.shape[0], dtype=np.int64)
+    np.add.at(merged_counts, inverse_index, counts)
+
+    merged_intensities = np.zeros(unique_pairs.shape[0], dtype=np.float64)
+    np.add.at(merged_intensities, inverse_index, intensities)
+
+    return (
+        unique_pairs["root"].astype(np.int64, copy=False),
+        unique_pairs["region"].astype(np.int64, copy=False),
+        merged_counts,
+        merged_intensities,
+    )
+
+
+def merge_root_region_hemisphere_arrays(
+    root_chunks,
+    region_chunks,
+    hemisphere_chunks,
+    count_chunks,
+    intensity_chunks,
+):
+    if not root_chunks:
+        empty_int64 = np.empty(0, dtype=np.int64)
+        empty_float64 = np.empty(0, dtype=np.float64)
+        return empty_int64, empty_int64, np.empty(0, dtype=np.int8), empty_int64, empty_float64
+
+    roots = np.concatenate(root_chunks).astype(np.int64, copy=False)
+    regions = np.concatenate(region_chunks).astype(np.int64, copy=False)
+    hemispheres = np.concatenate(hemisphere_chunks).astype(np.int8, copy=False)
+    counts = np.concatenate(count_chunks).astype(np.int64, copy=False)
+    intensities = np.concatenate(intensity_chunks).astype(np.float64, copy=False)
+    if roots.size == 0:
+        return roots, regions, hemispheres, counts, intensities
+
+    pair_values = np.empty(roots.size, dtype=ROOT_REGION_HEMISPHERE_DTYPE)
+    pair_values["root"] = roots
+    pair_values["region"] = regions
+    pair_values["hemisphere"] = hemispheres
+    unique_pairs, inverse_index = np.unique(pair_values, return_inverse=True)
+
+    merged_counts = np.zeros(unique_pairs.shape[0], dtype=np.int64)
+    np.add.at(merged_counts, inverse_index, counts)
+
+    merged_intensities = np.zeros(unique_pairs.shape[0], dtype=np.float64)
+    np.add.at(merged_intensities, inverse_index, intensities)
+
+    return (
+        unique_pairs["root"].astype(np.int64, copy=False),
+        unique_pairs["region"].astype(np.int64, copy=False),
+        unique_pairs["hemisphere"].astype(np.int8, copy=False),
+        merged_counts,
+        merged_intensities,
+    )
+
+
+def arrays_to_value_dict(keys, values, value_cast):
+    return {int(key): value_cast(value) for key, value in zip(keys.tolist(), values.tolist())}
+
+
+def arrays_to_pair_value_dict(keys_a, keys_b, values, value_cast):
+    return {
+        (int(key_a), int(key_b)): value_cast(value)
+        for key_a, key_b, value in zip(keys_a.tolist(), keys_b.tolist(), values.tolist())
+    }
+
+
+def aggregate_by_region_from_arrays(regions, values, value_dtype):
+    if regions.size == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=value_dtype)
+
+    unique_regions, inverse_index = np.unique(regions.astype(np.int64, copy=False), return_inverse=True)
+    aggregated = np.zeros(unique_regions.shape[0], dtype=value_dtype)
+    np.add.at(aggregated, inverse_index, values.astype(value_dtype, copy=False))
+    return unique_regions, aggregated
+
+
+def aggregate_by_region_hemisphere_from_arrays(regions, hemispheres, values, value_dtype):
+    if regions.size == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int8), np.empty(0, dtype=value_dtype)
+
+    pair_values = np.empty(regions.size, dtype=np.dtype([("region", np.int64), ("hemisphere", np.int8)]))
+    pair_values["region"] = regions.astype(np.int64, copy=False)
+    pair_values["hemisphere"] = hemispheres.astype(np.int8, copy=False)
+    unique_pairs, inverse_index = np.unique(pair_values, return_inverse=True)
+
+    aggregated = np.zeros(unique_pairs.shape[0], dtype=value_dtype)
+    np.add.at(aggregated, inverse_index, values.astype(value_dtype, copy=False))
+    return (
+        unique_pairs["region"].astype(np.int64, copy=False),
+        unique_pairs["hemisphere"].astype(np.int8, copy=False),
+        aggregated,
+    )
+
+
+def collapse_root_region_arrays_by_majority(roots, regions, counts, intensities):
+    """Collapse root-region arrays so each connected object contributes to one region."""
+    if roots.size == 0:
+        return {
+            "region_signal_voxels": {},
+            "region_signal_counts": {},
+            "region_sum_intensity": {},
+        }
+
+    order = np.lexsort((regions, roots))
+    roots = roots[order]
+    regions = regions[order]
+    counts = counts[order]
+    intensities = intensities[order]
+
+    group_starts = np.r_[0, np.flatnonzero(np.diff(roots)) + 1]
+    total_voxels = np.add.reduceat(counts, group_starts)
+    total_intensities = np.add.reduceat(intensities, group_starts)
+    root_count = group_starts.size
+
+    chosen_regions = np.empty(root_count, dtype=np.int64)
+    for group_index, start_index in enumerate(group_starts):
+        stop_index = group_starts[group_index + 1] if group_index + 1 < root_count else roots.size
+        group_counts = counts[start_index:stop_index]
+        max_count = group_counts.max()
+        chosen_regions[group_index] = regions[start_index + int(np.flatnonzero(group_counts == max_count)[0])]
+
+    region_keys, region_voxels = aggregate_by_region_from_arrays(chosen_regions, total_voxels, np.int64)
+    _, region_counts = aggregate_by_region_from_arrays(chosen_regions, np.ones(root_count, dtype=np.int64), np.int64)
+    _, region_intensities = aggregate_by_region_from_arrays(chosen_regions, total_intensities, np.float64)
+
+    return {
+        "region_signal_voxels": arrays_to_value_dict(region_keys, region_voxels, int),
+        "region_signal_counts": arrays_to_value_dict(region_keys, region_counts, int),
+        "region_sum_intensity": arrays_to_value_dict(region_keys, region_intensities, float),
+    }
+
+
+def collapse_root_region_hemisphere_arrays_by_majority(roots, regions, hemispheres, counts, intensities):
+    """Collapse root-region-hemisphere arrays so each object contributes to one region and hemisphere."""
+    if roots.size == 0:
+        result = collapse_root_region_arrays_by_majority(roots, regions, counts, intensities)
+        result.update(
+            {
+                "region_signal_voxels_by_hemisphere": {},
+                "region_signal_counts_by_hemisphere": {},
+                "region_sum_intensity_by_hemisphere": {},
+            }
+        )
+        return result
+
+    region_roots, region_ids, region_counts, region_intensities = merge_root_region_arrays(
+        [roots],
+        [regions],
+        [counts],
+        [intensities],
+    )
+    base_result = collapse_root_region_arrays_by_majority(
+        region_roots,
+        region_ids,
+        region_counts,
+        region_intensities,
+    )
+
+    order = np.lexsort((hemispheres, regions, roots))
+    roots = roots[order]
+    regions = regions[order]
+    hemispheres = hemispheres[order]
+    counts = counts[order]
+    intensities = intensities[order]
+
+    group_starts = np.r_[0, np.flatnonzero(np.diff(roots)) + 1]
+    root_count = group_starts.size
+    chosen_regions = np.empty(root_count, dtype=np.int64)
+    chosen_hemispheres = np.empty(root_count, dtype=np.int8)
+    total_voxels = np.add.reduceat(counts, group_starts)
+    total_intensities = np.add.reduceat(intensities, group_starts)
+
+    for group_index, start_index in enumerate(group_starts):
+        stop_index = group_starts[group_index + 1] if group_index + 1 < root_count else roots.size
+        group_regions = regions[start_index:stop_index]
+        group_hemispheres = hemispheres[start_index:stop_index]
+        group_counts = counts[start_index:stop_index]
+
+        region_keys, region_voxels = aggregate_by_region_from_arrays(group_regions, group_counts, np.int64)
+        max_region_voxels = region_voxels.max()
+        chosen_regions[group_index] = region_keys[int(np.flatnonzero(region_voxels == max_region_voxels)[0])]
+
+        left_voxels = int(group_counts[group_hemispheres == LEFT_HEMISPHERE_ID].sum(dtype=np.int64))
+        right_voxels = int(group_counts[group_hemispheres == RIGHT_HEMISPHERE_ID].sum(dtype=np.int64))
+        chosen_hemispheres[group_index] = choose_majority_hemisphere(left_voxels, right_voxels)
+
+    pair_regions, pair_hemispheres, pair_voxels = aggregate_by_region_hemisphere_from_arrays(
+        chosen_regions,
+        chosen_hemispheres,
+        total_voxels,
+        np.int64,
+    )
+    _, _, pair_counts = aggregate_by_region_hemisphere_from_arrays(
+        chosen_regions,
+        chosen_hemispheres,
+        np.ones(root_count, dtype=np.int64),
+        np.int64,
+    )
+    _, _, pair_intensities = aggregate_by_region_hemisphere_from_arrays(
+        chosen_regions,
+        chosen_hemispheres,
+        total_intensities,
+        np.float64,
+    )
+
+    base_result["region_signal_voxels_by_hemisphere"] = arrays_to_pair_value_dict(
+        pair_regions,
+        pair_hemispheres,
+        pair_voxels,
+        int,
+    )
+    base_result["region_signal_counts_by_hemisphere"] = arrays_to_pair_value_dict(
+        pair_regions,
+        pair_hemispheres,
+        pair_counts,
+        int,
+    )
+    base_result["region_sum_intensity_by_hemisphere"] = arrays_to_pair_value_dict(
+        pair_regions,
+        pair_hemispheres,
+        pair_intensities,
+        float,
+    )
+    return base_result
+
+
 def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels):
     logger.info("Pass 3/3b: collapsing merged objects into per-region statistics...")
     kept_root_mask = root_sizes >= int(min_voxels)
     kept_root_mask[0] = False
 
-    region_pair_voxels = {}
-    region_pair_intensity = {}
-    region_hemisphere_pair_voxels = {}
-    region_hemisphere_pair_intensity = {}
+    root_chunks = []
+    region_chunks = []
+    count_chunks = []
+    intensity_chunks = []
+    hemisphere_root_chunks = []
+    hemisphere_region_chunks = []
+    hemisphere_id_chunks = []
+    hemisphere_count_chunks = []
+    hemisphere_intensity_chunks = []
     with tqdm(total=len(manifest_payload["blocks"]), desc="Region collapse", unit="block") as progress_bar:
         for block in manifest_payload["blocks"]:
+            if not block.get("artifact_path"):
+                progress_bar.update(1)
+                continue
+
             arrays = load_block_arrays(block["artifact_path"])
             if arrays["pair_component_ids"].size == 0:
                 progress_bar.update(1)
@@ -1308,21 +1621,10 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
             kept_counts = arrays["pair_voxel_counts"][keep_mask].astype(np.int64, copy=False)
             kept_intensity = arrays["pair_intensity_sums"][keep_mask].astype(np.float64, copy=False)
 
-            pair_values = np.empty(kept_roots.size, dtype=ROOT_REGION_DTYPE)
-            pair_values["root"] = kept_roots
-            pair_values["region"] = kept_regions
-            unique_pairs, inverse_index = np.unique(pair_values, return_inverse=True)
-
-            merged_counts = np.zeros(unique_pairs.shape[0], dtype=np.int64)
-            np.add.at(merged_counts, inverse_index, kept_counts)
-
-            merged_intensity = np.zeros(unique_pairs.shape[0], dtype=np.float64)
-            np.add.at(merged_intensity, inverse_index, kept_intensity)
-
-            for pair, voxel_count, intensity_sum in zip(unique_pairs.tolist(), merged_counts.tolist(), merged_intensity.tolist()):
-                pair_key = (int(pair[0]), int(pair[1]))
-                region_pair_voxels[pair_key] = region_pair_voxels.get(pair_key, 0) + int(voxel_count)
-                region_pair_intensity[pair_key] = region_pair_intensity.get(pair_key, 0.0) + float(intensity_sum)
+            root_chunks.append(kept_roots)
+            region_chunks.append(kept_regions)
+            count_chunks.append(kept_counts)
+            intensity_chunks.append(kept_intensity)
 
             if arrays.get("hemisphere_pair_component_ids", np.empty(0, dtype=np.int64)).size > 0:
                 hemisphere_root_ids = parent[arrays["hemisphere_pair_component_ids"]]
@@ -1334,55 +1636,48 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
                     kept_hemisphere_counts = arrays["hemisphere_pair_voxel_counts"][hemisphere_keep_mask].astype(np.int64, copy=False)
                     kept_hemisphere_intensity = arrays["hemisphere_pair_intensity_sums"][hemisphere_keep_mask].astype(np.float64, copy=False)
 
-                    hemisphere_pair_values = np.empty(
-                        kept_hemisphere_roots.size,
-                        dtype=ROOT_REGION_HEMISPHERE_DTYPE,
-                    )
-                    hemisphere_pair_values["root"] = kept_hemisphere_roots
-                    hemisphere_pair_values["region"] = kept_hemisphere_regions
-                    hemisphere_pair_values["hemisphere"] = kept_hemisphere_ids
-                    unique_hemisphere_pairs, hemisphere_inverse_index = np.unique(
-                        hemisphere_pair_values,
-                        return_inverse=True,
-                    )
-
-                    merged_hemisphere_counts = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.int64)
-                    np.add.at(merged_hemisphere_counts, hemisphere_inverse_index, kept_hemisphere_counts)
-
-                    merged_hemisphere_intensity = np.zeros(unique_hemisphere_pairs.shape[0], dtype=np.float64)
-                    np.add.at(
-                        merged_hemisphere_intensity,
-                        hemisphere_inverse_index,
-                        kept_hemisphere_intensity,
-                    )
-
-                    for pair, voxel_count, intensity_sum in zip(
-                        unique_hemisphere_pairs.tolist(),
-                        merged_hemisphere_counts.tolist(),
-                        merged_hemisphere_intensity.tolist(),
-                    ):
-                        pair_key = (int(pair[0]), int(pair[1]), int(pair[2]))
-                        region_hemisphere_pair_voxels[pair_key] = (
-                            region_hemisphere_pair_voxels.get(pair_key, 0) + int(voxel_count)
-                        )
-                        region_hemisphere_pair_intensity[pair_key] = (
-                            region_hemisphere_pair_intensity.get(pair_key, 0.0) + float(intensity_sum)
-                        )
+                    hemisphere_root_chunks.append(kept_hemisphere_roots)
+                    hemisphere_region_chunks.append(kept_hemisphere_regions)
+                    hemisphere_id_chunks.append(kept_hemisphere_ids)
+                    hemisphere_count_chunks.append(kept_hemisphere_counts)
+                    hemisphere_intensity_chunks.append(kept_hemisphere_intensity)
 
             progress_bar.update(1)
 
-    assign_hemisphere = bool(region_hemisphere_pair_voxels)
+    assign_hemisphere = bool(hemisphere_root_chunks)
     if assign_hemisphere:
-        collapsed_stats = collapse_component_stats_by_majority(
-            region_hemisphere_pair_voxels=region_hemisphere_pair_voxels,
-            region_hemisphere_pair_intensity=region_hemisphere_pair_intensity,
-            assign_hemisphere=True,
+        (
+            hemisphere_roots,
+            hemisphere_regions,
+            hemisphere_ids,
+            hemisphere_counts,
+            hemisphere_intensities,
+        ) = merge_root_region_hemisphere_arrays(
+            hemisphere_root_chunks,
+            hemisphere_region_chunks,
+            hemisphere_id_chunks,
+            hemisphere_count_chunks,
+            hemisphere_intensity_chunks,
+        )
+        collapsed_stats = collapse_root_region_hemisphere_arrays_by_majority(
+            hemisphere_roots,
+            hemisphere_regions,
+            hemisphere_ids,
+            hemisphere_counts,
+            hemisphere_intensities,
         )
     else:
-        collapsed_stats = collapse_component_stats_by_majority(
-            region_pair_voxels=region_pair_voxels,
-            region_pair_intensity=region_pair_intensity,
-            assign_hemisphere=False,
+        roots, regions, counts, intensities = merge_root_region_arrays(
+            root_chunks,
+            region_chunks,
+            count_chunks,
+            intensity_chunks,
+        )
+        collapsed_stats = collapse_root_region_arrays_by_majority(
+            roots,
+            regions,
+            counts,
+            intensities,
         )
 
     region_signal_voxels = collapsed_stats["region_signal_voxels"]
