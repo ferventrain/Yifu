@@ -73,8 +73,9 @@
     "mode": "atlas2image",
     "atlas_path": "data/reference/atlas.tiff",
     "annotation_path": "data/reference/atlas_label.tiff",
-    "transform_type": "SyN",
+    "transform_type": "SyNRA",
     "allow_reflection": false,
+    "flip_atlas": [false, false, false],
         "save_upsampled_label": false,
         "save_upsampled_label_zarr": true,
         "save_upsampled_label_hemisphere_zarr": false

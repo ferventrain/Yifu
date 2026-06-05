@@ -372,6 +372,7 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
     else:
         atlas_path = resolve_project_path(reg_cfg["atlas_path"])
         annotation_path = resolve_project_path(reg_cfg["annotation_path"])
+        transform_type = reg_cfg.get("transform_type", "SyN")
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.registration.ANTs_registration '
             f'--sample_dir "{sample_dir}" '
@@ -380,6 +381,7 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
             f'--atlas_image "{atlas_path}" '
             f'--atlas_label "{annotation_path}" '
             f'--mode {MAIN_PIPELINE_REGISTRATION_MODE} '
+            f'--registration_type {transform_type} '
             f'--save_registered_image '
             f'--save_transforms '
             f'--config "{config_path}"'
@@ -479,7 +481,7 @@ def run_density_analysis(
     mask_tiff_dir = sample_dir / f"ch{signal_ch}_mask"
     ensure_mask_zarr(mask_tiff_dir, mask_zarr_path, zarr_cfg)
 
-    output_excel = sample_dir / f"{sample_dir.name}_density_result.xlsx"
+    output_excel = sample_dir / f"sample_ch{signal_ch}_result.xlsx"
     resolution_xyz_str = format_csv(resolution_xyz)
 
     cmd = (

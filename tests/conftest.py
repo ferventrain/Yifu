@@ -35,6 +35,16 @@ def tiny_annotation_zarr(tmp_path):
 
 
 @pytest.fixture()
+def tiny_mask_zarr(tmp_path):
+    """A small binary vessel mask Zarr matching tiny_annotation_zarr."""
+    store = zarr.open(str(tmp_path / "mask.zarr"), mode="w")
+    arr = store.zeros("0", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="uint8")
+    arr[1:3, 1:3, 1:3] = 1
+    arr[5:7, 1:3, 1:3] = 1
+    return tmp_path / "mask.zarr"
+
+
+@pytest.fixture()
 def tiny_skeleton_csvs(tmp_path):
     """Skeleton vertex + edge CSVs covering two regions (labels 10 and 20)."""
     n_vertices = 20

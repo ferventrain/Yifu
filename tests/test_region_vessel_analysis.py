@@ -106,12 +106,13 @@ class TestResolveRegionQuery:
 
 class TestAnalyzeRegionsFromSkeleton:
     def test_returns_summary_table(
-        self, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_region_csv
+        self, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_mask_zarr, tiny_region_csv
     ):
         vertex_csv, edge_csv = tiny_skeleton_csvs
         result = analyze_regions_from_skeleton(
             vertex_csv_path=vertex_csv,
             edge_csv_path=edge_csv,
+            mask_zarr_path=tiny_mask_zarr,
             annotation_zarr_path=tiny_annotation_zarr,
             region_cfg_csv=tiny_region_csv,
             regions="RA,RB",
@@ -121,15 +122,19 @@ class TestAnalyzeRegionsFromSkeleton:
         assert "summary_table" in result
         df = result["summary_table"]
         assert set(df["query"]) == {"RA", "RB"}
+        assert "vessel_volume_um3" in df.columns
+        assert "branch_point_path_length_sd_um" in df.columns
+        assert "num_edges" not in df.columns
 
     def test_writes_csv_and_json(
-        self, tmp_path, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_region_csv
+        self, tmp_path, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_mask_zarr, tiny_region_csv
     ):
         vertex_csv, edge_csv = tiny_skeleton_csvs
         out_dir = tmp_path / "region_out"
         result = analyze_regions_from_skeleton(
             vertex_csv_path=vertex_csv,
             edge_csv_path=edge_csv,
+            mask_zarr_path=tiny_mask_zarr,
             annotation_zarr_path=tiny_annotation_zarr,
             region_cfg_csv=tiny_region_csv,
             regions="RA",
@@ -141,7 +146,7 @@ class TestAnalyzeRegionsFromSkeleton:
         assert result["manifest_path"].exists()
 
     def test_defaults_to_sample_label_zarr_and_config_resolution(
-        self, tmp_path, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_region_csv
+        self, tmp_path, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_mask_zarr, tiny_region_csv
     ):
         import shutil
 
@@ -149,7 +154,9 @@ class TestAnalyzeRegionsFromSkeleton:
         tubule_dir = sample_dir / "tubule_reconstruction"
         tubule_dir.mkdir(parents=True)
         default_label_zarr = sample_dir / "upsampled_atlas_label.zarr"
+        default_mask_zarr = sample_dir / "ch1_mask.zarr"
         shutil.copytree(tiny_annotation_zarr, default_label_zarr)
+        shutil.copytree(tiny_mask_zarr, default_mask_zarr)
 
         vertex_csv, edge_csv = tiny_skeleton_csvs
         default_vertex_csv = tubule_dir / "skeleton_vertices.csv"
@@ -174,13 +181,14 @@ class TestAnalyzeRegionsFromSkeleton:
         assert "summary_table" in result
 
     def test_empty_regions_raises(
-        self, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_region_csv
+        self, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_mask_zarr, tiny_region_csv
     ):
         vertex_csv, edge_csv = tiny_skeleton_csvs
         with pytest.raises(ValueError):
             analyze_regions_from_skeleton(
                 vertex_csv_path=vertex_csv,
                 edge_csv_path=edge_csv,
+                mask_zarr_path=tiny_mask_zarr,
                 annotation_zarr_path=tiny_annotation_zarr,
                 region_cfg_csv=tiny_region_csv,
                 regions="",
@@ -188,12 +196,13 @@ class TestAnalyzeRegionsFromSkeleton:
             )
 
     def test_missing_vertex_csv_raises(
-        self, tmp_path, tiny_annotation_zarr, tiny_region_csv
+        self, tmp_path, tiny_annotation_zarr, tiny_mask_zarr, tiny_region_csv
     ):
         with pytest.raises(Exception):
             analyze_regions_from_skeleton(
                 vertex_csv_path=tmp_path / "ghost_vertices.csv",
                 edge_csv_path=tmp_path / "ghost_edges.csv",
+                mask_zarr_path=tiny_mask_zarr,
                 annotation_zarr_path=tiny_annotation_zarr,
                 region_cfg_csv=tiny_region_csv,
                 regions="RA",

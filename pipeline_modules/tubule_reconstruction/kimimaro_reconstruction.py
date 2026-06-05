@@ -1543,98 +1543,105 @@ def summarize_vessel_network(binary_mask, skeletons, branch_table, resolution_xy
     voxel_volume = float(np.prod(tuple(float(v) for v in resolution_xyz)))
     mask_voxels = int(np.count_nonzero(binary_mask))
 
-    total_vertices = 0
-    total_edges = 0
     total_branch_points = 0
-    total_end_points = 0
-    mean_radii = []
 
     for skeleton in skeletons.values():
         vertices = np.asarray(getattr(skeleton, "vertices", np.empty((0, 3))))
         edges = np.asarray(getattr(skeleton, "edges", np.empty((0, 2))))
-        total_vertices += int(len(vertices))
-        total_edges += int(len(edges))
 
         adjacency = _build_adjacency(len(vertices), edges) if len(vertices) > 0 else []
         degrees = np.array([len(neighbors) for neighbors in adjacency], dtype=np.int64) if adjacency else np.empty(0, dtype=np.int64)
         total_branch_points += int(np.sum(degrees >= 3))
-        total_end_points += int(np.sum(degrees == 1))
 
-        radii = _get_skeleton_radii(skeleton)
-        if radii is not None:
-            mean_radii.append(float(np.mean(radii)))
-
-    branch_lengths = branch_table["branch_length_um"].to_numpy(dtype=np.float64) if not branch_table.empty else np.empty(0, dtype=np.float64)
-    tortuosities = branch_table["tortuosity"].to_numpy(dtype=np.float64) if not branch_table.empty else np.empty(0, dtype=np.float64)
+    path_lengths = _branch_to_branch_lengths(branch_table)
+    tortuosities = _finite_column_values(branch_table, "tortuosity")
+    branch_depths = _finite_column_values(branch_table, "branch_depth")
     valid_tortuosities = tortuosities[np.isfinite(tortuosities)]
+    valid_branch_depths = branch_depths[np.isfinite(branch_depths)]
 
     summary = {
-        "num_skeletons": int(len(skeletons)),
-        "num_branches": int(len(branch_table)),
-        "num_vertices": int(total_vertices),
-        "num_edges": int(total_edges),
         "num_branch_points": int(total_branch_points),
-        "num_end_points": int(total_end_points),
         "mask_voxels": int(mask_voxels),
-        "mask_volume_um3": float(mask_voxels * voxel_volume),
-        "total_branch_length_um": float(branch_lengths.sum()) if branch_lengths.size > 0 else 0.0,
-        "mean_branch_length_um": float(branch_lengths.mean()) if branch_lengths.size > 0 else 0.0,
-        "median_branch_length_um": float(np.median(branch_lengths)) if branch_lengths.size > 0 else 0.0,
-        "max_branch_length_um": float(branch_lengths.max()) if branch_lengths.size > 0 else 0.0,
+        "vessel_volume_um3": float(mask_voxels * voxel_volume),
+        "branch_point_path_length_sum_um": float(path_lengths.sum()) if path_lengths.size > 0 else 0.0,
+        "branch_point_path_length_mean_um": float(path_lengths.mean()) if path_lengths.size > 0 else np.nan,
+        "branch_point_path_length_sd_um": float(path_lengths.std(ddof=1)) if path_lengths.size > 1 else np.nan,
         "mean_tortuosity": float(valid_tortuosities.mean()) if valid_tortuosities.size > 0 else np.nan,
-        "mean_skeleton_radius_um": float(np.mean(mean_radii)) if mean_radii else np.nan,
+        "mean_branch_depth": float(valid_branch_depths.mean()) if valid_branch_depths.size > 0 else np.nan,
     }
     return summary
+
+
+def _finite_column_values(table, column):
+    if table.empty or column not in table.columns:
+        return np.empty(0, dtype=np.float64)
+    values = table[column].to_numpy(dtype=np.float64)
+    return values[np.isfinite(values)]
+
+
+def _branch_to_branch_lengths(branch_table):
+    if branch_table.empty or "branch_length_um" not in branch_table.columns:
+        return np.empty(0, dtype=np.float64)
+    if "is_branch_to_branch" in branch_table.columns:
+        mask = branch_table["is_branch_to_branch"].fillna(False).astype(bool).to_numpy()
+    elif {"start_degree", "end_degree"}.issubset(branch_table.columns):
+        mask = (
+            (branch_table["start_degree"].to_numpy(dtype=np.float64) >= 3)
+            & (branch_table["end_degree"].to_numpy(dtype=np.float64) >= 3)
+        )
+    else:
+        mask = np.ones(len(branch_table), dtype=bool)
+    lengths = branch_table.loc[mask, "branch_length_um"].to_numpy(dtype=np.float64)
+    return lengths[np.isfinite(lengths)]
+
+
+def _count_branch_points_from_branch_table(branch_table):
+    if branch_table.empty:
+        return 0
+    points = set()
+    if {"skeleton_id", "start_node", "start_degree"}.issubset(branch_table.columns):
+        starts = branch_table.loc[
+            branch_table["start_degree"].to_numpy(dtype=np.float64) >= 3,
+            ["skeleton_id", "start_node"],
+        ]
+        points.update((int(row.skeleton_id), int(row.start_node)) for row in starts.itertuples(index=False))
+    if {"skeleton_id", "end_node", "end_degree"}.issubset(branch_table.columns):
+        ends = branch_table.loc[
+            branch_table["end_degree"].to_numpy(dtype=np.float64) >= 3,
+            ["skeleton_id", "end_node"],
+        ]
+        points.update((int(row.skeleton_id), int(row.end_node)) for row in ends.itertuples(index=False))
+    return int(len(points))
 
 
 def summarize_branch_table(branch_table):
     if branch_table.empty:
         return {
-            "num_skeletons": 0,
-            "num_branches": 0,
-            "num_vertices": 0,
-            "num_edges": 0,
             "num_branch_points": 0,
-            "num_end_points": 0,
             "mask_voxels": 0,
-            "mask_volume_um3": 0.0,
-            "total_branch_length_um": 0.0,
-            "mean_branch_length_um": 0.0,
-            "median_branch_length_um": 0.0,
-            "max_branch_length_um": 0.0,
+            "vessel_volume_um3": 0.0,
+            "branch_point_path_length_sum_um": 0.0,
+            "branch_point_path_length_mean_um": np.nan,
+            "branch_point_path_length_sd_um": np.nan,
             "mean_tortuosity": np.nan,
-            "mean_skeleton_radius_um": np.nan,
-            "num_terminal_branches": 0,
-            "max_branch_depth": None,
+            "mean_branch_depth": np.nan,
         }
 
-    lengths = branch_table["branch_length_um"].to_numpy(dtype=np.float64)
-    tortuosities = branch_table["tortuosity"].to_numpy(dtype=np.float64)
+    path_lengths = _branch_to_branch_lengths(branch_table)
+    tortuosities = _finite_column_values(branch_table, "tortuosity")
     valid_tortuosities = tortuosities[np.isfinite(tortuosities)]
-    radius_values = branch_table["mean_radius_um"].to_numpy(dtype=np.float64)
-    valid_radii = radius_values[np.isfinite(radius_values)]
+    branch_depths = _finite_column_values(branch_table, "branch_depth")
+    valid_branch_depths = branch_depths[np.isfinite(branch_depths)]
 
     return {
-        "num_skeletons": int(branch_table["skeleton_id"].nunique()),
-        "num_branches": int(len(branch_table)),
-        "num_vertices": None,
-        "num_edges": None,
-        "num_branch_points": None,
-        "num_end_points": None,
+        "num_branch_points": _count_branch_points_from_branch_table(branch_table),
         "mask_voxels": None,
-        "mask_volume_um3": None,
-        "total_branch_length_um": float(lengths.sum()),
-        "mean_branch_length_um": float(lengths.mean()),
-        "median_branch_length_um": float(np.median(lengths)),
-        "max_branch_length_um": float(lengths.max()),
+        "vessel_volume_um3": None,
+        "branch_point_path_length_sum_um": float(path_lengths.sum()) if path_lengths.size > 0 else 0.0,
+        "branch_point_path_length_mean_um": float(path_lengths.mean()) if path_lengths.size > 0 else np.nan,
+        "branch_point_path_length_sd_um": float(path_lengths.std(ddof=1)) if path_lengths.size > 1 else np.nan,
         "mean_tortuosity": float(valid_tortuosities.mean()) if valid_tortuosities.size > 0 else np.nan,
-        "mean_skeleton_radius_um": float(valid_radii.mean()) if valid_radii.size > 0 else np.nan,
-        "num_terminal_branches": int(branch_table["is_terminal_branch"].fillna(False).astype(bool).sum())
-        if "is_terminal_branch" in branch_table.columns
-        else None,
-        "max_branch_depth": int(np.nanmax(branch_table["branch_depth"].to_numpy(dtype=np.float64)))
-        if ("branch_depth" in branch_table.columns and np.any(np.isfinite(branch_table["branch_depth"].to_numpy(dtype=np.float64))))
-        else None,
+        "mean_branch_depth": float(valid_branch_depths.mean()) if valid_branch_depths.size > 0 else np.nan,
     }
 
 
@@ -1663,6 +1670,14 @@ def summarize_graph_from_skeleton_tables(vertex_table, edge_table):
         "num_end_points": int((degrees == 1).sum()),
         "num_end_points_non_boundary": int(((degrees == 1) & (~boundary_mask)).sum()),
     }
+
+
+def _update_summary_from_branch_table(summary, branch_table):
+    branch_summary = summarize_branch_table(branch_table)
+    for key, value in branch_summary.items():
+        if key in {"mask_voxels", "vessel_volume_um3"} and value is None:
+            continue
+        summary[key] = value
 
 
 def _write_summary_json(summary, output_path):
@@ -1747,6 +1762,7 @@ def analyze_binary_mask_zarr(
             # Rewrite branch CSV with cleaned data
             branch_table.to_csv(branch_csv_path, index=False)
             result["branch_table"] = branch_table
+            _update_summary_from_branch_table(summary, branch_table)
 
         vertex_csv_path, edge_csv_path = _write_skeleton_tables(vertex_table, edge_table, output_root)
         result["vertex_table"] = vertex_table
@@ -1924,7 +1940,7 @@ def analyze_binary_mask_zarr_chunkwise(
     summary["processed_chunks"] = int(len(chunk_indices))
     summary["connected_components"] = int(total_components)
     summary["mask_voxels"] = int(total_mask_voxels)
-    summary["mask_volume_um3"] = float(total_mask_voxels * np.prod(tuple(float(v) for v in resolution_xyz)))
+    summary["vessel_volume_um3"] = float(total_mask_voxels * np.prod(tuple(float(v) for v in resolution_xyz)))
     summary["halo_zyx"] = [int(v) for v in halo_zyx]
     summary["process_existing_only"] = bool(process_existing_only)
     summary["stitch_enabled"] = bool(stitch)
@@ -1987,6 +2003,7 @@ def analyze_binary_mask_zarr_chunkwise(
             combined_branch_table = cleaned_branch_table
             combined_branch_table.to_csv(branch_csv_path, index=False)
             result["branch_table"] = combined_branch_table
+            _update_summary_from_branch_table(summary, combined_branch_table)
             # Rewrite skeleton tables with cleaned data
             vertex_csv_path, edge_csv_path = _write_skeleton_tables(combined_vertex_table, combined_edge_table, output_root)
             result["vertex_table"] = combined_vertex_table
@@ -2000,7 +2017,7 @@ def analyze_binary_mask_zarr_chunkwise(
             result["swc_paths"] = swc_paths
 
         graph_summary = summarize_graph_from_skeleton_tables(combined_vertex_table, combined_edge_table)
-        summary.update(graph_summary)
+        summary["num_branch_points"] = graph_summary["num_branch_points"]
 
     _write_summary_json(summary, summary_json_path)
 

@@ -125,6 +125,26 @@ class BidirectionalRegistration:
         if config_path and os.path.exists(config_path):
             registration_config = full_config.get("registration", {})
         self.registration_config = registration_config
+
+        # Flip atlas if configured
+        flip_atlas = registration_config.get("flip_atlas", [False, False, False])
+        if any(flip_atlas):
+            flip_axes = tuple(i for i, flip in enumerate(flip_atlas) if flip)
+            logger.info("Flipping atlas along axis indices %s (x=%s, y=%s, z=%s)",
+                        flip_axes, flip_atlas[0], flip_atlas[1], flip_atlas[2])
+            self.atlas_image = ants.from_numpy(
+                np.flip(self.atlas_image.numpy(), axis=flip_axes).copy(),
+                spacing=self.atlas_image.spacing,
+                origin=self.atlas_image.origin,
+                direction=self.atlas_image.direction,
+            )
+            self.atlas_label = ants.from_numpy(
+                np.flip(self.atlas_label.numpy(), axis=flip_axes).copy(),
+                spacing=self.atlas_label.spacing,
+                origin=self.atlas_label.origin,
+                direction=self.atlas_label.direction,
+            )
+
         self.save_upsampled_label = bool(registration_config.get("save_upsampled_label", True))
         self.save_upsampled_label_zarr = bool(registration_config.get("save_upsampled_label_zarr", True))
         self.zarr_chunk_size = tuple(
@@ -389,8 +409,9 @@ class BidirectionalRegistration:
                         else:
                             from pipeline_modules.registration.atlas_label_to_hemisphere import convert_atlas_label_to_hemisphere
 
+                            hemisphere_input = label_zarr if label_zarr.exists() else label_dir
                             convert_atlas_label_to_hemisphere(
-                                label_dir,
+                                hemisphere_input,
                                 hemisphere_zarr,
                                 chunk_size=self.zarr_chunk_size,
                                 dataset_name="0",
@@ -482,7 +503,7 @@ def main():
     parser.add_argument('--register_channel', required=True, help='Registration channel')
     parser.add_argument('--save_registered_image', action='store_true', help='Save registered image')
     parser.add_argument('--mode', default='atlas2image', choices=['atlas2image', 'image2atlas'], help='Direction')
-    parser.add_argument('--registration_type', default='SyN', choices=['Rigid', 'Affine', 'SyN', 'SyNRA'])
+    parser.add_argument('--registration_type', default='SyN', choices=['Rigid', 'Affine', 'SyN', 'SyNRA', 'ElasticSyN'])
     parser.add_argument('--upsample_method', default='nearest', choices=['nearest', 'linear', 'cubic', 'quintic'])
     parser.add_argument('--chunk_size', type=int, default=50, help='Chunk size for upsampling')
     parser.add_argument('--save_transforms', action='store_true', help='Save transforms')
