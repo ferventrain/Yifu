@@ -107,6 +107,111 @@ def counts_to_density_volume(
     return volume / bin_volume_mm3
 
 
+def mean_voxels_per_cell(
+    resolution_xyz_um: tuple[float, float, float],
+    mean_cell_volume_um3: float,
+) -> float:
+    res_x, res_y, res_z = resolution_xyz_um
+    native_voxel_um3 = float(res_x) * float(res_y) * float(res_z)
+    if native_voxel_um3 <= 0:
+        raise ValueError(f"Invalid native voxel volume from resolution_xyz_um={resolution_xyz_um}")
+    if mean_cell_volume_um3 <= 0:
+        raise ValueError(f"mean_cell_volume_um3 must be > 0, got {mean_cell_volume_um3}")
+    return float(mean_cell_volume_um3) / native_voxel_um3
+
+
+def voxel_density_to_cell_density(
+    voxel_density: np.ndarray,
+    *,
+    resolution_xyz_um: tuple[float, float, float],
+    mean_cell_volume_um3: float,
+) -> np.ndarray:
+    """Convert foreground voxel density (voxels/mm³) to cell density (cells/mm³)."""
+    voxels_per_cell = mean_voxels_per_cell(resolution_xyz_um, mean_cell_volume_um3)
+    return np.asarray(voxel_density, dtype=np.float32) / voxels_per_cell
+
+
+def linspace_bregma_coords(start_mm: float, end_mm: float, count: int) -> list[float]:
+    if count < 1:
+        raise ValueError("slice count must be >= 1")
+    if count == 1:
+        return [float(start_mm)]
+    values = np.linspace(float(start_mm), float(end_mm), int(count), dtype=np.float64)
+    return [float(round(value, 4)) for value in values]
+
+
+def sample_has_batch_inputs(sample_dir: str | Path) -> bool:
+    sample_dir = Path(sample_dir)
+    if not sample_dir.is_dir():
+        return False
+    if any(sample_dir.glob("*_mask.zarr")):
+        return True
+    return default_sample_stack_volume(sample_dir).exists()
+
+
+def discover_sample_dirs(samples_root: str | Path) -> list[Path]:
+    samples_root = Path(samples_root)
+    if not samples_root.is_dir():
+        raise NotADirectoryError(f"samples_root is not a directory: {samples_root}")
+    discovered = [child for child in sorted(samples_root.iterdir()) if sample_has_batch_inputs(child)]
+    if not discovered:
+        raise FileNotFoundError(
+            "No sample directories with *_mask.zarr or visualization/*_heatmap3d_volume.tiff "
+            f"found under: {samples_root}"
+        )
+    return discovered
+
+
+def prepare_smoothed_voxel_density_volume(
+    atlas_count_volume: np.ndarray,
+    atlas_mask: np.ndarray,
+    *,
+    target_resolution_xyz: tuple[float, float, float],
+    volume_mode: str,
+    sigma: float,
+    alpha: float,
+) -> np.ndarray:
+    density_input = counts_to_density_volume(
+        np.asarray(atlas_count_volume, dtype=np.float32),
+        target_resolution_xyz=target_resolution_xyz,
+        volume_mode=volume_mode,
+    )
+    local_signal = build_local_signal_volume(
+        density_input,
+        sigma=float(sigma),
+        alpha=float(alpha),
+        atlas_mask=atlas_mask,
+        normalize=False,
+    )
+    return local_signal / max(float(alpha), 1e-12)
+
+
+def compute_shared_density_vmax(
+    density_volumes: list[np.ndarray],
+    atlas_mask: np.ndarray,
+    *,
+    density_vmin: float = 0.0,
+    percentile: float = 99.5,
+    explicit_vmax: float | None = None,
+) -> float:
+    if explicit_vmax is not None:
+        return float(explicit_vmax)
+    brain = np.asarray(atlas_mask) > 0
+    max_value = float(density_vmin)
+    for volume in density_volumes:
+        values = np.asarray(volume, dtype=np.float32)[brain]
+        positive = values[values > float(density_vmin)]
+        if positive.size:
+            max_value = max(max_value, float(np.percentile(positive, float(percentile))))
+    if max_value <= float(density_vmin):
+        max_value = float(density_vmin) + 1e-6
+    return max_value
+
+
+def default_cell_density_slice_dir(sample_dir: str | Path) -> Path:
+    return Path(sample_dir) / "visualization" / "cell_density_slices"
+
+
 def default_sample_points_csv(sample_dir: str | Path) -> Path:
     return Path(sample_dir) / "visualization" / "points.csv"
 
@@ -484,6 +589,303 @@ def render_heatmap_stack(
     }
 
 
+def ensure_atlas_count_volume(
+    *,
+    sample_dir: str | Path,
+    signal_ch: str,
+    register_ch: str,
+    mask_zarr: str | Path | None,
+    dataset_name: str,
+    sample_reference_nii: str | Path | None,
+    atlas_image: str | Path,
+    transforms_dir: str | Path | None,
+    transforms: str,
+    resolution_xyz: str | tuple[float, float, float],
+    target_resolution_xyz: str | tuple[float, float, float],
+    foreground_mode: str,
+    foreground_label: int,
+    block_shape: str,
+    min_voxels_per_point: int,
+    volume_mode: str,
+    output_volume: str | Path | None = None,
+) -> tuple[np.ndarray, Path, dict[str, object]]:
+    if ants is None:
+        raise ImportError("ANTsPy is required to build atlas-space volumes.")
+
+    from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
+        accumulate_sample_grid,
+        parse_block_shape,
+        parse_triplet,
+        resolve_inverse_transforms,
+        resolve_mask_zarr,
+        resolve_sample_reference_nii,
+        warp_sample_grid_to_atlas,
+        write_volume_output,
+    )
+    from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
+
+    sample_dir = Path(sample_dir)
+    sample_dir_value = sample_dir if sample_dir else None
+    cached_volume_path = Path(output_volume) if output_volume else default_sample_stack_volume(sample_dir)
+    if isinstance(target_resolution_xyz, tuple):
+        target_resolution = tuple(float(value) for value in target_resolution_xyz)
+    else:
+        target_resolution = parse_triplet(target_resolution_xyz, name="target_resolution_xyz")
+    if isinstance(resolution_xyz, tuple):
+        resolution = tuple(float(value) for value in resolution_xyz)
+    else:
+        resolution = parse_triplet(resolution_xyz, name="resolution_xyz")
+
+    summary: dict[str, object] = {
+        "cached_volume_path": str(cached_volume_path),
+        "volume_mode": volume_mode,
+        "target_resolution_xyz": list(target_resolution),
+        "resolution_xyz": list(resolution),
+        "atlas_image": str(atlas_image),
+    }
+
+    cached_mode = _load_cached_volume_mode(cached_volume_path)
+    use_cached_volume = cached_volume_path.exists() and (cached_mode is None or cached_mode == volume_mode)
+    if cached_volume_path.exists() and cached_mode is not None and cached_mode != volume_mode:
+        print(
+            f"Cached atlas volume uses volume_mode={cached_mode!r}; "
+            f"recomputing with requested volume_mode={volume_mode!r}."
+        )
+
+    if use_cached_volume:
+        print(f"Using cached atlas-space volume: {cached_volume_path}")
+        atlas_volume = read_tiff_stack(cached_volume_path)
+        summary["cache_hit"] = True
+        summary["output_volume"] = str(cached_volume_path)
+        return atlas_volume, cached_volume_path, summary
+
+    mask_zarr_path = resolve_mask_zarr(
+        sample_dir=sample_dir_value,
+        signal_ch=signal_ch,
+        mask_zarr=mask_zarr,
+    )
+    sample_reference_path = resolve_sample_reference_nii(
+        sample_dir=sample_dir_value,
+        register_ch=register_ch,
+        sample_reference_nii=sample_reference_nii,
+    )
+    transforms_root = transforms_dir or str(Path(sample_reference_path).parents[1] / "transforms")
+    transformlist = resolve_inverse_transforms(transforms_root, transforms)
+    if not transformlist:
+        raise ValueError(f"No inverse transforms found under: {transforms_root}")
+
+    summary.update(
+        {
+            "sample_reference_nii": str(sample_reference_path),
+            "transformlist": transformlist,
+        }
+    )
+
+    sample_ref = ants.image_read(str(sample_reference_path))
+    sample_shape_zyx = tuple(int(value) for value in sample_ref.shape[::-1])
+    arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
+    fallback_block_shape = tuple(int(value) for value in (getattr(arr, "chunks", None) or arr.shape))
+    resolved_block_shape = parse_block_shape(block_shape, fallback_block_shape)
+
+    print("Binning sample mask into atlas registration grid")
+    sample_volume, bin_summary = accumulate_sample_grid(
+        mask_zarr_path,
+        resolution_xyz=resolution,
+        target_resolution_xyz=target_resolution,
+        output_shape_zyx=sample_shape_zyx,
+        dataset_name=dataset_name,
+        foreground_mode=foreground_mode,
+        foreground_label=foreground_label,
+        block_shape=resolved_block_shape,
+        min_voxels_per_point=min_voxels_per_point,
+        volume_mode=volume_mode,
+    )
+    summary.update(bin_summary)
+    print("Warping binned volume into atlas space")
+    atlas_volume, raw_atlas_spacing_xyz = warp_sample_grid_to_atlas(
+        sample_volume,
+        sample_reference_nii=sample_reference_path,
+        atlas_image=atlas_image,
+        transformlist=transformlist,
+        interpolator="linear" if volume_mode == "count" else "nearestNeighbor",
+        binarize=volume_mode == "binary",
+    )
+    summary["raw_atlas_image_spacing_xyz"] = list(raw_atlas_spacing_xyz)
+
+    print(f"Writing cached atlas-space volume to: {cached_volume_path}")
+    cached_volume_path.parent.mkdir(parents=True, exist_ok=True)
+    write_volume_output(atlas_volume, cached_volume_path)
+    volume_meta_path = cached_volume_path.with_suffix(".json")
+    with volume_meta_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "volume_mode": volume_mode,
+                "target_resolution_xyz": list(target_resolution),
+                "output_volume": str(cached_volume_path),
+            },
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+    summary["cache_hit"] = False
+    summary["output_volume"] = str(cached_volume_path)
+    summary["volume_meta"] = str(volume_meta_path)
+    return atlas_volume, cached_volume_path, summary
+
+
+def generate_batch_cell_density_slices(
+    *,
+    samples_root: str | Path,
+    mean_cell_volume_um3: float,
+    config_path: str | Path | None = None,
+    label_path: str | Path | None = None,
+    atlas_image: str | Path | None = None,
+    bregma_start: float = 1.1,
+    bregma_end: float = -5.2,
+    slice_count: int = 12,
+    plane: str = "coronal",
+    coord_system: str = "bregma-mm",
+    atlas_resolution_um: float = 25.0,
+    bregma_index: tuple[int, int, int] = (18, 216, 228),
+    sigma: float = 10.0,
+    alpha: float = 2.0,
+    volume_mode: str = "count",
+    density_vmin: float = 0.0,
+    density_vmax: float | None = None,
+    density_percentile: float = 99.5,
+    cmap_name: str = "white_blue_red",
+    dpi: int = 300,
+    line_width: float = 0.16,
+    brain_outline_width: float = 0.42,
+    show_region_contours: bool = True,
+    colorbar_label: str = "cell density (cells/mm³)",
+    output_subdir: str = "cell_density_slices",
+    foreground_mode: str = "equal",
+    foreground_label: int = 1,
+    block_shape: str = "",
+    min_voxels_per_point: int = 1,
+    dataset_name: str = "0",
+) -> dict[str, object]:
+    sample_dirs = discover_sample_dirs(samples_root)
+    label_path = Path(label_path or DEFAULT_ATLAS_LABEL)
+    labels = np.asarray(tifffile.imread(str(label_path)))
+    atlas_image_path = Path(atlas_image or default_reference_dir() / "atlas.nii.gz")
+    bregma_coords = linspace_bregma_coords(bregma_start, bregma_end, slice_count)
+
+    cell_density_volumes: dict[str, np.ndarray] = {}
+    sample_summaries: dict[str, object] = {}
+    for sample_dir in sample_dirs:
+        defaults = resolve_sample_stack_defaults(sample_dir, config_path=config_path)
+        resolution_xyz = tuple(float(value) for value in defaults["resolution_xyz"])  # type: ignore[arg-type]
+        target_resolution_xyz = tuple(float(value) for value in defaults["target_resolution_xyz"])  # type: ignore[arg-type]
+        atlas_volume, cached_volume_path, volume_summary = ensure_atlas_count_volume(
+            sample_dir=sample_dir,
+            signal_ch=str(defaults["signal_ch"]),
+            register_ch=str(defaults["register_ch"]),
+            mask_zarr=defaults["mask_zarr"],
+            dataset_name=dataset_name,
+            sample_reference_nii=defaults["sample_reference_nii"],
+            atlas_image=atlas_image_path,
+            transforms_dir=defaults["transforms_dir"],
+            transforms="",
+            resolution_xyz=resolution_xyz,
+            target_resolution_xyz=target_resolution_xyz,
+            foreground_mode=foreground_mode,
+            foreground_label=foreground_label,
+            block_shape=block_shape,
+            min_voxels_per_point=min_voxels_per_point,
+            volume_mode=volume_mode,
+        )
+        voxel_density = prepare_smoothed_voxel_density_volume(
+            atlas_volume,
+            labels,
+            target_resolution_xyz=target_resolution_xyz,
+            volume_mode=volume_mode,
+            sigma=sigma,
+            alpha=alpha,
+        )
+        cell_density = voxel_density_to_cell_density(
+            voxel_density,
+            resolution_xyz_um=resolution_xyz,
+            mean_cell_volume_um3=mean_cell_volume_um3,
+        )
+        cell_density_volumes[str(sample_dir)] = cell_density
+        sample_summaries[str(sample_dir)] = {
+            "cached_volume": str(cached_volume_path),
+            "resolution_xyz": list(resolution_xyz),
+            "mean_cell_volume_um3": float(mean_cell_volume_um3),
+            "voxels_per_cell": mean_voxels_per_cell(resolution_xyz, mean_cell_volume_um3),
+            **volume_summary,
+        }
+
+    shared_vmax = compute_shared_density_vmax(
+        list(cell_density_volumes.values()),
+        labels,
+        density_vmin=density_vmin,
+        percentile=density_percentile,
+        explicit_vmax=density_vmax,
+    )
+    print(
+        "Shared cell density color scale: "
+        f"min={density_vmin:g}, max={shared_vmax:g} cells/mm³ "
+        f"(percentile={density_percentile}, samples={len(sample_dirs)})"
+    )
+
+    outputs_by_sample: dict[str, list[str]] = {}
+    for sample_dir in sample_dirs:
+        cell_density = cell_density_volumes[str(sample_dir)]
+        out_dir = Path(sample_dir) / "visualization" / output_subdir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sample_outputs: list[str] = []
+        for ap_mm in bregma_coords:
+            output_path = out_dir / f"bregma_{ap_mm}mm.png"
+            spec = AtlasSliceSpec(
+                plane=plane,
+                coordinate_system=coord_system,
+                coordinate=ap_mm,
+                atlas_resolution_um=atlas_resolution_um,
+                bregma_index=bregma_index,
+            )
+            render_local_signal_atlas_slice(
+                cell_density,
+                label_path,
+                spec,
+                output_path,
+                cmap_name=cmap_name,
+                vmin=float(density_vmin),
+                vmax=float(shared_vmax),
+                dpi=int(dpi),
+                line_width=float(line_width),
+                brain_outline_width=float(brain_outline_width),
+                show_region_contours=show_region_contours,
+                colorbar_label=colorbar_label,
+            )
+            sample_outputs.append(str(output_path))
+        outputs_by_sample[str(sample_dir)] = sample_outputs
+        print(f"Wrote {len(sample_outputs)} cell density slices to: {out_dir}")
+
+    summary_path = Path(samples_root) / "visualization" / "batch_cell_density_slices.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mode": "batch-cell-density-slices",
+        "samples_root": str(samples_root),
+        "sample_dirs": [str(path) for path in sample_dirs],
+        "mean_cell_volume_um3": float(mean_cell_volume_um3),
+        "bregma_coords_mm": bregma_coords,
+        "shared_density_vmin": float(density_vmin),
+        "shared_density_vmax": float(shared_vmax),
+        "density_percentile": float(density_percentile),
+        "show_region_contours": bool(show_region_contours),
+        "colorbar_label": colorbar_label,
+        "outputs_by_sample": outputs_by_sample,
+        "sample_summaries": sample_summaries,
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    payload["summary_json"] = str(summary_path)
+    return payload
+
+
 def generate_sample_stack_heatmap(
     *,
     sample_dir: str | Path | None,
@@ -523,122 +925,47 @@ def generate_sample_stack_heatmap(
         raise ImportError("ANTsPy is required for --mode sample-stack.")
 
     from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
-        accumulate_sample_grid,
         atlas_volume_to_points,
-        parse_block_shape,
         parse_triplet,
-        resolve_inverse_transforms,
-        resolve_mask_zarr,
-        resolve_sample_reference_nii,
         resolve_atlas_resolution_xyz,
         write_outputs,
-        warp_sample_grid_to_atlas,
-        write_volume_output,
     )
-    from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
 
-    print("Stage 1/4: resolve sample inputs")
-    sample_dir_value = sample_dir if sample_dir else None
-    mask_zarr_path = resolve_mask_zarr(
-        sample_dir=sample_dir_value,
-        signal_ch=signal_ch,
-        mask_zarr=mask_zarr,
-    )
-    sample_reference_path = resolve_sample_reference_nii(
-        sample_dir=sample_dir_value,
-        register_ch=register_ch,
-        sample_reference_nii=sample_reference_nii,
-    )
-    transforms_root = transforms_dir or str(Path(sample_reference_path).parents[1] / "transforms")
-    transformlist = resolve_inverse_transforms(transforms_root, transforms)
-    if not transformlist:
-        raise ValueError(f"No inverse transforms found under: {transforms_root}")
-
-    print(f"Using sample mask: {mask_zarr_path}")
-    print(f"Using sample reference: {sample_reference_path}")
-    print(f"Using transforms: {transformlist}")
-
-    cached_volume_path = Path(output_volume) if output_volume else default_sample_stack_volume(sample_dir)
-    points_csv_path = default_sample_points_csv(sample_dir)
+    print("Stage 1/4: resolve sample inputs and atlas count volume")
     if isinstance(target_resolution_xyz, tuple):
         target_resolution = tuple(float(value) for value in target_resolution_xyz)
     else:
         target_resolution = parse_triplet(target_resolution_xyz, name="target_resolution_xyz")
+    atlas_volume, cached_volume_path, volume_summary = ensure_atlas_count_volume(
+        sample_dir=sample_dir,
+        signal_ch=signal_ch,
+        register_ch=register_ch,
+        mask_zarr=mask_zarr,
+        dataset_name=dataset_name,
+        sample_reference_nii=sample_reference_nii,
+        atlas_image=atlas_image,
+        transforms_dir=transforms_dir,
+        transforms=transforms,
+        resolution_xyz=resolution_xyz,
+        target_resolution_xyz=target_resolution,
+        foreground_mode=foreground_mode,
+        foreground_label=foreground_label,
+        block_shape=block_shape,
+        min_voxels_per_point=min_voxels_per_point,
+        volume_mode=volume_mode,
+        output_volume=output_volume,
+    )
+    points_csv_path = default_sample_points_csv(sample_dir)
     summary: dict[str, object] = {
         "success": True,
         "mode": "sample-stack",
-        "sample_reference_nii": str(sample_reference_path),
-        "atlas_image": str(atlas_image),
-        "transformlist": transformlist,
         "cached_volume_path": str(cached_volume_path),
         "volume_mode": volume_mode,
         "target_resolution_xyz": list(target_resolution),
         "density_unit": colorbar_unit,
     }
-
-    cached_mode = _load_cached_volume_mode(cached_volume_path)
-    use_cached_volume = cached_volume_path.exists() and (cached_mode is None or cached_mode == volume_mode)
-    if cached_volume_path.exists() and cached_mode is not None and cached_mode != volume_mode:
-        print(
-            f"Cached atlas volume uses volume_mode={cached_mode!r}; "
-            f"recomputing with requested volume_mode={volume_mode!r}."
-        )
-
-    if use_cached_volume:
-        print(f"Using cached atlas-space volume: {cached_volume_path}")
-        atlas_volume = read_tiff_stack(cached_volume_path)
-        raw_atlas_spacing_xyz = tuple()
-        summary["cache_hit"] = True
-    else:
-        sample_ref = ants.image_read(str(sample_reference_path))
-        sample_shape_zyx = tuple(int(value) for value in sample_ref.shape[::-1])
-        resolution = parse_triplet(resolution_xyz, name="resolution_xyz")
-
-        arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
-        fallback_block_shape = tuple(int(value) for value in (getattr(arr, "chunks", None) or arr.shape))
-        resolved_block_shape = parse_block_shape(block_shape, fallback_block_shape)
-
-        print("Stage 2/4: binning sample mask")
-        sample_volume, summary = accumulate_sample_grid(
-            mask_zarr_path,
-            resolution_xyz=resolution,
-            target_resolution_xyz=target_resolution,
-            output_shape_zyx=sample_shape_zyx,
-            dataset_name=dataset_name,
-            foreground_mode=foreground_mode,
-            foreground_label=foreground_label,
-            block_shape=resolved_block_shape,
-            min_voxels_per_point=min_voxels_per_point,
-            volume_mode=volume_mode,
-        )
-        print("Stage 3/4: warping binned volume into atlas space")
-        atlas_volume, raw_atlas_spacing_xyz = warp_sample_grid_to_atlas(
-            sample_volume,
-            sample_reference_nii=sample_reference_path,
-            atlas_image=atlas_image,
-            transformlist=transformlist,
-            interpolator="linear" if volume_mode == "count" else "nearestNeighbor",
-            binarize=volume_mode == "binary",
-        )
-
-        print(f"Writing cached atlas-space volume to: {cached_volume_path}")
-        cached_volume_path.parent.mkdir(parents=True, exist_ok=True)
-        write_volume_output(atlas_volume, cached_volume_path)
-        volume_meta_path = cached_volume_path.with_suffix(".json")
-        with volume_meta_path.open("w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "volume_mode": volume_mode,
-                    "target_resolution_xyz": list(target_resolution),
-                    "output_volume": str(cached_volume_path),
-                },
-                handle,
-                indent=2,
-                ensure_ascii=False,
-            )
-        summary["cache_hit"] = False
-        summary["output_volume"] = str(cached_volume_path)
-        summary["volume_meta"] = str(volume_meta_path)
+    summary.update(volume_summary)
+    raw_atlas_spacing_xyz = tuple(volume_summary.get("raw_atlas_image_spacing_xyz") or ())
 
     if points_csv_path.exists() and summary.get("cache_hit"):
         print(f"Using cached atlas-space points CSV: {points_csv_path}")
@@ -715,6 +1042,7 @@ def _render_local_slice_array(
     line_width: float,
     brain_outline_width: float,
     colorbar_label: str,
+    show_region_contours: bool = True,
 ) -> np.ndarray:
     height, width = label_slice.shape
     aspect = width / max(height, 1)
@@ -729,7 +1057,7 @@ def _render_local_slice_array(
     masked_signal = np.ma.masked_where((label_slice <= 0) | (signal_slice <= vmin), signal_slice)
     image = ax.imshow(masked_signal, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
-    region_lines = _label_contour_lines(label_slice, smoothing=1.4)
+    region_lines = _label_contour_lines(label_slice, smoothing=1.4) if show_region_contours else []
     if region_lines and line_width > 0:
         from matplotlib.collections import LineCollection
 
@@ -790,6 +1118,7 @@ def render_local_signal_atlas_slice(
     dpi: int = 300,
     line_width: float = 0.3,
     brain_outline_width: float = 0.3,
+    show_region_contours: bool = True,
     colorbar_label: str = "Signal Intensity",
 ) -> Path:
     atlas_slice = extract_atlas_slice(label_path, spec)
@@ -811,6 +1140,7 @@ def render_local_signal_atlas_slice(
         line_width=float(line_width),
         brain_outline_width=float(brain_outline_width),
         colorbar_label=colorbar_label,
+        show_region_contours=show_region_contours,
     )
 
     output_path = Path(output_path)
@@ -1160,7 +1490,11 @@ def generate_prv_sample(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate 3D or atlas-slice signal heatmaps")
-    parser.add_argument("--mode", choices=["stack", "sample-stack", "atlas-slice", "prv-sample"], default="stack")
+    parser.add_argument(
+        "--mode",
+        choices=["stack", "sample-stack", "atlas-slice", "batch-cell-density-slices", "prv-sample"],
+        default="stack",
+    )
     parser.add_argument("--input", help="Path to input mask/density image (TIFF stack or folder)")
     parser.add_argument("--output", help="Path to save output heatmap")
 
@@ -1185,6 +1519,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--density-vmax", type=float, default=None, help="Maximum signal density shown on the colorbar")
 
     parser.add_argument("--sample-dir", default="", help="Sample directory for --mode sample-stack")
+    parser.add_argument(
+        "--samples-root",
+        default="",
+        help="Parent directory containing multiple sample subdirectories for --mode batch-cell-density-slices",
+    )
+    parser.add_argument(
+        "--mean-cell-volume-um3",
+        type=float,
+        default=None,
+        help="Mean cell volume in µm³; converts local voxel density to cell density (cells/mm³)",
+    )
+    parser.add_argument("--bregma-start", type=float, default=1.1, help="Start AP coordinate in mm for batch slice mode")
+    parser.add_argument("--bregma-end", type=float, default=-5.2, help="End AP coordinate in mm for batch slice mode")
+    parser.add_argument("--slice-count", type=int, default=12, help="Number of evenly spaced bregma slices in batch mode")
+    parser.add_argument(
+        "--density-percentile",
+        type=float,
+        default=99.5,
+        help="Percentile used to derive shared density_vmax across samples when --density-vmax is omitted",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        default="cell_density_slices",
+        help="Subdirectory under each sample's visualization/ folder for batch slice PNG outputs",
+    )
     parser.add_argument("--signal-ch", default="ch1", help="Signal channel label for --mode sample-stack")
     parser.add_argument("--register-ch", default="ch0", help="Registration channel label for --mode sample-stack")
     parser.add_argument("--sample-reference-nii", default="", help="Downsampled sample NIfTI used for registration")
@@ -1211,6 +1570,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--line-width", type=float, default=0.16)
     parser.add_argument("--brain-outline-width", type=float, default=0.42)
+    parser.add_argument(
+        "--hide-region-contours",
+        action="store_true",
+        help="Omit Allen internal region outlines on 2D atlas-slice heatmaps (outer brain outline is kept)",
+    )
     parser.add_argument("--colorbar-label", default="Signal Intensity")
 
     parser.add_argument("--sample-output-dir", default="S:/可视化素材/heatmap")
@@ -1307,22 +1671,129 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("--input, --output, and --coord are required for --mode atlas-slice")
             signal = read_volume(args.input, dataset_name=args.dataset_name).astype(np.float32)
             labels = np.asarray(tifffile.memmap(str(args.label)))
-            local_signal = build_local_signal_volume(signal, sigma=args.sigma, alpha=args.alpha, atlas_mask=labels, normalize=True)
+            target_resolution = _parse_triplet(args.target_resolution_xyz) if args.target_resolution_xyz else None
+            density_input = np.asarray(signal, dtype=np.float32)
+            if target_resolution is not None:
+                density_input = counts_to_density_volume(
+                    density_input,
+                    target_resolution_xyz=target_resolution,
+                    volume_mode=args.volume_mode,
+                )
+                local_signal = build_local_signal_volume(
+                    density_input,
+                    sigma=args.sigma,
+                    alpha=args.alpha,
+                    atlas_mask=labels,
+                    normalize=False,
+                )
+                display_signal = local_signal / max(float(args.alpha), 1e-12)
+                resolved_vmin, resolved_vmax = _resolve_density_range(
+                    display_signal,
+                    labels,
+                    vmin=args.density_vmin if args.density_vmin is not None else args.vmin,
+                    vmax=args.density_vmax if args.density_vmax is not None else args.vmax,
+                )
+                colorbar_label = args.colorbar_label
+                if colorbar_label == "Signal Intensity":
+                    colorbar_label = f"signal density ({args.colorbar_unit})"
+                if args.mean_cell_volume_um3 is not None:
+                    if not args.resolution_xyz:
+                        parser.error("--resolution-xyz is required when --mean-cell-volume-um3 is set")
+                    resolution = _parse_triplet(args.resolution_xyz)
+                    display_signal = voxel_density_to_cell_density(
+                        display_signal,
+                        resolution_xyz_um=resolution,
+                        mean_cell_volume_um3=float(args.mean_cell_volume_um3),
+                    )
+                    if args.colorbar_label == "Signal Intensity":
+                        colorbar_label = "cell density (cells/mm³)"
+                    resolved_vmin, resolved_vmax = _resolve_density_range(
+                        display_signal,
+                        labels,
+                        vmin=args.density_vmin if args.density_vmin is not None else args.vmin,
+                        vmax=args.density_vmax if args.density_vmax is not None else args.vmax,
+                    )
+            else:
+                display_signal = build_local_signal_volume(
+                    signal,
+                    sigma=args.sigma,
+                    alpha=args.alpha,
+                    atlas_mask=labels,
+                    normalize=True,
+                )
+                resolved_vmin = float(args.vmin)
+                resolved_vmax = float(args.vmax) if args.vmax is not None else None
+                colorbar_label = args.colorbar_label
             spec = AtlasSliceSpec(args.plane, args.coord_system, args.coord, args.atlas_resolution_um, parse_bregma_index(args.bregma_index))
             output_path = render_local_signal_atlas_slice(
-                local_signal,
+                display_signal,
                 args.label,
                 spec,
                 args.output,
                 cmap_name=args.cmap,
-                vmin=args.vmin,
-                vmax=args.vmax,
+                vmin=resolved_vmin,
+                vmax=resolved_vmax,
                 dpi=args.dpi,
                 line_width=args.line_width,
                 brain_outline_width=args.brain_outline_width,
-                colorbar_label=args.colorbar_label,
+                show_region_contours=not args.hide_region_contours,
+                colorbar_label=colorbar_label,
             )
-            payload = {"mode": args.mode, "output": str(output_path), "plane": args.plane, "coordinate": args.coord}
+            payload = {
+                "mode": args.mode,
+                "output": str(output_path),
+                "plane": args.plane,
+                "coordinate": args.coord,
+                "density_vmin": resolved_vmin,
+                "density_vmax": resolved_vmax,
+                "colorbar_label": colorbar_label,
+            }
+        elif args.mode == "batch-cell-density-slices":
+            if not args.samples_root:
+                parser.error("--samples-root is required for --mode batch-cell-density-slices")
+            if args.mean_cell_volume_um3 is None or args.mean_cell_volume_um3 <= 0:
+                parser.error("--mean-cell-volume-um3 must be > 0 for --mode batch-cell-density-slices")
+            batch_plane = args.plane
+            batch_coord_system = args.coord_system
+            if batch_plane == "horizontal" and batch_coord_system == "index":
+                batch_plane = "coronal"
+                batch_coord_system = "bregma-mm"
+            payload = generate_batch_cell_density_slices(
+                samples_root=args.samples_root,
+                mean_cell_volume_um3=float(args.mean_cell_volume_um3),
+                config_path=args.config or None,
+                label_path=args.label,
+                atlas_image=args.atlas_image or None,
+                bregma_start=float(args.bregma_start),
+                bregma_end=float(args.bregma_end),
+                slice_count=int(args.slice_count),
+                plane=batch_plane,
+                coord_system=batch_coord_system,
+                atlas_resolution_um=float(args.atlas_resolution_um),
+                bregma_index=parse_bregma_index(args.bregma_index),
+                sigma=float(args.sigma),
+                alpha=float(args.alpha),
+                volume_mode=args.volume_mode,
+                density_vmin=float(args.density_vmin or 0.0),
+                density_vmax=args.density_vmax,
+                density_percentile=float(args.density_percentile),
+                cmap_name=args.cmap,
+                dpi=int(args.dpi),
+                line_width=float(args.line_width),
+                brain_outline_width=float(args.brain_outline_width),
+                show_region_contours=not args.hide_region_contours,
+                colorbar_label=(
+                    args.colorbar_label
+                    if args.colorbar_label != "Signal Intensity"
+                    else "cell density (cells/mm³)"
+                ),
+                output_subdir=args.output_subdir,
+                foreground_mode=args.foreground_mode,
+                foreground_label=int(args.foreground_label),
+                block_shape=args.block_shape,
+                min_voxels_per_point=int(args.min_voxels_per_point),
+                dataset_name=args.dataset_name,
+            )
         else:
             outputs = generate_prv_sample(
                 label_path=args.label,

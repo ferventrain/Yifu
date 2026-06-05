@@ -260,7 +260,7 @@
         "mode": {
           "type": "string",
           "default": "sample-stack",
-          "examples": ["sample-stack", "stack", "atlas-slice"]
+          "examples": ["sample-stack", "stack", "atlas-slice", "batch-cell-density-slices"]
         },
         "input": {
           "type": "path|null",
@@ -318,6 +318,10 @@
         {
           "description": "Render a 2D coronal AP slice from the cached atlas-space volume",
           "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\heatmap.py --mode atlas-slice --input \"S:\\Arivis_Analysis\\sample01\\visualization\\sample01_heatmap3d_volume.tiff\" --label \"S:\\Yifu\\data\\reference\\atlas_label.tiff\" --plane coronal --coord-system index --coord 216 --output \"S:\\Arivis_Analysis\\sample01\\visualization\\ap_216.png\" --sigma 10"
+        },
+        {
+          "description": "Batch-render comparable cell density bregma slices for all samples under a folder",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; python pipeline_modules/visualization/heatmap.py --mode batch-cell-density-slices --samples-root \"S:\\Arivis_Analysis\\YF2026030302_wangzhinao\" --mean-cell-volume-um3 500 --volume-mode count --sigma 10 --bregma-start 1.1 --bregma-end -5.2 --slice-count 12"
         }
       ]
     },

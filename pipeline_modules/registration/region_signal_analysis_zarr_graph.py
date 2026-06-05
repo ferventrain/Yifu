@@ -270,15 +270,9 @@ def build_display_name(node):
 
 def build_region_row(node, aggregated_stats):
     hemispheres = aggregated_stats.get("hemispheres")
-    if hemispheres:
-        row_stats = {
-            "total_voxels": sum(int(stats["total_voxels"]) for stats in hemispheres.values()),
-            "signal_voxels": sum(int(stats["signal_voxels"]) for stats in hemispheres.values()),
-            "signal_count": sum(int(stats["signal_count"]) for stats in hemispheres.values()),
-            "sum_intensity": sum(float(stats["sum_intensity"]) for stats in hemispheres.values()),
-        }
-    else:
-        row_stats = aggregated_stats
+    # Whole-brain Total columns always come from region-pair object collapse,
+    # not from summing left/right hemisphere columns.
+    row_stats = aggregated_stats
 
     total_voxels = int(row_stats["total_voxels"])
     signal_voxels = int(row_stats["signal_voxels"])
@@ -1371,26 +1365,29 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
             progress_bar.update(1)
 
+    whole_brain_stats = collapse_component_stats_by_majority(
+        region_pair_voxels=region_pair_voxels,
+        region_pair_intensity=region_pair_intensity,
+        assign_hemisphere=False,
+    )
+    region_signal_voxels = whole_brain_stats["region_signal_voxels"]
+    region_signal_counts = whole_brain_stats["region_signal_counts"]
+    region_sum_intensity = whole_brain_stats["region_sum_intensity"]
+
     assign_hemisphere = bool(region_hemisphere_pair_voxels)
     if assign_hemisphere:
-        collapsed_stats = collapse_component_stats_by_majority(
+        hemisphere_stats = collapse_component_stats_by_majority(
             region_hemisphere_pair_voxels=region_hemisphere_pair_voxels,
             region_hemisphere_pair_intensity=region_hemisphere_pair_intensity,
             assign_hemisphere=True,
         )
+        region_signal_voxels_by_hemisphere = hemisphere_stats["region_signal_voxels_by_hemisphere"]
+        region_signal_counts_by_hemisphere = hemisphere_stats["region_signal_counts_by_hemisphere"]
+        region_sum_intensity_by_hemisphere = hemisphere_stats["region_sum_intensity_by_hemisphere"]
     else:
-        collapsed_stats = collapse_component_stats_by_majority(
-            region_pair_voxels=region_pair_voxels,
-            region_pair_intensity=region_pair_intensity,
-            assign_hemisphere=False,
-        )
-
-    region_signal_voxels = collapsed_stats["region_signal_voxels"]
-    region_signal_counts = collapsed_stats["region_signal_counts"]
-    region_sum_intensity = collapsed_stats["region_sum_intensity"]
-    region_signal_voxels_by_hemisphere = collapsed_stats.get("region_signal_voxels_by_hemisphere", {})
-    region_signal_counts_by_hemisphere = collapsed_stats.get("region_signal_counts_by_hemisphere", {})
-    region_sum_intensity_by_hemisphere = collapsed_stats.get("region_sum_intensity_by_hemisphere", {})
+        region_signal_voxels_by_hemisphere = {}
+        region_signal_counts_by_hemisphere = {}
+        region_sum_intensity_by_hemisphere = {}
 
     kept_components = int(np.count_nonzero((parent == np.arange(parent.shape[0], dtype=np.int64)) & kept_root_mask))
     kept_voxels = int(root_sizes[kept_root_mask].sum(dtype=np.int64))

@@ -279,3 +279,87 @@ def test_majority_region_prefers_smaller_id_on_ties():
     assert choose_majority_region({10: 3, 20: 3}) == 10
     assert choose_majority_region({10: 4, 20: 3}) == 10
     assert choose_majority_region({10: 2, 20: 5}) == 20
+
+
+def test_whole_brain_totals_use_region_pair_collapse_when_hemisphere_enabled(tmp_path):
+    mask_chunk = np.array([[[1, 1, 1, 1, 1]]], dtype=np.uint8)
+    label_chunk = np.array([[[10, 10, 10, 20, 20]]], dtype=np.int32)
+    signal_chunk = np.array([[[1, 2, 3, 4, 5]]], dtype=np.float32)
+    hemisphere_chunk = np.array([[[1, 1, 1, 0, 0]]], dtype=np.uint8)
+
+    artifact = compute_block_artifacts(
+        mask_chunk=mask_chunk,
+        label_chunk=label_chunk,
+        signal_chunk=signal_chunk,
+        start=(0, 0, 0),
+        foreground_mode="nonzero",
+        foreground_label=1,
+        next_component_id=1,
+        boundary_mask_cache={},
+        volume_shape=mask_chunk.shape,
+        hemisphere_chunk=hemisphere_chunk,
+    )
+    artifact_path = tmp_path / "block.npz"
+    save_block_artifact(artifact_path, artifact)
+
+    parent = np.arange(artifact["next_component_id"], dtype=np.int64)
+    root_sizes = np.zeros(artifact["next_component_id"], dtype=np.int64)
+    root_sizes[artifact["component_ids"]] = artifact["component_sizes"]
+    manifest_payload = {
+        "blocks": [{"artifact_path": str(artifact_path)}],
+        "total_region_voxels": {"10": 3, "20": 2},
+        "total_region_voxels_by_hemisphere": {
+            f"10:{int(LEFT_HEMISPHERE_ID)}": 3,
+        },
+    }
+
+    stats = aggregate_final_region_stats(
+        manifest_payload=manifest_payload,
+        parent=parent,
+        root_sizes=root_sizes,
+        min_voxels=1,
+    )
+
+    assert stats["region_signal_counts"][10] == 1
+    assert 20 not in stats["region_signal_counts"]
+    assert stats["region_signal_counts_by_hemisphere"][(10, int(LEFT_HEMISPHERE_ID))] == 1
+    assert sum(stats["region_signal_counts_by_hemisphere"].values()) == stats["region_signal_counts"][10]
+
+
+def test_excel_total_columns_use_whole_brain_collapse_not_left_plus_right():
+    region_tree = {
+        "id": 10,
+        "name": "paired child,PAIR",
+        "st_level": 1,
+        "children": [],
+    }
+    direct_stats = {
+        "total_region_voxels": {10: 10},
+        "region_signal_voxels": {10: 5},
+        "region_signal_counts": {10: 1},
+        "region_sum_intensity": {10: 35.0},
+        "total_region_voxels_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 3,
+            (10, int(RIGHT_HEMISPHERE_ID)): 2,
+        },
+        "region_signal_voxels_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 3,
+            (10, int(RIGHT_HEMISPHERE_ID)): 2,
+        },
+        "region_signal_counts_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 1,
+        },
+        "region_sum_intensity_by_hemisphere": {
+            (10, int(LEFT_HEMISPHERE_ID)): 21.0,
+            (10, int(RIGHT_HEMISPHERE_ID)): 14.0,
+        },
+    }
+
+    rows = flatten_region_rows(region_tree, direct_stats)
+    row = rows[0]
+
+    assert row["Signal Count"] == 1
+    assert row["Signal Voxels"] == 5
+    assert row["Sum Intensity"] == 35.0
+    assert row["Left Signal Count"] == 1
+    assert row["Right Signal Count"] == 0
