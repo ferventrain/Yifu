@@ -110,6 +110,19 @@ WHITE_BLUE_RED_CMAP = LinearSegmentedColormap.from_list(
     ],
 )
 
+# Diverging colormap for sample A minus sample B signal-count differences.
+# Colorbar top -> bottom: #702136, #ea8c70, #f7f6f7, #75b2d4, #092c57
+SIGNAL_COUNT_DIFF_CMAP = LinearSegmentedColormap.from_list(
+    "signal_count_diff",
+    [
+        (0.0, "#092c57"),
+        (0.25, "#75b2d4"),
+        (0.5, "#f7f6f7"),
+        (0.75, "#ea8c70"),
+        (1.0, "#702136"),
+    ],
+)
+
 
 @dataclass(frozen=True)
 class SliceHeatmapStyle:
@@ -367,6 +380,80 @@ def build_region_metric_lookup(
     return value_by_region_id, path_by_region_id
 
 
+def subtract_region_metric_values(
+    minuend_by_region_id: dict[int, float],
+    subtrahend_by_region_id: dict[int, float],
+) -> dict[int, float]:
+    """Return per-region metric values for minuend minus subtrahend."""
+    region_ids = set(minuend_by_region_id) | set(subtrahend_by_region_id)
+    return {
+        int(region_id): float(minuend_by_region_id.get(region_id, 0.0) - subtrahend_by_region_id.get(region_id, 0.0))
+        for region_id in region_ids
+    }
+
+
+def compute_symmetric_metric_limits(
+    values: list[float] | tuple[float, ...],
+    *,
+    percentile: float = 99.5,
+    explicit_vmax: float | None = None,
+) -> tuple[float, float]:
+    """Symmetric vmin/vmax for diverging difference maps centered at zero."""
+    if explicit_vmax is not None:
+        limit = abs(float(explicit_vmax))
+        if limit <= 0:
+            limit = 1e-6
+        return -limit, limit
+    finite = [float(value) for value in values if np.isfinite(value)]
+    if not finite:
+        return -1.0, 1.0
+    positive = [abs(value) for value in finite if abs(value) > 0]
+    if not positive:
+        return -1.0, 1.0
+    limit = float(np.percentile(positive, float(percentile)))
+    if limit <= 0:
+        limit = max(positive)
+    if limit <= 0:
+        limit = 1e-6
+    return -limit, limit
+
+
+def lookup_region_metric_value(
+    region_id: int,
+    value_by_region_id: dict[int, float],
+    path_by_region_id: dict[int, list[int]],
+) -> float | None:
+    """Return direct or inherited metric value, or None when no data exists."""
+    if region_id in value_by_region_id:
+        return float(value_by_region_id[region_id])
+    path = path_by_region_id.get(region_id, [])
+    for ancestor_id in reversed(path[:-1]):
+        if ancestor_id in value_by_region_id:
+            return float(value_by_region_id[ancestor_id])
+    return None
+
+
+def collect_regions_missing_metric_data(
+    label_image: np.ndarray,
+    value_by_region_id: dict[int, float],
+    path_by_region_id: dict[int, list[int]],
+) -> list[int]:
+    """Brain region ids visible on the slice that have no metric data."""
+    missing: list[int] = []
+    for label in np.unique(np.asarray(label_image)):
+        region_id = int(label)
+        if region_id == 0:
+            continue
+        if lookup_region_metric_value(region_id, value_by_region_id, path_by_region_id) is None:
+            missing.append(region_id)
+    return missing
+
+
+def build_region_name_lookup(cfg_path: str | Path) -> dict[int, str]:
+    region_table = load_region_metadata(cfg_path)
+    return {int(row["region_id"]): str(row["excel_name"]) for _, row in region_table.iterrows()}
+
+
 def resolve_slice_region_values(
     label_image: np.ndarray,
     value_by_region_id: dict[int, float],
@@ -377,14 +464,8 @@ def resolve_slice_region_values(
         region_id = int(label)
         if region_id == 0:
             continue
-        if region_id in value_by_region_id:
-            resolved[region_id] = float(value_by_region_id[region_id])
-            continue
-        path = path_by_region_id.get(region_id, [])
-        for ancestor_id in reversed(path[:-1]):
-            if ancestor_id in value_by_region_id:
-                resolved[region_id] = float(value_by_region_id[ancestor_id])
-                break
+        value = lookup_region_metric_value(region_id, value_by_region_id, path_by_region_id)
+        resolved[region_id] = 0.0 if value is None else float(value)
     return resolved
 
 
@@ -595,6 +676,8 @@ def _colormap_by_name(name: str):
         return WHITE_ORANGE_RED_BLACK_CMAP
     if name == "white_blue_red":
         return WHITE_BLUE_RED_CMAP
+    if name == "signal_count_diff":
+        return SIGNAL_COUNT_DIFF_CMAP
     cmap = plt.get_cmap(name)
     if not isinstance(cmap, LinearSegmentedColormap):
         return LinearSegmentedColormap.from_list(name, cmap(np.linspace(0.0, 1.0, 256)))

@@ -100,7 +100,7 @@
       "min_object_size": 10
     },
     "cfos_unet": {
-      "checkpoint_path": "H:/yifu0428/Yifu/best_model.pt",
+      "checkpoint_path": "S:/Yifu/best_model.pt",
       "save_probability": true,
       "probability_zarr": "",
       "dataset_name": "0",

@@ -36,11 +36,32 @@ from pipeline_modules.visualization.atlas_slice import (
     _format_svg_color,
     _label_contour_lines,
     _mask_contour_lines,
+    build_region_metric_lookup,
+    build_region_name_lookup,
+    collect_regions_missing_metric_data,
+    compute_symmetric_metric_limits,
     extract_atlas_slice,
+    resolve_slice_region_values,
+    subtract_region_metric_values,
+)
+
+from pipeline_modules.utils.deliverable_paths import (
+    brain_distribution_stats_xlsx,
+    heatmap_2d_dir,
+    heatmap_3d_colorbar_png,
+    heatmap_3d_png,
+    heatmap_3d_stack_tiff,
+    heatmap_3d_summary_json,
+    heatmap_3d_volume_tiff,
+    legacy_brain_distribution_candidates,
+    legacy_heatmap_3d_volume_candidates,
 )
 
 SVG_NS = "http://www.w3.org/2000/svg"
 ET.register_namespace("", SVG_NS)
+
+BATCH_SLICE_DEFAULT_PERCENTILE = 99.5
+SUBTRACT_DIFF_DEFAULT_PERCENTILE = 95.0
 
 
 def project_root() -> Path:
@@ -69,19 +90,20 @@ def resolve_sample_config(sample_dir: str | Path) -> Path:
     raise FileNotFoundError(f"Could not find config.json near sample_dir: {sample_dir}")
 
 
-def default_sample_stack_output(sample_dir: str | Path) -> Path:
-    sample_dir = Path(sample_dir)
-    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_stack.tiff"
+def default_sample_stack_output(sample_dir: str | Path, signal_ch: str = "ch1") -> Path:
+    return heatmap_3d_stack_tiff(sample_dir, signal_ch)
 
 
-def default_sample_stack_volume(sample_dir: str | Path) -> Path:
-    sample_dir = Path(sample_dir)
-    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_volume.tiff"
+def default_sample_stack_volume(sample_dir: str | Path, signal_ch: str = "ch1") -> Path:
+    return heatmap_3d_volume_tiff(sample_dir, signal_ch)
 
 
-def default_sample_stack_colorbar(sample_dir: str | Path) -> Path:
-    sample_dir = Path(sample_dir)
-    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_colorbar.png"
+def default_sample_stack_colorbar(sample_dir: str | Path, signal_ch: str = "ch1") -> Path:
+    return heatmap_3d_colorbar_png(sample_dir, signal_ch)
+
+
+def default_sample_heatmap_3d_png(sample_dir: str | Path, signal_ch: str = "ch1") -> Path:
+    return heatmap_3d_png(sample_dir, signal_ch)
 
 
 def atlas_bin_volume_mm3(target_resolution_xyz: tuple[float, float, float]) -> float:
@@ -140,26 +162,89 @@ def linspace_bregma_coords(start_mm: float, end_mm: float, count: int) -> list[f
     return [float(round(value, 4)) for value in values]
 
 
-def sample_has_batch_inputs(sample_dir: str | Path) -> bool:
+def sample_has_batch_inputs(sample_dir: str | Path, signal_ch: str = "ch1") -> bool:
     sample_dir = Path(sample_dir)
     if not sample_dir.is_dir():
         return False
     if any(sample_dir.glob("*_mask.zarr")):
         return True
-    return default_sample_stack_volume(sample_dir).exists()
+    for candidate in legacy_heatmap_3d_volume_candidates(sample_dir, signal_ch):
+        if candidate.exists():
+            return True
+    return default_sample_stack_volume(sample_dir, signal_ch).exists()
 
 
-def discover_sample_dirs(samples_root: str | Path) -> list[Path]:
+def default_sample_density_excel(sample_dir: str | Path, signal_ch: str = "ch1") -> Path:
+    return brain_distribution_stats_xlsx(sample_dir, signal_ch)
+
+
+def default_region_cfg_path() -> Path:
+    return project_root() / "pipeline_modules" / "registration" / "Region_Csv_Rev1_updated.CSV"
+
+
+def resolve_density_excel_path(
+    sample_dir: str | Path,
+    input_excel: str | Path | None = None,
+    signal_ch: str = "ch1",
+) -> Path:
+    if input_excel:
+        path = Path(input_excel)
+        if not path.exists():
+            raise FileNotFoundError(f"Density Excel not found: {path}")
+        return path
+    for candidate in legacy_brain_distribution_candidates(sample_dir, signal_ch):
+        if candidate.exists():
+            return candidate
+    default_path = default_sample_density_excel(sample_dir, signal_ch)
+    raise FileNotFoundError(
+        f"No density Excel found for sample_dir={sample_dir}. "
+        f"Expected {default_path} or a legacy *density*.xlsx workbook"
+    )
+
+
+def sample_has_density_excel(sample_dir: str | Path, signal_ch: str = "ch1") -> bool:
+    sample_dir = Path(sample_dir)
+    if default_sample_density_excel(sample_dir, signal_ch).exists():
+        return True
+    return any(path.exists() for path in legacy_brain_distribution_candidates(sample_dir, signal_ch)[1:])
+
+
+def discover_sample_dirs(samples_root: str | Path, *, require_volume: bool = True) -> list[Path]:
     samples_root = Path(samples_root)
     if not samples_root.is_dir():
         raise NotADirectoryError(f"samples_root is not a directory: {samples_root}")
-    discovered = [child for child in sorted(samples_root.iterdir()) if sample_has_batch_inputs(child)]
+
+    def _matches(child: Path) -> bool:
+        if sample_has_batch_inputs(child):
+            return True
+        if not require_volume and sample_has_density_excel(child):
+            return True
+        return False
+
+    discovered = [child for child in sorted(samples_root.iterdir()) if child.is_dir() and _matches(child)]
     if not discovered:
+        if require_volume:
+            raise FileNotFoundError(
+                "No sample directories with *_mask.zarr or visualization/*_heatmap_3d_volume.tiff "
+                f"found under: {samples_root}"
+            )
         raise FileNotFoundError(
-            "No sample directories with *_mask.zarr or visualization/*_heatmap3d_volume.tiff "
-            f"found under: {samples_root}"
+            "No sample directories with density Excel workbooks found under: "
+            f"{samples_root}"
         )
     return discovered
+
+
+def _paint_region_values_on_slice(label_slice: np.ndarray, region_values: dict[int, float]) -> np.ndarray:
+    painted = np.full(label_slice.shape, np.nan, dtype=np.float32)
+    labels = np.asarray(label_slice)
+    for region_id, value in region_values.items():
+        mask = labels == int(region_id)
+        if np.any(mask):
+            painted[mask] = float(value)
+    inside_brain = labels > 0
+    painted[inside_brain & np.isnan(painted)] = 0.0
+    return painted
 
 
 def prepare_smoothed_voxel_density_volume(
@@ -246,10 +331,26 @@ def resolve_sample_stack_defaults(
         "atlas_image": default_reference_dir() / "atlas_label.tiff",
         "edge": default_reference_dir() / "atlas_edge.tiff",
         "atlas_mask": default_reference_dir() / "atlas_label.tiff",
-        "output": default_sample_stack_output(sample_dir),
-        "output_volume": default_sample_stack_volume(sample_dir),
+        "output": default_sample_stack_output(sample_dir, signal_ch),
+        "output_volume": default_sample_stack_volume(sample_dir, signal_ch),
+        "output_png": default_sample_heatmap_3d_png(sample_dir, signal_ch),
         "points_csv": default_sample_points_csv(sample_dir),
     }
+
+
+def resolve_slice_output_dir(
+    sample_dir: str | Path,
+    *,
+    config_path: str | Path | None = None,
+    output_subdir: str = "",
+    signal_ch: str | None = None,
+) -> Path:
+    if output_subdir:
+        return Path(sample_dir) / "visualization" / output_subdir
+    if signal_ch is None:
+        defaults = resolve_sample_stack_defaults(sample_dir, config_path=config_path)
+        signal_ch = str(defaults["signal_ch"])
+    return heatmap_2d_dir(sample_dir, signal_ch)
 
 
 def create_gaussian_kernel_3d(kernel_size=7, sigma=1.0):
@@ -508,6 +609,7 @@ def render_heatmap_stack(
     colorbar_unit: str = "count/mm³",
     density_vmin: float | None = None,
     density_vmax: float | None = None,
+    preview_png_path: str | Path | None = None,
 ) -> dict[str, float | str | None]:
     img = np.asarray(img)
 
@@ -564,10 +666,20 @@ def render_heatmap_stack(
             print("Warning: local signal max is 0; skipping normalization.")
     heatimg = _legacy_rgb_heat_volume(display_signal, edge, atlas_mask)
 
-    print(f"Saving heatmap to: {save_path}")
+    print(f"Saving heatmap stack to: {save_path}")
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(save_path, heatimg, compression="lzw")
+
+    preview_saved = None
+    if preview_png_path:
+        preview_saved = Path(preview_png_path)
+        preview_saved.parent.mkdir(parents=True, exist_ok=True)
+        preview_image = np.max(np.asarray(heatimg), axis=0)
+        if preview_image.dtype != np.uint8:
+            preview_image = np.clip(preview_image, 0, 255).astype(np.uint8)
+        Image.fromarray(preview_image).save(preview_saved)
+        print(f"Saved 3D heatmap preview PNG to: {preview_saved}")
 
     colorbar_path = None
     if save_colorbar:
@@ -586,6 +698,7 @@ def render_heatmap_stack(
         "density_max": resolved_density_max,
         "density_unit": colorbar_unit,
         "colorbar_output": str(colorbar_path) if colorbar_path else None,
+        "preview_png_output": str(preview_saved) if preview_saved else None,
     }
 
 
@@ -626,7 +739,7 @@ def ensure_atlas_count_volume(
 
     sample_dir = Path(sample_dir)
     sample_dir_value = sample_dir if sample_dir else None
-    cached_volume_path = Path(output_volume) if output_volume else default_sample_stack_volume(sample_dir)
+    cached_volume_path = Path(output_volume) if output_volume else default_sample_stack_volume(sample_dir, signal_ch)
     if isinstance(target_resolution_xyz, tuple):
         target_resolution = tuple(float(value) for value in target_resolution_xyz)
     else:
@@ -733,6 +846,377 @@ def ensure_atlas_count_volume(
     return atlas_volume, cached_volume_path, summary
 
 
+def _report_missing_region_metric_data(
+    *,
+    sample_label: str,
+    missing_region_ids: set[int],
+    region_name_by_id: dict[int, str],
+    region_metric: str,
+) -> None:
+    if not missing_region_ids:
+        return
+    formatted = [
+        f"{region_id} ({region_name_by_id.get(region_id, 'unknown')})"
+        for region_id in sorted(missing_region_ids)
+    ]
+    print(
+        f"Sample '{sample_label}' has no {region_metric} data for "
+        f"{len(missing_region_ids)} brain region(s) on rendered slices; using 0: "
+        + ", ".join(formatted)
+    )
+
+
+def _accumulate_missing_regions_for_slices(
+    *,
+    label_path: Path,
+    bregma_coords: list[float],
+    plane: str,
+    coord_system: str,
+    atlas_resolution_um: float,
+    bregma_index: tuple[int, int, int],
+    value_by_region_id: dict[int, float],
+    path_by_region_id: dict[int, list[int]],
+) -> set[int]:
+    missing: set[int] = set()
+    for ap_mm in bregma_coords:
+        spec = AtlasSliceSpec(
+            plane=plane,
+            coordinate_system=coord_system,
+            coordinate=ap_mm,
+            atlas_resolution_um=atlas_resolution_um,
+            bregma_index=bregma_index,
+        )
+        atlas_slice = extract_atlas_slice(label_path, spec)
+        missing.update(
+            collect_regions_missing_metric_data(
+                atlas_slice.image,
+                value_by_region_id,
+                path_by_region_id,
+            )
+        )
+    return missing
+
+
+def _resolve_subtract_diff_percentile(cli_value: float) -> float:
+    """Signal-count diff maps default to P95 symmetric limits."""
+    if cli_value == BATCH_SLICE_DEFAULT_PERCENTILE:
+        return SUBTRACT_DIFF_DEFAULT_PERCENTILE
+    return float(cli_value)
+
+
+def _resolve_shared_metric_limits(
+    metric_values: list[float],
+    *,
+    density_vmin: float | None,
+    density_vmax: float | None,
+    density_percentile: float,
+    symmetric: bool = False,
+) -> tuple[float, float]:
+    if symmetric:
+        explicit = density_vmax if density_vmax is not None else None
+        return compute_symmetric_metric_limits(
+            metric_values,
+            percentile=density_percentile,
+            explicit_vmax=explicit,
+        )
+    vmin = float(density_vmin or 0.0)
+    if density_vmax is not None:
+        vmax = float(density_vmax)
+    else:
+        finite = [float(value) for value in metric_values if np.isfinite(value) and value > vmin]
+        vmax = float(np.percentile(finite, float(density_percentile))) if finite else vmin + 1e-6
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+    return vmin, vmax
+
+
+def generate_batch_region_metric_slices(
+    *,
+    samples_root: str | Path,
+    region_metric: str = "Signal Count",
+    region_cfg_path: str | Path | None = None,
+    label_path: str | Path | None = None,
+    bregma_start: float = 1.1,
+    bregma_end: float = -5.2,
+    slice_count: int = 12,
+    plane: str = "coronal",
+    coord_system: str = "bregma-mm",
+    atlas_resolution_um: float = 25.0,
+    bregma_index: tuple[int, int, int] = (18, 216, 228),
+    density_vmin: float | None = None,
+    density_vmax: float | None = None,
+    density_percentile: float = 99.5,
+    cmap_name: str = "white_orange_red_black",
+    dpi: int = 300,
+    line_width: float = 0.16,
+    brain_outline_width: float = 0.42,
+    show_region_contours: bool = True,
+    colorbar_label: str | None = None,
+    output_subdir: str = "",
+) -> dict[str, object]:
+    sample_dirs = discover_sample_dirs(samples_root, require_volume=False)
+    label_path = Path(label_path or DEFAULT_ATLAS_LABEL)
+    region_cfg_path = Path(region_cfg_path or default_region_cfg_path())
+    bregma_coords = linspace_bregma_coords(bregma_start, bregma_end, slice_count)
+    region_name_by_id = build_region_name_lookup(region_cfg_path)
+
+    lookups: dict[str, tuple[dict[int, float], dict[int, list[int]]]] = {}
+    all_values: list[float] = []
+    for sample_dir in sample_dirs:
+        excel_path = resolve_density_excel_path(sample_dir)
+        value_by_region_id, path_by_region_id = build_region_metric_lookup(
+            excel_path,
+            cfg_path=region_cfg_path,
+            metric=region_metric,
+        )
+        lookups[str(sample_dir)] = (value_by_region_id, path_by_region_id)
+        all_values.extend(float(value) for value in value_by_region_id.values())
+        missing_regions = _accumulate_missing_regions_for_slices(
+            label_path=label_path,
+            bregma_coords=bregma_coords,
+            plane=plane,
+            coord_system=coord_system,
+            atlas_resolution_um=atlas_resolution_um,
+            bregma_index=bregma_index,
+            value_by_region_id=value_by_region_id,
+            path_by_region_id=path_by_region_id,
+        )
+        _report_missing_region_metric_data(
+            sample_label=sample_dir.name,
+            missing_region_ids=missing_regions,
+            region_name_by_id=region_name_by_id,
+            region_metric=region_metric,
+        )
+
+    shared_vmin, shared_vmax = _resolve_shared_metric_limits(
+        all_values,
+        density_vmin=density_vmin,
+        density_vmax=density_vmax,
+        density_percentile=density_percentile,
+        symmetric=False,
+    )
+    resolved_colorbar_label = colorbar_label or region_metric
+    print(
+        f"Shared region metric color scale ({region_metric}): "
+        f"min={shared_vmin:g}, max={shared_vmax:g} (samples={len(sample_dirs)})"
+    )
+
+    outputs_by_sample: dict[str, list[str]] = {}
+    for sample_dir in sample_dirs:
+        value_by_region_id, path_by_region_id = lookups[str(sample_dir)]
+        defaults = resolve_sample_stack_defaults(sample_dir)
+        out_dir = resolve_slice_output_dir(
+            sample_dir,
+            output_subdir=output_subdir,
+            signal_ch=str(defaults["signal_ch"]),
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sample_outputs: list[str] = []
+        for ap_mm in bregma_coords:
+            spec = AtlasSliceSpec(
+                plane=plane,
+                coordinate_system=coord_system,
+                coordinate=ap_mm,
+                atlas_resolution_um=atlas_resolution_um,
+                bregma_index=bregma_index,
+            )
+            atlas_slice = extract_atlas_slice(label_path, spec)
+            slice_region_values = resolve_slice_region_values(
+                atlas_slice.image,
+                value_by_region_id,
+                path_by_region_id,
+            )
+            output_path = out_dir / f"bregma_{ap_mm}mm.png"
+            render_region_metric_atlas_slice(
+                label_path,
+                spec,
+                slice_region_values,
+                output_path,
+                cmap_name=cmap_name,
+                vmin=float(shared_vmin),
+                vmax=float(shared_vmax),
+                dpi=int(dpi),
+                line_width=float(line_width),
+                brain_outline_width=float(brain_outline_width),
+                show_region_contours=show_region_contours,
+                colorbar_label=resolved_colorbar_label,
+            )
+            sample_outputs.append(str(output_path))
+        outputs_by_sample[str(sample_dir)] = sample_outputs
+        print(f"Wrote {len(sample_outputs)} region metric slices to: {out_dir}")
+
+    summary_path = Path(samples_root) / "visualization" / "batch_region_metric_slices.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mode": "batch-cell-density-slices",
+        "slice_color_mode": "region",
+        "samples_root": str(samples_root),
+        "sample_dirs": [str(path) for path in sample_dirs],
+        "region_metric": region_metric,
+        "region_cfg_path": str(region_cfg_path),
+        "bregma_coords_mm": bregma_coords,
+        "shared_metric_vmin": float(shared_vmin),
+        "shared_metric_vmax": float(shared_vmax),
+        "cmap_name": cmap_name,
+        "colorbar_label": resolved_colorbar_label,
+        "show_region_contours": bool(show_region_contours),
+        "outputs_by_sample": outputs_by_sample,
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    payload["summary_json"] = str(summary_path)
+    return payload
+
+
+def generate_batch_signal_count_diff_slices(
+    *,
+    sample_dir: str | Path,
+    subtract_sample_dir: str | Path,
+    region_metric: str = "Signal Count",
+    region_cfg_path: str | Path | None = None,
+    input_excel: str | Path | None = None,
+    subtract_input_excel: str | Path | None = None,
+    label_path: str | Path | None = None,
+    bregma_start: float = 1.1,
+    bregma_end: float = -5.2,
+    slice_count: int = 12,
+    plane: str = "coronal",
+    coord_system: str = "bregma-mm",
+    atlas_resolution_um: float = 25.0,
+    bregma_index: tuple[int, int, int] = (18, 216, 228),
+    density_vmin: float | None = None,
+    density_vmax: float | None = None,
+    density_percentile: float = SUBTRACT_DIFF_DEFAULT_PERCENTILE,
+    cmap_name: str = "signal_count_diff",
+    dpi: int = 300,
+    line_width: float = 0.16,
+    brain_outline_width: float = 0.42,
+    show_region_contours: bool = True,
+    colorbar_label: str | None = None,
+    output_subdir: str = "",
+) -> dict[str, object]:
+    sample_dir = Path(sample_dir)
+    subtract_sample_dir = Path(subtract_sample_dir)
+    label_path = Path(label_path or DEFAULT_ATLAS_LABEL)
+    region_cfg_path = Path(region_cfg_path or default_region_cfg_path())
+    bregma_coords = linspace_bregma_coords(bregma_start, bregma_end, slice_count)
+
+    excel_a = resolve_density_excel_path(sample_dir, input_excel)
+    excel_b = resolve_density_excel_path(subtract_sample_dir, subtract_input_excel)
+    lookup_a, path_by_region_id = build_region_metric_lookup(excel_a, cfg_path=region_cfg_path, metric=region_metric)
+    lookup_b, path_by_region_id_b = build_region_metric_lookup(excel_b, cfg_path=region_cfg_path, metric=region_metric)
+    diff_lookup = subtract_region_metric_values(lookup_a, lookup_b)
+    region_name_by_id = build_region_name_lookup(region_cfg_path)
+    missing_a = _accumulate_missing_regions_for_slices(
+        label_path=label_path,
+        bregma_coords=bregma_coords,
+        plane=plane,
+        coord_system=coord_system,
+        atlas_resolution_um=atlas_resolution_um,
+        bregma_index=bregma_index,
+        value_by_region_id=lookup_a,
+        path_by_region_id=path_by_region_id,
+    )
+    missing_b = _accumulate_missing_regions_for_slices(
+        label_path=label_path,
+        bregma_coords=bregma_coords,
+        plane=plane,
+        coord_system=coord_system,
+        atlas_resolution_um=atlas_resolution_um,
+        bregma_index=bregma_index,
+        value_by_region_id=lookup_b,
+        path_by_region_id=path_by_region_id_b,
+    )
+    _report_missing_region_metric_data(
+        sample_label=sample_dir.name,
+        missing_region_ids=missing_a,
+        region_name_by_id=region_name_by_id,
+        region_metric=region_metric,
+    )
+    _report_missing_region_metric_data(
+        sample_label=subtract_sample_dir.name,
+        missing_region_ids=missing_b,
+        region_name_by_id=region_name_by_id,
+        region_metric=region_metric,
+    )
+
+    shared_vmin, shared_vmax = _resolve_shared_metric_limits(
+        list(diff_lookup.values()),
+        density_vmin=density_vmin,
+        density_vmax=density_vmax,
+        density_percentile=density_percentile,
+        symmetric=True,
+    )
+    resolved_colorbar_label = colorbar_label or f"{region_metric} diff ({sample_dir.name} - {subtract_sample_dir.name})"
+    print(
+        f"Shared signal-count diff color scale: min={shared_vmin:g}, max={shared_vmax:g} "
+        f"({sample_dir.name} minus {subtract_sample_dir.name})"
+    )
+
+    out_dir = resolve_slice_output_dir(
+        sample_dir,
+        output_subdir=output_subdir,
+        signal_ch=str(resolve_sample_stack_defaults(sample_dir)["signal_ch"]),
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs: list[str] = []
+    for ap_mm in bregma_coords:
+        spec = AtlasSliceSpec(
+            plane=plane,
+            coordinate_system=coord_system,
+            coordinate=ap_mm,
+            atlas_resolution_um=atlas_resolution_um,
+            bregma_index=bregma_index,
+        )
+        atlas_slice = extract_atlas_slice(label_path, spec)
+        slice_region_values = resolve_slice_region_values(
+            atlas_slice.image,
+            diff_lookup,
+            path_by_region_id,
+        )
+        output_path = out_dir / f"bregma_{ap_mm}mm_{sample_dir.name}_minus_{subtract_sample_dir.name}.png"
+        render_region_metric_atlas_slice(
+            label_path,
+            spec,
+            slice_region_values,
+            output_path,
+            cmap_name=cmap_name,
+            vmin=float(shared_vmin),
+            vmax=float(shared_vmax),
+            dpi=int(dpi),
+            line_width=float(line_width),
+            brain_outline_width=float(brain_outline_width),
+            show_region_contours=show_region_contours,
+            colorbar_label=resolved_colorbar_label,
+        )
+        outputs.append(str(output_path))
+    print(f"Wrote {len(outputs)} signal-count diff slices to: {out_dir}")
+
+    summary_path = out_dir / f"{sample_dir.name}_minus_{subtract_sample_dir.name}_summary.json"
+    payload = {
+        "mode": "batch-cell-density-slices",
+        "slice_color_mode": "region",
+        "subtract_mode": True,
+        "sample_dir": str(sample_dir),
+        "subtract_sample_dir": str(subtract_sample_dir),
+        "input_excel": str(excel_a),
+        "subtract_input_excel": str(excel_b),
+        "region_metric": region_metric,
+        "region_cfg_path": str(region_cfg_path),
+        "bregma_coords_mm": bregma_coords,
+        "shared_metric_vmin": float(shared_vmin),
+        "shared_metric_vmax": float(shared_vmax),
+        "cmap_name": cmap_name,
+        "colorbar_label": resolved_colorbar_label,
+        "show_region_contours": bool(show_region_contours),
+        "outputs": outputs,
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    payload["summary_json"] = str(summary_path)
+    return payload
+
+
 def generate_batch_cell_density_slices(
     *,
     samples_root: str | Path,
@@ -759,7 +1243,7 @@ def generate_batch_cell_density_slices(
     brain_outline_width: float = 0.42,
     show_region_contours: bool = True,
     colorbar_label: str = "cell density (cells/mm³)",
-    output_subdir: str = "cell_density_slices",
+    output_subdir: str = "",
     foreground_mode: str = "equal",
     foreground_label: int = 1,
     block_shape: str = "",
@@ -834,7 +1318,12 @@ def generate_batch_cell_density_slices(
     outputs_by_sample: dict[str, list[str]] = {}
     for sample_dir in sample_dirs:
         cell_density = cell_density_volumes[str(sample_dir)]
-        out_dir = Path(sample_dir) / "visualization" / output_subdir
+        out_dir = resolve_slice_output_dir(
+            sample_dir,
+            config_path=config_path,
+            output_subdir=output_subdir,
+            signal_ch=str(defaults["signal_ch"]),
+        )
         out_dir.mkdir(parents=True, exist_ok=True)
         sample_outputs: list[str] = []
         for ap_mm in bregma_coords:
@@ -981,8 +1470,9 @@ def generate_sample_stack_heatmap(
     resolved_colorbar_output = (
         Path(colorbar_output)
         if colorbar_output
-        else default_sample_stack_colorbar(sample_dir)
+        else default_sample_stack_colorbar(sample_dir, signal_ch)
     )
+    preview_png_path = default_sample_heatmap_3d_png(sample_dir, signal_ch)
     render_stats = render_heatmap_stack(
         atlas_volume,
         edge_path=edge_path,
@@ -1002,19 +1492,21 @@ def generate_sample_stack_heatmap(
         colorbar_unit=colorbar_unit,
         density_vmin=density_vmin,
         density_vmax=density_vmax,
+        preview_png_path=preview_png_path,
     )
 
     summary.update(
         {
             "atlas_shape_zyx": list(atlas_volume.shape),
             "raw_atlas_image_spacing_xyz": list(raw_atlas_spacing_xyz) if raw_atlas_spacing_xyz else [],
-            "heatmap_output": str(output),
+            "heatmap_stack_output": str(output),
+            "heatmap_output": str(render_stats.get("preview_png_output") or preview_png_path),
             "density_min": render_stats["density_min"],
             "density_max": render_stats["density_max"],
             "colorbar_output": render_stats["colorbar_output"],
         }
     )
-    summary_path = Path(output).with_suffix(".json")
+    summary_path = heatmap_3d_summary_json(sample_dir, signal_ch)
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
     print(f"Saved summary to: {summary_path}")
@@ -1104,6 +1596,122 @@ def _render_local_slice_array(
     plt.close(fig)
     buffer.seek(0)
     return np.asarray(Image.open(buffer).convert("RGBA"))
+
+
+def _render_region_metric_slice_array(
+    label_slice: np.ndarray,
+    region_values: dict[int, float],
+    *,
+    cmap_name: str,
+    vmin: float,
+    vmax: float,
+    dpi: int,
+    line_width: float,
+    brain_outline_width: float,
+    colorbar_label: str,
+    show_region_contours: bool = True,
+) -> np.ndarray:
+    painted = _paint_region_values_on_slice(label_slice, region_values)
+    height, width = label_slice.shape
+    aspect = width / max(height, 1)
+    long_side = 6.2
+    figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+
+    cmap = _colormap_by_name(cmap_name).copy()
+    cmap.set_bad((0, 0, 0, 0))
+    masked = np.ma.masked_where(np.asarray(label_slice) <= 0, painted)
+    image = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+
+    region_lines = _label_contour_lines(label_slice, smoothing=1.4) if show_region_contours else []
+    if region_lines and line_width > 0:
+        from matplotlib.collections import LineCollection
+
+        ax.add_collection(
+            LineCollection(
+                region_lines,
+                colors="white",
+                linewidths=line_width,
+                alpha=0.95,
+                antialiaseds=True,
+                capstyle="round",
+                joinstyle="round",
+            )
+        )
+
+    brain_lines = _mask_contour_lines(label_slice > 0, smoothing=1.8)
+    if brain_lines and brain_outline_width > 0:
+        from matplotlib.collections import LineCollection
+
+        ax.add_collection(
+            LineCollection(
+                brain_lines,
+                colors="white",
+                linewidths=brain_outline_width,
+                alpha=0.95,
+                antialiaseds=True,
+                capstyle="round",
+                joinstyle="round",
+            )
+        )
+
+    ax.set_axis_off()
+    ax.set_xlim(-0.5, width - 0.5)
+    ax.set_ylim(height - 0.5, -0.5)
+    cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
+    cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors="white")
+    cbar.outline.set_linewidth(0.6)
+    cbar.outline.set_edgecolor("white")
+    cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color="white")
+
+    fig.tight_layout(pad=0.08)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=dpi, facecolor="black", bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+    buffer.seek(0)
+    return np.asarray(Image.open(buffer).convert("RGBA"))
+
+
+def render_region_metric_atlas_slice(
+    label_path: str | Path,
+    spec: AtlasSliceSpec,
+    region_values: dict[int, float],
+    output_path: str | Path,
+    *,
+    cmap_name: str = "white_orange_red_black",
+    vmin: float = 0.0,
+    vmax: float | None = None,
+    dpi: int = 300,
+    line_width: float = 0.16,
+    brain_outline_width: float = 0.42,
+    show_region_contours: bool = True,
+    colorbar_label: str = "Signal Count",
+) -> Path:
+    atlas_slice = extract_atlas_slice(label_path, spec)
+    finite_values = [float(value) for value in region_values.values() if np.isfinite(value)]
+    upper = float(vmax) if vmax is not None else (max(finite_values) if finite_values else float(vmin) + 1e-6)
+    lower = float(vmin)
+    if upper <= lower:
+        upper = lower + 1e-6
+
+    rendered = _render_region_metric_slice_array(
+        atlas_slice.image,
+        region_values,
+        cmap_name=cmap_name,
+        vmin=lower,
+        vmax=upper,
+        dpi=int(dpi),
+        line_width=float(line_width),
+        brain_outline_width=float(brain_outline_width),
+        colorbar_label=colorbar_label,
+        show_region_contours=show_region_contours,
+    )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rendered).save(output_path)
+    return output_path
 
 
 def render_local_signal_atlas_slice(
@@ -1536,13 +2144,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--density-percentile",
         type=float,
-        default=99.5,
-        help="Percentile used to derive shared density_vmax across samples when --density-vmax is omitted",
+        default=BATCH_SLICE_DEFAULT_PERCENTILE,
+        help="Percentile for shared color scale when --density-vmax is omitted; subtract diff mode defaults to 95 unless this flag is set",
     )
     parser.add_argument(
         "--output-subdir",
-        default="cell_density_slices",
-        help="Subdirectory under each sample's visualization/ folder for batch slice PNG outputs",
+        default="",
+        help="Subdirectory under visualization/ for batch slice PNG outputs; defaults depend on slice-color-mode",
+    )
+    parser.add_argument(
+        "--slice-color-mode",
+        choices=["signal", "region"],
+        default="signal",
+        help="signal=smoothed atlas-space density slices; region=fill Allen brain areas from density Excel metrics",
+    )
+    parser.add_argument(
+        "--subtract-sample-dir",
+        default="",
+        help="Subtract this sample's region metric from --sample-dir and render one diff heatmap series",
+    )
+    parser.add_argument(
+        "--region-metric",
+        default="Signal Count",
+        help="Metric column from density Excel Level_* sheets used by --slice-color-mode region",
+    )
+    parser.add_argument(
+        "--region-cfg",
+        default="",
+        help="Allen region CSV for mapping Excel rows to atlas region ids",
+    )
+    parser.add_argument(
+        "--input-excel",
+        default="",
+        help="Optional density Excel override for --sample-dir in region or diff modes",
+    )
+    parser.add_argument(
+        "--subtract-input-excel",
+        default="",
+        help="Optional density Excel override for --subtract-sample-dir",
     )
     parser.add_argument("--signal-ch", default="ch1", help="Signal channel label for --mode sample-stack")
     parser.add_argument("--register-ch", default="ch0", help="Registration channel label for --mode sample-stack")
@@ -1749,21 +2388,13 @@ def main(argv: list[str] | None = None) -> int:
                 "colorbar_label": colorbar_label,
             }
         elif args.mode == "batch-cell-density-slices":
-            if not args.samples_root:
-                parser.error("--samples-root is required for --mode batch-cell-density-slices")
-            if args.mean_cell_volume_um3 is None or args.mean_cell_volume_um3 <= 0:
-                parser.error("--mean-cell-volume-um3 must be > 0 for --mode batch-cell-density-slices")
             batch_plane = args.plane
             batch_coord_system = args.coord_system
             if batch_plane == "horizontal" and batch_coord_system == "index":
                 batch_plane = "coronal"
                 batch_coord_system = "bregma-mm"
-            payload = generate_batch_cell_density_slices(
-                samples_root=args.samples_root,
-                mean_cell_volume_um3=float(args.mean_cell_volume_um3),
-                config_path=args.config or None,
+            batch_kwargs = dict(
                 label_path=args.label,
-                atlas_image=args.atlas_image or None,
                 bregma_start=float(args.bregma_start),
                 bregma_end=float(args.bregma_end),
                 slice_count=int(args.slice_count),
@@ -1771,29 +2402,84 @@ def main(argv: list[str] | None = None) -> int:
                 coord_system=batch_coord_system,
                 atlas_resolution_um=float(args.atlas_resolution_um),
                 bregma_index=parse_bregma_index(args.bregma_index),
-                sigma=float(args.sigma),
-                alpha=float(args.alpha),
-                volume_mode=args.volume_mode,
-                density_vmin=float(args.density_vmin or 0.0),
+                density_vmin=args.density_vmin,
                 density_vmax=args.density_vmax,
                 density_percentile=float(args.density_percentile),
-                cmap_name=args.cmap,
                 dpi=int(args.dpi),
                 line_width=float(args.line_width),
                 brain_outline_width=float(args.brain_outline_width),
                 show_region_contours=not args.hide_region_contours,
-                colorbar_label=(
+                region_metric=args.region_metric,
+                region_cfg_path=args.region_cfg or None,
+                output_subdir=args.output_subdir or "",
+            )
+            if args.subtract_sample_dir:
+                if not args.sample_dir:
+                    parser.error("--sample-dir is required when --subtract-sample-dir is set")
+                diff_cmap = args.cmap if args.cmap != "white_blue_red" else "signal_count_diff"
+                diff_colorbar = (
                     args.colorbar_label
                     if args.colorbar_label != "Signal Intensity"
-                    else "cell density (cells/mm³)"
-                ),
-                output_subdir=args.output_subdir,
-                foreground_mode=args.foreground_mode,
-                foreground_label=int(args.foreground_label),
-                block_shape=args.block_shape,
-                min_voxels_per_point=int(args.min_voxels_per_point),
-                dataset_name=args.dataset_name,
-            )
+                    else None
+                )
+                subtract_kwargs = {
+                    key: value
+                    for key, value in batch_kwargs.items()
+                    if key != "density_percentile" and value is not None
+                }
+                payload = generate_batch_signal_count_diff_slices(
+                    sample_dir=args.sample_dir,
+                    subtract_sample_dir=args.subtract_sample_dir,
+                    input_excel=args.input_excel or None,
+                    subtract_input_excel=args.subtract_input_excel or None,
+                    cmap_name=diff_cmap,
+                    colorbar_label=diff_colorbar,
+                    output_subdir=args.output_subdir or "",
+                    density_percentile=_resolve_subtract_diff_percentile(float(args.density_percentile)),
+                    **subtract_kwargs,
+                )
+            elif args.slice_color_mode == "region":
+                if not args.samples_root:
+                    parser.error("--samples-root is required for --slice-color-mode region")
+                region_colorbar = (
+                    args.colorbar_label
+                    if args.colorbar_label != "Signal Intensity"
+                    else None
+                )
+                payload = generate_batch_region_metric_slices(
+                    samples_root=args.samples_root,
+                    cmap_name=args.cmap if args.cmap != "white_blue_red" else "white_orange_red_black",
+                    colorbar_label=region_colorbar,
+                    output_subdir=args.output_subdir or "",
+                    **{key: value for key, value in batch_kwargs.items() if value is not None},
+                )
+            else:
+                if not args.samples_root:
+                    parser.error("--samples-root is required for --slice-color-mode signal")
+                if args.mean_cell_volume_um3 is None or args.mean_cell_volume_um3 <= 0:
+                    parser.error("--mean-cell-volume-um3 must be > 0 for --slice-color-mode signal")
+                payload = generate_batch_cell_density_slices(
+                    samples_root=args.samples_root,
+                    mean_cell_volume_um3=float(args.mean_cell_volume_um3),
+                    config_path=args.config or None,
+                    atlas_image=args.atlas_image or None,
+                    sigma=float(args.sigma),
+                    alpha=float(args.alpha),
+                    volume_mode=args.volume_mode,
+                    cmap_name=args.cmap,
+                    colorbar_label=(
+                        args.colorbar_label
+                        if args.colorbar_label != "Signal Intensity"
+                        else "cell density (cells/mm³)"
+                    ),
+                    output_subdir=args.output_subdir or "",
+                    foreground_mode=args.foreground_mode,
+                    foreground_label=int(args.foreground_label),
+                    block_shape=args.block_shape,
+                    min_voxels_per_point=int(args.min_voxels_per_point),
+                    dataset_name=args.dataset_name,
+                    **{key: value for key, value in batch_kwargs.items() if key not in {"region_metric", "region_cfg_path"} and value is not None},
+                )
         else:
             outputs = generate_prv_sample(
                 label_path=args.label,

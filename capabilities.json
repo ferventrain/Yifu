@@ -109,6 +109,19 @@
       ]
     },
     {
+      "id": "qc",
+      "path": "pipeline_modules/qc",
+      "description": "No-reference image quality control for raw or preprocessed TIFF/Zarr signal volumes.",
+      "agent_native": true,
+      "capability_manifest": "pipeline_modules/qc/capability_manifest.json",
+      "primary_scripts": [
+        "pipeline_modules/qc/image_qc.py"
+      ],
+      "python_package": "pipeline_modules.qc",
+      "inputs_from": ["signal_zarr"],
+      "outputs_to": ["qc_report_json"]
+    },
+    {
       "id": "utils",
       "path": "pipeline_modules/utils",
       "description": "Shared utilities: SampleLayout (canonical path registry), PipelineError (structured errors), write_run_manifest.",

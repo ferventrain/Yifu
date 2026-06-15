@@ -1,0 +1,78 @@
+{
+  "schema_version": "1",
+  "notes": "Starter thresholds for image QC grading. Review and adjust on a reference sample cohort before production gating.",
+  "rules": [
+    {
+      "metric": "global_exposure_dynamic_range.dark_pixel_ratio",
+      "direction": "lower_is_better",
+      "pass_max": 0.05,
+      "warn_max": 0.15,
+      "category": "exposure_dynamic_range",
+      "description": "Fraction of pixels below dark threshold (default <100)."
+    },
+    {
+      "metric": "global_exposure_dynamic_range.saturated_pixel_ratio",
+      "direction": "lower_is_better",
+      "pass_max": 0.001,
+      "warn_max": 0.01,
+      "category": "exposure_dynamic_range",
+      "description": "Fraction of saturated/near-max pixels."
+    },
+    {
+      "metric": "slice_aggregate.brightness_uniformity.tile_median_cv.median",
+      "direction": "lower_is_better",
+      "pass_max": 0.15,
+      "warn_max": 0.30,
+      "category": "brightness_uniformity",
+      "description": "Median tile-brightness coefficient of variation across sampled slices."
+    },
+    {
+      "metric": "slice_aggregate.stripe_artifacts.slab_stripe_score.median",
+      "direction": "lower_is_better",
+      "pass_max": 0.08,
+      "warn_max": 0.20,
+      "category": "stripe_artifacts",
+      "description": "Combined row/column/slab stripe score."
+    },
+    {
+      "metric": "slice_aggregate.diffuse_signal.diffuse_noise_score.median",
+      "direction": "lower_is_better",
+      "pass_max": 0.20,
+      "warn_max": 0.40,
+      "category": "diffuse_signal",
+      "description": "Low-contrast elevated area likely to be diffuse noise rather than structured signal."
+    },
+    {
+      "metric": "slice_aggregate.diffuse_signal.noise_to_signal_area_ratio.median",
+      "direction": "lower_is_better",
+      "pass_max": 0.50,
+      "warn_max": 1.50,
+      "category": "diffuse_signal",
+      "description": "Ratio of diffuse-noise tile area to structured-signal tile area."
+    },
+    {
+      "metric": "slice_aggregate.diffuse_signal.large_diffuse_component_fraction.median",
+      "direction": "lower_is_better",
+      "pass_max": 0.10,
+      "warn_max": 0.25,
+      "category": "diffuse_signal",
+      "description": "Largest connected diffuse-noise tile component as fraction of tile grid."
+    },
+    {
+      "metric": "slice_aggregate.contrast.candidate_cnr.median",
+      "direction": "higher_is_better",
+      "pass_min": 3.0,
+      "warn_min": 1.5,
+      "category": "contrast",
+      "description": "Robust Otsu-based candidate contrast-to-noise ratio."
+    },
+    {
+      "metric": "slice_aggregate.focus.laplacian_variance.median",
+      "direction": "higher_is_better",
+      "pass_min": 50.0,
+      "warn_min": 20.0,
+      "category": "focus",
+      "description": "Median Laplacian variance across sampled slices (resolution dependent)."
+    }
+  ]
+}

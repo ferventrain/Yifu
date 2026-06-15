@@ -1,0 +1,130 @@
+{
+  "schema_version": "1",
+  "module": "qc",
+  "description": "No-reference image quality control for LSFM TIFF and Zarr volumes.",
+  "entrypoints": [
+    {
+      "id": "image_qc",
+      "function": "pipeline_modules.qc.image_qc.run_image_qc",
+      "cli": "python pipeline_modules/qc/image_qc.py",
+      "description": "Compute exposure, uniformity, contrast, diffuse-signal, stripe, and focus metrics on sampled Z slices.",
+      "inputs": {
+        "input_zarr": {
+          "type": "path|null",
+          "default": null,
+          "description": "Input Zarr volume; mutually exclusive with TIFF inputs"
+        },
+        "input_tiff_dir": {
+          "type": "path|null",
+          "default": null,
+          "description": "Directory of per-slice TIFF files"
+        },
+        "input_tiff": {
+          "type": "path|null",
+          "default": null,
+          "description": "Single 2D or multi-page TIFF"
+        },
+        "input_ims": {
+          "type": "path|null",
+          "default": null,
+          "description": "Imaris IMS on NAS/local; uses chunk-aligned reads"
+        },
+        "nas_qc": {
+          "type": "bool",
+          "default": false,
+          "description": "NAS preset: ResolutionLevel 2, 8 aligned slices, 24 histogram z-chunks"
+        },
+        "ims_resolution_level": {
+          "type": "int",
+          "default": 2
+        },
+        "ims_channel": {
+          "type": "int",
+          "default": 0
+        },
+        "ims_histogram_z_chunks": {
+          "type": "int",
+          "default": 24
+        },
+        "output_json": {
+          "type": "path",
+          "required": true,
+          "description": "JSON report path, e.g. sample_dir/qc/image_qc.json"
+        },
+        "output_csv": {
+          "type": "path|null",
+          "default": null,
+          "description": "Optional per-slice CSV export"
+        },
+        "sample_id": {
+          "type": "string|null",
+          "default": null
+        },
+        "tile_size": {
+          "type": "int",
+          "default": 256
+        },
+        "n_slabs": {
+          "type": "int",
+          "default": 32
+        },
+        "max_slices": {
+          "type": "int",
+          "default": 16
+        },
+        "projection": {
+          "type": "string",
+          "default": "none",
+          "examples": ["none", "max", "mean"]
+        },
+        "histogram_bins": {
+          "type": "int",
+          "default": 65536
+        },
+        "dark_pixel_threshold": {
+          "type": "float",
+          "default": 100.0
+        },
+        "thresholds": {
+          "type": "path",
+          "default": "pipeline_modules/qc/qc_thresholds.json"
+        }
+      },
+      "outputs": {
+        "output_json": "Structured QC report with global exposure metrics, per-slice aggregates, and grading",
+        "output_csv": "Optional flat per-slice metrics table",
+        "_run_manifest.json": "Standard run manifest beside outputs"
+      },
+      "common_commands": [
+        "python pipeline_modules/qc/image_qc.py --input_zarr sample_dir/ch0.zarr --output_json sample_dir/qc/image_qc.json --output_csv sample_dir/qc/image_qc_slices.csv",
+        "python pipeline_modules/qc/image_qc.py --input_ims \"\\\\nas\\share\\sample.ims\" --nas_qc --ims_channel 0 --output_json sample_dir/qc/image_qc.json",
+        "python pipeline_modules/qc/batch_image_qc.py --root Z:\\ --output_root Z:\\qc --channels 0"
+      ]
+    },
+    {
+      "id": "batch_image_qc",
+      "function": "pipeline_modules.qc.batch_image_qc.run_batch_image_qc",
+      "cli": "python pipeline_modules/qc/batch_image_qc.py",
+      "description": "Scan NAS/root for IMS files, run NAS-optimized QC into output_root, resume via _batch_qc_state.json.",
+      "inputs": {
+        "root": {
+          "type": "path",
+          "default": "Z:\\"
+        },
+        "output_root": {
+          "type": "path",
+          "default": "Z:\\qc"
+        },
+        "channels": {
+          "type": "string",
+          "default": "0"
+        }
+      },
+      "outputs": {
+        "output_root": "Per-IMS qc folders with image_qc.json and image_qc_slices.csv",
+        "_batch_qc_state.json": "Resume state",
+        "batch_qc_summary.csv": "Batch summary table"
+      }
+    }
+  ]
+}

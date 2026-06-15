@@ -829,9 +829,10 @@ def default_points_csv_for_sample(sample_dir: str | Path, signal_ch: str) -> Pat
     return Path(sample_dir) / "visualization" / "points.csv"
 
 
-def default_heatmap_volume_for_sample(sample_dir: str | Path) -> Path:
-    sample_dir = Path(sample_dir)
-    return sample_dir / "visualization" / f"{sample_dir.name}_heatmap3d_volume.tiff"
+def default_heatmap_volume_for_sample(sample_dir: str | Path, signal_ch: str = "ch1") -> Path:
+    from pipeline_modules.utils.deliverable_paths import heatmap_3d_volume_tiff
+
+    return heatmap_3d_volume_tiff(sample_dir, signal_ch)
 
 
 def default_reference_atlas_image() -> Path:

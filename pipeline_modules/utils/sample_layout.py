@@ -19,6 +19,14 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from pipeline_modules.utils.deliverable_paths import (
+    brain_distribution_stats_xlsx as deliverable_brain_distribution_stats_xlsx,
+    heatmap_2d_dir as deliverable_heatmap_2d_dir,
+    heatmap_3d_png as deliverable_heatmap_3d_png,
+    results_dir as deliverable_results_dir,
+    visualization_dir as deliverable_visualization_dir,
+)
+
 
 class SampleLayout(BaseModel):
     """Canonical paths for one sample processed through the full pipeline.
@@ -127,9 +135,34 @@ class SampleLayout(BaseModel):
     # ------------------------------------------------------------------
 
     @property
+    def results_dir(self) -> Path:
+        """Directory for analysis Excel deliverables."""
+        return deliverable_results_dir(self.sample_dir)
+
+    @property
+    def visualization_dir(self) -> Path:
+        """Directory for visualization deliverables."""
+        return deliverable_visualization_dir(self.sample_dir)
+
+    @property
+    def brain_distribution_stats_xlsx(self) -> Path:
+        """Whole-brain distribution statistics Excel workbook."""
+        return deliverable_brain_distribution_stats_xlsx(self.sample_dir, self.signal_ch)
+
+    @property
     def density_results_xlsx(self) -> Path:
-        """Region density statistics Excel workbook."""
-        return self.sample_dir / f"sample_{self.signal_ch}_result.xlsx"
+        """Alias for :attr:`brain_distribution_stats_xlsx`."""
+        return self.brain_distribution_stats_xlsx
+
+    @property
+    def heatmap_2d_dir(self) -> Path:
+        """2D heatmap slice output directory."""
+        return deliverable_heatmap_2d_dir(self.sample_dir, self.signal_ch)
+
+    @property
+    def heatmap_3d_png(self) -> Path:
+        """Primary 3D heatmap deliverable PNG."""
+        return deliverable_heatmap_3d_png(self.sample_dir, self.signal_ch)
 
     # ------------------------------------------------------------------
     # Tubule reconstruction outputs
@@ -179,7 +212,9 @@ class SampleLayout(BaseModel):
             "signal_zarr", "mask_zarr", "atlas_label_zarr",
             "atlas_label_hemisphere_zarr",
             "reg_downsample_dir", "reg_downsample_nii", "atlas_label_tiff_dir",
-            "mask_tiff_dir", "density_results_xlsx",
+            "mask_tiff_dir", "results_dir", "visualization_dir",
+            "brain_distribution_stats_xlsx", "density_results_xlsx",
+            "heatmap_2d_dir", "heatmap_3d_png",
             "tubule_reconstruction_dir", "tubule_branch_csv", "tubule_summary_json",
             "tubule_vertex_csv", "tubule_edge_csv",
             "tubule_region_summary_csv", "tubule_region_summary_json",

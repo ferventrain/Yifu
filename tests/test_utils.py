@@ -154,9 +154,16 @@ class TestSampleLayout:
         assert layout.tubule_edge_csv.name == "skeleton_edges.csv"
         assert layout.tubule_run_manifest.name == "_run_manifest.json"
 
-    def test_density_xlsx_uses_sample_dir_name(self, tmp_path):
-        layout = SampleLayout(sample_dir=tmp_path, signal_ch="ch2")
-        assert layout.density_results_xlsx.name == f"sample_ch2_result.xlsx"
+    def test_density_xlsx_uses_standard_deliverable_name(self, tmp_path):
+        sample_dir = tmp_path / "mouse01"
+        sample_dir.mkdir()
+        layout = SampleLayout(sample_dir=sample_dir, signal_ch="ch2")
+        assert layout.brain_distribution_stats_xlsx == (
+            sample_dir / "results" / "mouse01_ch2_brain_distribution_stats.xlsx"
+        )
+        assert layout.density_results_xlsx == layout.brain_distribution_stats_xlsx
+        assert layout.heatmap_2d_dir == sample_dir / "visualization" / "mouse01_ch2_heatmap_2d"
+        assert layout.heatmap_3d_png == sample_dir / "visualization" / "mouse01_ch2_heatmap_3d.png"
 
     def test_atlas_label_hemisphere_zarr(self, tmp_path):
         layout = SampleLayout(sample_dir=tmp_path)

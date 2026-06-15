@@ -17,7 +17,7 @@
         "input_excel": {
           "type": "path",
           "required": true,
-          "description": "Density/results Excel workbook, commonly sample_dir/<sample_dir_name>_density_result.xlsx"
+          "description": "Density/results Excel workbook at sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx"
         },
         "cfg": {
           "type": "path",
@@ -84,7 +84,7 @@
         }
       ],
       "sample_layout": {
-        "density_results_xlsx": "sample_dir/<sample_dir_name>_density_result.xlsx"
+        "density_results_xlsx": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx"
       }
     },
     {
@@ -249,7 +249,7 @@
       "prerequisites": [
         "sample_dir should contain <signal_ch>_mask.zarr, <register_ch>_downsample/volume.nii.gz, and transforms/",
         "Atlas reference files should exist under data/reference/",
-        "For repeated runs, the cached atlas-space volume can be reused from sample_dir/visualization/<sample>_heatmap3d_volume.tiff"
+        "For repeated runs, the cached atlas-space volume can be reused from sample_dir/visualization/<sample>_<channel>_heatmap_3d_volume.tiff"
       ],
       "inputs": {
         "sample_dir": {
@@ -270,7 +270,7 @@
         "output": {
           "type": "path|null",
           "default": null,
-          "description": "Output heatmap path. sample-stack defaults to sample_dir/visualization/<sample>_heatmap3d_stack.tiff"
+          "description": "Output heatmap path. sample-stack defaults to sample_dir/visualization/<sample>_<channel>_heatmap_3d_stack.tiff and writes preview PNG <sample>_<channel>_heatmap_3d.png"
         },
         "sigma": {
           "type": "float",
@@ -291,11 +291,15 @@
       "outputs": {
         "heatmap_stack_tiff": {
           "type": "path",
-          "description": "sample_dir/visualization/<sample>_heatmap3d_stack.tiff"
+          "description": "sample_dir/visualization/<sample>_<channel>_heatmap_3d_stack.tiff"
+        },
+        "heatmap_3d_png": {
+          "type": "path",
+          "description": "sample_dir/visualization/<sample>_<channel>_heatmap_3d.png"
         },
         "cached_atlas_volume_tiff": {
           "type": "path",
-          "description": "sample_dir/visualization/<sample>_heatmap3d_volume.tiff"
+          "description": "sample_dir/visualization/<sample>_<channel>_heatmap_3d_volume.tiff"
         },
         "atlas_points_csv": {
           "type": "path",
@@ -569,7 +573,7 @@
         }
       ],
       "sample_layout": {
-        "density_results_xlsx": "sample_dir/<sample_dir_name>_density_result.xlsx"
+        "density_results_xlsx": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx"
       }
     },
     {
@@ -694,6 +698,44 @@
           "Mean and median reference lines",
           "Summary box with n, mean, median, std, min, max"
         ]
+      }
+    },
+    {
+      "id": "export_region_mip",
+      "function": "pipeline_modules.visualization.region_mip_export.export_region_mip_tiffs",
+      "cli": "python pipeline_modules/visualization/region_mip_export.py",
+      "description": "Mask one Allen brain region in sample space using upsampled_atlas_label.zarr, then export horizontal/coronal/sagittal maximum-intensity projection TIFFs from the signal Zarr.",
+      "prerequisites": [
+        "sample_dir must contain signal Zarr (e.g. ch1.zarr) and upsampled_atlas_label.zarr with identical shapes",
+        "Region query resolves against pipeline_modules/registration/Region_Csv_Rev1_updated.CSV by acronym, full name, or numeric id",
+        "Optional mask Zarr can gate foreground voxels before projection"
+      ],
+      "inputs": {
+        "sample_dir": { "type": "dir", "required": true },
+        "region": { "type": "string", "required": true, "examples": ["HIP", "PVH", "Anterior cingulate area", "295"] },
+        "cfg": { "type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV" },
+        "config": { "type": "path|null", "default": null, "description": "Optional config.json for default signal channel" },
+        "signal_zarr": { "type": "path|null", "default": null },
+        "label_zarr": { "type": "path|null", "default": null },
+        "mask_zarr": { "type": "path|null", "default": null },
+        "block_shape": { "type": "z,y,x", "default": "128,256,256" },
+        "output_dir": { "type": "path|null", "default": "sample_dir/visualization/region_mip" }
+      },
+      "outputs": {
+        "horizontal_mip_tiff": { "type": "path", "description": "{sample}_{region}_{horizontal}.tiff" },
+        "coronal_mip_tiff": { "type": "path", "description": "{sample}_{region}_{coronal}.tiff" },
+        "sagittal_mip_tiff": { "type": "path", "description": "{sample}_{region}_{sagittal}.tiff" },
+        "summary_json": { "type": "path", "description": "{sample}_{region}_mip_summary.json" }
+      },
+      "common_commands": [
+        {
+          "description": "Export hippocampus MIPs for a sample using default Zarr paths",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; python pipeline_modules/visualization/region_mip_export.py --sample-dir \"S:\\Arivis_Analysis\\YF2026011501liuyuan\" --region HIP --config \"S:\\Yifu\\config\\config.json\""
+        }
+      ],
+      "sample_layout": {
+        "signal_zarr": "sample_dir/<signal_ch>.zarr",
+        "atlas_label_zarr": "sample_dir/upsampled_atlas_label.zarr"
       }
     }
   ]

@@ -22,12 +22,32 @@
   "AMY": {
     "acronyms": ["BLA", "BMA", "LA", "PA", "CEA", "MEA", "AAA", "IA", "COA", "PAA"],
     "color": "#CC79A7",
-    "description": "Amygdalar nuclei including cortical amygdala (COA, PAA)"
+    "description": "Amygdala (杏仁核); cortical and subcortical amygdalar nuclei"
+  },
+  "PVH": {
+    "acronyms": ["PVH"],
+    "color": "#F0E442",
+    "description": "Paraventricular nucleus of hypothalamus (下丘脑室旁核); Allen PVH includes subdivisions"
+  },
+  "PAG": {
+    "acronyms": ["PAG"],
+    "color": "#999999",
+    "description": "Periaqueductal gray (导水管周围灰质)"
+  },
+  "PMC": {
+    "acronyms": ["B"],
+    "color": "#E41A1C",
+    "description": "Pontine micturition center homolog in mouse: Barrington's nucleus (Allen acronym B, id 280)"
+  },
+  "ACG": {
+    "acronyms": ["ACA"],
+    "color": "#E69F00",
+    "description": "Anterior cingulate gyrus (前扣带回); Allen mouse atlas uses ACA"
   },
   "ACC": {
     "acronyms": ["ACA"],
     "color": "#E69F00",
-    "description": "Anterior cingulate cortex; may overlap PFC group points"
+    "description": "Alias of ACG (anterior cingulate); may overlap PFC group points"
   },
   "NAc": {
     "acronyms": ["ACB"],
