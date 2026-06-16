@@ -24,6 +24,35 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _nifti_spacing_from_affine(affine: np.ndarray):
+    return tuple(float(abs(affine[i, i])) for i in range(3))
+
+
+def _load_nifti_as_ants(path):
+    """Load NIfTI via nibabel and convert to ANTs image.
+
+    ANTs/ITK image_read can crash on Windows when the path contains non-ASCII
+    characters (e.g. Chinese folder names on NAS paths).
+    """
+    try:
+        import nibabel as nib
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("nibabel is required to load NIfTI registration volumes") from exc
+
+    nii = nib.load(str(path))
+    data = np.asanyarray(nii.dataobj)
+    if not np.issubdtype(data.dtype, np.floating):
+        data = data.astype(np.float32)
+    return ants.from_numpy(data, spacing=_nifti_spacing_from_affine(nii.affine))
+
+
+def _ants_image_read(path):
+    path_str = str(path)
+    if path_str.lower().endswith((".nii", ".nii.gz")):
+        return _load_nifti_as_ants(path)
+    return ants.image_read(path_str)
+
+
 def _ensure_label_storage_dtype(array: np.ndarray) -> np.dtype:
     """Pick a TIFF-safe integer dtype that preserves atlas label ids."""
     if np.issubdtype(array.dtype, np.integer):
@@ -96,7 +125,7 @@ class BidirectionalRegistration:
         
         # Load Config
         if config_path and os.path.exists(config_path):
-             with open(config_path, 'r') as f:
+             with open(config_path, 'r', encoding='utf-8') as f:
                 full_config = json.load(f)
                 # Parse resolution from main config structure
                 # Input resolution (Source)
@@ -109,7 +138,7 @@ class BidirectionalRegistration:
             current_dir = Path(__file__).parent
             resolution_config_path = current_dir / 'resolution.json'
             if resolution_config_path.exists():
-                with open(resolution_config_path, 'r') as f:
+                with open(resolution_config_path, 'r', encoding='utf-8') as f:
                     self.config = json.load(f)
                 self.source_resolution = self.config['source_resolution']
                 self.atlas_resolution = self.config['target_resolution']
@@ -162,7 +191,7 @@ class BidirectionalRegistration:
         if not reg_img_path.exists():
             raise FileNotFoundError(f"Registration image not found at {reg_img_path}. Please run downsampling first.")
         
-        self.register_image = ants.image_read(str(reg_img_path))
+        self.register_image = _ants_image_read(reg_img_path)
         
         # Force direction matrix to identity to avoid flipping/reflection
         identity_direction = np.eye(3)
@@ -539,7 +568,7 @@ def main():
         original_shape = None
         origin_shape_path = Path(args.sample_dir) / 'original_shape.json'
         if origin_shape_path.exists():
-            with open(origin_shape_path, 'r') as f:
+            with open(origin_shape_path, 'r', encoding='utf-8') as f:
                 original_shape = tuple(json.load(f)['original_shape'])
             logger.info('Loaded original shape from %s: %s', origin_shape_path, original_shape)
         else:
