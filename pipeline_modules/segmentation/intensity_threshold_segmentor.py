@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
@@ -134,6 +136,7 @@ def run_threshold_segmentation(
     dataset_name: str = "0",
     process_existing_only: bool = False,
     resume: bool = False,
+    tile_size: int = 1024,
 ) -> dict[str, Any]:
     started_at = time.time()
     input_path = Path(input_zarr)
@@ -164,18 +167,26 @@ def run_threshold_segmentation(
                      incomplete_z_indices)
 
         z_chunk_size = chunks[0]
+        n_y = (shape[1] + tile_size - 1) // tile_size
+        n_x = (shape[2] + tile_size - 1) // tile_size
+        pbar = tqdm(total=len(incomplete_z_indices) * n_y * n_x, desc="Resume threshold segmentation", unit="tile")
         for z_idx in incomplete_z_indices:
             z = z_idx * z_chunk_size
             z_end = min(z + z_chunk_size, shape[0])
-            logger.info("Processing z-range [%d:%d) (z-chunk %d)", z, z_end, z_idx)
-            data_out[z:z_end, :, :] = segment_chunk(
-                data_in[z:z_end, :, :],
-                threshold,
-                sigma,
-                min_size,
-                output_mode=output_mode,
-            )
+            for y in range(0, shape[1], tile_size):
+                y_end = min(y + tile_size, shape[1])
+                for x in range(0, shape[2], tile_size):
+                    x_end = min(x + tile_size, shape[2])
+                    data_out[z:z_end, y:y_end, x:x_end] = segment_chunk(
+                        data_in[z:z_end, y:y_end, x:x_end],
+                        threshold,
+                        sigma,
+                        min_size,
+                        output_mode=output_mode,
+                    )
+                    pbar.update(1)
             processed_chunks += 1
+        pbar.close()
     else:
         _, data_out = create_output_zarr(output_zarr, shape, chunks, output_dtype, dataset_name=dataset_name)
 
@@ -187,6 +198,7 @@ def run_threshold_segmentation(
                     "No physical chunks found in input store",
                     {"input_zarr": str(input_path)},
                 )
+            pbar = tqdm(total=len(existing_indices), desc="Threshold segmentation (test mode)", unit="chunk")
             for idx in existing_indices:
                 slices = []
                 for axis, chunk_idx in enumerate(idx):
@@ -202,18 +214,30 @@ def run_threshold_segmentation(
                     output_mode=output_mode,
                 )
                 processed_chunks += 1
+                pbar.update(1)
+            pbar.close()
         else:
             z_chunk_size = chunks[0]
+            n_z = (shape[0] + z_chunk_size - 1) // z_chunk_size
+            n_y = (shape[1] + tile_size - 1) // tile_size
+            n_x = (shape[2] + tile_size - 1) // tile_size
+            pbar = tqdm(total=n_z * n_y * n_x, desc="Threshold segmentation", unit="tile")
             for z in range(0, shape[0], z_chunk_size):
                 z_end = min(z + z_chunk_size, shape[0])
-                data_out[z:z_end, :, :] = segment_chunk(
-                    data_in[z:z_end, :, :],
-                    threshold,
-                    sigma,
-                    min_size,
-                    output_mode=output_mode,
-                )
+                for y in range(0, shape[1], tile_size):
+                    y_end = min(y + tile_size, shape[1])
+                    for x in range(0, shape[2], tile_size):
+                        x_end = min(x + tile_size, shape[2])
+                        data_out[z:z_end, y:y_end, x:x_end] = segment_chunk(
+                            data_in[z:z_end, y:y_end, x:x_end],
+                            threshold,
+                            sigma,
+                            min_size,
+                            output_mode=output_mode,
+                        )
+                        pbar.update(1)
                 processed_chunks += 1
+            pbar.close()
 
     result = {
         "success": True,
@@ -262,6 +286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
     parser.add_argument("--test", action="store_true", help="Only process chunks that physically exist in the input store")
     parser.add_argument("--resume", action="store_true", help="Resume from existing output Zarr, skipping completed z-chunks")
+    parser.add_argument("--tile_size", type=int, default=1024, help="XY tile size for memory-limited processing (default: 1024)")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()
 
@@ -280,6 +305,7 @@ def main() -> int:
             dataset_name=args.dataset_name,
             process_existing_only=args.test,
             resume=args.resume,
+            tile_size=args.tile_size,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
