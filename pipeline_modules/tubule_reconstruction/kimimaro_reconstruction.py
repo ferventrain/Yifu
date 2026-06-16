@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import zarr
 from scipy import ndimage
+from tqdm import tqdm
 
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
@@ -227,12 +228,36 @@ def _process_chunk_task(task):
             "num_skeletons": 0,
         }
 
-    binary_mask = _extract_binary_mask(
-        mask_zarr,
-        roi=expanded_slices,
-        foreground_label=task["foreground_label"],
-    )
+    if expanded_slices == chunk_slices:
+        binary_mask = core_binary_mask
+    else:
+        binary_mask = _extract_binary_mask(
+            mask_zarr,
+            roi=expanded_slices,
+            foreground_label=task["foreground_label"],
+        )
     expanded_mask_voxels = int(np.count_nonzero(binary_mask))
+
+    if task["dust_threshold"] and expanded_mask_voxels < int(task["dust_threshold"]):
+        chunk_summary = {
+            **metadata,
+            "mask_voxels": core_mask_voxels,
+            "expanded_mask_voxels": expanded_mask_voxels,
+            "connected_components": 0,
+            "num_skeletons": 0,
+            "num_branches": 0,
+            "total_branch_length_um": 0.0,
+        }
+        return {
+            "chunk_index": chunk_index,
+            "core_mask_voxels": core_mask_voxels,
+            "connected_components": 0,
+            "branch_table": branch_table_from_skeletons({}),
+            "vertex_table": pd.DataFrame(),
+            "edge_table": pd.DataFrame(),
+            "chunk_summary": chunk_summary,
+            "num_skeletons": 0,
+        }
 
     skeletons, meta = skeletonize_binary_mask(
         binary_mask=binary_mask,
@@ -1883,10 +1908,13 @@ def analyze_binary_mask_zarr_chunkwise(
     ]
 
     if chunk_workers <= 1:
-        chunk_results = [_process_chunk_task(task) for task in task_payloads]
+        chunk_results = [_process_chunk_task(task) for task in tqdm(task_payloads, desc="Processing chunks")]
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=chunk_workers) as executor:
-            chunk_results = list(executor.map(_process_chunk_task, task_payloads))
+            futures = {executor.submit(_process_chunk_task, task): task["chunk_index"] for task in task_payloads}
+            chunk_results = []
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing chunks"):
+                chunk_results.append(future.result())
 
     chunk_results.sort(key=lambda item: tuple(item["chunk_index"]))
 
@@ -2061,7 +2089,13 @@ def build_argparser():
     parser.add_argument("--save_swc", action="store_true", help="Export one SWC file per skeleton")
     parser.add_argument("--chunkwise", action="store_true", help="Process the mask chunk-by-chunk instead of loading the full volume")
     parser.add_argument("--chunk_workers", type=int, default=1, help="Number of worker processes for chunkwise processing")
-    parser.add_argument("--existing_only", action="store_true", help="In chunkwise mode, only process chunks that physically exist in the store")
+    parser.add_argument(
+        "--existing_only",
+        "--process_existing_only",
+        dest="existing_only",
+        action="store_true",
+        help="In chunkwise mode, only process chunks that physically exist in the store",
+    )
     parser.add_argument("--halo_zyx", default="0,0,0", help="Halo overlap in voxels for chunkwise processing as z,y,x")
     parser.add_argument("--no_stitch", action="store_true", help="Disable cross-chunk skeleton stitching in chunkwise mode")
     parser.add_argument("--stitch_max_distance_um", type=float, default=5.0, help="Maximum distance in microns for cross-chunk endpoint stitching")
