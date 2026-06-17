@@ -47,20 +47,22 @@
     {
       "id": "segmentation",
       "path": "pipeline_modules/segmentation",
-      "description": "Vessel / cell mask generation from signal Zarr using thresholding or local-checkpoint 3D U-Net inference.",
+      "description": "Vessel / cell mask generation and spot detection from signal Zarr using thresholding, local-checkpoint 3D U-Net inference, or Spotiflow.",
       "agent_native": true,
       "capability_manifest": "pipeline_modules/segmentation/capability_manifest.json",
       "primary_scripts": [
         "pipeline_modules/segmentation/intensity_threshold_segmentor.py",
-        "pipeline_modules/segmentation/cfos_unet_inference.py"
+        "pipeline_modules/segmentation/cfos_unet_inference.py",
+        "pipeline_modules/segmentation/spotiflow_inference.py"
       ],
       "python_package": "pipeline_modules.segmentation",
       "config_models": {
         "SegmentationCfg": "pipeline_modules.segmentation.config.SegmentationCfg",
         "ThresholdSegmentationCfg": "pipeline_modules.segmentation.config.ThresholdSegmentationCfg",
-        "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg"
+        "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg",
+        "SpotiflowInferenceCfg": "pipeline_modules.segmentation.config.SpotiflowInferenceCfg"
       },
-      "outputs_to": ["mask_zarr", "mask_tiff_dir"]
+      "outputs_to": ["mask_zarr", "mask_tiff_dir", "spotiflow_points_csv", "spotiflow_region_counts_csv"]
     },
     {
       "id": "tubule_reconstruction",

@@ -6,6 +6,7 @@ from pathlib import Path
 from pipeline_modules.segmentation import (
     CfosUNetInferenceCfg,
     SegmentationCfg,
+    SpotiflowInferenceCfg,
     ThresholdSegmentationCfg,
     export_json_schema,
     layout_for_sample,
@@ -47,6 +48,7 @@ def test_schema_export_contains_expected_models():
     assert "SegmentationCfg" in schema
     assert "ThresholdSegmentationCfg" in schema
     assert "CfosUNetInferenceCfg" in schema
+    assert "SpotiflowInferenceCfg" in schema
 
 
 def test_capability_manifest_contains_cfos_entrypoint():
@@ -54,6 +56,7 @@ def test_capability_manifest_contains_cfos_entrypoint():
     entrypoint_ids = {entry["id"] for entry in manifest["entrypoints"]}
     assert "threshold_segmentation" in entrypoint_ids
     assert "cfos_unet_inference" in entrypoint_ids
+    assert "spotiflow_inference" in entrypoint_ids
     assert "cfos_unet_qc" in entrypoint_ids
     assert "export_zarr_to_tiff" in entrypoint_ids
 
@@ -88,3 +91,26 @@ def test_package_exports_config_classes():
     assert SegmentationCfg is not None
     assert ThresholdSegmentationCfg is not None
     assert CfosUNetInferenceCfg is not None
+    assert SpotiflowInferenceCfg is not None
+
+
+def test_segmentation_cfg_accepts_spotiflow_fields():
+    cfg = SegmentationCfg.model_validate(
+        {
+            "method": "spotiflow",
+            "spotiflow": {
+                "model_dir": "model/spotiflow",
+                "prob_thresh": "0.35",
+                "tile_size": [64, 128, 128],
+                "skip_below_threshold": "none",
+                "normalizer": "none",
+            },
+        }
+    )
+    dumped = cfg.model_dump()
+    assert dumped["method"] == "spotiflow"
+    assert dumped["spotiflow"]["model_dir"] == "model/spotiflow"
+    assert dumped["spotiflow"]["prob_thresh"] == 0.35
+    assert dumped["spotiflow"]["tile_size"] == (64, 128, 128)
+    assert dumped["spotiflow"]["skip_below_threshold"] is None
+    assert dumped["spotiflow"]["normalizer"] is None

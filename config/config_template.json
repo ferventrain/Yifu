@@ -116,6 +116,28 @@
             "output_dtype": "uint8",
             "probability_dtype": "float16",
             "normalize_percentiles": [1.0, 99.5]
+        },
+
+        "spotiflow": {
+            "model_dir": "model/spotiflow",
+            "output_csv": "",
+            "region_counts_csv": "",
+            "summary_json": "",
+            "label_zarr": "",
+            "cfg": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+            "dataset_name": "0",
+            "which": "best",
+            "prob_thresh": 0.35,
+            "min_distance": 1,
+            "tile_size": null,
+            "tile_overlap": 16,
+            "skip_below_threshold": null,
+            "device": "auto",
+            "peak_mode": "fast",
+            "normalizer": "auto",
+            "subpix": null,
+            "use_tuned_tile_overlap": false,
+            "rerun_if_model_updated": true
         }
     },
     

@@ -102,6 +102,46 @@ class CfosUNetInferenceCfg(_ModelMixin):
 
 
 @dataclass(frozen=True)
+class SpotiflowInferenceCfg(_ModelMixin):
+    apply: bool = True
+    model_dir: str = "model/spotiflow"
+    output_csv: str = ""
+    region_counts_csv: str = ""
+    summary_json: str = ""
+    label_zarr: str = ""
+    cfg: str = "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+    dataset_name: str = "0"
+    which: str = "best"
+    prob_thresh: float | None = 0.35
+    min_distance: int = 1
+    tile_size: tuple[int, int, int] | None = None
+    tile_overlap: int = 16
+    skip_below_threshold: float | None = None
+    device: str = "auto"
+    peak_mode: str = "fast"
+    normalizer: str | None = "auto"
+    subpix: bool | None = None
+    use_tuned_tile_overlap: bool = False
+    rerun_if_model_updated: bool = True
+
+    def __post_init__(self) -> None:
+        if self.tile_size is not None:
+            object.__setattr__(self, "tile_size", _coerce_int_triplet(self.tile_size))
+        if isinstance(self.prob_thresh, str):
+            text = self.prob_thresh.strip().lower()
+            object.__setattr__(self, "prob_thresh", None if text in {"", "none", "null"} else float(text))
+        if isinstance(self.skip_below_threshold, str):
+            text = self.skip_below_threshold.strip().lower()
+            object.__setattr__(
+                self,
+                "skip_below_threshold",
+                None if text in {"", "none", "null"} else float(text),
+            )
+        if isinstance(self.normalizer, str) and self.normalizer.strip().lower() in {"", "none", "null"}:
+            object.__setattr__(self, "normalizer", None)
+
+
+@dataclass(frozen=True)
 class SegmentationCfg(_ModelMixin):
     """Top-level segmentation configuration."""
 
@@ -109,10 +149,12 @@ class SegmentationCfg(_ModelMixin):
     export_mask_tiff: bool = False
     threshold: ThresholdSegmentationCfg = field(default_factory=ThresholdSegmentationCfg)
     cfos_unet: CfosUNetInferenceCfg = field(default_factory=CfosUNetInferenceCfg)
+    spotiflow: SpotiflowInferenceCfg = field(default_factory=SpotiflowInferenceCfg)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "threshold", ThresholdSegmentationCfg.model_validate(self.threshold))
         object.__setattr__(self, "cfos_unet", CfosUNetInferenceCfg.model_validate(self.cfos_unet))
+        object.__setattr__(self, "spotiflow", SpotiflowInferenceCfg.model_validate(self.spotiflow))
 
     @classmethod
     def model_json_schema(cls) -> dict[str, Any]:
@@ -120,10 +162,11 @@ class SegmentationCfg(_ModelMixin):
             "title": cls.__name__,
             "type": "object",
             "properties": {
-                "method": {"type": "string", "enum": ["threshold", "cfos_unet", "cellpose"]},
+                "method": {"type": "string", "enum": ["threshold", "cfos_unet", "spotiflow", "cellpose"]},
                 "export_mask_tiff": {"type": "boolean", "default": False},
                 "threshold": {"type": "object"},
                 "cfos_unet": {"type": "object"},
+                "spotiflow": {"type": "object"},
             },
         }
 
@@ -175,6 +218,7 @@ def export_json_schema() -> dict[str, Any]:
         "SegmentationCfg": SegmentationCfg.model_json_schema(),
         "ThresholdSegmentationCfg": ThresholdSegmentationCfg.model_json_schema(),
         "CfosUNetInferenceCfg": CfosUNetInferenceCfg.model_json_schema(),
+        "SpotiflowInferenceCfg": SpotiflowInferenceCfg.model_json_schema(),
     }
 
 

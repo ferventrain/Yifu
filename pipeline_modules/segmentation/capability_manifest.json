@@ -1,7 +1,7 @@
 {
   "schema_version": "1",
   "module": "segmentation",
-  "description": "Threshold-based and local-checkpoint 3D U-Net segmentation over signal Zarr volumes, with TIFF export helpers.",
+  "description": "Threshold-based, local-checkpoint 3D U-Net, and Spotiflow spot detection over signal Zarr volumes, with TIFF export helpers.",
   "entrypoints": [
     {
       "id": "threshold_segmentation",
@@ -98,6 +98,39 @@
       }
     },
     {
+      "id": "spotiflow_inference",
+      "function": "pipeline_modules.segmentation.spotiflow_inference.run_spotiflow_inference",
+      "cli": "python -m pipeline_modules.segmentation.spotiflow_inference",
+      "description": "Run Spotiflow whole-brain spot detection on a 3D signal Zarr volume, optionally map detections to atlas regions, and export per-region signal counts.",
+      "inputs": {
+        "input_zarr": {"type": "path", "required": true},
+        "output_csv": {"type": "path", "required": true},
+        "model_dir": {"type": "path", "default": "model/spotiflow"},
+        "label_zarr": {"type": "path|null", "default": null},
+        "region_counts_csv": {"type": "path|null", "default": null},
+        "summary_json": {"type": "path|null", "default": null},
+        "cfg": {"type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"},
+        "dataset_name": {"type": "string", "default": "0"},
+        "which": {"type": "string", "default": "best", "choices": ["best", "last"]},
+        "prob_thresh": {"type": "float|null", "default": 0.35},
+        "min_distance": {"type": "int", "default": 1},
+        "tile_size": {"type": "triplet_int|null", "default": null},
+        "tile_overlap": {"type": "int", "default": 16},
+        "skip_below_threshold": {"type": "float|null", "default": null},
+        "device": {"type": "string", "default": "auto"},
+        "peak_mode": {"type": "string", "default": "fast", "choices": ["fast", "skimage"]},
+        "normalizer": {"type": "string|null", "default": "auto"},
+        "subpix": {"type": "bool|null", "default": null},
+        "use_tuned_tile_overlap": {"type": "bool", "default": false}
+      },
+      "outputs": {
+        "output_csv": {"type": "path"},
+        "region_counts_csv": {"type": "path", "required": false},
+        "summary_json": {"type": "path"},
+        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
+      }
+    },
+    {
       "id": "export_zarr_to_tiff",
       "function": "pipeline_modules.segmentation.zarr_utils.export_zarr_to_tiff",
       "cli": "python -c \"from pipeline_modules.segmentation import export_zarr_to_tiff; ...\"",
@@ -115,7 +148,8 @@
   "configuration_models": {
     "SegmentationCfg": "pipeline_modules.segmentation.config.SegmentationCfg",
     "ThresholdSegmentationCfg": "pipeline_modules.segmentation.config.ThresholdSegmentationCfg",
-    "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg"
+    "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg",
+    "SpotiflowInferenceCfg": "pipeline_modules.segmentation.config.SpotiflowInferenceCfg"
   },
   "sample_layout": {
     "class": "pipeline_modules.utils.sample_layout.SampleLayout",

@@ -3,6 +3,7 @@
 from .config import (
     CfosUNetInferenceCfg,
     SegmentationCfg,
+    SpotiflowInferenceCfg,
     ThresholdSegmentationCfg,
     export_json_schema,
     layout_for_sample,
@@ -49,9 +50,18 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     def normalize_volume(*args, **kwargs):  # type: ignore[no-redef]
         raise ModuleNotFoundError(f"cfos_unet inference is unavailable: {_cfos_import_error}")
 
+try:
+    from .spotiflow_inference import run_spotiflow_inference
+except ModuleNotFoundError as exc:  # pragma: no cover
+    _spotiflow_import_error = str(exc)
+
+    def run_spotiflow_inference(*args, **kwargs):  # type: ignore[no-redef]
+        raise ModuleNotFoundError(f"spotiflow inference is unavailable: {_spotiflow_import_error}")
+
 __all__ = [
     "CfosUNetInferenceCfg",
     "SegmentationCfg",
+    "SpotiflowInferenceCfg",
     "ThresholdSegmentationCfg",
     "build_cfos_unet_classes",
     "export_json_schema",
@@ -61,6 +71,7 @@ __all__ = [
     "load_cfos_unet_checkpoint",
     "normalize_volume",
     "open_zarr_dataset",
+    "run_spotiflow_inference",
     "run_cfos_unet_inference",
     "run_threshold_segmentation",
     "segment_chunk",

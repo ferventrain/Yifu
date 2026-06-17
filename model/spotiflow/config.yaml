@@ -1,0 +1,43 @@
+backbone: unet
+background_remover: false
+batch_norm: true
+compute_flow: true
+downsample_factor: 2
+downsample_factors:
+-   - 2
+    - 2
+    - 2
+-   - 2
+    - 2
+    - 2
+-   - 2
+    - 2
+    - 2
+-   - 2
+    - 2
+    - 2
+dropout: 0.0
+fmap_inc_factor: 2
+grid:
+- 2
+- 2
+- 2
+in_channels: 1
+initial_fmaps: 32
+is_3d: true
+kernel_sizes:
+-   - 3
+    - 3
+    - 3
+-   - 3
+    - 3
+    - 3
+-   - 3
+    - 3
+    - 3
+levels: 4
+mode: slim
+n_convs_per_level: 3
+out_channels: 1
+padding: 1
+sigma: 1.0

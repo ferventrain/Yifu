@@ -124,6 +124,29 @@ def cfos_unet_outputs_are_stale(model_cfg, output_paths):
     return checkpoint_mtime > min(existing_output_mtimes)
 
 
+def spotiflow_model_mtime(model_cfg):
+    model_value = str(model_cfg.get("model_dir", "model/spotiflow")).strip()
+    if not model_value:
+        return None
+    model_path = Path(model_value)
+    if not model_path.is_absolute():
+        model_path = project_root / model_path
+    return newest_mtime(model_path)
+
+
+def spotiflow_outputs_are_stale(model_cfg, output_paths):
+    if not model_cfg.get("rerun_if_model_updated", True):
+        return False
+    model_mtime = spotiflow_model_mtime(model_cfg)
+    if model_mtime is None:
+        print("Warning: Spotiflow model folder not found for freshness check.")
+        return False
+    existing_output_mtimes = [mtime for mtime in (newest_mtime(path) for path in output_paths if path) if mtime is not None]
+    if not existing_output_mtimes:
+        return True
+    return model_mtime > min(existing_output_mtimes)
+
+
 def run_tiff_to_zarr(input_path, output_path, chunk_size, desc):
     chunk_str = format_csv(chunk_size)
     cmd = (
@@ -292,6 +315,116 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
 
     print(f"Unknown segmentation method: {seg_method}")
     sys.exit(1)
+
+
+def resolve_spotiflow_outputs(sample_dir, signal_ch, model_cfg):
+    output_csv = model_cfg.get("output_csv") or f"ch{signal_ch}_spotiflow_points.csv"
+    region_counts_csv = model_cfg.get("region_counts_csv") or f"ch{signal_ch}_spotiflow_region_counts.csv"
+    summary_json = model_cfg.get("summary_json") or f"ch{signal_ch}_spotiflow_summary.json"
+
+    def _resolve(path_value):
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = sample_dir / path
+        return path
+
+    return _resolve(output_csv), _resolve(region_counts_csv), _resolve(summary_json)
+
+
+def build_spotiflow_command(
+    model_cfg,
+    zarr_path,
+    output_csv,
+    region_counts_csv,
+    summary_json,
+    label_zarr_path=None,
+    density_cfg_path=None,
+):
+    model_dir = Path(model_cfg.get("model_dir", "model/spotiflow"))
+    if not model_dir.is_absolute():
+        model_dir = project_root / model_dir
+
+    cmd = (
+        f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.spotiflow_inference '
+        f'--input_zarr "{zarr_path}" '
+        f'--output_csv "{output_csv}" '
+        f'--model_dir "{model_dir}" '
+        f'--region_counts_csv "{region_counts_csv}" '
+        f'--summary_json "{summary_json}" '
+        f'--dataset_name "{model_cfg.get("dataset_name", "0")}" '
+        f'--which "{model_cfg.get("which", "best")}" '
+        f'--min_distance {model_cfg.get("min_distance", 1)} '
+        f'--tile_overlap {model_cfg.get("tile_overlap", 16)} '
+        f'--device "{model_cfg.get("device", "auto")}" '
+        f'--peak_mode "{model_cfg.get("peak_mode", "fast")}"'
+    )
+    if model_cfg.get("prob_thresh") is not None:
+        cmd += f' --prob_thresh {model_cfg.get("prob_thresh")}'
+    if model_cfg.get("tile_size"):
+        cmd += f' --tile_size "{format_csv(model_cfg["tile_size"])}"'
+    if model_cfg.get("skip_below_threshold") is not None:
+        cmd += f' --skip_below_threshold {model_cfg.get("skip_below_threshold")}'
+    if model_cfg.get("normalizer") is None:
+        cmd += ' --normalizer none'
+    else:
+        cmd += f' --normalizer "{model_cfg.get("normalizer", "auto")}"'
+    if model_cfg.get("subpix") is True:
+        cmd += ' --subpix true'
+    elif model_cfg.get("subpix") is False:
+        cmd += ' --subpix false'
+    if model_cfg.get("use_tuned_tile_overlap", False):
+        cmd += ' --use_tuned_tile_overlap'
+    if label_zarr_path:
+        cmd += f' --label_zarr "{label_zarr_path}"'
+    configured_label_zarr = model_cfg.get("label_zarr")
+    if configured_label_zarr and not label_zarr_path:
+        label_path = Path(configured_label_zarr)
+        if not label_path.is_absolute():
+            label_path = zarr_path.parent / label_path
+        cmd += f' --label_zarr "{label_path}"'
+    if density_cfg_path:
+        cmd += f' --cfg "{density_cfg_path}"'
+    elif model_cfg.get("cfg"):
+        cfg_path = Path(model_cfg.get("cfg"))
+        if not cfg_path.is_absolute():
+            cfg_path = project_root / cfg_path
+        cmd += f' --cfg "{cfg_path}"'
+    return cmd
+
+
+def ensure_spotiflow_outputs(
+    sample_dir,
+    signal_ch,
+    zarr_path,
+    model_cfg,
+    label_zarr_path=None,
+    density_cfg_path=None,
+):
+    output_csv, region_counts_csv, summary_json = resolve_spotiflow_outputs(sample_dir, signal_ch, model_cfg)
+    outputs = [output_csv, summary_json]
+    if label_zarr_path or model_cfg.get("label_zarr"):
+        outputs.append(region_counts_csv)
+
+    force_rerun = spotiflow_outputs_are_stale(model_cfg, outputs)
+    outputs_ready = all(Path(path).exists() for path in outputs)
+    if force_rerun:
+        print_note("Spotiflow model is newer than existing outputs; rerunning detection.")
+
+    if outputs_ready and not force_rerun:
+        print_skip(f"Spotiflow outputs already exist: {output_csv}")
+        return output_csv, region_counts_csv, summary_json
+
+    cmd = build_spotiflow_command(
+        model_cfg,
+        zarr_path,
+        output_csv,
+        region_counts_csv,
+        summary_json,
+        label_zarr_path=label_zarr_path,
+        density_cfg_path=density_cfg_path,
+    )
+    run_command(cmd, "4.1 Spotiflow whole-brain signal detection")
+    return output_csv, region_counts_csv, summary_json
 
 
 def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
@@ -627,24 +760,47 @@ def main():
         zarr_path = ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg)
 
     print_step(4, "Segmentation")
-    mask_zarr_path, _ = ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg)
+    if seg_cfg["method"] == "spotiflow":
+        spotiflow_label_zarr = warped_label_zarr
+        if not spotiflow_label_zarr and seg_cfg.get("spotiflow", {}).get("label_zarr"):
+            spotiflow_label_zarr = Path(seg_cfg["spotiflow"]["label_zarr"])
+            if not spotiflow_label_zarr.is_absolute():
+                spotiflow_label_zarr = sample_dir / spotiflow_label_zarr
 
-    if warped_label_zarr:
-        print_step(5, "Region density analysis")
-        run_density_analysis(
+        points_csv, region_counts_csv, summary_json = ensure_spotiflow_outputs(
             sample_dir,
             signal_ch,
             zarr_path,
-            mask_zarr_path,
-            warped_label_zarr,
-            hemisphere_label_zarr,
-            zarr_cfg,
-            density_cfg_path,
-            cfg["input"]["resolution_xyz"],
+            seg_cfg["spotiflow"],
+            label_zarr_path=spotiflow_label_zarr if spotiflow_label_zarr and spotiflow_label_zarr.exists() else None,
+            density_cfg_path=density_cfg_path,
         )
+        print_step(5, "Spotiflow signal count summary")
+        print_note(f"Whole-brain points CSV: {points_csv}")
+        print_note(f"Summary JSON: {summary_json}")
+        if spotiflow_label_zarr and spotiflow_label_zarr.exists():
+            print_note(f"Per-region signal counts CSV: {region_counts_csv}")
+        else:
+            print_skip("Per-region counts skipped (atlas label Zarr unavailable).")
     else:
-        print_step(5, "Region density analysis")
-        print_skip("Density analysis skipped (atlas label Zarr unavailable).")
+        mask_zarr_path, _ = ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg)
+
+        if warped_label_zarr:
+            print_step(5, "Region density analysis")
+            run_density_analysis(
+                sample_dir,
+                signal_ch,
+                zarr_path,
+                mask_zarr_path,
+                warped_label_zarr,
+                hemisphere_label_zarr,
+                zarr_cfg,
+                density_cfg_path,
+                cfg["input"]["resolution_xyz"],
+            )
+        else:
+            print_step(5, "Region density analysis")
+            print_skip("Density analysis skipped (atlas label Zarr unavailable).")
 
     print("\n" + "=" * 60)
     print("Pipeline completed successfully.")
