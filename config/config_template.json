@@ -71,8 +71,8 @@
     "registration": {
         "method": "ants",
         "mode": "atlas2image",
-        "atlas_path": "s:/Yifu/Allen_brainatlas/atlas.tiff",
-        "annotation_path": "s:/Yifu/Allen_brainatlas/atlas_label.tiff",
+        "atlas_path": "${YIFU_DATA_DIR}/reference/atlas.tiff",
+        "annotation_path": "${YIFU_DATA_DIR}/reference/atlas_label.tiff",
         "transform_type": "SyN",
         "allow_reflection": false,
         "save_upsampled_label": true,
@@ -99,7 +99,7 @@
         },
 
         "cfos_unet": {
-            "checkpoint_path": "S:/Yifu/models/cfos/best_model.pt",
+            "checkpoint_path": "${YIFU_DATA_DIR}/models/cfos/best_model.pt",
             "save_probability": true,
             "probability_zarr": "",
             "dataset_name": "0",

@@ -55,11 +55,10 @@ def load_config(config_path):
 
 
 def resolve_project_path(path_value):
-    """Resolve a config path relative to the repository root."""
-    path = Path(path_value)
-    if path.is_absolute():
-        return path
-    return project_root / path
+    """Resolve config paths: ${YIFU_DATA_DIR}/..., absolute, or repo-relative."""
+    from pipeline_modules.utils.data_paths import expand_config_path
+
+    return expand_config_path(path_value, project_root_override=project_root)
 
 
 def directory_has_files(path):
@@ -101,10 +100,7 @@ def cfos_unet_checkpoint_path(model_cfg):
     checkpoint_value = str(model_cfg.get("checkpoint_path", "")).strip()
     if not checkpoint_value:
         return None
-    checkpoint_path = Path(checkpoint_value)
-    if not checkpoint_path.is_absolute():
-        checkpoint_path = project_root / checkpoint_path
-    return checkpoint_path
+    return resolve_project_path(checkpoint_value)
 
 
 def cfos_unet_outputs_are_stale(model_cfg, output_paths):
@@ -288,7 +284,7 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
             f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.cfos_unet_inference '
             f'--input_zarr "{zarr_path}" '
             f'--output_zarr "{mask_zarr_path}" '
-            f'--checkpoint_path "{model_cfg["checkpoint_path"]}" '
+            f'--checkpoint_path "{cfos_unet_checkpoint_path(model_cfg)}" '
             f'--dataset_name "{model_cfg.get("dataset_name", "0")}" '
             f'--overlap {model_cfg.get("overlap", 0.25)} '
             f'--batch_size {model_cfg.get("batch_size", 4)} '

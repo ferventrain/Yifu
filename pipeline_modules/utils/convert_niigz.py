@@ -100,12 +100,14 @@ def convert_tiff_to_nifti_with_spacing(
     print("--- 处理完成 ---")
 
 
+from pipeline_modules.utils.data_paths import reference_dir
+
 #    - 如果是单个3D TIFF文件, 写完整的文件路径, 例如: Path("data/atlas/allen_atlas.tif")
 #    - 如果是包含多个2D切片的文件夹, 写文件夹的路径, 例如: Path("data/atlas_slices/")
-INPUT_PATH = Path(r"S:\Yifu\data\reference\atlas.tiff") 
+INPUT_PATH = reference_dir() / "atlas.tiff"
 
 # 2. 设置输出路径
-OUTPUT_PATH = Path(r"S:\Yifu\data\reference\atlas.nii.gz")
+OUTPUT_PATH = reference_dir() / "atlas.nii.gz"
 
 # 3. 设置你的Atlas的物理间距 (Spacing)
 ATLAS_SPACING = (1.0, 1.0, 1.0) 

@@ -1,58 +1,115 @@
+# Yifu LSFM pipeline — unified conda environment
+#
+# Covers: main pipeline, QC/IMS, tubule reconstruction, napari viewers,
+# brainrender/pyvista visualization, and cFos training (mlflow).
+#
+# Python 3.11: napari and brainrender (>=2.1) both require >=3.11; 3.11 is the
+# recommended single-env choice (avoid splitting envs for version reasons alone).
+#
+# Create / update:
+#   conda env create -f environment.yml
+#   conda env update -f environment.yml --prune
+#   conda activate yifu
+#
+# Verify GPU + core imports:
+#   python test_env.py
+#
+# Notes:
+# - PyTorch is installed from pytorch + nvidia channels (CUDA 12.4 wheels).
+#   Requires NVIDIA driver 535+ (CUDA 12.x). Change pytorch-cuda if your driver
+#   needs a different CUDA runtime (see https://pytorch.org/get-started/locally/).
+# - napari Qt backend comes from conda-forge (pyqt). Do not pip-install PySide2
+#   alongside pyqt in the same env.
+# - brainrender (vedo/vtk) and napari can occasionally conflict on vtk/qt builds.
+#   If one viewer fails after a full install, try `conda list vtk` and avoid
+#   mixing conda + pip vtk installs.
+
 name: yifu
 channels:
+  - pytorch
+  - nvidia
   - conda-forge
   - defaults
+
 dependencies:
+  # --- runtime ---
   - python=3.11
   - pip
-  - click
-  - cython
-  - dill
-  - fasteners
-  - networkx
-  - numcodecs
-  - pathos
-  - pox
-  - ppft
-  - simpleitk
+
+  # --- PyTorch GPU (do not also pip-install torch/torchvision) ---
+  - pytorch::pytorch
+  - pytorch::torchvision
+  - pytorch::pytorch-cuda=12.4
+
+  # --- core scientific stack ---
   - numpy>=1.24,<3
   - scipy>=1.13
   - pandas
-  - pydantic>=2.0
-  - openpyxl
-  - napari
   - scikit-image
   - scikit-learn
   - matplotlib
+  - tqdm
+  - pydantic>=2.0
+  - openpyxl
+  - pyyaml
+  - h5py
+  - pillow
+
+  # --- medical / volume IO ---
+  - simpleitk
+  - zarr<3
+  - numcodecs
+  - nibabel
+
+  # --- parallel / chunked processing ---
   - dask
   - distributed
   - dask-image
   - dask-jobqueue
-  - zarr<3
   - bokeh
-  - pyyaml
+  - networkx
+  - click
+  - cython
+  - dill
+  - fasteners
+  - pathos
+  - pox
+  - ppft
+
+  # --- napari interactive viewers (view_skeleton_napari.py, etc.) ---
+  - napari
   - pyqt
   - pyqtgraph
-  - tqdm
+
+  # --- tests ---
+  - pytest
+
   - pip:
+      # registration + segmentation
       - antspyx
       - cellpose
-      - torch
-      - torchvision
+      - segment-anything
       - opencv-python-headless
+
+      # tiff / zarr helpers
       - tifffile
+      - imagecodecs
+      - google-crc32c
       - fastremap
       - roifile
       - fill-voids
       - natsort
-      - nibabel
+
+      # tubule reconstruction (kimimaro / TEASAR)
       - kimimaro
       - connected-components-3d
       - dijkstra3d
       - edt
-      - osteoid
-      - xs3d
-      - crackle-codec
-      - google-crc32c
-      - microviewer
-      - pybind11
+
+      # 3D visualization
+      - brainrender>=2.1
+      - brainglobe-atlasapi>=2.2
+      - pyvista
+
+      # cFos model training (train_cfos_3d_mlflow.py)
+      - mlflow
