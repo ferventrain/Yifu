@@ -71,8 +71,8 @@
   "registration": {
     "method": "ants",
     "mode": "atlas2image",
-    "atlas_path": "data/reference/atlas.tiff",
-    "annotation_path": "data/reference/atlas_label.tiff",
+    "atlas_path": "${YIFU_DATA_DIR}/reference/atlas.tiff",
+    "annotation_path": "${YIFU_DATA_DIR}/reference/atlas_label.tiff",
     "transform_type": "SyNRA",
     "allow_reflection": false,
     "flip_atlas": [false, false, false],
@@ -100,7 +100,7 @@
       "min_object_size": 10
     },
     "cfos_unet": {
-      "checkpoint_path": "S:/Yifu/best_model.pt",
+      "checkpoint_path": "${YIFU_DATA_DIR}/models/cfos/best_model.pt",
       "save_probability": true,
       "probability_zarr": "",
       "dataset_name": "0",

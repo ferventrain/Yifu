@@ -188,3 +188,31 @@ class TestSampleLayout:
         layout = SampleLayout(sample_dir=tmp_path)
         with pytest.raises(Exception):
             layout.signal_ch = "ch9"  # type: ignore[misc]
+
+
+class TestDataPaths:
+    def test_expand_config_path_env_placeholder(self, tmp_path, monkeypatch):
+        data_root = tmp_path / "yifu_data"
+        data_root.mkdir()
+        monkeypatch.setenv("YIFU_DATA_DIR", str(data_root))
+
+        from pipeline_modules.utils.data_paths import expand_config_path
+
+        resolved = expand_config_path("${YIFU_DATA_DIR}/reference/atlas.tiff")
+        assert resolved == (data_root / "reference" / "atlas.tiff").resolve()
+
+    def test_expand_config_path_repo_relative(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("YIFU_DATA_DIR", raising=False)
+
+        from pipeline_modules.utils.data_paths import expand_config_path
+
+        resolved = expand_config_path("config/config.json", project_root_override=tmp_path)
+        assert resolved == (tmp_path / "config" / "config.json").resolve()
+
+    def test_get_yifu_data_dir_required(self, monkeypatch):
+        monkeypatch.delenv("YIFU_DATA_DIR", raising=False)
+
+        from pipeline_modules.utils.data_paths import get_yifu_data_dir
+
+        with pytest.raises(RuntimeError, match="YIFU_DATA_DIR"):
+            get_yifu_data_dir(required=True)

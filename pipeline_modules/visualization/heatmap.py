@@ -69,7 +69,9 @@ def project_root() -> Path:
 
 
 def default_reference_dir() -> Path:
-    return project_root() / "data" / "reference"
+    from pipeline_modules.utils.data_paths import reference_dir
+
+    return reference_dir()
 
 
 def load_json(path: str | Path) -> dict:
