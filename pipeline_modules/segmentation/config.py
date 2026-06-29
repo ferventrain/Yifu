@@ -116,12 +116,18 @@ class SpotiflowInferenceCfg(_ModelMixin):
     min_distance: int = 1
     tile_size: tuple[int, int, int] | None = None
     tile_overlap: int = 16
-    skip_below_threshold: float | None = None
+    skip_below_threshold: float | None = 100.0
     device: str = "auto"
     peak_mode: str = "fast"
     normalizer: str | None = "auto"
     subpix: bool | None = None
     use_tuned_tile_overlap: bool = False
+    checkpoint_tiles: int = 32
+    qc_top_n: int = 0
+    qc_tile_csv: str = ""
+    qc_top_csv: str = ""
+    qc_preview_dir: str = ""
+    qc_preview_mode: str = "mip"
     rerun_if_model_updated: bool = True
 
     def __post_init__(self) -> None:

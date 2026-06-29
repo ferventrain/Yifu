@@ -1,0 +1,10 @@
+name: yifu-pipeline-tools
+display_name: Yifu Point Cropper
+contributions:
+  commands:
+    - id: yifu-pipeline-tools.make_point_cropper_widget
+      python_name: pipeline_modules.visualization.napari_point_cropper:make_point_cropper_widget
+      title: Make point cropper widget
+  widgets:
+    - command: yifu-pipeline-tools.make_point_cropper_widget
+      display_name: Point Cropper

@@ -1,0 +1,2 @@
+[napari.manifest]
+yifu-point-cropper = pipeline_modules.visualization:napari.yaml

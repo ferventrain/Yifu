@@ -137,6 +137,50 @@ class TestLayoutForSample:
 
 
 # ---------------------------------------------------------------------------
+# Atlas label id encoding
+# ---------------------------------------------------------------------------
+
+
+class TestAtlasLabelCodec:
+    def test_tiff_stack_loads_in_ants_xyz_order(self, tmp_path):
+        import numpy as np
+        import tifffile
+
+        from pipeline_modules.registration.label_codec import load_label_array_preserving_ids
+
+        labels_zyx = np.arange(2 * 3 * 4, dtype=np.uint32).reshape(2, 3, 4)
+        path = tmp_path / "atlas_label.tiff"
+        tifffile.imwrite(path, labels_zyx)
+
+        loaded = load_label_array_preserving_ids(path)
+        assert loaded.shape == (4, 3, 2)
+        np.testing.assert_array_equal(loaded, np.transpose(labels_zyx, (2, 1, 0)))
+
+    def test_large_allen_ids_round_trip_without_float32_quantization(self):
+        import numpy as np
+
+        from pipeline_modules.registration.label_codec import (
+            build_label_id_codec,
+            decode_label_codes,
+        )
+
+        labels = np.asarray(
+            [
+                [[0, 589508447], [589508451, 589508455]],
+                [[607344830, 607344834], [312782562, 182305697]],
+            ],
+            dtype=np.uint32,
+        )
+
+        encoded, lut = build_label_id_codec(labels)
+        assert encoded.max() < 10
+        assert int(np.float32(589508447)) == 589508416
+
+        decoded = decode_label_codes(encoded.astype(np.float32), lut)
+        np.testing.assert_array_equal(decoded, labels.astype(np.int64))
+
+
+# ---------------------------------------------------------------------------
 # export_json_schema / load_capability_manifest
 # ---------------------------------------------------------------------------
 

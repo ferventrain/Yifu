@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import numpy as np
@@ -12,15 +13,21 @@ from pipeline_modules.segmentation.spotiflow_inference import run_spotiflow_infe
 
 
 class _FakeSpotiflow:
+    _prob_thresh = [0.35]
+    predict_calls = 0
+
     @classmethod
     def from_folder(cls, *args, **kwargs):
         return cls()
 
     def predict(self, img, **kwargs):
-        return np.asarray([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], dtype=np.float32), object()
+        type(self).predict_calls += 1
+        details = type("Details", (), {"prob": np.asarray([0.34, 0.9], dtype=np.float32)})()
+        return np.asarray([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], dtype=np.float32), details
 
 
 def test_run_spotiflow_inference_counts_regions(tmp_path, monkeypatch):
+    _FakeSpotiflow.predict_calls = 0
     model_module = ModuleType("spotiflow.model")
     model_module.Spotiflow = _FakeSpotiflow
     package_module = ModuleType("spotiflow")
@@ -30,7 +37,7 @@ def test_run_spotiflow_inference_counts_regions(tmp_path, monkeypatch):
 
     input_zarr = tmp_path / "signal.zarr"
     root = zarr.group(store=zarr.DirectoryStore(str(input_zarr)), overwrite=True)
-    root.create_dataset("0", data=np.ones((4, 4, 4), dtype=np.uint16), chunks=(4, 4, 4))
+    root.create_dataset("0", data=np.full((4, 4, 4), 101, dtype=np.uint16), chunks=(4, 4, 4))
 
     label_zarr = tmp_path / "labels.zarr"
     label_root = zarr.group(store=zarr.DirectoryStore(str(label_zarr)), overwrite=True)
@@ -62,6 +69,8 @@ def test_run_spotiflow_inference_counts_regions(tmp_path, monkeypatch):
         summary_json=tmp_path / "summary.json",
         tile_overlap=0,
         device="cpu",
+        qc_top_n=1,
+        qc_preview_dir=tmp_path / "qc_previews",
     )
 
     assert result["total_signal_count"] == 2
@@ -70,3 +79,45 @@ def test_run_spotiflow_inference_counts_regions(tmp_path, monkeypatch):
     assert counts.loc[8, "signal_count"] == 1
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert summary["total_signal_count"] == 2
+    assert summary["resolved_prob_thresh"] == 0.35
+
+    top_qc = pd.read_csv(tmp_path / "points_top1_uncertain_tiles.csv")
+    assert len(top_qc) == 1
+    assert top_qc.loc[0, "near_threshold_count"] == 1
+    assert Path(top_qc.loc[0, "preview_path"]).exists()
+
+
+def test_run_spotiflow_inference_skips_tiles_below_default_threshold(tmp_path, monkeypatch):
+    _FakeSpotiflow.predict_calls = 0
+    model_module = ModuleType("spotiflow.model")
+    model_module.Spotiflow = _FakeSpotiflow
+    package_module = ModuleType("spotiflow")
+    package_module.model = model_module
+    monkeypatch.setitem(sys.modules, "spotiflow", package_module)
+    monkeypatch.setitem(sys.modules, "spotiflow.model", model_module)
+
+    input_zarr = tmp_path / "signal.zarr"
+    root = zarr.group(store=zarr.DirectoryStore(str(input_zarr)), overwrite=True)
+    root.create_dataset("0", data=np.full((4, 4, 4), 99, dtype=np.uint16), chunks=(4, 4, 4))
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.yaml").write_text("is_3d: true\n", encoding="utf-8")
+    (model_dir / "best.pt").write_bytes(b"fake")
+
+    result = run_spotiflow_inference(
+        input_zarr=input_zarr,
+        model_dir=model_dir,
+        output_csv=tmp_path / "points.csv",
+        summary_json=tmp_path / "summary.json",
+        tile_overlap=0,
+        device="cpu",
+    )
+
+    assert result["total_signal_count"] == 0
+    assert result["skipped_tiles"] == 1
+    assert result["processed_tiles"] == 0
+    assert _FakeSpotiflow.predict_calls == 0
+
+    points = pd.read_csv(tmp_path / "points.csv")
+    assert points.empty

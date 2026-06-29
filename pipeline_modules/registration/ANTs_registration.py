@@ -12,10 +12,23 @@ import tifffile
 from tqdm import tqdm
 
 try:
+    from pipeline_modules.registration.label_codec import (
+        build_label_id_codec,
+        decode_label_codes,
+        ensure_label_storage_dtype,
+        load_label_array_preserving_ids,
+    )
     from pipeline_modules.preprocessing.tiff_to_zarr import convert_tiff_to_zarr
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
 except ImportError:
+    from .label_codec import (  # type: ignore[no-redef]
+        build_label_id_codec,
+        decode_label_codes,
+        ensure_label_storage_dtype,
+        load_label_array_preserving_ids,
+    )
+
     convert_tiff_to_zarr = None  # type: ignore[assignment]
     PipelineError = None  # type: ignore[assignment,misc]
     ErrorCode = None  # type: ignore[assignment]
@@ -51,30 +64,6 @@ def _ants_image_read(path):
     if path_str.lower().endswith((".nii", ".nii.gz")):
         return _load_nifti_as_ants(path)
     return ants.image_read(path_str)
-
-
-def _ensure_label_storage_dtype(array: np.ndarray) -> np.dtype:
-    """Pick a TIFF-safe integer dtype that preserves atlas label ids."""
-    if np.issubdtype(array.dtype, np.integer):
-        max_value = int(array.max()) if array.size > 0 else 0
-        min_value = int(array.min()) if array.size > 0 else 0
-        if min_value >= 0:
-            if max_value <= np.iinfo(np.uint16).max:
-                return np.uint16
-            if max_value <= np.iinfo(np.uint32).max:
-                return np.uint32
-        if min_value >= np.iinfo(np.int32).min and max_value <= np.iinfo(np.int32).max:
-            return np.int32
-        return np.int64
-
-    if np.issubdtype(array.dtype, np.floating):
-        max_value = float(array.max()) if array.size > 0 else 0.0
-        min_value = float(array.min()) if array.size > 0 else 0.0
-        if np.allclose(array, np.round(array), atol=0):
-            rounded = np.rint(array)
-            return _ensure_label_storage_dtype(rounded.astype(np.int64))
-
-    raise ValueError(f"Label array must contain integer ids, got dtype={array.dtype}")
 
 
 class BidirectionalRegistration:
@@ -114,7 +103,8 @@ class BidirectionalRegistration:
 
         # Load Atlas
         self.atlas_image = ants.image_read(atlas_image_path)
-        self.atlas_label = ants.image_read(atlas_label_path)
+        self.atlas_label_id_lut: np.ndarray | None = None
+        self.atlas_label = self._load_encoded_atlas_label(atlas_label_path)
         
         # Force direction matrix to identity to avoid flipping/reflection
         # [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
@@ -125,7 +115,7 @@ class BidirectionalRegistration:
         
         # Load Config
         if config_path and os.path.exists(config_path):
-             with open(config_path, 'r', encoding='utf-8') as f:
+             with open(config_path, 'r', encoding='utf-8-sig') as f:
                 full_config = json.load(f)
                 # Parse resolution from main config structure
                 # Input resolution (Source)
@@ -201,6 +191,22 @@ class BidirectionalRegistration:
         # Density Config
         self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Region_Csv_Rev1_updated.CSV')
 
+    def _load_encoded_atlas_label(self, atlas_label_path: str) -> ants.ANTsImage:
+        label_array = load_label_array_preserving_ids(atlas_label_path)
+        encoded, label_id_lut = build_label_id_codec(label_array)
+        self.atlas_label_id_lut = label_id_lut
+        logger.info(
+            "Encoded atlas label ids for ANTs warp: %d original ids -> codes 0..%d",
+            len(label_id_lut),
+            len(label_id_lut) - 1,
+        )
+        return ants.from_numpy(
+            encoded,
+            spacing=self.atlas_image.spacing,
+            origin=self.atlas_image.origin,
+            direction=self.atlas_image.direction,
+        )
+
     def _infer_original_shape(self) -> Optional[Tuple[int, int, int]]:
         """Try to infer original shape from raw TIFF files"""
         logger.info("Attempting to infer original shape from raw data...")
@@ -247,7 +253,7 @@ class BidirectionalRegistration:
         if arr.ndim != 3:
             raise ValueError(f"Expected 3D array, got shape {arr.shape}")
 
-        output_dtype = _ensure_label_storage_dtype(arr) if prefix in {"label", "mask"} else np.uint16
+        output_dtype = ensure_label_storage_dtype(arr) if prefix in {"label", "mask"} else np.uint16
         logger.info("Saving dtype for %s: %s", prefix, output_dtype)
             
         logger.info("Saving %s TIFFs to %s (shape: %s)...", prefix, output_dir, arr.shape)
@@ -331,29 +337,19 @@ class BidirectionalRegistration:
             }
 
     def upsample_label_chunked(self, label_image: ants.ANTsImage, output_dir: str, 
-                             method: str = 'nearest', chunk_size: int = 50) -> None:
+                             method: str = 'nearest', chunk_size: int = 50,
+                             label_id_lut: np.ndarray | None = None) -> None:
         """分块上采样标签图像 - 强制对齐到原始尺寸"""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        label_array = label_image.numpy() # (Z, Y, X) from ANTs numpy (if we transposed earlier? Wait, ants.numpy is (X,Y,Z))
-        # Let's check how we handle ANTs image.
-        # In this class, we often use ants.image_read.
-        # ants.ANTsImage.numpy() returns (X, Y, Z) usually, but let's verify context.
-        # In _save_volume_as_tiff: arr = np.transpose(arr, (1, 0, 2)) -> (Y, X, Z)
-        
-        # Here we get label_image directly from ants.apply_transforms
-        # It is an ANTsImage.
         arr = label_image.numpy()
-        # Transpose to (Z, Y, X) for easier slicing if needed, OR (Z, X, Y)
-        # Standard python convention for 3D volume is (Z, Y, X).
-        # ANTs is (X, Y, Z).
-        # Let's transpose to (Z, Y, X)
-        source_volume = np.transpose(arr, (2, 1, 0)) 
+        # ANTs numpy is (X, Y, Z); pipeline volumes are saved as (Z, Y, X).
+        source_volume = decode_label_codes(np.transpose(arr, (2, 1, 0)), label_id_lut)
         
         source_shape = source_volume.shape
         target_shape = self.original_shape # (Z, Y, X)
-        output_dtype = _ensure_label_storage_dtype(source_volume)
+        output_dtype = ensure_label_storage_dtype(source_volume)
         
         logger.info("Upsampling from %s to %s...", source_shape, target_shape)
         logger.debug("ANTs raw shape = %s, after transpose = %s", arr.shape, source_volume.shape)
@@ -380,7 +376,7 @@ class BidirectionalRegistration:
             
             # Use nearest neighbor for labels
             resized_slice = cv2.resize(
-                source_slice.astype(np.float64, copy=False),
+                source_slice,
                 target_xy, 
                 interpolation=cv2.INTER_NEAREST
             )
@@ -416,7 +412,11 @@ class BidirectionalRegistration:
                     if label_dir.exists() and any(label_dir.iterdir()):
                         logger.info("Upsampled atlas label already exists at %s. Skipping upsampling.", label_dir)
                     else:
-                        self.upsample_label_chunked(results['warped_label'], str(label_dir))
+                        self.upsample_label_chunked(
+                            results['warped_label'],
+                            str(label_dir),
+                            label_id_lut=self.atlas_label_id_lut,
+                        )
 
                     if self.save_upsampled_label_zarr:
                         if label_zarr.exists():

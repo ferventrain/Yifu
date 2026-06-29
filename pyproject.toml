@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yifu-pipeline-tools"
+version = "0.1.0"
+description = "Local Yifu pipeline utilities and napari widgets"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["pipeline_modules*"]
+
+[tool.setuptools.package-data]
+"pipeline_modules.visualization" = ["napari.yaml"]
+
+[project.entry-points."napari.manifest"]
+yifu-point-cropper = "pipeline_modules.visualization:napari.yaml"

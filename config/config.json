@@ -131,7 +131,7 @@
       "min_distance": 1,
       "tile_size": null,
       "tile_overlap": 16,
-      "skip_below_threshold": null,
+      "skip_below_threshold": 100.0,
       "device": "auto",
       "peak_mode": "fast",
       "normalizer": "auto",

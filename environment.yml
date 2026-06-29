@@ -24,7 +24,7 @@
 #   If one viewer fails after a full install, try `conda list vtk` and avoid
 #   mixing conda + pip vtk installs.
 
-name: yifu
+name: Yifu
 channels:
   - pytorch
   - nvidia
@@ -89,6 +89,7 @@ dependencies:
       - antspyx
       - cellpose
       - segment-anything
+      - spotiflow
       - opencv-python-headless
 
       # tiff / zarr helpers

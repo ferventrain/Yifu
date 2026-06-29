@@ -104,6 +104,9 @@ def test_segmentation_cfg_accepts_spotiflow_fields():
                 "tile_size": [64, 128, 128],
                 "skip_below_threshold": "none",
                 "normalizer": "none",
+                "checkpoint_tiles": 16,
+                "qc_top_n": 10,
+                "qc_preview_mode": "mip",
             },
         }
     )
@@ -114,3 +117,6 @@ def test_segmentation_cfg_accepts_spotiflow_fields():
     assert dumped["spotiflow"]["tile_size"] == (64, 128, 128)
     assert dumped["spotiflow"]["skip_below_threshold"] is None
     assert dumped["spotiflow"]["normalizer"] is None
+    assert dumped["spotiflow"]["checkpoint_tiles"] == 16
+    assert dumped["spotiflow"]["qc_top_n"] == 10
+    assert dumped["spotiflow"]["qc_preview_mode"] == "mip"

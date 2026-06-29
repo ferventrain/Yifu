@@ -137,6 +137,54 @@ def resolve_region_query(query, nodes_by_id, acronym_to_ids, name_to_ids):
     return nodes_by_id[matched_ids[0]]
 
 
+def parse_region_groups(region_groups):
+    """Parse region groups from JSON, a JSON file, or CLI-friendly shorthand."""
+    if region_groups is None or not isinstance(region_groups, str):
+        return region_groups
+
+    candidate = region_groups.strip()
+    if not candidate:
+        return {}
+
+    if Path(candidate).is_file():
+        with open(candidate, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+
+    if not (candidate.startswith("{") and candidate.endswith("}")):
+        raise ValueError(
+            "region_groups must be JSON, a JSON file path, or shorthand like "
+            "{PFC:[FRP,ACA,PL,ILA,ORB,DP]}"
+        )
+
+    groups = {}
+    body = candidate[1:-1].strip()
+    if not body:
+        return groups
+
+    for match in re.finditer(r"([^:,\{\}\[\]]+)\s*:\s*\[([^\]]*)\]", body):
+        name = match.group(1).strip().strip("'\"")
+        values = [
+            item.strip().strip("'\"")
+            for item in match.group(2).split(",")
+            if item.strip()
+        ]
+        if name:
+            groups[name] = values
+
+    if not groups:
+        raise ValueError(
+            "Could not parse region_groups. Use JSON like "
+            "'{\"PFC\":[\"FRP\",\"ACA\",\"PL\",\"ILA\",\"ORB\",\"DP\"]}' "
+            "or shorthand {PFC:[FRP,ACA,PL,ILA,ORB,DP]}."
+        )
+    return groups
+
+
 def parse_region_list(text):
     """Split a region list string on comma / semicolon / newline."""
     if isinstance(text, (list, tuple)):
@@ -437,13 +485,7 @@ def analyze_regions_from_skeleton(
         raise ValueError("regions or region_groups is required.")
     region_queries = parse_region_list(regions) if regions else []
     if region_groups is not None:
-        if isinstance(region_groups, str):
-            candidate = region_groups.strip()
-            if Path(candidate).is_file():
-                with open(candidate, "r", encoding="utf-8") as fh:
-                    region_groups = json.load(fh)
-            else:
-                region_groups = json.loads(candidate)
+        region_groups = parse_region_groups(region_groups)
     if not region_queries and not region_groups:
         raise ValueError("No regions or region groups provided.")
 

@@ -50,7 +50,7 @@ def run_command(cmd, desc, *, show_command=True):
 
 def load_config(config_path):
     """Load JSON config."""
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -370,6 +370,26 @@ def build_spotiflow_command(
         cmd += ' --subpix false'
     if model_cfg.get("use_tuned_tile_overlap", False):
         cmd += ' --use_tuned_tile_overlap'
+    if model_cfg.get("checkpoint_tiles") is not None:
+        cmd += f' --checkpoint_tiles {model_cfg.get("checkpoint_tiles")}'
+    if model_cfg.get("qc_top_n"):
+        cmd += f' --qc_top_n {model_cfg.get("qc_top_n")}'
+        if model_cfg.get("qc_tile_csv"):
+            qc_tile_csv = Path(model_cfg.get("qc_tile_csv"))
+            if not qc_tile_csv.is_absolute():
+                qc_tile_csv = zarr_path.parent / qc_tile_csv
+            cmd += f' --qc_tile_csv "{qc_tile_csv}"'
+        if model_cfg.get("qc_top_csv"):
+            qc_top_csv = Path(model_cfg.get("qc_top_csv"))
+            if not qc_top_csv.is_absolute():
+                qc_top_csv = zarr_path.parent / qc_top_csv
+            cmd += f' --qc_top_csv "{qc_top_csv}"'
+        if model_cfg.get("qc_preview_dir"):
+            qc_preview_dir = Path(model_cfg.get("qc_preview_dir"))
+            if not qc_preview_dir.is_absolute():
+                qc_preview_dir = zarr_path.parent / qc_preview_dir
+            cmd += f' --qc_preview_dir "{qc_preview_dir}"'
+        cmd += f' --qc_preview_mode "{model_cfg.get("qc_preview_mode", "mip")}"'
     if label_zarr_path:
         cmd += f' --label_zarr "{label_zarr_path}"'
     configured_label_zarr = model_cfg.get("label_zarr")

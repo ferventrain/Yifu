@@ -116,7 +116,7 @@
         "min_distance": {"type": "int", "default": 1},
         "tile_size": {"type": "triplet_int|null", "default": null},
         "tile_overlap": {"type": "int", "default": 16},
-        "skip_below_threshold": {"type": "float|null", "default": null},
+        "skip_below_threshold": {"type": "float|null", "default": 100.0},
         "device": {"type": "string", "default": "auto"},
         "peak_mode": {"type": "string", "default": "fast", "choices": ["fast", "skimage"]},
         "normalizer": {"type": "string|null", "default": "auto"},

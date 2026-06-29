@@ -720,6 +720,45 @@ def install_camera_export_hook(scene: Scene, output_path: str | Path) -> None:
     scene.render = render
 
 
+def _actor_list(actors) -> list:
+    if actors is None:
+        return []
+    return actors if isinstance(actors, list) else [actors]
+
+
+def _mesh_x_bounds(actors: list) -> tuple[float, float]:
+    bounds: list[np.ndarray] = []
+    for actor in actors:
+        mesh = getattr(actor, "_mesh", None) or getattr(actor, "mesh", None)
+        if mesh is None:
+            continue
+        bounds.append(np.asarray(mesh.bounds(), dtype=np.float64).reshape((3, 2))[0])
+    if not bounds:
+        raise ValueError("Could not determine region mesh bounds for coronal slab clipping.")
+    stacked = np.vstack(bounds)
+    return float(np.min(stacked[:, 0])), float(np.max(stacked[:, 1]))
+
+
+def _cut_actor_between_x(actor, x_start: float, x_stop: float) -> None:
+    mesh = actor._mesh
+    cut = getattr(mesh, "cut_with_plane", None) or getattr(mesh, "cutWithPlane", None)
+    if cut is None:
+        raise AttributeError("Actor mesh does not support cut_with_plane/cutWithPlane.")
+    cut(origin=(x_start, 0, 0), normal=(1, 0, 0))
+    cut(origin=(x_stop, 0, 0), normal=(-1, 0, 0))
+    actor.cap()
+
+
+def clip_root_to_region_coronal_slab(scene: Scene, region_actors) -> tuple[float, float]:
+    slab_start, slab_stop = _mesh_x_bounds(_actor_list(region_actors))
+    if slab_start >= slab_stop:
+        raise ValueError(
+            f"Invalid coronal slab bounds from region mesh: start={slab_start:.1f}, stop={slab_stop:.1f}."
+        )
+    _cut_actor_between_x(scene.root, slab_start, slab_stop)
+    return slab_start, slab_stop
+
+
 def render_points_scene(
     points: np.ndarray,
     *,
@@ -740,6 +779,7 @@ def render_points_scene(
     region_silhouette: bool,
     hemisphere: str,
     region_groups: list[RegionGroup] | None = None,
+    region_coronal_slab: bool = False,
 ) -> Scene:
     scene = Scene(
         root=root,
@@ -759,7 +799,7 @@ def render_points_scene(
                 resolved_id = resolve_region_id(atlas, acronym, None)
                 if resolved_id is None:
                     continue
-                scene.add_brain_region(
+                actors = scene.add_brain_region(
                     region_acronym(atlas, resolved_id),
                     alpha=region_alpha,
                     color=mesh_color,
@@ -767,12 +807,14 @@ def render_points_scene(
                     hemisphere=hemisphere,
                     force=True,
                 )
+                if region_coronal_slab:
+                    clip_root_to_region_coronal_slab(scene, actors)
     elif region_mesh or region_mesh_id is not None:
         atlas = BrainGlobeAtlas(atlas_name, check_latest=False)
         resolved_id = resolve_region_id(atlas, region_mesh, region_mesh_id)
         if resolved_id is None:
             raise ValueError("--region_mesh or --region_mesh_id is required to render a region mesh.")
-        scene.add_brain_region(
+        actors = scene.add_brain_region(
             region_acronym(atlas, resolved_id),
             alpha=region_alpha,
             color=region_color or None,
@@ -780,6 +822,12 @@ def render_points_scene(
             hemisphere=hemisphere,
             force=True,
         )
+        if region_coronal_slab:
+            slab_start, slab_stop = clip_root_to_region_coronal_slab(scene, actors)
+            print(
+                f"Coronal slab clipped whole-brain outline from {region_acronym(atlas, resolved_id)} bounds: "
+                f"x={slab_start:.1f}..{slab_stop:.1f} um"
+            )
 
     scene.add(
         Points(
@@ -1030,6 +1078,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--only_region", default="", help="Render only points inside this atlas region acronym/name.")
     parser.add_argument("--show_region", default="", help="Render this atlas region mesh by acronym/name.")
     parser.add_argument("--region_outline", action="store_true", help="Draw an outline around --show_region.")
+    parser.add_argument(
+        "--region_coronal_slab",
+        action="store_true",
+        help="Clip the whole-brain outline to the selected region's x/AP coronal extent.",
+    )
     parser.add_argument("--hide_whole_brain", action="store_true", help="Hide the transparent whole-brain mesh.")
     parser.add_argument("--region_alpha", type=float, default=0.18, help="Rendered region opacity.")
     parser.add_argument("--region_color", default="#4cc9f0", help="Rendered region color.")
@@ -1161,6 +1214,10 @@ def main() -> int:
     requested_region_mesh = args.show_region or args.region_mesh
     hide_whole_brain = args.hide_whole_brain or args.no_root
     region_silhouette = args.region_outline or args.region_silhouette
+    if args.region_coronal_slab and not requested_region_mesh and args.region_mesh_id is None:
+        raise ValueError("--region_coronal_slab requires --show_region or --region_mesh_id.")
+    if args.region_coronal_slab and hide_whole_brain:
+        raise ValueError("--region_coronal_slab clips the whole-brain outline, so do not combine it with --hide_whole_brain.")
 
     if args.axis_order:
         points = reorder_axes(points, args.axis_order)
@@ -1329,6 +1386,7 @@ def main() -> int:
                 region_silhouette=region_silhouette,
                 hemisphere=args.hemisphere,
                 region_groups=[group],
+                region_coronal_slab=args.region_coronal_slab,
             )
             output_file = output_dir / f"{group.name}_brainrender.png"
             saved_path = save_scene_screenshot(
@@ -1360,6 +1418,7 @@ def main() -> int:
         region_silhouette=region_silhouette,
         hemisphere=args.hemisphere,
         region_groups=region_groups_for_mesh,
+        region_coronal_slab=args.region_coronal_slab,
     )
 
     if export_camera_path is not None:
