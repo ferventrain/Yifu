@@ -65,10 +65,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default="/data/cfos", help="Root folder containing image/ and mask/.")
     parser.add_argument("--image-dir", type=str, default=None, help="Override image directory. Default: <data-root>/image")
     parser.add_argument("--mask-dir", type=str, default=None, help="Override mask directory. Default: <data-root>/mask")
+    parser.add_argument(
+        "--reference-image-dir",
+        type=str,
+        default=None,
+        help="Optional reference validation image directory used to guard fine-tuning regressions.",
+    )
+    parser.add_argument(
+        "--reference-mask-dir",
+        type=str,
+        default=None,
+        help="Optional reference validation mask directory used with --reference-image-dir.",
+    )
     parser.add_argument("--output-dir", type=str, default="./outputs/cfos_3d_mlflow", help="Folder for checkpoints and logs.")
     parser.add_argument("--experiment-name", type=str, default="cfos_3d_segmentation", help="MLflow experiment name.")
     parser.add_argument("--run-name", type=str, default=None, help="Optional MLflow run name.")
-    parser.add_argument("--tracking-uri", type=str, default="file:./mlruns", help="MLflow tracking URI.")
+    parser.add_argument("--tracking-uri", type=str, default="sqlite:///mlruns.db", help="MLflow tracking URI.")
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Optional checkpoint used to initialize model weights for fine-tuning. Optimizer state is not loaded.",
+    )
+    parser.add_argument(
+        "--reference-baseline-checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint used to compute reference baseline dice. Defaults to --init-checkpoint.",
+    )
+    parser.add_argument(
+        "--reference-dice-margin",
+        type=float,
+        default=0.02,
+        help="Best checkpoint is allowed only when reference_val_dice >= baseline - this margin.",
+    )
+    parser.add_argument(
+        "--reference-every",
+        type=int,
+        default=1,
+        help=(
+            "Run reference validation every N epochs that are otherwise validated. "
+            "Use 0 to run reference validation only on the final epoch."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size.")
     parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers. Use 0 first in Docker/debug mode.")
@@ -162,7 +201,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--patches-per-volume",
         type=int,
-        default=2,
+        default=1,
         help="Training virtual dataset length multiplier: each volume is sampled this many patches per epoch.",
     )
     parser.add_argument(
@@ -171,6 +210,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="sliding",
         choices=["center", "sliding"],
         help="Validation mode. 'center' = single center crop. 'sliding' = tile whole volume with overlap and aggregate.",
+    )
+    parser.add_argument(
+        "--val-every",
+        type=int,
+        default=1,
+        help="Run validation every N epochs. Use >1 for faster fine-tuning; final epoch is always validated.",
     )
     parser.add_argument(
         "--val-overlap",
@@ -264,6 +309,35 @@ def compute_lr_for_epoch(
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
+
+
+def load_model_weights(model: nn.Module, checkpoint_path: str, device: torch.device) -> None:
+    """Initialize model weights from a checkpoint without loading optimizer state."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        raise ValueError("Checkpoint does not contain a model state dict: {}".format(checkpoint_path))
+
+    cleaned_state_dict = {}
+    for key, value in state_dict.items():
+        cleaned_key = key[7:] if str(key).startswith("module.") else key
+        cleaned_state_dict[cleaned_key] = value
+
+    missing, unexpected = model.load_state_dict(cleaned_state_dict, strict=False)
+    if unexpected:
+        raise ValueError(
+            "Checkpoint has unexpected model keys for this architecture: {}".format(
+                ", ".join(unexpected[:10])
+            )
+        )
+    if missing:
+        print(
+            "Warning: checkpoint missing {} model key(s), e.g. {}".format(
+                len(missing), ", ".join(missing[:10])
+            ),
+            flush=True,
+        )
+    print("Initialized model weights from {}".format(Path(checkpoint_path).resolve()), flush=True)
 
 
 # =====================================================================
@@ -1032,6 +1106,61 @@ def validate_sliding_window(
     }
 
 
+def evaluate_sample_set(
+    model: nn.Module,
+    samples: List[Dict[str, str]],
+    dataset: VolumeDataset,
+    loader: DataLoader,
+    patch_size: Sequence[int],
+    val_mode: str,
+    num_classes: int,
+    cls_loss_fn: nn.Module,
+    dice_loss: DiceLoss,
+    device: torch.device,
+    ce_weight: float,
+    dice_weight: float,
+    overlap: float,
+    phase_name: str,
+    epoch: int,
+    show_progress_bar: bool,
+) -> Dict[str, float]:
+    if val_mode == "sliding":
+        return validate_sliding_window(
+            model=model,
+            val_samples=samples,
+            patch_size=patch_size,
+            num_classes=num_classes,
+            cls_loss_fn=cls_loss_fn,
+            dice_loss=dice_loss,
+            device=device,
+            ce_weight=ce_weight,
+            dice_weight=dice_weight,
+            overlap=overlap,
+            phase_name=phase_name,
+            epoch=epoch,
+            show_progress_bar=show_progress_bar,
+        )
+
+    return run_epoch(
+        model=model,
+        loader=loader,
+        optimizer=None,
+        cls_loss_fn=cls_loss_fn,
+        dice_loss=dice_loss,
+        device=device,
+        num_classes=num_classes,
+        ce_weight=ce_weight,
+        dice_weight=dice_weight,
+        use_amp=False,
+        accumulate_steps=1,
+        phase_name=phase_name,
+        epoch=epoch,
+        log_every_n_batches=0,
+        show_progress_bar=show_progress_bar,
+        grad_clip_norm=0.0,
+    )
+
+
 # =====================================================================
 #  Main Entry Point
 # =====================================================================
@@ -1111,8 +1240,14 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if bool(args.reference_image_dir) != bool(args.reference_mask_dir):
+        raise ValueError("--reference-image-dir and --reference-mask-dir must be provided together.")
+
     samples = collect_samples(image_dir, mask_dir)
     train_samples, val_samples = split_samples(samples, args.val_ratio, args.seed)
+    reference_samples: List[Dict[str, str]] = []
+    if args.reference_image_dir and args.reference_mask_dir:
+        reference_samples = collect_samples(Path(args.reference_image_dir), Path(args.reference_mask_dir))
 
     if not val_samples:
         raise RuntimeError("Validation split is empty. Please increase the dataset size or val ratio.")
@@ -1138,6 +1273,18 @@ def main() -> None:
         p_intensity_aug=0.0,
         fg_aware_crop_prob=0.0,
     )
+    reference_dataset = None
+    if reference_samples:
+        reference_dataset = VolumeDataset(
+            samples=reference_samples,
+            patch_size=args.patch_size,
+            num_classes=args.num_classes,
+            training=False,
+            cache_data=False,
+            p_spatial_aug=0.0,
+            p_intensity_aug=0.0,
+            fg_aware_crop_prob=0.0,
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = torch.cuda.is_available() and not args.no_amp
@@ -1182,11 +1329,22 @@ def main() -> None:
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=max(1, args.num_workers // 2),
+        num_workers=max(0, args.num_workers // 2),
         pin_memory=torch.cuda.is_available(),
     )
+    reference_loader = None
+    if reference_dataset is not None:
+        reference_loader = DataLoader(
+            reference_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=max(0, args.num_workers // 2),
+            pin_memory=torch.cuda.is_available(),
+        )
 
     model = SimpleUNet3D(in_channels=1, num_classes=args.num_classes, base_channels=args.base_channels).to(device)
+    if args.init_checkpoint:
+        load_model_weights(model, args.init_checkpoint, device)
     if torch.cuda.device_count() > 1:
         print("Using {} GPUs (DataParallel)".format(torch.cuda.device_count()), flush=True)
         model = nn.DataParallel(model)
@@ -1201,12 +1359,59 @@ def main() -> None:
         cls_loss_fn = nn.CrossEntropyLoss()
     dice_loss = DiceLoss(num_classes=args.num_classes)
 
+    reference_baseline_dice = None
+    reference_gate_threshold = None
+    baseline_checkpoint = args.reference_baseline_checkpoint or args.init_checkpoint
+    if reference_samples:
+        if not baseline_checkpoint:
+            raise ValueError(
+                "Reference guarded best selection requires --reference-baseline-checkpoint "
+                "or --init-checkpoint."
+            )
+        baseline_model = SimpleUNet3D(
+            in_channels=1,
+            num_classes=args.num_classes,
+            base_channels=args.base_channels,
+        ).to(device)
+        load_model_weights(baseline_model, baseline_checkpoint, device)
+        baseline_stats = evaluate_sample_set(
+            model=baseline_model,
+            samples=reference_samples,
+            dataset=reference_dataset,
+            loader=reference_loader,
+            patch_size=args.patch_size,
+            val_mode=args.val_mode,
+            num_classes=args.num_classes,
+            cls_loss_fn=cls_loss_fn,
+            dice_loss=dice_loss,
+            device=device,
+            ce_weight=args.ce_weight,
+            dice_weight=args.dice_weight,
+            overlap=args.val_overlap,
+            phase_name="reference_baseline",
+            epoch=0,
+            show_progress_bar=args.show_progress_bar,
+        )
+        reference_baseline_dice = baseline_stats["dice"]
+        reference_gate_threshold = reference_baseline_dice - float(args.reference_dice_margin)
+        print(
+            "reference baseline dice={:.4f}; best checkpoint gate requires reference_val_dice >= {:.4f}".format(
+                reference_baseline_dice,
+                reference_gate_threshold,
+            ),
+            flush=True,
+        )
+        del baseline_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     run_name = args.run_name or "cfos3d_{}".format(time.strftime("%Y%m%d_%H%M%S"))
     train_cases = [sample["case_id"] for sample in train_samples]
     val_cases = [sample["case_id"] for sample in val_samples]
+    reference_cases = [sample["case_id"] for sample in reference_samples]
 
     split_path = output_dir / "data_split.json"
-    save_json(split_path, {"train_cases": train_cases, "val_cases": val_cases})
+    save_json(split_path, {"train_cases": train_cases, "val_cases": val_cases, "reference_cases": reference_cases})
     config_path = output_dir / "train_config.json"
     save_json(config_path, vars(args))
 
@@ -1223,6 +1428,15 @@ def main() -> None:
                 "data_root": str(Path(args.data_root).resolve()),
                 "image_dir": str(image_dir.resolve()),
                 "mask_dir": str(mask_dir.resolve()),
+                "init_checkpoint": str(Path(args.init_checkpoint).resolve()) if args.init_checkpoint else "",
+                "reference_image_dir": str(Path(args.reference_image_dir).resolve()) if args.reference_image_dir else "",
+                "reference_mask_dir": str(Path(args.reference_mask_dir).resolve()) if args.reference_mask_dir else "",
+                "reference_baseline_checkpoint": str(Path(baseline_checkpoint).resolve()) if baseline_checkpoint else "",
+                "reference_cases": len(reference_cases),
+                "reference_dice_margin": args.reference_dice_margin,
+                "reference_every": args.reference_every,
+                "reference_baseline_dice": reference_baseline_dice if reference_baseline_dice is not None else "",
+                "reference_gate_threshold": reference_gate_threshold if reference_gate_threshold is not None else "",
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
@@ -1250,11 +1464,15 @@ def main() -> None:
                 "fg_sampler_min_weight": args.fg_sampler_min_weight,
                 "patches_per_volume": args.patches_per_volume,
                 "val_mode": args.val_mode,
+                "val_every": args.val_every,
                 "val_overlap": args.val_overlap,
             }
         )
         mlflow.log_artifact(str(config_path))
         mlflow.log_artifact(str(split_path))
+        if reference_baseline_dice is not None:
+            mlflow.log_metric("reference_baseline_dice", reference_baseline_dice, step=0)
+            mlflow.log_metric("reference_gate_threshold", reference_gate_threshold, step=0)
 
         for epoch in range(1, args.epochs + 1):
             current_lr = compute_lr_for_epoch(
@@ -1283,11 +1501,15 @@ def main() -> None:
                 show_progress_bar=args.show_progress_bar,
                 grad_clip_norm=args.grad_clip_norm,
             )
-            if args.val_mode == "sliding":
-                val_stats = validate_sliding_window(
+            should_validate = (epoch % max(args.val_every, 1) == 0) or (epoch == args.epochs)
+            if should_validate:
+                val_stats = evaluate_sample_set(
                     model=model,
-                    val_samples=val_samples,
+                    samples=val_samples,
+                    dataset=val_dataset,
+                    loader=val_loader,
                     patch_size=args.patch_size,
+                    val_mode=args.val_mode,
                     num_classes=args.num_classes,
                     cls_loss_fn=cls_loss_fn,
                     dice_loss=dice_loss,
@@ -1295,65 +1517,109 @@ def main() -> None:
                     ce_weight=args.ce_weight,
                     dice_weight=args.dice_weight,
                     overlap=args.val_overlap,
-                    phase_name="val_sw",
+                    phase_name="val_sw" if args.val_mode == "sliding" else "val",
                     epoch=epoch,
                     show_progress_bar=args.show_progress_bar,
+                )
+                reference_stats = None
+                should_run_reference = False
+                if reference_samples:
+                    if args.reference_every <= 0:
+                        should_run_reference = epoch == args.epochs
+                    else:
+                        should_run_reference = (epoch % max(args.reference_every, 1) == 0) or (epoch == args.epochs)
+                if reference_samples and should_run_reference:
+                    reference_stats = evaluate_sample_set(
+                        model=model,
+                        samples=reference_samples,
+                        dataset=reference_dataset,
+                        loader=reference_loader,
+                        patch_size=args.patch_size,
+                        val_mode=args.val_mode,
+                        num_classes=args.num_classes,
+                        cls_loss_fn=cls_loss_fn,
+                        dice_loss=dice_loss,
+                        device=device,
+                        ce_weight=args.ce_weight,
+                        dice_weight=args.dice_weight,
+                        overlap=args.val_overlap,
+                        phase_name="reference_val_sw" if args.val_mode == "sliding" else "reference_val",
+                        epoch=epoch,
+                        show_progress_bar=args.show_progress_bar,
+                    )
+            else:
+                val_stats = None
+                reference_stats = None
+
+            metrics_to_log = {
+                "train_loss": train_stats["loss"],
+                "train_loss_cls": train_stats["loss_cls"],
+                "train_loss_ce": train_stats["loss_cls"],
+                "train_loss_dice": train_stats["loss_dice"],
+                "train_dice": train_stats["dice"],
+                "train_iou": train_stats["iou"],
+                "lr": current_lr,
+            }
+            if val_stats is not None:
+                metrics_to_log.update(
+                    {
+                        "val_loss": val_stats["loss"],
+                        "val_loss_cls": val_stats["loss_cls"],
+                        "val_loss_ce": val_stats["loss_cls"],
+                        "val_loss_dice": val_stats["loss_dice"],
+                        "val_dice": val_stats["dice"],
+                        "val_iou": val_stats["iou"],
+                        "val_precision": val_stats["precision"],
+                        "val_recall": val_stats["recall"],
+                    }
+                )
+            if reference_stats is not None:
+                metrics_to_log.update(
+                    {
+                        "reference_val_loss": reference_stats["loss"],
+                        "reference_val_dice": reference_stats["dice"],
+                        "reference_val_iou": reference_stats["iou"],
+                        "reference_val_precision": reference_stats["precision"],
+                        "reference_val_recall": reference_stats["recall"],
+                        "reference_gate_pass": float(reference_stats["dice"] >= reference_gate_threshold),
+                    }
+                )
+            mlflow.log_metrics(metrics_to_log, step=epoch)
+
+            if val_stats is not None:
+                print(
+                    "Epoch [{}/{}] "
+                    "train_loss={:.4f} train_dice={:.4f} "
+                    "val_loss={:.4f} val_dice={:.4f}{}".format(
+                        epoch,
+                        args.epochs,
+                        train_stats["loss"],
+                        train_stats["dice"],
+                        val_stats["loss"],
+                        val_stats["dice"],
+                        ""
+                        if reference_stats is None
+                        else " reference_dice={:.4f} gate={}".format(
+                            reference_stats["dice"],
+                            reference_stats["dice"] >= reference_gate_threshold,
+                        ),
+                    )
                 )
             else:
-                val_stats = run_epoch(
-                    model=model,
-                    loader=val_loader,
-                    optimizer=None,
-                    cls_loss_fn=cls_loss_fn,
-                    dice_loss=dice_loss,
-                    device=device,
-                    num_classes=args.num_classes,
-                    ce_weight=args.ce_weight,
-                    dice_weight=args.dice_weight,
-                    use_amp=False,
-                    accumulate_steps=1,
-                    phase_name="val",
-                    epoch=epoch,
-                    log_every_n_batches=args.log_every_n_batches,
-                    show_progress_bar=args.show_progress_bar,
-                    grad_clip_norm=0.0,
+                print(
+                    "Epoch [{}/{}] train_loss={:.4f} train_dice={:.4f} val=skipped".format(
+                        epoch,
+                        args.epochs,
+                        train_stats["loss"],
+                        train_stats["dice"],
+                    )
                 )
 
-            mlflow.log_metrics(
-                {
-                    "train_loss": train_stats["loss"],
-                    "train_loss_cls": train_stats["loss_cls"],
-                    "train_loss_ce": train_stats["loss_cls"],
-                    "train_loss_dice": train_stats["loss_dice"],
-                    "train_dice": train_stats["dice"],
-                    "train_iou": train_stats["iou"],
-                    "val_loss": val_stats["loss"],
-                    "val_loss_cls": val_stats["loss_cls"],
-                    "val_loss_ce": val_stats["loss_cls"],
-                    "val_loss_dice": val_stats["loss_dice"],
-                    "val_dice": val_stats["dice"],
-                    "val_iou": val_stats["iou"],
-                    "val_precision": val_stats["precision"],
-                    "val_recall": val_stats["recall"],
-                    "lr": current_lr,
-                },
-                step=epoch,
-            )
+            reference_gate_pass = True
+            if reference_stats is not None:
+                reference_gate_pass = reference_stats["dice"] >= reference_gate_threshold
 
-            print(
-                "Epoch [{}/{}] "
-                "train_loss={:.4f} train_dice={:.4f} "
-                "val_loss={:.4f} val_dice={:.4f}".format(
-                    epoch,
-                    args.epochs,
-                    train_stats["loss"],
-                    train_stats["dice"],
-                    val_stats["loss"],
-                    val_stats["dice"],
-                )
-            )
-
-            if val_stats["dice"] > best_dice:
+            if val_stats is not None and reference_gate_pass and val_stats["dice"] > best_dice:
                 best_dice = val_stats["dice"]
                 is_best = True
             else:
@@ -1365,6 +1631,9 @@ def main() -> None:
                 "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_val_dice": best_dice,
+                "reference_baseline_dice": reference_baseline_dice,
+                "reference_gate_threshold": reference_gate_threshold,
+                "reference_val_dice": reference_stats["dice"] if reference_stats is not None else None,
                 "args": vars(args),
             }
             torch.save(checkpoint, str(last_ckpt_path))
@@ -1377,11 +1646,20 @@ def main() -> None:
                 torch.save(checkpoint, str(epoch_ckpt))
 
         mlflow.log_metric("best_val_dice", best_dice)
-        mlflow.log_artifact(str(best_ckpt_path), artifact_path="checkpoints")
+        if best_ckpt_path.exists():
+            mlflow.log_artifact(str(best_ckpt_path), artifact_path="checkpoints")
+        else:
+            print(
+                "Warning: no best checkpoint was saved because no validated epoch passed the selection rule.",
+                flush=True,
+            )
         mlflow.log_artifact(str(last_ckpt_path), artifact_path="checkpoints")
 
     print("Training finished. Best val dice: {:.4f}".format(best_dice))
-    print("Best checkpoint: {}".format(best_ckpt_path.resolve()))
+    if best_ckpt_path.exists():
+        print("Best checkpoint: {}".format(best_ckpt_path.resolve()))
+    else:
+        print("Best checkpoint: not saved")
     print("MLflow tracking URI: {}".format(args.tracking_uri))
 
 
