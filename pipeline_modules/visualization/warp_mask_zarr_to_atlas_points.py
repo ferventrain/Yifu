@@ -3,22 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
+import os
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
-try:
-    import ants
-except ModuleNotFoundError as exc:  # pragma: no cover
-    raise ModuleNotFoundError("ANTsPy is required. Run this in the registration/napari environment.") from exc
 
 try:
     from brainglobe_atlasapi.bg_atlas import BrainGlobeAtlas
@@ -32,11 +28,6 @@ except ImportError:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class BinAccumulator:
-    count: int = 0
 
 
 def configure_logging() -> None:
@@ -148,6 +139,133 @@ def resolve_sample_reference_nii(
     return path
 
 
+def resolve_bin_workers(bin_workers: int) -> int:
+    if bin_workers < 0:
+        raise ValueError(f"bin_workers must be >= 0, got: {bin_workers}")
+    if bin_workers == 0:
+        worker_count = max(1, (os.cpu_count() or 4) // 4)
+    else:
+        worker_count = int(bin_workers)
+    if os.name == "nt" and worker_count > 61:
+        worker_count = 61
+    return worker_count
+
+
+def _bin_mask_block_array(
+    block: np.ndarray,
+    *,
+    z_start: int,
+    y_start: int,
+    x_start: int,
+    resolution_xyz: tuple[float, float, float],
+    target_resolution_xyz: tuple[float, float, float],
+    grid_shape_zyx: tuple[int, int, int],
+    foreground_mode: str,
+    foreground_label: int,
+) -> tuple[int, int, dict[int, int]]:
+    res_x, res_y, res_z = resolution_xyz
+    target_x, target_y, target_z = target_resolution_xyz
+    grid_z, grid_y, grid_x = grid_shape_zyx
+    key_stride_y = grid_x
+    key_stride_z = grid_y * grid_x
+
+    fg = foreground_mask(block, mode=foreground_mode, label=foreground_label)
+    if not fg.any():
+        return 0, 0, {}
+
+    local_z, local_y, local_x = np.nonzero(fg)
+    foreground_voxels = int(local_z.size)
+    z_indices = local_z + z_start
+    y_indices = local_y + y_start
+    x_indices = local_x + x_start
+
+    gx = np.floor(((x_indices.astype(np.float64) + 0.5) * res_x) / target_x).astype(np.int64)
+    gy = np.floor(((y_indices.astype(np.float64) + 0.5) * res_y) / target_y).astype(np.int64)
+    gz = np.floor(((z_indices.astype(np.float64) + 0.5) * res_z) / target_z).astype(np.int64)
+    in_bounds = (gx >= 0) & (gx < grid_x) & (gy >= 0) & (gy < grid_y) & (gz >= 0) & (gz < grid_z)
+    clipped_voxels = int(np.count_nonzero(~in_bounds))
+    if not np.any(in_bounds):
+        return foreground_voxels, clipped_voxels, {}
+
+    flat_keys = gz[in_bounds] * key_stride_z + gy[in_bounds] * key_stride_y + gx[in_bounds]
+    unique_keys, inverse = np.unique(flat_keys, return_inverse=True)
+    counts = np.bincount(inverse)
+    bin_counts: dict[int, int] = {}
+    for idx, raw_key in enumerate(unique_keys):
+        bin_counts[int(raw_key)] = int(counts[idx])
+    return foreground_voxels, clipped_voxels, bin_counts
+
+
+def _merge_bin_partials(
+    partials: list[tuple[int, int, dict[int, int]]],
+) -> tuple[int, int, dict[int, int]]:
+    foreground_voxels = 0
+    clipped_voxels = 0
+    merged: dict[int, int] = {}
+    for partial_foreground, partial_clipped, partial_counts in partials:
+        foreground_voxels += partial_foreground
+        clipped_voxels += partial_clipped
+        for key, count in partial_counts.items():
+            merged[key] = merged.get(key, 0) + count
+    return foreground_voxels, clipped_voxels, merged
+
+
+def _volume_from_bin_counts(
+    bin_counts: dict[int, int],
+    *,
+    output_shape_zyx: tuple[int, int, int],
+    min_voxels_per_point: int,
+    volume_mode: str,
+) -> tuple[np.ndarray, int]:
+    grid_z, grid_y, grid_x = output_shape_zyx
+    key_stride_y = grid_x
+    key_stride_z = grid_y * grid_x
+    volume_dtype = np.float32 if volume_mode == "count" else np.uint8
+    volume = np.zeros(output_shape_zyx, dtype=volume_dtype)
+    occupied_bins = 0
+    for flat_key, count in bin_counts.items():
+        if count < min_voxels_per_point:
+            continue
+        gz = flat_key // key_stride_z
+        rem = flat_key % key_stride_z
+        gy = rem // key_stride_y
+        gx = rem % key_stride_y
+        if volume_mode == "count":
+            volume[int(gz), int(gy), int(gx)] = float(count)
+        else:
+            volume[int(gz), int(gy), int(gx)] = 1
+        occupied_bins += 1
+    return volume, occupied_bins
+
+
+WORKER_MASK_ARR = None
+WORKER_BIN_CONFIG: dict[str, Any] | None = None
+
+
+def init_bin_worker(mask_zarr_path: str, dataset_name: str, bin_config: dict[str, Any]) -> None:
+    global WORKER_MASK_ARR, WORKER_BIN_CONFIG
+    WORKER_MASK_ARR = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
+    WORKER_BIN_CONFIG = bin_config
+
+
+def process_bin_block_worker(block_bounds: tuple[int, int, int, int, int, int]) -> tuple[int, int, dict[int, int]]:
+    if WORKER_MASK_ARR is None or WORKER_BIN_CONFIG is None:
+        raise RuntimeError("Bin worker was not initialized.")
+    z0, z1, y0, y1, x0, x1 = block_bounds
+    block = np.asarray(WORKER_MASK_ARR[z0:z1, y0:y1, x0:x1])
+    return _bin_mask_block_array(
+        block,
+        z_start=z0,
+        y_start=y0,
+        x_start=x0,
+        resolution_xyz=WORKER_BIN_CONFIG["resolution_xyz"],
+        target_resolution_xyz=WORKER_BIN_CONFIG["target_resolution_xyz"],
+        grid_shape_zyx=WORKER_BIN_CONFIG["grid_shape_zyx"],
+        foreground_mode=WORKER_BIN_CONFIG["foreground_mode"],
+        foreground_label=int(WORKER_BIN_CONFIG["foreground_label"]),
+    )
+
+
 def resolve_inverse_transforms(transforms_dir: str | Path, transforms: str) -> list[str]:
     if transforms.strip():
         paths = [Path(part.strip()) for part in transforms.split(",") if part.strip()]
@@ -176,69 +294,76 @@ def accumulate_sample_grid(
     block_shape: tuple[int, int, int],
     min_voxels_per_point: int,
     volume_mode: str,
+    bin_workers: int = 0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     arr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
     shape = tuple(int(v) for v in arr.shape)
     if len(shape) != 3:
         raise ValueError(f"Expected a 3D mask Zarr, got shape: {shape}")
 
-    res_x, res_y, res_z = resolution_xyz
-    target_x, target_y, target_z = target_resolution_xyz
-    grid_z, grid_y, grid_x = output_shape_zyx
-    key_stride_y = grid_x
-    key_stride_z = grid_y * grid_x
+    worker_count = resolve_bin_workers(bin_workers)
+    block_bounds = [
+        (z_slice.start, z_slice.stop, y_slice.start, y_slice.stop, x_slice.start, x_slice.stop)
+        for z_slice, y_slice, x_slice in iter_block_slices(shape, block_shape)
+    ]
+    bin_config = {
+        "resolution_xyz": resolution_xyz,
+        "target_resolution_xyz": target_resolution_xyz,
+        "grid_shape_zyx": output_shape_zyx,
+        "foreground_mode": foreground_mode,
+        "foreground_label": int(foreground_label),
+    }
 
-    accumulators: dict[int, BinAccumulator] = {}
-    foreground_voxels = 0
-    clipped_voxels = 0
-    blocks = list(iter_block_slices(shape, block_shape))
+    if worker_count <= 1:
+        partials: list[tuple[int, int, dict[int, int]]] = []
+        for z0, z1, y0, y1, x0, x1 in tqdm(
+            block_bounds,
+            desc="Binning sample mask",
+            unit="block",
+            leave=False,
+            file=sys.stderr,
+        ):
+            block = np.asarray(arr[z0:z1, y0:y1, x0:x1])
+            partials.append(
+                _bin_mask_block_array(
+                    block,
+                    z_start=z0,
+                    y_start=y0,
+                    x_start=x0,
+                    resolution_xyz=resolution_xyz,
+                    target_resolution_xyz=target_resolution_xyz,
+                    grid_shape_zyx=output_shape_zyx,
+                    foreground_mode=foreground_mode,
+                    foreground_label=foreground_label,
+                )
+            )
+    else:
+        logger.info("Binning sample mask with %d worker process(es)", worker_count)
+        partials = []
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=init_bin_worker,
+            initargs=(str(mask_zarr_path), dataset_name, bin_config),
+        ) as executor:
+            futures = [executor.submit(process_bin_block_worker, bounds) for bounds in block_bounds]
+            progress = tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc="Binning sample mask",
+                unit="block",
+                leave=False,
+                file=sys.stderr,
+            )
+            for future in progress:
+                partials.append(future.result())
 
-    for z_slice, y_slice, x_slice in tqdm(blocks, desc="Binning sample mask", unit="block", leave=False, file=sys.stderr):
-        block = np.asarray(arr[z_slice, y_slice, x_slice])
-        fg = foreground_mask(block, mode=foreground_mode, label=foreground_label)
-        if not fg.any():
-            continue
-
-        local_z, local_y, local_x = np.nonzero(fg)
-        foreground_voxels += int(local_z.size)
-        z_indices = local_z + z_slice.start
-        y_indices = local_y + y_slice.start
-        x_indices = local_x + x_slice.start
-
-        gx = np.floor(((x_indices.astype(np.float64) + 0.5) * res_x) / target_x).astype(np.int64)
-        gy = np.floor(((y_indices.astype(np.float64) + 0.5) * res_y) / target_y).astype(np.int64)
-        gz = np.floor(((z_indices.astype(np.float64) + 0.5) * res_z) / target_z).astype(np.int64)
-        in_bounds = (gx >= 0) & (gx < grid_x) & (gy >= 0) & (gy < grid_y) & (gz >= 0) & (gz < grid_z)
-        clipped_voxels += int(np.count_nonzero(~in_bounds))
-        if not np.any(in_bounds):
-            continue
-
-        flat_keys = gz[in_bounds] * key_stride_z + gy[in_bounds] * key_stride_y + gx[in_bounds]
-        unique_keys, inverse = np.unique(flat_keys, return_inverse=True)
-        counts = np.bincount(inverse)
-        for idx, raw_key in enumerate(unique_keys):
-            key = int(raw_key)
-            accumulator = accumulators.get(key)
-            if accumulator is None:
-                accumulator = BinAccumulator()
-                accumulators[key] = accumulator
-            accumulator.count += int(counts[idx])
-
-    volume_dtype = np.float32 if volume_mode == "count" else np.uint8
-    volume = np.zeros(output_shape_zyx, dtype=volume_dtype)
-    occupied_bins = 0
-    for flat_key, accumulator in accumulators.items():
-        if accumulator.count < min_voxels_per_point:
-            continue
-        gz = flat_key // key_stride_z
-        rem = flat_key % key_stride_z
-        gy = rem // key_stride_y
-        gx = rem % key_stride_y
-        if volume_mode == "count":
-            volume[int(gz), int(gy), int(gx)] = float(accumulator.count)
-        else:
-            volume[int(gz), int(gy), int(gx)] = 1
-        occupied_bins += 1
+    foreground_voxels, clipped_voxels, bin_counts = _merge_bin_partials(partials)
+    volume, occupied_bins = _volume_from_bin_counts(
+        bin_counts,
+        output_shape_zyx=output_shape_zyx,
+        min_voxels_per_point=min_voxels_per_point,
+        volume_mode=volume_mode,
+    )
 
     summary = {
         "mask_zarr": str(mask_zarr_path),
@@ -253,6 +378,8 @@ def accumulate_sample_grid(
         "occupied_sample_bins": occupied_bins,
         "min_voxels_per_point": min_voxels_per_point,
         "volume_mode": volume_mode,
+        "bin_workers": worker_count,
+        "block_shape": list(block_shape),
     }
     return volume, summary
 
@@ -266,6 +393,11 @@ def warp_sample_grid_to_atlas(
     interpolator: str,
     binarize: bool,
 ) -> tuple[np.ndarray, tuple[float, float, float]]:
+    try:
+        import ants
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError("ANTsPy is required. Run this in the registration/napari environment.") from exc
+
     sample_ref = ants.image_read(str(sample_reference_nii))
     atlas_ref = ants.image_read(str(atlas_image))
     identity = np.eye(3)
@@ -359,6 +491,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--foreground_mode", choices=("nonzero", "equal"), default="nonzero")
     parser.add_argument("--foreground_label", type=int, default=1)
     parser.add_argument("--block_shape", default="", help="Optional block shape in z,y,x order.")
+    parser.add_argument(
+        "--bin_workers",
+        type=int,
+        default=0,
+        help="Worker processes for mask binning. 0 uses cpu_count // 4 (default). 1 disables parallel binning.",
+    )
     parser.add_argument("--min_voxels_per_point", type=int, default=1)
     parser.add_argument("--volume_mode", choices=("binary", "count"), default="binary", help="Output atlas volume values.")
     parser.add_argument("--max_points", type=int, default=150_000, help="Randomly keep N atlas voxels; 0 disables cap.")
@@ -369,6 +507,11 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    try:
+        import ants  # noqa: F401
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError("ANTsPy is required. Run this in the registration/napari environment.") from exc
+
     configure_logging()
     started_at = time.time()
     args = build_argparser().parse_args()
@@ -403,6 +546,7 @@ def main() -> int:
         block_shape=block_shape,
         min_voxels_per_point=args.min_voxels_per_point,
         volume_mode=args.volume_mode,
+        bin_workers=args.bin_workers,
     )
     atlas_volume, raw_atlas_spacing_xyz = warp_sample_grid_to_atlas(
         sample_volume,

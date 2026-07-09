@@ -1,0 +1,76 @@
+{
+  "project_name": "YF2026032001zzj_cfos_sham_rerun",
+  "input": {
+    "resolution_xyz": [1.8, 1.8, 2.0],
+    "channels": {
+      "signal": "1",
+      "registration": "0"
+    }
+  },
+  "preprocessing": {
+    "channel_subtraction": {
+      "apply": true,
+      "background_channel": "ch0",
+      "weight": 1.0,
+      "adaptive": true,
+      "save_plots": true,
+      "sample_ratio": 0.01,
+      "min_samples": 10,
+      "max_samples": 50,
+      "compression": "lzw"
+    },
+    "tophat": {"apply": true, "kernel_size": 21},
+    "rolling_ball": {"apply": false, "radius": 50},
+    "scattering_removal": {"apply": true, "sigma": 25.0, "weight": 1.0},
+    "median_filter": {"apply": true, "kernel_size": 5},
+    "clahe": {"apply": false, "clip_limit": 2.0, "tile_grid_size": 8},
+    "downsample": {
+      "target_resolution_xyz": [25.0, 25.0, 25.0],
+      "chunk_size": 100
+    },
+    "zarr": {
+      "chunk_size": [256, 256, 256],
+      "compressor": "default"
+    }
+  },
+  "registration": {
+    "method": "ants",
+    "mode": "atlas2image",
+    "atlas_path": "${YIFU_DATA_DIR}/reference/atlas.tiff",
+    "annotation_path": "${YIFU_DATA_DIR}/reference/atlas_label.tiff",
+    "transform_type": "SyNRA",
+    "allow_reflection": false,
+    "flip_atlas": [false, false, false],
+    "save_upsampled_label": false,
+    "save_upsampled_label_zarr": true,
+    "save_upsampled_label_hemisphere_zarr": true
+  },
+  "segmentation": {
+    "method": "cfos_unet",
+    "export_mask_tiff": false,
+    "cfos_unet": {
+      "checkpoint_path": "S:/Yifu/outputs/cfos_noise_finetune_v3/best_model.pt",
+      "save_probability": true,
+      "probability_zarr": "",
+      "dataset_name": "0",
+      "patch_size": [256, 256, 256],
+      "overlap": 0.25,
+      "batch_size": 16,
+      "device": "auto",
+      "foreground_class": 1,
+      "probability_threshold": 0.4,
+      "process_existing_only": false,
+      "skip_below_threshold": 100.0,
+      "rerun_if_model_updated": true,
+      "output_mode": "binary",
+      "output_dtype": "uint8",
+      "probability_dtype": "float16",
+      "normalize_percentiles": [1.0, 99.5]
+    }
+  },
+  "analysis": {
+    "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+    "output_format": "xlsx",
+    "use_hemisphere_label": true
+  }
+}

@@ -1,14 +1,14 @@
 {
-  "schema_version": "1",
-  "notes": "Starter thresholds for image QC grading. Review and adjust on a reference sample cohort before production gating.",
+  "schema_version": "2",
+  "notes": "Calibrated 2026-06-30 on 763 IMS QC results from \\\\192.168.110.9\\MegaSpim\\qc (resolution_level=2). Lower-is-better: pass ~cohort p25-p30, warn ~p75-p85. dark_pixel_ratio disabled for sparse LSFM. Review on reference slides before production gating.",
   "rules": [
     {
       "metric": "global_exposure_dynamic_range.dark_pixel_ratio",
       "direction": "lower_is_better",
-      "pass_max": 0.05,
-      "warn_max": 0.15,
+      "pass_max": 1.0,
+      "warn_max": 1.0,
       "category": "exposure_dynamic_range",
-      "description": "Fraction of pixels below dark threshold (default <100)."
+      "description": "Disabled for sparse LSFM (high dark fraction is normal). Only retained for schema compatibility."
     },
     {
       "metric": "global_exposure_dynamic_range.saturated_pixel_ratio",
@@ -21,58 +21,58 @@
     {
       "metric": "slice_aggregate.brightness_uniformity.tile_median_cv.median",
       "direction": "lower_is_better",
-      "pass_max": 0.15,
-      "warn_max": 0.30,
+      "pass_max": 0.45,
+      "warn_max": 0.95,
       "category": "brightness_uniformity",
-      "description": "Median tile-brightness coefficient of variation across sampled slices."
+      "description": "Median tile-brightness CV across sampled slices. Cohort p25=0.31, p75=0.98."
     },
     {
       "metric": "slice_aggregate.stripe_artifacts.slab_stripe_score.median",
       "direction": "lower_is_better",
-      "pass_max": 0.08,
-      "warn_max": 0.20,
+      "pass_max": 0.9,
+      "warn_max": 1.35,
       "category": "stripe_artifacts",
-      "description": "Combined row/column/slab stripe score."
+      "description": "Combined row/column/slab stripe score. Cohort p25=0.82, p75=1.27, p90=1.60."
     },
     {
       "metric": "slice_aggregate.diffuse_signal.diffuse_noise_score.median",
       "direction": "lower_is_better",
-      "pass_max": 0.20,
-      "warn_max": 0.40,
+      "pass_max": 0.05,
+      "warn_max": 0.35,
       "category": "diffuse_signal",
-      "description": "Low-contrast elevated area likely to be diffuse noise rather than structured signal."
+      "description": "Diffuse background noise score. Cohort 62% are zero; p90(nonzero)=0.64."
     },
     {
       "metric": "slice_aggregate.diffuse_signal.noise_to_signal_area_ratio.median",
       "direction": "lower_is_better",
-      "pass_max": 0.50,
-      "warn_max": 1.50,
+      "pass_max": 0.5,
+      "warn_max": 2.0,
       "category": "diffuse_signal",
       "description": "Ratio of diffuse-noise tile area to structured-signal tile area."
     },
     {
       "metric": "slice_aggregate.diffuse_signal.large_diffuse_component_fraction.median",
       "direction": "lower_is_better",
-      "pass_max": 0.10,
-      "warn_max": 0.25,
+      "pass_max": 0.08,
+      "warn_max": 0.22,
       "category": "diffuse_signal",
-      "description": "Largest connected diffuse-noise tile component as fraction of tile grid."
+      "description": "Largest connected diffuse-noise component fraction. Cohort p90=0.14."
     },
     {
       "metric": "slice_aggregate.contrast.candidate_cnr.median",
       "direction": "higher_is_better",
-      "pass_min": 3.0,
-      "warn_min": 1.5,
+      "pass_min": 15.0,
+      "warn_min": 5.0,
       "category": "contrast",
-      "description": "Robust Otsu-based candidate contrast-to-noise ratio."
+      "description": "Robust Otsu CNR; flags very low-contrast/blank channels."
     },
     {
       "metric": "slice_aggregate.focus.laplacian_variance.median",
       "direction": "higher_is_better",
-      "pass_min": 50.0,
-      "warn_min": 20.0,
+      "pass_min": 100.0,
+      "warn_min": 25.0,
       "category": "focus",
-      "description": "Median Laplacian variance across sampled slices (resolution dependent)."
+      "description": "Median Laplacian variance (resolution_level=2). Cohort p25=13, p50=167."
     }
   ]
 }

@@ -3,13 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
+import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
-from typing import Any
+from typing import Any, Iterable, Iterator, Literal
 
 import numpy as np
 import tifffile
@@ -59,6 +59,120 @@ def _coerce_chunk_size(value: str | tuple[int, int, int]) -> tuple[int, int, int
     return (int(parts[0]), int(parts[1]), int(parts[2]))
 
 
+def resolve_tiff_workers(workers: int) -> int:
+    if workers < 0:
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "workers must be >= 0",
+            {"workers": workers},
+        )
+    if workers == 0:
+        worker_count = max(1, (os.cpu_count() or 4) // 2)
+    else:
+        worker_count = int(workers)
+    if os.name == "nt" and worker_count > 61:
+        worker_count = 61
+    return worker_count
+
+
+def resolve_read_z_chunk(zarr_z_chunk: int, read_z_chunk: int | None) -> int:
+    if read_z_chunk is None or read_z_chunk <= 0:
+        return max(1, min(16, int(zarr_z_chunk)))
+    read_z = int(read_z_chunk)
+    if read_z <= 0:
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "read_z_chunk must be positive when explicitly set",
+            {"read_z_chunk": read_z_chunk},
+        )
+    return read_z
+
+
+def resolve_compressor(compressor: Any) -> Any | None:
+    if compressor is None or compressor == "none":
+        return None
+    if compressor == "default":
+        from numcodecs import Blosc
+
+        return Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
+    if compressor == "fast":
+        from numcodecs import Blosc
+
+        return Blosc(cname="lz4", clevel=1, shuffle=Blosc.SHUFFLE)
+    return compressor
+
+
+def _read_z_chunk(tiff_files: list[Path]) -> np.ndarray:
+    return np.stack([tifffile.imread(str(path)) for path in tiff_files])
+
+
+def _iter_read_jobs(
+    depth: int,
+    tiff_files: list[Path],
+    read_z_chunk: int,
+) -> Iterator[tuple[int, int, list[Path]]]:
+    for start in range(0, depth, read_z_chunk):
+        end = min(start + read_z_chunk, depth)
+        yield start, end, tiff_files[start:end]
+
+
+def _run_bounded_read_pipeline(
+    dataset: Any,
+    jobs: Iterable[tuple[int, int, list[Path]]],
+    *,
+    worker_count: int,
+    executor_kind: Literal["thread", "process"] = "thread",
+) -> None:
+    job_list = list(jobs)
+    if not job_list:
+        return
+
+    executor_cls = ProcessPoolExecutor if executor_kind == "process" else ThreadPoolExecutor
+    max_in_flight = max(1, min(worker_count + 1, len(job_list)))
+    pending: dict[Future[np.ndarray], tuple[int, int]] = {}
+    job_iter = iter(job_list)
+
+    def submit_next(pool: ThreadPoolExecutor | ProcessPoolExecutor) -> None:
+        try:
+            start, end, files = next(job_iter)
+        except StopIteration:
+            return
+        pending[pool.submit(_read_z_chunk, files)] = (start, end)
+
+    with executor_cls(max_workers=worker_count) as pool:
+        for _ in range(max_in_flight):
+            submit_next(pool)
+
+        progress = tqdm(total=len(job_list), desc="Converting to Zarr", unit="batch", leave=True)
+        try:
+            while pending:
+                for future in as_completed(list(pending)):
+                    start, end = pending.pop(future)
+                    dataset[start:end] = future.result()
+                    progress.update(1)
+                    submit_next(pool)
+                    break
+        finally:
+            progress.close()
+
+
+def normalize_channel_label(value: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise PipelineError(ErrorCode.ARGUMENT_INVALID, "Channel label must not be empty", {"channel": value})
+    return text if text.startswith("ch") else f"ch{text}"
+
+
+def parse_channel_list(channels: str | list[str]) -> list[str]:
+    if isinstance(channels, list):
+        parts = [str(part).strip() for part in channels if str(part).strip()]
+    else:
+        parts = [part.strip() for part in str(channels).split(",") if part.strip()]
+    if not parts:
+        raise PipelineError(ErrorCode.ARGUMENT_INVALID, "At least one channel is required", {"channels": channels})
+    return [normalize_channel_label(part) for part in parts]
+
+
 def convert_tiff_to_zarr(
     input_dir: str | Path,
     output_zarr: str | Path,
@@ -66,6 +180,9 @@ def convert_tiff_to_zarr(
     compressor: Any = "default",
     *,
     dataset_name: str = "0",
+    workers: int = 0,
+    read_z_chunk: int | None = None,
+    executor: Literal["thread", "process"] = "thread",
 ) -> dict[str, Any]:
     """Convert a folder of TIFF files into a directory-store Zarr volume."""
     started_at = time.time()
@@ -74,12 +191,20 @@ def convert_tiff_to_zarr(
 
     try:
         import zarr
-        from numcodecs import Blosc
     except ModuleNotFoundError as exc:
         raise PipelineError(
             ErrorCode.DEPENDENCY_MISSING,
-            "zarr and numcodecs are required for TIFF-to-Zarr conversion",
-            {"dependency": "zarr/numcodecs", "error": str(exc)},
+            "zarr is required for TIFF-to-Zarr conversion",
+            {"dependency": "zarr", "error": str(exc)},
+        ) from exc
+
+    try:
+        resolved_compressor = resolve_compressor(compressor)
+    except ModuleNotFoundError as exc:
+        raise PipelineError(
+            ErrorCode.DEPENDENCY_MISSING,
+            "numcodecs is required for Zarr compression",
+            {"dependency": "numcodecs", "error": str(exc)},
         ) from exc
 
     if not input_path.exists():
@@ -110,30 +235,35 @@ def convert_tiff_to_zarr(
 
     store = zarr.DirectoryStore(str(output_path))
     root = zarr.group(store=store, overwrite=True)
-    if compressor == "default":
-        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
 
     dataset = root.create_dataset(
         dataset_name,
         shape=shape,
         chunks=chunk_size,
         dtype=dtype,
-        compressor=compressor,
+        compressor=resolved_compressor,
     )
     root.attrs["multiscales"] = [{
         "version": "0.4",
         "datasets": [{"path": dataset_name}],
     }]
 
-    z_chunk = chunk_size[0]
-    n_chunks = math.ceil(shape[0] / z_chunk)
-    n_workers = min(4, max(1, n_chunks))
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for start in tqdm(range(0, shape[0], z_chunk), total=n_chunks, desc="Converting to Zarr", unit="chunk"):
-            end = min(start + z_chunk, shape[0])
-            slices_files = tiff_files[start:end]
-            images = list(pool.map(tifffile.imread, [str(f) for f in slices_files]))
-            dataset[start:end] = np.stack(images)
+    read_batch = resolve_read_z_chunk(chunk_size[0], read_z_chunk)
+    worker_count = resolve_tiff_workers(workers)
+    logger.info(
+        "Using %d %s worker(s), read batch=%d slice(s), zarr z-chunk=%d",
+        worker_count,
+        executor,
+        read_batch,
+        chunk_size[0],
+    )
+
+    _run_bounded_read_pipeline(
+        dataset,
+        _iter_read_jobs(shape[0], tiff_files, read_batch),
+        worker_count=worker_count,
+        executor_kind=executor,
+    )
 
     result = {
         "success": True,
@@ -143,6 +273,10 @@ def convert_tiff_to_zarr(
         "shape": list(shape),
         "dtype": str(dtype),
         "chunk_size": list(chunk_size),
+        "read_z_chunk": read_batch,
+        "workers": worker_count,
+        "executor": executor,
+        "compressor": str(compressor),
     }
     manifest_path = write_run_manifest(
         output_path,
@@ -162,11 +296,105 @@ def convert_tiff_to_zarr(
     return result
 
 
+def convert_sample_channels_to_zarr(
+    sample_dir: str | Path,
+    channels: str | list[str],
+    *,
+    chunk_size: tuple[int, int, int] = (256, 256, 256),
+    workers: int = 0,
+    read_z_chunk: int | None = None,
+    executor: Literal["thread", "process"] = "thread",
+    compressor: Any = "default",
+    dataset_name: str = "0",
+    skip_existing: bool = True,
+) -> dict[str, Any]:
+    sample_path = Path(sample_dir)
+    if not sample_path.exists():
+        raise PipelineError(
+            ErrorCode.INPUT_NOT_FOUND,
+            "Sample directory not found",
+            {"sample_dir": str(sample_path)},
+        )
+
+    channel_labels = parse_channel_list(channels)
+    converted: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, str] = {}
+    failed: dict[str, str] = {}
+
+    for channel in channel_labels:
+        output_zarr = sample_path / f"{channel}.zarr"
+        if skip_existing and output_zarr.exists():
+            skipped[channel] = str(output_zarr)
+            continue
+        input_dir = sample_path / channel
+        if not input_dir.exists():
+            failed[channel] = f"Missing TIFF folder and Zarr store: {input_dir}"
+            continue
+        try:
+            converted[channel] = convert_tiff_to_zarr(
+                input_dir,
+                output_zarr,
+                chunk_size=chunk_size,
+                compressor=compressor,
+                dataset_name=dataset_name,
+                workers=workers,
+                read_z_chunk=read_z_chunk,
+                executor=executor,
+            )
+        except PipelineError as exc:
+            failed[channel] = str(exc.message)
+        except Exception as exc:  # pragma: no cover - defensive batch boundary
+            failed[channel] = str(exc)
+
+    if not converted and failed:
+        raise PipelineError(
+            ErrorCode.INPUT_NOT_FOUND,
+            "No channels were converted to Zarr",
+            {"failed": failed, "sample_dir": str(sample_path)},
+        )
+
+    return {
+        "success": True,
+        "sample_dir": str(sample_path),
+        "channels_requested": channel_labels,
+        "converted": converted,
+        "skipped_existing": skipped,
+        "failed": failed,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert a TIFF folder to a directory-store Zarr volume")
-    parser.add_argument("--input", required=True, help="Input TIFF folder")
-    parser.add_argument("--output", required=True, help="Output .zarr path")
+    parser.add_argument("--input", default="", help="Input TIFF folder")
+    parser.add_argument("--output", default="", help="Output .zarr path")
+    parser.add_argument("--sample_dir", default="", help="Sample root directory for --channels batch mode")
+    parser.add_argument("--channels", default="", help="Comma-separated channels for batch mode, e.g. 0,1,2,3")
     parser.add_argument("--chunk_size", default="256,256,256", help="Chunk size z,y,x")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel workers for TIFF reads. 0 uses cpu_count // 2 (default).",
+    )
+    parser.add_argument(
+        "--read-z-chunk",
+        type=int,
+        default=0,
+        help="Slices read per worker batch. 0 uses min(16, zarr z-chunk). Lower = less RAM, more CPU parallelism.",
+    )
+    parser.add_argument(
+        "--executor",
+        choices=("thread", "process"),
+        default="thread",
+        help="thread=low memory overhead (default); process=more CPU for TIFF decode, higher RAM.",
+    )
+    parser.add_argument(
+        "--compressor",
+        choices=("default", "fast", "none"),
+        default="default",
+        help="Zarr compression: default=zstd, fast=lz4, none=fastest write/largest store.",
+    )
+    parser.add_argument("--skip_existing", action="store_true", help="Skip channels whose .zarr already exists in batch mode")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()
@@ -177,12 +405,35 @@ def main() -> int:
     _configure_logging(args.json_logs)
 
     try:
-        result = convert_tiff_to_zarr(
-            args.input,
-            args.output,
-            _coerce_chunk_size(args.chunk_size),
-            dataset_name=args.dataset_name,
-        )
+        if args.sample_dir and args.channels:
+            result = convert_sample_channels_to_zarr(
+                args.sample_dir,
+                args.channels,
+                chunk_size=_coerce_chunk_size(args.chunk_size),
+                workers=int(args.workers),
+                read_z_chunk=int(args.read_z_chunk) or None,
+                executor=args.executor,
+                compressor=args.compressor,
+                dataset_name=args.dataset_name,
+                skip_existing=bool(args.skip_existing),
+            )
+        else:
+            if not args.input or not args.output:
+                raise PipelineError(
+                    ErrorCode.ARGUMENT_INVALID,
+                    "Provide --input and --output, or use --sample_dir with --channels",
+                    {"input": args.input, "output": args.output, "sample_dir": args.sample_dir},
+                )
+            result = convert_tiff_to_zarr(
+                args.input,
+                args.output,
+                _coerce_chunk_size(args.chunk_size),
+                compressor=args.compressor,
+                dataset_name=args.dataset_name,
+                workers=int(args.workers),
+                read_z_chunk=int(args.read_z_chunk) or None,
+                executor=args.executor,
+            )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except PipelineError as exc:

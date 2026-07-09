@@ -37,9 +37,13 @@
         "Input TIFF directory must exist and contain TIFF slices"
       ],
       "inputs": {
-        "input_dir": { "type": "path", "required": true },
-        "output_zarr": { "type": "path", "required": true },
-        "chunk_size": { "type": "triplet_int", "default": [128, 256, 256] },
+        "input_dir": { "type": "path", "required": false, "description": "Single-channel TIFF folder; required unless using sample_dir + channels batch mode" },
+        "output_zarr": { "type": "path", "required": false, "description": "Single-channel output .zarr; required unless using sample_dir + channels batch mode" },
+        "sample_dir": { "type": "dir", "required": false, "description": "Sample root for batch conversion of ch0,ch1,..." },
+        "channels": { "type": "string", "required": false, "examples": ["0,1,2,3"], "description": "Comma-separated channel labels for batch mode" },
+        "chunk_size": { "type": "triplet_int", "default": [256, 256, 256] },
+        "workers": { "type": "int", "default": 0, "description": "Thread count for parallel TIFF chunk reads; 0 uses cpu_count // 4" },
+        "skip_existing": { "type": "bool", "default": false, "description": "In batch mode, skip channels whose chX.zarr already exists" },
         "compressor": { "type": "string", "default": "default" },
         "dataset_name": { "type": "string", "default": "0" }
       },

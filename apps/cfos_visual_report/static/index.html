@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cFos Visual Report</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <link rel="stylesheet" href="/styles.css?v=32" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <h1>cFos Visual Report</h1>
+    </div>
+    <div class="header-meta">
+      <span id="header-sample-id" class="header-sample-id">Loading…</span>
+    </div>
+  </header>
+
+  <main id="app-layout" class="layout">
+    <aside id="panel-left" class="panel panel-left">
+      <button id="toggle-panel-left" type="button" class="panel-toggle" title="Collapse region browser" aria-expanded="true">‹</button>
+      <div class="panel-body">
+        <div class="panel-header">
+          <h2>Region browser</h2>
+          <input id="region-search" type="search" placeholder="Search name, acronym, ID" />
+        </div>
+        <div id="region-tree" class="region-tree"></div>
+        <div class="panel-actions">
+          <button id="export-selected" type="button" disabled>Export selected CSV</button>
+        </div>
+      </div>
+    </aside>
+
+    <section class="panel panel-center">
+      <div class="panel-header center-controls">
+        <div class="view-tabs">
+          <button type="button" class="view-tab active" data-view="summary">Summary</button>
+          <button type="button" class="view-tab" data-view="slice2d">2D slice</button>
+          <button type="button" class="view-tab" data-view="points3d">3D points</button>
+          <button type="button" class="view-tab" data-view="compare">Analysis</button>
+        </div>
+
+        <div id="slice-controls" class="control-row hidden">
+          <label>
+            Heatmap mode
+            <select id="slice-color-mode">
+              <option value="region">Region metric (by structure)</option>
+              <option value="signal">Local signal density</option>
+              <option value="hemisphere">Left / right hemisphere (single sample)</option>
+              <option value="dual">Two samples: side-by-side</option>
+              <option value="split_lr">Two samples: L/R split on one slice</option>
+              <option value="diff">Two samples: density difference (A − B)</option>
+              <option value="fold">Two samples: log2 fold change (A / B)</option>
+            </select>
+          </label>
+          <label>
+            Compare sample dir
+            <input id="compare-sample-dir" type="text" placeholder="Second sample path (for dual/diff/fold)" />
+          </label>
+          <label>
+            Metric
+            <select id="metric-select">
+              <option value="cfos_count">cFos count</option>
+              <option value="voxel_density">Voxel density</option>
+              <option value="signal_voxels">Signal voxels</option>
+              <option value="mean_cfos_intensity">Mean cFos intensity</option>
+              <option value="laterality_index">Laterality index</option>
+            </select>
+          </label>
+          <label>
+            Plane
+            <select id="plane-select">
+              <option value="coronal">Coronal (AP)</option>
+              <option value="sagittal">Sagittal (ML)</option>
+              <option value="horizontal">Horizontal (DV)</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="viewer3d-controls" class="control-row hidden">
+          <button id="toggle-brain-outline" type="button" class="toggle-btn" disabled>Brain outline</button>
+          <label class="checkbox inline"><input id="filter-in-brain-points" type="checkbox" checked /> In-brain points only</label>
+          <button id="reset-camera" type="button">Reset camera</button>
+          <button id="save-camera" type="button">Save view</button>
+          <button id="screenshot-3d" type="button">Screenshot PNG</button>
+          <div id="saved-views-panel" class="saved-views-panel">
+            <span class="saved-views-label">Saved views</span>
+            <ul id="saved-views-list" class="saved-views-list"></ul>
+          </div>
+        </div>
+
+        <div id="compare-controls" class="compare-controls analysis-controls hidden">
+          <p id="group-status" class="compare-status muted hidden" aria-live="polite"></p>
+          <details class="compare-sample-details" open>
+            <summary>Samples &amp; group labels</summary>
+            <div id="analysis-samples-wrap" class="analysis-samples-wrap">
+              <table id="analysis-samples-table" class="analysis-samples-table">
+                <thead>
+                  <tr><th>Sample</th><th>Group label</th><th></th></tr>
+                </thead>
+                <tbody id="analysis-samples-body"></tbody>
+              </table>
+              <div class="analysis-add-sample">
+                <input id="analysis-add-sample-path" type="text" placeholder="Add another sample directory path" />
+                <button id="analysis-add-sample-btn" type="button">Add sample</button>
+              </div>
+            </div>
+            <div class="group-controls">
+              <label>Level <select id="group-level-select"></select></label>
+              <label>
+                Metric
+                <select id="group-metric-select">
+                  <option value="cfos_count">cFos count</option>
+                  <option value="voxel_density">Cell / voxel density</option>
+                  <option value="signal_voxels">Signal voxels</option>
+                  <option value="mean_cfos_intensity">Mean cFos intensity</option>
+                </select>
+              </label>
+              <label>
+                Region scope
+                <select id="group-region-scope">
+                  <option value="all">All regions at level</option>
+                  <option value="subtree">Selected region + subregions</option>
+                </select>
+              </label>
+              <label>
+                Heatmap rows
+                <select id="group-heatmap-mode">
+                  <option value="differential">Top differential (|log2FC|)</option>
+                  <option value="absolute">Raw metric values</option>
+                </select>
+              </label>
+            </div>
+          </details>
+          <details class="group-advanced">
+            <summary>Advanced: manifest CSV (optional)</summary>
+            <label class="stack-label">Manifest CSV path <input id="group-manifest-path" type="text" placeholder="Optional CSV with sample_dir, group columns" /></label>
+            <div class="group-controls">
+              <label>Group A <select id="group-a-select"></select></label>
+              <label>Group B <select id="group-b-select"></select></label>
+            </div>
+          </details>
+          <div class="compare-actions">
+            <button id="run-group-analysis" type="button">Run analysis</button>
+            <button id="export-group-diff" type="button" disabled>Export comparison CSV</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="summary-view" class="view-pane active">
+        <div id="summary-panel" class="summary-viewport">
+          <p class="placeholder muted">Loading report…</p>
+        </div>
+      </div>
+
+      <div id="slice-view" class="view-pane">
+        <div class="slice-layout">
+          <div class="slice-main">
+            <div class="slice-viewport">
+              <img id="slice-image" alt="Atlas slice heatmap" />
+              <div id="slice-placeholder" class="placeholder">Select 2D slice to render.</div>
+            </div>
+            <div id="slice-navigator" class="slice-navigator hidden">
+              <canvas id="hist-axis" width="960" height="88"></canvas>
+              <div class="slice-navigator-controls">
+                <input id="slice-index" type="range" min="0" max="455" value="216" />
+                <div class="slice-navigator-meta">
+                  <span id="slice-index-label">216</span>
+                  <span id="bregma-label" class="bregma-label">Bregma — mm</span>
+                </div>
+              </div>
+            </div>
+            <div id="slice-export-panel" class="slice-export-panel">
+              <div class="slice-export-toolbar">
+                <button id="add-slice-bookmark" type="button" title="Bookmark current slice with all heatmap modes">+ Slice</button>
+                <button id="export-slice-bookmarks" type="button" disabled title="Export selected heatmaps as ZIP">Export selected</button>
+              </div>
+              <div id="slice-export-table-wrap" class="slice-export-table-wrap">
+                <p class="muted slice-export-empty">Add slices to export region and signal heatmaps.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="points3d-view" class="view-pane">
+        <div id="viewer3d" class="viewer3d-host">
+          <div id="viewer3d-canvas" class="viewer3d-canvas"></div>
+          <div id="viewer3d-placeholder" class="viewer3d-overlay">3D view requires points.csv or atlas volume TIFF.</div>
+        </div>
+      </div>
+
+      <div id="compare-view" class="view-pane analysis-viewport-wrap">
+        <div class="compare-viewport">
+          <p id="compare-placeholder" class="placeholder">Load two or more samples, set group labels, then run Analysis.</p>
+          <div class="group-charts compare-charts hidden">
+            <div class="chart-wrap">
+              <canvas id="group-scatter" width="520" height="320"></canvas>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="group-heatmap" width="520" height="360"></canvas>
+            </div>
+          </div>
+          <div class="chart-wrap chart-wrap-wide hidden" id="group-correlation-wrap">
+            <canvas id="group-correlation" width="1040" height="280"></canvas>
+          </div>
+          <div id="group-diff-table"></div>
+        </div>
+      </div>
+    </section>
+
+    <aside id="panel-right" class="panel panel-right">
+      <button id="toggle-panel-right" type="button" class="panel-toggle panel-toggle-right" title="Collapse region detail" aria-expanded="true">›</button>
+      <div class="panel-body">
+        <div class="panel-header"><h2>Region detail</h2></div>
+        <div id="region-detail-panel" class="detail-panel">
+          <p class="muted">Select a region to inspect metrics.</p>
+          <dl id="region-detail" class="hidden"></dl>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="chart-tooltip" class="chart-tooltip hidden" role="tooltip"></div>
+  <script type="module" src="/app.js?v=34"></script>
+</body>
+</html>

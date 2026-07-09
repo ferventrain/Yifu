@@ -1,0 +1,10 @@
+name: napari-point-cropper
+display_name: Point Cropper
+contributions:
+  commands:
+    - id: napari-point-cropper.make_point_cropper_widget
+      title: Point cropper
+      python_name: napari_point_cropper:make_point_cropper_widget
+  widgets:
+    - command: napari-point-cropper.make_point_cropper_widget
+      display_name: Point cropper

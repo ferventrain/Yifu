@@ -723,6 +723,7 @@ def ensure_atlas_count_volume(
     min_voxels_per_point: int,
     volume_mode: str,
     output_volume: str | Path | None = None,
+    bin_workers: int = 0,
 ) -> tuple[np.ndarray, Path, dict[str, object]]:
     if ants is None:
         raise ImportError("ANTsPy is required to build atlas-space volumes.")
@@ -814,6 +815,7 @@ def ensure_atlas_count_volume(
         block_shape=resolved_block_shape,
         min_voxels_per_point=min_voxels_per_point,
         volume_mode=volume_mode,
+        bin_workers=bin_workers,
     )
     summary.update(bin_summary)
     print("Warping binned volume into atlas space")
@@ -1250,6 +1252,7 @@ def generate_batch_cell_density_slices(
     foreground_label: int = 1,
     block_shape: str = "",
     min_voxels_per_point: int = 1,
+    bin_workers: int = 0,
     dataset_name: str = "0",
 ) -> dict[str, object]:
     sample_dirs = discover_sample_dirs(samples_root)
@@ -1281,6 +1284,7 @@ def generate_batch_cell_density_slices(
             block_shape=block_shape,
             min_voxels_per_point=min_voxels_per_point,
             volume_mode=volume_mode,
+            bin_workers=bin_workers,
         )
         voxel_density = prepare_smoothed_voxel_density_volume(
             atlas_volume,
@@ -1396,6 +1400,7 @@ def generate_sample_stack_heatmap(
     min_voxels_per_point: int,
     volume_mode: str,
     output_volume: str | Path | None,
+    bin_workers: int = 0,
     edge_path: str | Path,
     atlas_mask_path: str | Path,
     output: str | Path,
@@ -1445,6 +1450,7 @@ def generate_sample_stack_heatmap(
         min_voxels_per_point=min_voxels_per_point,
         volume_mode=volume_mode,
         output_volume=output_volume,
+        bin_workers=bin_workers,
     )
     points_csv_path = default_sample_points_csv(sample_dir)
     summary: dict[str, object] = {
@@ -1525,6 +1531,87 @@ def _slice_signal_volume(local_signal_volume: np.ndarray, atlas_slice: AtlasSlic
     return np.asarray(local_signal_volume[:, :, atlas_slice.index], dtype=np.float32)
 
 
+def _export_slice_figure_png(
+    fig,
+    ax,
+    *,
+    dpi: int,
+    width: int,
+    height: int,
+    theme: dict[str, str],
+    include_colorbar: bool = True,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Export a slice matplotlib figure to RGBA array and atlas pixel layout metadata."""
+    buffer = io.BytesIO()
+    if include_colorbar:
+        fig.tight_layout(pad=0.08)
+        fig.savefig(
+            buffer,
+            format="png",
+            dpi=dpi,
+            facecolor=theme["background"],
+            bbox_inches="tight",
+            pad_inches=0.02,
+        )
+    else:
+        fig.subplots_adjust(0, 0, 1, 1)
+        ax.set_position([0, 0, 1, 1])
+        fig.savefig(
+            buffer,
+            format="png",
+            dpi=1,
+            facecolor=theme["background"],
+            pad_inches=0,
+            bbox_inches=None,
+        )
+    buffer.seek(0)
+    image = np.asarray(Image.open(buffer).convert("RGBA"))
+    img_h, img_w = int(image.shape[0]), int(image.shape[1])
+    if include_colorbar:
+        fig.canvas.draw()
+        bbox = ax.get_tightbbox(fig.canvas.get_renderer())
+        slice_left = max(int(bbox.x0), 0)
+        slice_top = max(int(img_h - bbox.y1), 0)
+        slice_width = max(int(bbox.width), 1)
+        slice_height = max(int(bbox.height), 1)
+    else:
+        slice_left = 0
+        slice_top = 0
+        slice_width = width
+        slice_height = height
+    layout = {
+        "image_width": img_w,
+        "image_height": img_h,
+        "slice_left": slice_left,
+        "slice_top": slice_top,
+        "slice_width": slice_width,
+        "slice_height": slice_height,
+        "atlas_width": width,
+        "atlas_height": height,
+    }
+    return image, layout
+
+
+def _slice_figure_theme(*, background: str = "white") -> dict[str, str]:
+    if background == "white":
+        return {
+            "background": "white",
+            "contour": "#334155",
+            "focus": "#2563eb",
+            "cbar_tick": "#334155",
+            "cbar_edge": "#64748b",
+            "cbar_label": "#1e293b",
+        }
+    return {
+        "background": "black",
+        "contour": "white",
+        "focus": "#4cc9f0",
+        "cbar_tick": "white",
+        "cbar_edge": "white",
+        "cbar_label": "white",
+    }
+
+
 def _render_local_slice_array(
     signal_slice: np.ndarray,
     label_slice: np.ndarray,
@@ -1537,67 +1624,80 @@ def _render_local_slice_array(
     brain_outline_width: float,
     colorbar_label: str,
     show_region_contours: bool = True,
-) -> np.ndarray:
+    background: str = "white",
+    include_colorbar: bool = True,
+) -> tuple[np.ndarray, dict[str, int]]:
     height, width = label_slice.shape
-    aspect = width / max(height, 1)
-    long_side = 6.2
-    figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
+    if include_colorbar:
+        aspect = width / max(height, 1)
+        long_side = 6.2
+        figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    else:
+        fig, ax = plt.subplots(figsize=(width, height), dpi=1)
+    theme = _slice_figure_theme(background=background)
+    try:
+        fig.patch.set_facecolor(theme["background"])
+        ax.set_facecolor(theme["background"])
 
-    cmap = _colormap_by_name(cmap_name).copy()
-    cmap.set_bad((0, 0, 0, 0))
-    masked_signal = np.ma.masked_where((label_slice <= 0) | (signal_slice <= vmin), signal_slice)
-    image = ax.imshow(masked_signal, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+        cmap = _colormap_by_name(cmap_name).copy()
+        cmap.set_bad((0, 0, 0, 0))
+        masked_signal = np.ma.masked_where(label_slice <= 0, signal_slice)
+        image = ax.imshow(masked_signal, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
-    region_lines = _label_contour_lines(label_slice, smoothing=1.4) if show_region_contours else []
-    if region_lines and line_width > 0:
-        from matplotlib.collections import LineCollection
+        region_lines = _label_contour_lines(label_slice, smoothing=1.4) if show_region_contours else []
+        if region_lines and line_width > 0:
+            from matplotlib.collections import LineCollection
 
-        ax.add_collection(
-            LineCollection(
-                region_lines,
-                colors="white",
-                linewidths=line_width,
-                alpha=0.95,
-                antialiaseds=True,
-                capstyle="round",
-                joinstyle="round",
+            ax.add_collection(
+                LineCollection(
+                    region_lines,
+                    colors=theme["contour"],
+                    linewidths=line_width,
+                    alpha=0.95,
+                    antialiaseds=True,
+                    capstyle="round",
+                    joinstyle="round",
+                )
             )
-        )
 
-    brain_lines = _mask_contour_lines(label_slice > 0, smoothing=1.8)
-    if brain_lines and brain_outline_width > 0:
-        from matplotlib.collections import LineCollection
+        brain_lines = _mask_contour_lines(label_slice > 0, smoothing=1.8)
+        if brain_lines and brain_outline_width > 0:
+            from matplotlib.collections import LineCollection
 
-        ax.add_collection(
-            LineCollection(
-                brain_lines,
-                colors="white",
-                linewidths=brain_outline_width,
-                alpha=0.95,
-                antialiaseds=True,
-                capstyle="round",
-                joinstyle="round",
+            ax.add_collection(
+                LineCollection(
+                    brain_lines,
+                    colors=theme["contour"],
+                    linewidths=brain_outline_width,
+                    alpha=0.95,
+                    antialiaseds=True,
+                    capstyle="round",
+                    joinstyle="round",
+                )
             )
+
+        ax.set_axis_off()
+        ax.set_xlim(-0.5, width - 0.5)
+        ax.set_ylim(height - 0.5, -0.5)
+        if include_colorbar:
+            cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
+            cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors=theme["cbar_tick"])
+            cbar.outline.set_linewidth(0.6)
+            cbar.outline.set_edgecolor(theme["cbar_edge"])
+            cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color=theme["cbar_label"])
+
+        return _export_slice_figure_png(
+            fig,
+            ax,
+            dpi=dpi,
+            width=width,
+            height=height,
+            theme=theme,
+            include_colorbar=include_colorbar,
         )
-
-    ax.set_axis_off()
-    ax.set_xlim(-0.5, width - 0.5)
-    ax.set_ylim(height - 0.5, -0.5)
-    cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
-    cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors="white")
-    cbar.outline.set_linewidth(0.6)
-    cbar.outline.set_edgecolor("white")
-    cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color="white")
-
-    fig.tight_layout(pad=0.08)
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=dpi, facecolor="black", bbox_inches="tight", pad_inches=0.02)
-    plt.close(fig)
-    buffer.seek(0)
-    return np.asarray(Image.open(buffer).convert("RGBA"))
+    finally:
+        plt.close(fig)
 
 
 def _render_region_metric_slice_array(
@@ -1612,68 +1712,107 @@ def _render_region_metric_slice_array(
     brain_outline_width: float,
     colorbar_label: str,
     show_region_contours: bool = True,
-) -> np.ndarray:
-    painted = _paint_region_values_on_slice(label_slice, region_values)
-    height, width = label_slice.shape
-    aspect = width / max(height, 1)
-    long_side = 6.2
-    figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
+    focus_region_ids: frozenset[int] | None = None,
+    focus_only: bool = False,
+    background: str = "white",
+    include_colorbar: bool = True,
+) -> tuple[np.ndarray, dict[str, int]]:
+    label_arr = np.asarray(label_slice)
+    focus_mask = None
+    if focus_region_ids:
+        focus_mask = np.isin(label_arr, tuple(focus_region_ids))
+        if focus_only:
+            label_arr = np.where(focus_mask, label_arr, 0)
 
-    cmap = _colormap_by_name(cmap_name).copy()
-    cmap.set_bad((0, 0, 0, 0))
-    masked = np.ma.masked_where(np.asarray(label_slice) <= 0, painted)
-    image = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    painted = _paint_region_values_on_slice(label_arr, region_values)
+    height, width = label_arr.shape
+    if include_colorbar:
+        aspect = width / max(height, 1)
+        long_side = 6.2
+        figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    else:
+        fig, ax = plt.subplots(figsize=(width, height), dpi=1)
+    theme = _slice_figure_theme(background=background)
+    try:
+        fig.patch.set_facecolor(theme["background"])
+        ax.set_facecolor(theme["background"])
 
-    region_lines = _label_contour_lines(label_slice, smoothing=1.4) if show_region_contours else []
-    if region_lines and line_width > 0:
-        from matplotlib.collections import LineCollection
+        cmap = _colormap_by_name(cmap_name).copy()
+        cmap.set_bad((0, 0, 0, 0))
+        masked = np.ma.masked_where(label_arr <= 0, painted)
+        image = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
-        ax.add_collection(
-            LineCollection(
-                region_lines,
-                colors="white",
-                linewidths=line_width,
-                alpha=0.95,
-                antialiaseds=True,
-                capstyle="round",
-                joinstyle="round",
+        region_lines = _label_contour_lines(label_arr, smoothing=1.4) if show_region_contours else []
+        if region_lines and line_width > 0:
+            from matplotlib.collections import LineCollection
+
+            ax.add_collection(
+                LineCollection(
+                    region_lines,
+                    colors=theme["contour"],
+                    linewidths=line_width,
+                    alpha=0.95,
+                    antialiaseds=True,
+                    capstyle="round",
+                    joinstyle="round",
+                )
             )
-        )
 
-    brain_lines = _mask_contour_lines(label_slice > 0, smoothing=1.8)
-    if brain_lines and brain_outline_width > 0:
-        from matplotlib.collections import LineCollection
+        brain_lines = _mask_contour_lines(label_arr > 0, smoothing=1.8)
+        if brain_lines and brain_outline_width > 0:
+            from matplotlib.collections import LineCollection
 
-        ax.add_collection(
-            LineCollection(
-                brain_lines,
-                colors="white",
-                linewidths=brain_outline_width,
-                alpha=0.95,
-                antialiaseds=True,
-                capstyle="round",
-                joinstyle="round",
+            ax.add_collection(
+                LineCollection(
+                    brain_lines,
+                    colors=theme["contour"],
+                    linewidths=brain_outline_width,
+                    alpha=0.95,
+                    antialiaseds=True,
+                    capstyle="round",
+                    joinstyle="round",
+                )
             )
+
+        if focus_mask is not None and np.any(focus_mask):
+            from matplotlib.collections import LineCollection
+
+            focus_lines = _mask_contour_lines(focus_mask, smoothing=1.6)
+            if focus_lines:
+                ax.add_collection(
+                    LineCollection(
+                        focus_lines,
+                        colors=theme["focus"],
+                        linewidths=max(brain_outline_width * 2.2, 0.8),
+                        alpha=1.0,
+                        antialiaseds=True,
+                        capstyle="round",
+                        joinstyle="round",
+                    )
+                )
+
+        ax.set_axis_off()
+        ax.set_xlim(-0.5, width - 0.5)
+        ax.set_ylim(height - 0.5, -0.5)
+        if include_colorbar:
+            cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
+            cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors=theme["cbar_tick"])
+            cbar.outline.set_linewidth(0.6)
+            cbar.outline.set_edgecolor(theme["cbar_edge"])
+            cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color=theme["cbar_label"])
+
+        return _export_slice_figure_png(
+            fig,
+            ax,
+            dpi=dpi,
+            width=width,
+            height=height,
+            theme=theme,
+            include_colorbar=include_colorbar,
         )
-
-    ax.set_axis_off()
-    ax.set_xlim(-0.5, width - 0.5)
-    ax.set_ylim(height - 0.5, -0.5)
-    cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
-    cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors="white")
-    cbar.outline.set_linewidth(0.6)
-    cbar.outline.set_edgecolor("white")
-    cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color="white")
-
-    fig.tight_layout(pad=0.08)
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=dpi, facecolor="black", bbox_inches="tight", pad_inches=0.02)
-    plt.close(fig)
-    buffer.seek(0)
-    return np.asarray(Image.open(buffer).convert("RGBA"))
+    finally:
+        plt.close(fig)
 
 
 def render_region_metric_atlas_slice(
@@ -1698,7 +1837,7 @@ def render_region_metric_atlas_slice(
     if upper <= lower:
         upper = lower + 1e-6
 
-    rendered = _render_region_metric_slice_array(
+    rendered, _layout = _render_region_metric_slice_array(
         atlas_slice.image,
         region_values,
         cmap_name=cmap_name,
@@ -1740,7 +1879,7 @@ def render_local_signal_atlas_slice(
     if upper <= vmin:
         upper = float(vmin) + 1e-6
 
-    rendered = _render_local_slice_array(
+    rendered, _layout = _render_local_slice_array(
         signal_slice,
         atlas_slice.image,
         cmap_name=cmap_name,
@@ -2195,6 +2334,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--foreground-mode", choices=("nonzero", "equal"), default="equal")
     parser.add_argument("--foreground-label", type=int, default=1)
     parser.add_argument("--block-shape", default="", help="Optional block shape in z,y,x order")
+    parser.add_argument(
+        "--bin-workers",
+        type=int,
+        default=0,
+        help="Worker processes for sample-stack mask binning. 0 uses cpu_count // 4 (default).",
+    )
     parser.add_argument("--min-voxels-per-point", type=int, default=1)
     parser.add_argument("--volume-mode", choices=("binary", "count"), default="binary")
     parser.add_argument("--output-volume", default="", help="Optional atlas-space volume TIFF written before heatmap rendering")
@@ -2289,6 +2434,7 @@ def main(argv: list[str] | None = None) -> int:
                 foreground_label=args.foreground_label,
                 block_shape=args.block_shape,
                 min_voxels_per_point=args.min_voxels_per_point,
+                bin_workers=args.bin_workers,
                 volume_mode=args.volume_mode,
                 output_volume=args.output_volume or None,
                 edge_path=args.edge or defaults["edge"],
@@ -2479,6 +2625,7 @@ def main(argv: list[str] | None = None) -> int:
                     foreground_label=int(args.foreground_label),
                     block_shape=args.block_shape,
                     min_voxels_per_point=int(args.min_voxels_per_point),
+                    bin_workers=args.bin_workers,
                     dataset_name=args.dataset_name,
                     **{key: value for key, value in batch_kwargs.items() if key not in {"region_metric", "region_cfg_path"} and value is not None},
                 )

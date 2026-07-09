@@ -1018,6 +1018,8 @@ def resolve_points_csv(args: argparse.Namespace) -> Path:
         args.foreground_mode,
         "--foreground_label",
         str(args.foreground_label),
+        "--bin_workers",
+        str(getattr(args, "bin_workers", 0) or 0),
         "--output",
         str(points_csv),
         "--output_volume",

@@ -15,7 +15,7 @@ Quick start:
         --use-fg-aware-sampler --cache-data
 
 Outputs:
-    outputs/<experiment>/best_model.pt   - best val-dice checkpoint
+    outputs/<experiment>/best_model.pt   - best checkpoint by --best-metric (default: global_precision)
     outputs/<experiment>/train_config.json - full config for reproducibility
     outputs/<experiment>/data_split.json  - train/val case lists
     mlruns/                               - MLflow tracking data
@@ -97,7 +97,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--reference-dice-margin",
         type=float,
         default=0.02,
-        help="Best checkpoint is allowed only when reference_val_dice >= baseline - this margin.",
+        help="Best checkpoint is allowed only when reference metric >= baseline - this margin.",
     )
     parser.add_argument(
         "--reference-every",
@@ -120,7 +120,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="Minimum LR as a ratio of base lr for cosine decay, e.g. 0.05 means min_lr = 0.05 * lr.",
     )
-    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio.")
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="Validation split ratio. Use 0 for full-data training with in-set evaluation.",
+    )
+    parser.add_argument(
+        "--best-metric",
+        type=str,
+        default="global_precision",
+        choices=[
+            "global_precision",
+            "global_recall",
+            "global_dice",
+            "global_iou",
+            "macro_dice",
+            "macro_precision",
+            "macro_recall",
+        ],
+        help=(
+            "Metric used to select best_model.pt. Global metrics aggregate TP/FP/FN over all "
+            "validation voxels and are less diluted by empty-mask samples than macro averages."
+        ),
+    )
+    parser.add_argument(
+        "--reference-metric",
+        type=str,
+        default=None,
+        choices=[
+            "global_precision",
+            "global_recall",
+            "global_dice",
+            "global_iou",
+            "macro_dice",
+            "macro_precision",
+            "macro_recall",
+        ],
+        help="Metric used for reference-set checkpoint guard. Defaults to --best-metric.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--num-classes", type=int, default=2, help="Number of segmentation classes.")
     parser.add_argument("--base-channels", type=int, default=8, help="Base channel width for the 3D U-Net.")
@@ -420,6 +458,8 @@ def collect_samples(image_dir: Path, mask_dir: Path) -> List[Dict[str, str]]:
 
 def split_samples(samples: List[Dict[str, str]], val_ratio: float, seed: int) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     if len(samples) == 1:
+        return samples, samples
+    if val_ratio <= 0:
         return samples, samples
 
     indices = list(range(len(samples)))
@@ -874,8 +914,83 @@ class FocalLoss(nn.Module):
 
 
 # =====================================================================
-#  Metrics (batch-level, used during training)
+#  Metrics
 # =====================================================================
+
+METRIC_STAT_KEYS = {
+    "global_precision": "global_precision",
+    "global_recall": "global_recall",
+    "global_dice": "global_dice",
+    "global_iou": "global_iou",
+    "macro_dice": "dice",
+    "macro_precision": "precision",
+    "macro_recall": "recall",
+}
+
+
+def metric_value(stats: Dict[str, float], metric_name: str) -> float:
+    stat_key = METRIC_STAT_KEYS.get(metric_name)
+    if stat_key is None:
+        raise ValueError("Unsupported metric name: {}".format(metric_name))
+    if stat_key not in stats:
+        raise KeyError("Metric {} is missing from evaluation stats.".format(metric_name))
+    return float(stats[stat_key])
+
+
+def accumulate_foreground_counts(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+) -> Tuple[float, float, float]:
+    start_class = 1 if num_classes > 1 else 0
+    tp = fp = fn = 0.0
+    for class_index in range(start_class, num_classes):
+        pred_mask = pred == class_index
+        target_mask = target == class_index
+        tp += float((pred_mask & target_mask).sum().item())
+        fp += float((pred_mask & ~target_mask).sum().item())
+        fn += float((~pred_mask & target_mask).sum().item())
+    return tp, fp, fn
+
+
+def metrics_from_counts(tp: float, fp: float, fn: float) -> Dict[str, float]:
+    tp = float(tp)
+    fp = float(fp)
+    fn = float(fn)
+
+    if (tp + fp) > 0:
+        global_precision = tp / (tp + fp)
+    else:
+        global_precision = 1.0
+
+    if (tp + fn) > 0:
+        global_recall = tp / (tp + fn)
+    else:
+        global_recall = 1.0
+
+    dice_denom = 2.0 * tp + fp + fn
+    global_dice = (2.0 * tp) / dice_denom if dice_denom > 0 else 1.0
+
+    iou_denom = tp + fp + fn
+    global_iou = tp / iou_denom if iou_denom > 0 else 1.0
+
+    return {
+        "global_precision": float(global_precision),
+        "global_recall": float(global_recall),
+        "global_dice": float(global_dice),
+        "global_iou": float(global_iou),
+    }
+
+
+def attach_global_metrics(
+    stats: Dict[str, float],
+    tp: float,
+    fp: float,
+    fn: float,
+) -> Dict[str, float]:
+    stats.update(metrics_from_counts(tp, fp, fn))
+    return stats
+
 
 def compute_metrics(logits: torch.Tensor, target: torch.Tensor, num_classes: int) -> Dict[str, float]:
     pred = torch.argmax(logits, dim=1)
@@ -947,6 +1062,7 @@ def run_epoch(
     total_cls = 0.0
     total_dice_loss = 0.0
     total_metrics = {"dice": 0.0, "iou": 0.0, "precision": 0.0, "recall": 0.0}
+    global_tp = global_fp = global_fn = 0.0
 
     if is_train:
         optimizer.zero_grad(set_to_none=True)
@@ -976,6 +1092,12 @@ def run_epoch(
                     optimizer.zero_grad(set_to_none=True)
 
         batch_metrics = compute_metrics(logits.detach(), masks.detach(), num_classes)
+        if not is_train:
+            pred = torch.argmax(logits.detach(), dim=1)
+            batch_tp, batch_fp, batch_fn = accumulate_foreground_counts(pred, masks.detach(), num_classes)
+            global_tp += batch_tp
+            global_fp += batch_fp
+            global_fn += batch_fn
         total_loss += loss.item()
         total_cls += loss_cls.item()
         total_dice_loss += loss_dice.item()
@@ -1012,6 +1134,8 @@ def run_epoch(
     }
     for key in total_metrics:
         results[key] = total_metrics[key] / num_batches
+    if not is_train:
+        attach_global_metrics(results, global_tp, global_fp, global_fn)
     return results
 
 
@@ -1047,6 +1171,7 @@ def validate_sliding_window(
 
     dice_scores, iou_scores, prec_scores, recall_scores = [], [], [], []
     loss_list, loss_cls_list, loss_dice_list = [], [], []
+    global_tp = global_fp = global_fn = 0.0
 
     iterator = tqdm(val_samples, desc="{} epoch {}".format(phase_name, epoch), leave=False) if show_progress_bar else val_samples
     for sample in iterator:
@@ -1085,6 +1210,11 @@ def validate_sliding_window(
             loss = ce_weight * loss_cls + dice_weight * loss_dice_val
 
         m = compute_metrics(logits_full, mask_t, num_classes)
+        pred = torch.argmax(logits_full, dim=1)
+        sample_tp, sample_fp, sample_fn = accumulate_foreground_counts(pred, mask_t, num_classes)
+        global_tp += sample_tp
+        global_fp += sample_fp
+        global_fn += sample_fn
         dice_scores.append(m["dice"])
         iou_scores.append(m["iou"])
         prec_scores.append(m["precision"])
@@ -1095,7 +1225,7 @@ def validate_sliding_window(
 
         del image_t, logits_acc, count_acc, logits_full, mask_t
 
-    return {
+    results = {
         "loss": float(np.mean(loss_list)) if loss_list else 0.0,
         "loss_cls": float(np.mean(loss_cls_list)) if loss_cls_list else 0.0,
         "loss_dice": float(np.mean(loss_dice_list)) if loss_dice_list else 0.0,
@@ -1104,6 +1234,8 @@ def validate_sliding_window(
         "precision": float(np.mean(prec_scores)) if prec_scores else 0.0,
         "recall": float(np.mean(recall_scores)) if recall_scores else 0.0,
     }
+    attach_global_metrics(results, global_tp, global_fp, global_fn)
+    return results
 
 
 def evaluate_sample_set(
@@ -1359,9 +1491,10 @@ def main() -> None:
         cls_loss_fn = nn.CrossEntropyLoss()
     dice_loss = DiceLoss(num_classes=args.num_classes)
 
-    reference_baseline_dice = None
+    reference_baseline_value = None
     reference_gate_threshold = None
     baseline_checkpoint = args.reference_baseline_checkpoint or args.init_checkpoint
+    reference_metric = args.reference_metric or args.best_metric
     if reference_samples:
         if not baseline_checkpoint:
             raise ValueError(
@@ -1392,11 +1525,13 @@ def main() -> None:
             epoch=0,
             show_progress_bar=args.show_progress_bar,
         )
-        reference_baseline_dice = baseline_stats["dice"]
-        reference_gate_threshold = reference_baseline_dice - float(args.reference_dice_margin)
+        reference_baseline_value = metric_value(baseline_stats, reference_metric)
+        reference_gate_threshold = reference_baseline_value - float(args.reference_dice_margin)
         print(
-            "reference baseline dice={:.4f}; best checkpoint gate requires reference_val_dice >= {:.4f}".format(
-                reference_baseline_dice,
+            "reference baseline {}={:.4f}; best checkpoint gate requires reference {} >= {:.4f}".format(
+                reference_metric,
+                reference_baseline_value,
+                reference_metric,
                 reference_gate_threshold,
             ),
             flush=True,
@@ -1418,7 +1553,7 @@ def main() -> None:
     mlflow.set_tracking_uri(args.tracking_uri)
     mlflow.set_experiment(args.experiment_name)
 
-    best_dice = -1.0
+    best_metric_value = -1.0
     best_ckpt_path = output_dir / "best_model.pt"
     last_ckpt_path = output_dir / "last_model.pt"
 
@@ -1433,10 +1568,12 @@ def main() -> None:
                 "reference_mask_dir": str(Path(args.reference_mask_dir).resolve()) if args.reference_mask_dir else "",
                 "reference_baseline_checkpoint": str(Path(baseline_checkpoint).resolve()) if baseline_checkpoint else "",
                 "reference_cases": len(reference_cases),
+                "reference_metric": reference_metric,
                 "reference_dice_margin": args.reference_dice_margin,
                 "reference_every": args.reference_every,
-                "reference_baseline_dice": reference_baseline_dice if reference_baseline_dice is not None else "",
+                "reference_baseline_value": reference_baseline_value if reference_baseline_value is not None else "",
                 "reference_gate_threshold": reference_gate_threshold if reference_gate_threshold is not None else "",
+                "best_metric": args.best_metric,
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
@@ -1470,8 +1607,8 @@ def main() -> None:
         )
         mlflow.log_artifact(str(config_path))
         mlflow.log_artifact(str(split_path))
-        if reference_baseline_dice is not None:
-            mlflow.log_metric("reference_baseline_dice", reference_baseline_dice, step=0)
+        if reference_baseline_value is not None:
+            mlflow.log_metric("reference_baseline_value", reference_baseline_value, step=0)
             mlflow.log_metric("reference_gate_threshold", reference_gate_threshold, step=0)
 
         for epoch in range(1, args.epochs + 1):
@@ -1571,6 +1708,11 @@ def main() -> None:
                         "val_iou": val_stats["iou"],
                         "val_precision": val_stats["precision"],
                         "val_recall": val_stats["recall"],
+                        "val_global_precision": val_stats["global_precision"],
+                        "val_global_recall": val_stats["global_recall"],
+                        "val_global_dice": val_stats["global_dice"],
+                        "val_global_iou": val_stats["global_iou"],
+                        "val_best_metric": metric_value(val_stats, args.best_metric),
                     }
                 )
             if reference_stats is not None:
@@ -1581,7 +1723,14 @@ def main() -> None:
                         "reference_val_iou": reference_stats["iou"],
                         "reference_val_precision": reference_stats["precision"],
                         "reference_val_recall": reference_stats["recall"],
-                        "reference_gate_pass": float(reference_stats["dice"] >= reference_gate_threshold),
+                        "reference_val_global_precision": reference_stats["global_precision"],
+                        "reference_val_global_recall": reference_stats["global_recall"],
+                        "reference_val_global_dice": reference_stats["global_dice"],
+                        "reference_val_global_iou": reference_stats["global_iou"],
+                        "reference_val_metric": metric_value(reference_stats, reference_metric),
+                        "reference_gate_pass": float(
+                            metric_value(reference_stats, reference_metric) >= reference_gate_threshold
+                        ),
                     }
                 )
             mlflow.log_metrics(metrics_to_log, step=epoch)
@@ -1590,18 +1739,21 @@ def main() -> None:
                 print(
                     "Epoch [{}/{}] "
                     "train_loss={:.4f} train_dice={:.4f} "
-                    "val_loss={:.4f} val_dice={:.4f}{}".format(
+                    "val_loss={:.4f} val_global_precision={:.4f} val_global_dice={:.4f} val_macro_dice={:.4f}{}".format(
                         epoch,
                         args.epochs,
                         train_stats["loss"],
                         train_stats["dice"],
                         val_stats["loss"],
+                        val_stats["global_precision"],
+                        val_stats["global_dice"],
                         val_stats["dice"],
                         ""
                         if reference_stats is None
-                        else " reference_dice={:.4f} gate={}".format(
-                            reference_stats["dice"],
-                            reference_stats["dice"] >= reference_gate_threshold,
+                        else " reference_{}={:.4f} gate={}".format(
+                            reference_metric,
+                            metric_value(reference_stats, reference_metric),
+                            metric_value(reference_stats, reference_metric) >= reference_gate_threshold,
                         ),
                     )
                 )
@@ -1617,10 +1769,11 @@ def main() -> None:
 
             reference_gate_pass = True
             if reference_stats is not None:
-                reference_gate_pass = reference_stats["dice"] >= reference_gate_threshold
+                reference_gate_pass = metric_value(reference_stats, reference_metric) >= reference_gate_threshold
 
-            if val_stats is not None and reference_gate_pass and val_stats["dice"] > best_dice:
-                best_dice = val_stats["dice"]
+            current_metric = metric_value(val_stats, args.best_metric) if val_stats is not None else None
+            if val_stats is not None and reference_gate_pass and current_metric > best_metric_value:
+                best_metric_value = current_metric
                 is_best = True
             else:
                 is_best = False
@@ -1630,10 +1783,14 @@ def main() -> None:
                 "epoch": epoch,
                 "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
-                "best_val_dice": best_dice,
-                "reference_baseline_dice": reference_baseline_dice,
+                "best_metric_name": args.best_metric,
+                "best_metric_value": best_metric_value,
+                "best_val_dice": val_stats["global_dice"] if val_stats is not None else None,
+                "reference_baseline_value": reference_baseline_value,
                 "reference_gate_threshold": reference_gate_threshold,
-                "reference_val_dice": reference_stats["dice"] if reference_stats is not None else None,
+                "reference_val_metric": (
+                    metric_value(reference_stats, reference_metric) if reference_stats is not None else None
+                ),
                 "args": vars(args),
             }
             torch.save(checkpoint, str(last_ckpt_path))
@@ -1645,7 +1802,8 @@ def main() -> None:
                 epoch_ckpt = output_dir / "epoch_{:03d}.pt".format(epoch)
                 torch.save(checkpoint, str(epoch_ckpt))
 
-        mlflow.log_metric("best_val_dice", best_dice)
+        mlflow.log_metric("best_metric_value", best_metric_value)
+        mlflow.log_param("best_metric", args.best_metric)
         if best_ckpt_path.exists():
             mlflow.log_artifact(str(best_ckpt_path), artifact_path="checkpoints")
         else:
@@ -1655,7 +1813,9 @@ def main() -> None:
             )
         mlflow.log_artifact(str(last_ckpt_path), artifact_path="checkpoints")
 
-    print("Training finished. Best val dice: {:.4f}".format(best_dice))
+    print(
+        "Training finished. Best {}: {:.4f}".format(args.best_metric, best_metric_value)
+    )
     if best_ckpt_path.exists():
         print("Best checkpoint: {}".format(best_ckpt_path.resolve()))
     else:

@@ -51,3 +51,49 @@ def reference_dir() -> Path:
 
 def cfos_checkpoint_path(filename: str = "best_model.pt") -> Path:
     return get_yifu_data_dir() / "models" / "cfos" / filename
+
+
+def resolve_atlas_label_path() -> Path:
+    """Find Allen atlas_label.tiff from config, YIFU_DATA_DIR, or repo data/."""
+    candidates: list[Path] = []
+    data_dir = get_yifu_data_dir(required=False)
+
+    config_path = project_root() / "config" / "config.json"
+    if config_path.exists():
+        import json
+
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            annotation = payload.get("registration", {}).get("annotation_path")
+            if annotation:
+                if _ENV_PATTERN.search(str(annotation)):
+                    if data_dir is not None:
+                        candidates.append(expand_config_path(annotation))
+                else:
+                    try:
+                        candidates.append(expand_config_path(annotation))
+                    except RuntimeError:
+                        candidates.append(project_root() / str(annotation))
+        except Exception:
+            pass
+
+    candidates.append(project_root() / "data" / "reference" / "atlas_label.tiff")
+    if data_dir is not None:
+        candidates.append(data_dir / "reference" / "atlas_label.tiff")
+
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+
+    tried = "\n  ".join(str(path) for path in seen)
+    raise FileNotFoundError(
+        "Allen atlas label TIFF not found. Tried:\n  "
+        f"{tried}\n"
+        f"Set {YIFU_DATA_DIR_ENV} to your data root (with reference/atlas_label.tiff) "
+        "or update config/registration annotation_path."
+    )

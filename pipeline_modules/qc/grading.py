@@ -25,10 +25,10 @@ DEFAULT_THRESHOLD_RULES: list[ThresholdRule] = [
     ThresholdRule(
         metric="global_exposure_dynamic_range.dark_pixel_ratio",
         direction="lower_is_better",
-        pass_max=0.05,
-        warn_max=0.15,
+        pass_max=1.0,
+        warn_max=1.0,
         category="exposure_dynamic_range",
-        description="Fraction of pixels below dark threshold (default <100).",
+        description="Disabled for sparse LSFM (high dark fraction is normal).",
     ),
     ThresholdRule(
         metric="global_exposure_dynamic_range.saturated_pixel_ratio",
@@ -41,56 +41,56 @@ DEFAULT_THRESHOLD_RULES: list[ThresholdRule] = [
     ThresholdRule(
         metric="slice_aggregate.brightness_uniformity.tile_median_cv.median",
         direction="lower_is_better",
-        pass_max=0.15,
-        warn_max=0.30,
+        pass_max=0.45,
+        warn_max=0.95,
         category="brightness_uniformity",
         description="Median tile-brightness coefficient of variation across sampled slices.",
     ),
     ThresholdRule(
         metric="slice_aggregate.stripe_artifacts.slab_stripe_score.median",
         direction="lower_is_better",
-        pass_max=0.08,
-        warn_max=0.20,
+        pass_max=0.9,
+        warn_max=1.35,
         category="stripe_artifacts",
         description="Combined row/column/slab stripe score.",
     ),
     ThresholdRule(
         metric="slice_aggregate.diffuse_signal.diffuse_noise_score.median",
         direction="lower_is_better",
-        pass_max=0.20,
-        warn_max=0.40,
+        pass_max=0.05,
+        warn_max=0.35,
         category="diffuse_signal",
         description="Low-contrast elevated area likely to be diffuse noise rather than structured signal.",
     ),
     ThresholdRule(
         metric="slice_aggregate.diffuse_signal.noise_to_signal_area_ratio.median",
         direction="lower_is_better",
-        pass_max=0.50,
-        warn_max=1.50,
+        pass_max=0.5,
+        warn_max=2.0,
         category="diffuse_signal",
         description="Ratio of diffuse-noise tile area to structured-signal tile area.",
     ),
     ThresholdRule(
         metric="slice_aggregate.diffuse_signal.large_diffuse_component_fraction.median",
         direction="lower_is_better",
-        pass_max=0.10,
-        warn_max=0.25,
+        pass_max=0.08,
+        warn_max=0.22,
         category="diffuse_signal",
         description="Largest connected diffuse-noise tile component as fraction of tile grid.",
     ),
     ThresholdRule(
         metric="slice_aggregate.contrast.candidate_cnr.median",
         direction="higher_is_better",
-        pass_min=3.0,
-        warn_min=1.5,
+        pass_min=15.0,
+        warn_min=5.0,
         category="contrast",
         description="Robust Otsu-based candidate contrast-to-noise ratio.",
     ),
     ThresholdRule(
         metric="slice_aggregate.focus.laplacian_variance.median",
         direction="higher_is_better",
-        pass_min=50.0,
-        warn_min=20.0,
+        pass_min=100.0,
+        warn_min=25.0,
         category="focus",
         description="Median Laplacian variance across sampled slices (resolution dependent).",
     ),
@@ -98,14 +98,23 @@ DEFAULT_THRESHOLD_RULES: list[ThresholdRule] = [
 
 
 def _lookup_metric(flat_metrics: dict[str, Any], metric_path: str) -> float | None:
-    if metric_path in flat_metrics:
-        value = flat_metrics[metric_path]
+    candidates = [metric_path]
+    if metric_path.startswith("slice_aggregate."):
+        candidates.append(metric_path[len("slice_aggregate.") :])
+    if metric_path.startswith("projection_metrics."):
+        candidates.append(metric_path[len("projection_metrics.") :])
+
+    for candidate in candidates:
+        if candidate not in flat_metrics:
+            continue
+        value = flat_metrics[candidate]
         if value is None:
             return None
         try:
             return float(value)
         except (TypeError, ValueError):
             return None
+
     parts = metric_path.split(".")
     current: Any = flat_metrics
     for part in parts:

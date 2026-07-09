@@ -53,6 +53,44 @@ PLANE_TO_OUTPUT_AXES: dict[str, tuple[int, int]] = {
 AXIS_NAMES = ("DV", "AP", "ML")
 
 
+def axis_index_for_name(axis_name: str) -> int:
+    normalized = str(axis_name).strip().upper()
+    if normalized not in AXIS_NAMES:
+        raise ValueError(f"axis must be one of {AXIS_NAMES}, got: {axis_name}")
+    return AXIS_NAMES.index(normalized)
+
+
+def index_to_bregma_mm(
+    axis: int | str,
+    index: float,
+    *,
+    bregma_index: tuple[int, int, int] = DEFAULT_BREGMA_INDEX,
+    resolution_um: float = 25.0,
+) -> float:
+    """Convert an atlas array index to mm relative to bregma along DV/AP/ML."""
+
+    axis_idx = axis_index_for_name(axis) if isinstance(axis, str) else int(axis)
+    if axis_idx == 1:  # AP: anterior is positive bregma mm.
+        return (float(bregma_index[axis_idx]) - float(index)) * float(resolution_um) / 1000.0
+    return (float(index) - float(bregma_index[axis_idx])) * float(resolution_um) / 1000.0
+
+
+def bregma_mm_for_plane_index(
+    plane: Plane,
+    index: float,
+    *,
+    bregma_index: tuple[int, int, int] = DEFAULT_BREGMA_INDEX,
+    resolution_um: float = 25.0,
+) -> float:
+    fixed_axis = PLANE_TO_FIXED_AXIS[plane]
+    return index_to_bregma_mm(
+        fixed_axis,
+        index,
+        bregma_index=bregma_index,
+        resolution_um=resolution_um,
+    )
+
+
 @dataclass(frozen=True)
 class AtlasSliceSpec:
     """Coordinate request for a 2D atlas slice.
@@ -390,6 +428,68 @@ def subtract_region_metric_values(
         int(region_id): float(minuend_by_region_id.get(region_id, 0.0) - subtrahend_by_region_id.get(region_id, 0.0))
         for region_id in region_ids
     }
+
+
+def fold_change_region_metric_values(
+    numerator_by_region_id: dict[int, float],
+    denominator_by_region_id: dict[int, float],
+    *,
+    pseudocount: float = 1.0,
+) -> dict[int, float]:
+    """Return per-region log2 fold change: numerator / denominator."""
+    region_ids = set(numerator_by_region_id) | set(denominator_by_region_id)
+    pseudo = float(pseudocount)
+    return {
+        int(region_id): float(
+            np.log2((float(numerator_by_region_id.get(region_id, 0.0)) + pseudo) / (float(denominator_by_region_id.get(region_id, 0.0)) + pseudo))
+        )
+        for region_id in region_ids
+    }
+
+
+def paint_hemisphere_split_slice(
+    label_slice: np.ndarray,
+    left_values: dict[int, float],
+    right_values: dict[int, float],
+    path_by_region_id: dict[int, list[int]],
+    *,
+    ml_mid_index: int,
+) -> np.ndarray:
+    """Paint left/right Excel metrics on the ML-left / ML-right sides of a coronal slice."""
+    from pipeline_modules.visualization.heatmap import _paint_region_values_on_slice
+
+    labels = np.asarray(label_slice)
+    left_painted = _paint_region_values_on_slice(labels, left_values)
+    right_painted = _paint_region_values_on_slice(labels, right_values)
+    ml_mid_index = int(max(ml_mid_index, 0))
+    combined = np.full(labels.shape, np.nan, dtype=np.float32)
+    combined[:, :ml_mid_index] = left_painted[:, :ml_mid_index]
+    combined[:, ml_mid_index:] = right_painted[:, ml_mid_index:]
+    inside_brain = labels > 0
+    combined[inside_brain & np.isnan(combined)] = 0.0
+    return combined
+
+
+def paint_lr_sample_split_slice(
+    label_slice: np.ndarray,
+    sample_a_values: dict[int, float],
+    sample_b_values: dict[int, float],
+    *,
+    ml_mid_index: int,
+) -> np.ndarray:
+    """Paint sample A on ML-left and sample B on ML-right within one coronal slice."""
+    from pipeline_modules.visualization.heatmap import _paint_region_values_on_slice
+
+    labels = np.asarray(label_slice)
+    painted_a = _paint_region_values_on_slice(labels, sample_a_values)
+    painted_b = _paint_region_values_on_slice(labels, sample_b_values)
+    ml_mid_index = int(max(ml_mid_index, 0))
+    combined = np.full(labels.shape, np.nan, dtype=np.float32)
+    combined[:, :ml_mid_index] = painted_a[:, :ml_mid_index]
+    combined[:, ml_mid_index:] = painted_b[:, ml_mid_index:]
+    inside_brain = labels > 0
+    combined[inside_brain & np.isnan(combined)] = 0.0
+    return combined
 
 
 def compute_symmetric_metric_limits(

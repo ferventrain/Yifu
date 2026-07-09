@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import argparse
 import json
+import pathlib
 from pathlib import Path
 from typing import Any
 
@@ -201,17 +204,29 @@ def _build_cropper(viewer: Any) -> Any:
         return None
 
     default_image = _current_image_layer()
+    image_layer_names = _image_layer_names()
+    if default_image is not None and default_image.name in image_layer_names:
+        default_image_layer = default_image.name
+    elif image_layer_names:
+        default_image_layer = image_layer_names[0]
+    else:
+        default_image_layer = None
+
+    points_layer_names = _points_layer_names()
+    default_points_layer = _points_layer_choice(viewer) or points_layer.name
+    if default_points_layer not in points_layer_names:
+        default_points_layer = points_layer_names[0] if points_layer_names else None
 
     @magicgui(
         call_button="Save all crops",
-        image_layer={"choices": _image_layer_names},
-        points_layer_name={"choices": _points_layer_names},
+        image_layer={"choices": _image_layer_names, "nullable": True},
+        points_layer_name={"choices": _points_layer_names, "nullable": True},
         output_format={"choices": ["tiff", "npy"]},
     )
     def cropper(
-        image_layer: str = default_image.name if default_image is not None else "",
-        points_layer_name: str = _points_layer_choice(viewer) or points_layer.name,
-        save_dir: Path = default_crop_output_dir(default_image),
+        image_layer: str | None = default_image_layer,
+        points_layer_name: str | None = default_points_layer,
+        save_dir: pathlib.Path = default_crop_output_dir(default_image),
         size_z: int = DEFAULT_CROP_SIZE[0],
         size_y: int = DEFAULT_CROP_SIZE[1],
         size_x: int = DEFAULT_CROP_SIZE[2],

@@ -1,0 +1,2 @@
+[napari.manifest]
+napari-point-cropper = napari_point_cropper:napari.yaml

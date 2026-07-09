@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cFos Visual Report — Summary payload",
+  "description": "First-screen dashboard fields for a single sample. Written to sample_dir/visualization/<sample_id>_<signal_ch>_summary.json and returned as bundle.summary / GET /api/summary.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "sample",
+    "atlas",
+    "data_availability",
+    "headline_stats",
+    "top_regions_by_count",
+    "systems",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "sample": {
+      "type": "object",
+      "required": ["sample_id", "sample_dir", "signal_ch", "density_excel"],
+      "properties": {
+        "sample_id": { "type": "string" },
+        "sample_dir": { "type": "string" },
+        "signal_ch": { "type": "string" },
+        "group": { "type": ["string", "null"] },
+        "density_excel": { "type": "string" },
+        "atlas_version": { "type": "string" }
+      }
+    },
+    "atlas": {
+      "type": "object",
+      "required": ["level", "atlas_label_available"],
+      "properties": {
+        "level": { "type": "string", "description": "Allen hierarchy level used for aggregates (e.g. Level_8)" },
+        "default_level": { "type": "string" },
+        "atlas_label_available": { "type": "boolean" },
+        "atlas_label_error": { "type": ["string", "null"] },
+        "atlas_shape_dv_ap_ml": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 }
+      }
+    },
+    "data_availability": {
+      "type": "object",
+      "description": "Quick checklist for what downstream tabs can use",
+      "properties": {
+        "density_excel": { "type": "boolean" },
+        "atlas_label": { "type": "boolean" },
+        "spatial_axes": { "type": "boolean" },
+        "points_csv": { "type": "boolean" },
+        "spotiflow_points_csv": { "type": "boolean" },
+        "atlas_volume_tiff": { "type": "boolean" }
+      }
+    },
+    "headline_stats": {
+      "type": "object",
+      "description": "Whole-brain numbers at the selected level",
+      "required": [
+        "total_cfos_count",
+        "total_signal_voxels",
+        "total_region_volume_voxels",
+        "whole_brain_voxel_density",
+        "activated_region_count",
+        "activation_threshold"
+      ],
+      "properties": {
+        "total_cfos_count": { "type": "number" },
+        "total_signal_voxels": { "type": "number" },
+        "total_region_volume_voxels": { "type": "number" },
+        "whole_brain_voxel_density": { "type": "number" },
+        "activated_region_count": { "type": "integer" },
+        "activation_threshold": { "type": "number" }
+      }
+    },
+    "laterality": {
+      "type": ["object", "null"],
+      "properties": {
+        "left_total_cfos_count": { "type": "number" },
+        "right_total_cfos_count": { "type": "number" },
+        "whole_brain_count_laterality_index": { "type": ["number", "null"] }
+      }
+    },
+    "top_regions_by_count": {
+      "type": "array",
+      "description": "Top activated regions ranked by cFos count",
+      "items": { "$ref": "#/$defs/region_row" },
+      "maxItems": 15
+    },
+    "top_regions_by_density": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/region_row" },
+      "maxItems": 15
+    },
+    "systems": {
+      "type": "array",
+      "description": "Coarse Allen system-level aggregates",
+      "items": { "$ref": "#/$defs/system_row" }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Exploratory highlights (high activation, laterality, enrichment)",
+      "items": { "$ref": "#/$defs/finding_row" },
+      "maxItems": 12
+    }
+  },
+  "$defs": {
+    "region_row": {
+      "type": "object",
+      "required": ["region_id", "region_name", "region_acronym", "cfos_count", "voxel_density"],
+      "properties": {
+        "region_id": { "type": "integer" },
+        "region_name": { "type": "string" },
+        "region_acronym": { "type": "string" },
+        "cfos_count": { "type": "number" },
+        "voxel_density": { "type": "number" },
+        "signal_voxels": { "type": "number" }
+      }
+    },
+    "system_row": {
+      "type": "object",
+      "required": ["region_id", "system_name", "system_acronym", "system_cfos_count", "activation_load", "enrichment_score"],
+      "properties": {
+        "region_id": { "type": ["integer", "null"] },
+        "system_name": { "type": "string" },
+        "system_acronym": { "type": "string" },
+        "system_cfos_count": { "type": "number" },
+        "activation_load": { "type": "number" },
+        "enrichment_score": { "type": "number" },
+        "activated_region_count": { "type": "integer" }
+      }
+    },
+    "finding_row": {
+      "type": "object",
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": { "type": "string" },
+        "region_id": { "type": ["integer", "null"] },
+        "region_name": { "type": "string" },
+        "region_acronym": { "type": "string" },
+        "metric": { "type": "string" },
+        "value": { "type": "number" },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

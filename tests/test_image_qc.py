@@ -174,18 +174,45 @@ def test_progress_tracker_renders_distribution_bar():
 
 def test_grade_qc_results_flags_high_dark_pixel_ratio():
     results = {
-        "global_exposure_dynamic_range": {"dark_pixel_ratio": 0.30},
+        "global_exposure_dynamic_range": {"dark_pixel_ratio": 0.30, "saturated_pixel_ratio": 0.0},
         "slice_aggregate": {
             "diffuse_signal.diffuse_noise_score.median": 0.05,
             "diffuse_signal.noise_to_signal_area_ratio.median": 0.1,
             "diffuse_signal.large_diffuse_component_fraction.median": 0.02,
             "brightness_uniformity.tile_median_cv.median": 0.05,
-            "stripe_artifacts.slab_stripe_score.median": 0.03,
+            "stripe_artifacts.slab_stripe_score.median": 2.0,
             "contrast.candidate_cnr.median": 5.0,
             "focus.laplacian_variance.median": 100.0,
         },
     }
     grading = grade_qc_results(results)
     dark_rule = next(item for item in grading["rules"] if item["metric"].endswith("dark_pixel_ratio"))
-    assert dark_rule["verdict"] == "fail"
+    assert dark_rule["verdict"] == "pass"
+    stripe_rule = next(item for item in grading["rules"] if "slab_stripe_score" in item["metric"])
+    assert stripe_rule["verdict"] == "fail"
     assert grading["overall_verdict"] == "fail"
+
+
+def test_grade_qc_results_resolves_slice_aggregate_flat_keys():
+    results = {
+        "global_exposure_dynamic_range": {
+            "dark_pixel_ratio": 0.98,
+            "saturated_pixel_ratio": 0.0,
+        },
+        "slice_aggregate": {
+            "brightness_uniformity.tile_median_cv.median": 0.05,
+            "stripe_artifacts.slab_stripe_score.median": 0.03,
+            "diffuse_signal.diffuse_noise_score.median": 0.05,
+            "diffuse_signal.noise_to_signal_area_ratio.median": 0.1,
+            "diffuse_signal.large_diffuse_component_fraction.median": 0.02,
+            "contrast.candidate_cnr.median": 5.0,
+            "focus.laplacian_variance.median": 100.0,
+        },
+    }
+    grading = grade_qc_results(results)
+    stripe_rule = next(
+        item for item in grading["rules"] if "slab_stripe_score" in item["metric"]
+    )
+    assert stripe_rule["value"] == 0.03
+    assert stripe_rule["verdict"] == "pass"
+    assert stripe_rule.get("reason") != "metric_missing"

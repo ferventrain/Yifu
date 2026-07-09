@@ -737,6 +737,48 @@
         "signal_zarr": "sample_dir/<signal_ch>.zarr",
         "atlas_label_zarr": "sample_dir/upsampled_atlas_label.zarr"
       }
+    },
+    {
+      "id": "export_region_masked_volume",
+      "function": "pipeline_modules.visualization.region_masked_volume_export.export_region_masked_volume_tiffs",
+      "cli": "python pipeline_modules/visualization/region_masked_volume_export.py",
+      "description": "Mask one Allen brain region in sample space using upsampled_atlas_label.zarr and export a full 3D masked TIFF stack. Supports single channel or batch multi-channel export with optional TIFF-to-Zarr conversion.",
+      "prerequisites": [
+        "sample_dir must contain upsampled_atlas_label.zarr",
+        "For export-mode signal, each channel needs chX.zarr (or chX/ TIFF folder for auto-conversion)",
+        "Region query resolves against pipeline_modules/registration/Region_Csv_Rev1_updated.CSV by acronym, full name, or numeric id"
+      ],
+      "inputs": {
+        "sample_dir": { "type": "dir", "required": true },
+        "region": { "type": "string", "required": true, "examples": ["HIP", "PVH", "295"] },
+        "export_mode": { "type": "string", "default": "signal", "examples": ["signal", "mask", "region"] },
+        "channels": { "type": "string|null", "default": null, "examples": ["0,1,2,3"], "description": "Multi-channel batch export; converts missing chX.zarr from chX/ first" },
+        "signal_ch": { "type": "string|null", "default": null, "description": "Single-channel mode signal channel label" },
+        "cfg": { "type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV" },
+        "config": { "type": "path|null", "default": null },
+        "convert_tiff_workers": { "type": "int", "default": 0, "description": "Parallel TIFF-to-Zarr workers when converting missing channels; 0 uses cpu_count // 4" },
+        "chunk_size": { "type": "z,y,x", "default": "256,256,256" },
+        "output_dir": { "type": "path|null", "default": "sample_dir/visualization/region_masked/{ch}_{region}_{mode}" },
+        "output_root": { "type": "path|null", "default": "sample_dir/visualization/region_masked" }
+      },
+      "outputs": {
+        "masked_tiff_stack": { "type": "dir", "description": "C1*.tiff slices with region mask applied" },
+        "summary_json": { "type": "path", "description": "{ch}_{region}_{mode}_summary.json" }
+      },
+      "common_commands": [
+        {
+          "description": "Export HIP masked signal for one channel",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; python pipeline_modules/visualization/region_masked_volume_export.py --sample-dir \"S:\\path\\to\\sample\" --region HIP --signal-ch ch3 --export-mode signal"
+        },
+        {
+          "description": "Batch export HIP masked signal for channels 0-3 with parallel TIFF-to-Zarr conversion",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; python pipeline_modules/visualization/region_masked_volume_export.py --sample-dir \"S:\\path\\to\\sample\" --region HIP --channels 0,1,2,3 --export-mode signal --convert-tiff-workers 0"
+        }
+      ],
+      "sample_layout": {
+        "signal_zarr": "sample_dir/<signal_ch>.zarr",
+        "atlas_label_zarr": "sample_dir/upsampled_atlas_label.zarr"
+      }
     }
   ]
 }

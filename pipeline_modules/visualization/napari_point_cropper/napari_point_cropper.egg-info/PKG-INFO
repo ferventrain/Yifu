@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: napari-point-cropper
+Version: 0.1.0
+Summary: A napari dock widget for saving 3D crops from point anchors.
+Requires-Python: >=3.8
+Requires-Dist: magicgui
+Requires-Dist: napari
+Requires-Dist: numpy
+Requires-Dist: tifffile

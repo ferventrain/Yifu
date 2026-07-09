@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-point-cropper"
+version = "0.1.0"
+description = "A napari dock widget for saving 3D crops from point anchors."
+requires-python = ">=3.8"
+dependencies = [
+    "magicgui",
+    "napari",
+    "numpy",
+    "tifffile",
+]
+
+[project.entry-points."napari.manifest"]
+napari-point-cropper = "napari_point_cropper:napari.yaml"
+
+[tool.setuptools]
+packages = ["napari_point_cropper"]
+
+[tool.setuptools.package-dir]
+napari_point_cropper = "."
+
+[tool.setuptools.package-data]
+napari_point_cropper = ["napari.yaml"]
