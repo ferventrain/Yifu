@@ -742,22 +742,22 @@
       "id": "export_region_masked_volume",
       "function": "pipeline_modules.visualization.region_masked_volume_export.export_region_masked_volume_tiffs",
       "cli": "python pipeline_modules/visualization/region_masked_volume_export.py",
-      "description": "Mask one Allen brain region in sample space using upsampled_atlas_label.zarr and export a full 3D masked TIFF stack. Supports single channel or batch multi-channel export with optional TIFF-to-Zarr conversion.",
+      "description": "Mask one Allen brain region in sample space and export a full 3D masked TIFF stack. Defaults to TIFF stacks (chX/ + upsampled_atlas_label/) without Zarr conversion.",
       "prerequisites": [
-        "sample_dir must contain upsampled_atlas_label.zarr",
-        "For export-mode signal, each channel needs chX.zarr (or chX/ TIFF folder for auto-conversion)",
+        "sample_dir must contain upsampled_atlas_label/ TIFF stack",
+        "For export-mode signal, each channel needs a matching chX/ TIFF folder with the same slice count as the label stack",
         "Region query resolves against pipeline_modules/registration/Region_Csv_Rev1_updated.CSV by acronym, full name, or numeric id"
       ],
       "inputs": {
         "sample_dir": { "type": "dir", "required": true },
         "region": { "type": "string", "required": true, "examples": ["HIP", "PVH", "295"] },
         "export_mode": { "type": "string", "default": "signal", "examples": ["signal", "mask", "region"] },
-        "channels": { "type": "string|null", "default": null, "examples": ["0,1,2,3"], "description": "Multi-channel batch export; converts missing chX.zarr from chX/ first" },
+        "source": { "type": "string", "default": "auto", "examples": ["auto", "tiff", "zarr"] },
+        "channels": { "type": "string|null", "default": null, "examples": ["1,2,3"], "description": "Multi-channel batch export directly from TIFF stacks" },
         "signal_ch": { "type": "string|null", "default": null, "description": "Single-channel mode signal channel label" },
         "cfg": { "type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV" },
         "config": { "type": "path|null", "default": null },
-        "convert_tiff_workers": { "type": "int", "default": 0, "description": "Parallel TIFF-to-Zarr workers when converting missing channels; 0 uses cpu_count // 4" },
-        "chunk_size": { "type": "z,y,x", "default": "256,256,256" },
+        "workers": { "type": "int", "default": 0, "description": "Parallel slice workers in TIFF mode; 0 uses cpu_count // 2" },
         "output_dir": { "type": "path|null", "default": "sample_dir/visualization/region_masked/{ch}_{region}_{mode}" },
         "output_root": { "type": "path|null", "default": "sample_dir/visualization/region_masked" }
       },
@@ -771,13 +771,13 @@
           "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; python pipeline_modules/visualization/region_masked_volume_export.py --sample-dir \"S:\\path\\to\\sample\" --region HIP --signal-ch ch3 --export-mode signal"
         },
         {
-          "description": "Batch export HIP masked signal for channels 0-3 with parallel TIFF-to-Zarr conversion",
-          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; python pipeline_modules/visualization/region_masked_volume_export.py --sample-dir \"S:\\path\\to\\sample\" --region HIP --channels 0,1,2,3 --export-mode signal --convert-tiff-workers 0"
+          "description": "Batch export HIP masked signal for channels 1-3 directly from TIFF stacks",
+          "powershell": "cd S:\\Yifu; $env:PYTHONPATH='S:\\Yifu'; python pipeline_modules/visualization/region_masked_volume_export.py --sample-dir \"S:\\path\\to\\sample\" --region HIP --channels \"1,2,3\" --export-mode signal --source tiff --workers 0"
         }
       ],
       "sample_layout": {
-        "signal_zarr": "sample_dir/<signal_ch>.zarr",
-        "atlas_label_zarr": "sample_dir/upsampled_atlas_label.zarr"
+        "signal_tiff_dir": "sample_dir/<signal_ch>/",
+        "atlas_label_tiff_dir": "sample_dir/upsampled_atlas_label/"
       }
     }
   ]
