@@ -7,6 +7,29 @@ const ROOT_SURFACE_COLOR = 0xa8bace;
 const BRAIN_OUTLINE_COLOR = 0x64748b;
 const DEFAULT_RESOLUTION_UM = [25, 25, 25];
 
+/** Distinct colors for multi-region 3D selection (points + outlines). */
+export const REGION_FOCUS_PALETTE = [
+  0xc44e52, // red
+  0x3182bd, // blue
+  0x31a354, // green
+  0xe6550d, // orange
+  0x756bb1, // purple
+  0x17becf, // cyan
+  0xd6616b, // rose
+  0x8c6d31, // brown
+  0x7b4173, // magenta
+  0x637939, // olive
+];
+
+export function regionFocusColor(index) {
+  return REGION_FOCUS_PALETTE[Number(index) % REGION_FOCUS_PALETTE.length];
+}
+
+function hexToRgb01(hex) {
+  const value = Number(hex) >>> 0;
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255].map((channel) => channel / 255);
+}
+
 let circleTexture = null;
 
 function getCircleTexture() {
@@ -84,9 +107,12 @@ export class PointsViewer3D {
     this.signalPoints = null;
     this.rootSurface = null;
     this.regionSurface = null;
+    this.regionSurfaceGroup = null;
     this.brainOutlineSurface = null;
     this.fullPayload = null;
     this.focusRegionIds = null;
+    this.focusColorByLeafId = null;
+    this.showRegionOutlines = true;
     this.atlasShape = [456, 528, 320];
     this.atlasResolutionUm = DEFAULT_RESOLUTION_UM;
     this.sampleId = null;
@@ -185,6 +211,13 @@ export class PointsViewer3D {
 
   clearRegionSurface() {
     this._clearMeshObject("regionSurface");
+    if (this.regionSurfaceGroup) {
+      this.scene.remove(this.regionSurfaceGroup);
+      this.regionSurfaceGroup.traverse((child) => {
+        if (child.isMesh) disposeObject3D(child);
+      });
+      this.regionSurfaceGroup = null;
+    }
   }
 
   clearBrainOutlineSurface() {
@@ -202,11 +235,18 @@ export class PointsViewer3D {
     this.clearRootSurface();
     this.fullPayload = null;
     this.focusRegionIds = null;
+    this.focusColorByLeafId = null;
     this._cameraInitialized = false;
   }
 
   _sceneBoundsObject() {
-    return this.regionSurface || this.brainOutlineSurface || this.rootSurface || this.signalPoints;
+    return (
+      this.regionSurfaceGroup ||
+      this.regionSurface ||
+      this.brainOutlineSurface ||
+      this.rootSurface ||
+      this.signalPoints
+    );
   }
 
   fitCameraToScene() {
@@ -248,19 +288,31 @@ export class PointsViewer3D {
     return Math.max(0.008, Math.min(0.022, 28 / Math.cbrt(Math.max(count, 1))));
   }
 
-  _buildPointCloud(points, { color, size, opacity = 0.88 }) {
+  _buildPointCloud(points, { color, colors, size, opacity = 0.88 }) {
     const positions = new Float32Array(points.length * 3);
+    const useVertexColors = Array.isArray(colors) && colors.length === points.length;
+    const colorAttr = useVertexColors ? new Float32Array(points.length * 3) : null;
     points.forEach((point, index) => {
       const [x, y, z] = atlasPosition(point, this.atlasShape, this.atlasResolutionUm);
       const base = index * 3;
       positions[base] = x;
       positions[base + 1] = y;
       positions[base + 2] = z;
+      if (colorAttr) {
+        const [r, g, b] = hexToRgb01(colors[index] ?? color ?? SIGNAL_COLOR);
+        colorAttr[base] = r;
+        colorAttr[base + 1] = g;
+        colorAttr[base + 2] = b;
+      }
     });
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    if (colorAttr) {
+      geometry.setAttribute("color", new THREE.BufferAttribute(colorAttr, 3));
+    }
     const material = new THREE.PointsMaterial({
-      color,
+      color: useVertexColors ? 0xffffff : color,
+      vertexColors: useVertexColors,
       size,
       map: getCircleTexture(),
       alphaTest: 0.15,
@@ -341,11 +393,11 @@ export class PointsViewer3D {
     }
   }
 
-  setRegionSurface(surfacePayload) {
+  setRegionSurface(surfacePayload, color = REGION_SURFACE_COLOR) {
     this.clearRegionSurface();
     if (!surfacePayload?.available) return false;
     this.regionSurface = this._buildSurfaceMesh(surfacePayload, {
-      color: REGION_SURFACE_COLOR,
+      color,
       opacity: 0.34,
       shininess: 48,
     });
@@ -354,6 +406,39 @@ export class PointsViewer3D {
       return true;
     }
     return false;
+  }
+
+  setRegionSurfaces(surfaceEntries, { visible = true } = {}) {
+    this.clearRegionSurface();
+    const entries = (surfaceEntries || []).filter((entry) => entry?.surface?.available);
+    if (!entries.length) return false;
+
+    if (entries.length === 1) {
+      const ok = this.setRegionSurface(entries[0].surface, entries[0].color ?? REGION_SURFACE_COLOR);
+      if (this.regionSurface) this.regionSurface.visible = Boolean(visible);
+      return ok;
+    }
+
+    const group = new THREE.Group();
+    for (const entry of entries) {
+      const mesh = this._buildSurfaceMesh(entry.surface, {
+        color: entry.color ?? REGION_SURFACE_COLOR,
+        opacity: 0.32,
+        shininess: 48,
+      });
+      if (mesh) group.add(mesh);
+    }
+    if (!group.children.length) return false;
+    group.visible = Boolean(visible);
+    this.regionSurfaceGroup = group;
+    this.scene.add(group);
+    return true;
+  }
+
+  setRegionOutlinesVisible(visible) {
+    this.showRegionOutlines = Boolean(visible);
+    if (this.regionSurface) this.regionSurface.visible = this.showRegionOutlines;
+    if (this.regionSurfaceGroup) this.regionSurfaceGroup.visible = this.showRegionOutlines;
   }
 
   setBrainOutlineSurface(surfacePayload) {
@@ -413,8 +498,16 @@ export class PointsViewer3D {
     const visiblePoints = this._filteredSignalPoints();
     this._visiblePointRecords = visiblePoints;
     if (visiblePoints.length) {
+      const colors =
+        this.focusColorByLeafId && this.focusColorByLeafId.size
+          ? visiblePoints.map((point) => {
+              const leafId = Number(point.region_id || 0);
+              return this.focusColorByLeafId.get(leafId) ?? SIGNAL_COLOR;
+            })
+          : null;
       this.signalPoints = this._buildPointCloud(visiblePoints, {
         color: SIGNAL_COLOR,
+        colors,
         size: this._pointSize(visiblePoints.length),
       });
       this.scene.add(this.signalPoints);
@@ -426,6 +519,7 @@ export class PointsViewer3D {
     this.sampleId = sampleId;
     this.fullPayload = payload;
     this.focusRegionIds = null;
+    this.focusColorByLeafId = null;
     this.clearRegionSurface();
     this.clearBrainOutlineSurface();
     if (!payload?.available || !payload.points?.length) {
@@ -447,18 +541,86 @@ export class PointsViewer3D {
     return ok;
   }
 
-  setRegionFocus(memberRegionIds, regionSurfacePayload = null, brainOutlinePayload = undefined) {
+  /**
+   * Focus one or more selected regions.
+   * @param {null|number[]|{
+   *   selections?: Array<{regionId:number, memberIds:number[], color?:number, surface?:object|null}>,
+   *   memberRegionIds?: number[],
+   *   regionSurfacePayload?: object|null,
+   *   showOutlines?: boolean,
+   *   brainOutlinePayload?: object|null|undefined,
+   * }} focus
+   * @param {object|null} regionSurfacePayload legacy single-surface arg
+   * @param {object|null|undefined} brainOutlinePayload legacy brain-outline arg
+   */
+  setRegionFocus(focus, regionSurfacePayload = null, brainOutlinePayload = undefined) {
     if (!this.fullPayload) return false;
 
+    let selections = null;
+    let memberRegionIds = null;
+    let showOutlines = this.showRegionOutlines;
+    let brainOutline = brainOutlinePayload;
+    let legacySurface = regionSurfacePayload;
+
+    if (focus && !Array.isArray(focus) && typeof focus === "object") {
+      selections = focus.selections || null;
+      memberRegionIds = focus.memberRegionIds || null;
+      if (focus.showOutlines !== undefined) showOutlines = Boolean(focus.showOutlines);
+      if (focus.brainOutlinePayload !== undefined) brainOutline = focus.brainOutlinePayload;
+      if (focus.regionSurfacePayload !== undefined) legacySurface = focus.regionSurfacePayload;
+    } else {
+      memberRegionIds = focus;
+    }
+
+    this.showRegionOutlines = Boolean(showOutlines);
     this.clearRegionSurface();
-    if (brainOutlinePayload !== undefined) {
-      if (brainOutlinePayload) {
-        this.setBrainOutlineSurface(brainOutlinePayload);
+    if (brainOutline !== undefined) {
+      if (brainOutline) {
+        this.setBrainOutlineSurface(brainOutline);
       } else {
         this.clearBrainOutlineSurface();
       }
     }
 
+    if (selections?.length) {
+      const colorByLeaf = new Map();
+      const allMembers = new Set();
+      const ranked = [...selections].sort(
+        (a, b) => (b.memberIds?.length || 0) - (a.memberIds?.length || 0)
+      );
+      for (const selection of ranked) {
+        const color = selection.color ?? regionFocusColor(0);
+        for (const memberId of selection.memberIds || []) {
+          const id = Number(memberId);
+          allMembers.add(id);
+          colorByLeaf.set(id, color);
+        }
+      }
+      // Most-specific (smallest subtree) wins for nested selections.
+      const specificFirst = [...selections].sort(
+        (a, b) => (a.memberIds?.length || 0) - (b.memberIds?.length || 0)
+      );
+      for (const selection of specificFirst) {
+        const color = selection.color ?? regionFocusColor(0);
+        for (const memberId of selection.memberIds || []) {
+          colorByLeaf.set(Number(memberId), color);
+        }
+      }
+
+      this.focusRegionIds = allMembers;
+      this.focusColorByLeafId = colorByLeaf;
+      this.setRegionSurfaces(
+        selections.map((selection) => ({
+          surface: selection.surface,
+          color: selection.color ?? REGION_SURFACE_COLOR,
+        })),
+        { visible: this.showRegionOutlines }
+      );
+      this._syncWholeBrainContext();
+      return this._renderSignalPoints();
+    }
+
+    this.focusColorByLeafId = null;
     if (!memberRegionIds || memberRegionIds.length === 0) {
       this.focusRegionIds = null;
       this._syncWholeBrainContext();
@@ -466,14 +628,16 @@ export class PointsViewer3D {
     }
 
     this.focusRegionIds = new Set(memberRegionIds.map((value) => Number(value)));
-    if (regionSurfacePayload) {
-      this.setRegionSurface(regionSurfacePayload);
+    if (legacySurface) {
+      this.setRegionSurface(legacySurface, REGION_SURFACE_COLOR);
+      if (this.regionSurface) this.regionSurface.visible = this.showRegionOutlines;
     }
     this._syncWholeBrainContext();
     return this._renderSignalPoints();
   }
 
   clearRegionFocus() {
+    this.focusColorByLeafId = null;
     return this.setRegionFocus(null, null, null);
   }
 

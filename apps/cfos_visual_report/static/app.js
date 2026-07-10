@@ -34,9 +34,12 @@ const state = {
   highlightMemberIds: null,
   collapsedRegionIds: new Set(),
   showBrainOutline: false,
+  showRegionOutlines: true,
   brainOutlinePayload: null,
   cachedRegionSurface: null,
   cachedRegionSurfaceId: null,
+  regionSurfaceCache: new Map(),
+  regionSubtreeCache: new Map(),
   regionSelectionSeq: 0,
   regionTreeBound: false,
   groupAnalysis: null,
@@ -118,6 +121,8 @@ const els = {
   savedViewsList: document.getElementById("saved-views-list"),
   screenshot3d: document.getElementById("screenshot-3d"),
   toggleBrainOutline: document.getElementById("toggle-brain-outline"),
+  toggleRegionOutlines: document.getElementById("toggle-region-outlines"),
+  regionColorLegend: document.getElementById("region-color-legend"),
 };
 
 function currentAxisFromPlane() {
@@ -396,6 +401,8 @@ function clearRegionSelection() {
   els.regionDetail?.classList.add("hidden");
   els.regionDetailPanel?.querySelector(".muted")?.classList.remove("hidden");
   syncBrainOutlineButton();
+  syncRegionOutlinesButton();
+  renderRegionColorLegend([]);
   if (state.viewer3d) {
     state.viewer3d.clearRegionFocus();
   }
@@ -427,13 +434,7 @@ function initRegionTreeInteractions() {
     event.stopPropagation();
     const regionId = Number(item.dataset.regionId);
     if (event.shiftKey || event.ctrlKey || event.metaKey) {
-      if (state.selectedRegionIds.has(regionId)) {
-        state.selectedRegionIds.delete(regionId);
-      } else {
-        state.selectedRegionIds.add(regionId);
-      }
-      renderRegionTree();
-      updateExportButton();
+      void toggleMultiRegionSelection(regionId);
       return;
     }
     toggleRegionSelection(regionId);
@@ -471,6 +472,26 @@ function renderTreeNode(node) {
   if (state.selectedRegionIds.has(node.region_id)) item.classList.add("selected");
   if (state.activeRegionId === node.region_id) item.classList.add("active");
 
+  const selectedIndex = [...state.selectedRegionIds].indexOf(node.region_id);
+  if (selectedIndex >= 0) {
+    const swatch = document.createElement("span");
+    swatch.className = "tree-color-swatch";
+    const palette = [
+      "#c44e52",
+      "#3182bd",
+      "#31a354",
+      "#e6550d",
+      "#756bb1",
+      "#17becf",
+      "#d6616b",
+      "#8c6d31",
+      "#7b4173",
+      "#637939",
+    ];
+    swatch.style.background = palette[selectedIndex % palette.length];
+    item.appendChild(swatch);
+  }
+
   const acronym = document.createElement("span");
   acronym.className = "acronym";
   acronym.textContent = node.region_acronym || `#${node.region_id}`;
@@ -504,7 +525,7 @@ function renderTreeNode(node) {
 function syncBrainOutlineButton() {
   const btn = els.toggleBrainOutline;
   if (!btn) return;
-  const enabled = Boolean(state.activeRegionId);
+  const enabled = state.selectedRegionIds.size > 0;
   btn.disabled = !enabled;
   btn.classList.toggle("active", enabled && state.showBrainOutline);
   btn.textContent = enabled
@@ -515,8 +536,44 @@ function syncBrainOutlineButton() {
   btn.setAttribute("aria-pressed", enabled && state.showBrainOutline ? "true" : "false");
 }
 
+function syncRegionOutlinesButton() {
+  const btn = els.toggleRegionOutlines;
+  if (!btn) return;
+  const enabled = state.selectedRegionIds.size > 0;
+  btn.disabled = !enabled;
+  btn.classList.toggle("active", enabled && state.showRegionOutlines);
+  btn.textContent = enabled
+    ? state.showRegionOutlines
+      ? "Region outlines: ON"
+      : "Region outlines: OFF"
+    : "Region outlines";
+  btn.setAttribute("aria-pressed", enabled && state.showRegionOutlines ? "true" : "false");
+}
+
+function hexCssColor(hex) {
+  return `#${Number(hex).toString(16).padStart(6, "0")}`;
+}
+
+function renderRegionColorLegend(selections) {
+  const legend = els.regionColorLegend;
+  if (!legend) return;
+  if (!selections?.length) {
+    legend.classList.add("hidden");
+    legend.innerHTML = "";
+    return;
+  }
+  legend.classList.remove("hidden");
+  legend.innerHTML = selections
+    .map((entry) => {
+      const node = findRegionTreeNode(state.bundle?.region_tree, entry.regionId);
+      const label = node?.region_acronym || `#${entry.regionId}`;
+      return `<span class="region-legend-item"><i style="background:${hexCssColor(entry.color)}"></i>${label}</span>`;
+    })
+    .join("");
+}
+
 async function toggleBrainOutline() {
-  if (!state.activeRegionId || !state.viewer3d) return;
+  if (!state.selectedRegionIds.size || !state.viewer3d) return;
   state.showBrainOutline = !state.showBrainOutline;
   syncBrainOutlineButton();
   if (state.showBrainOutline) {
@@ -529,8 +586,47 @@ async function toggleBrainOutline() {
   }
 }
 
+async function toggleRegionOutlines() {
+  if (!state.selectedRegionIds.size || !state.viewer3d) return;
+  state.showRegionOutlines = !state.showRegionOutlines;
+  syncRegionOutlinesButton();
+  state.viewer3d.setRegionOutlinesVisible(state.showRegionOutlines);
+}
+
 function selectRegion(regionId) {
   void selectRegionCore(regionId);
+}
+
+async function toggleMultiRegionSelection(regionId) {
+  if (!regionId) return;
+  const seq = ++state.regionSelectionSeq;
+  const displayRegionId = state.bundle ? resolveDisplayRegionIdLocal(regionId) : regionId;
+  if (seq !== state.regionSelectionSeq) return;
+
+  if (state.selectedRegionIds.has(displayRegionId)) {
+    state.selectedRegionIds.delete(displayRegionId);
+  } else {
+    state.selectedRegionIds.add(displayRegionId);
+  }
+
+  if (state.selectedRegionIds.size === 0) {
+    clearRegionSelection();
+    return;
+  }
+
+  state.activeRegionId = displayRegionId;
+  if (!state.selectedRegionIds.has(state.activeRegionId)) {
+    state.activeRegionId = [...state.selectedRegionIds][state.selectedRegionIds.size - 1];
+  }
+  syncBrainOutlineButton();
+  syncRegionOutlinesButton();
+  renderRegionDetail(state.activeRegionId);
+  renderRegionTree();
+  updateExportButton();
+  void applySelectedRegionsFocus3D(seq);
+  if (state.activeView === "slice2d") {
+    void jumpToRegionSlice(state.activeRegionId);
+  }
 }
 
 async function selectRegionCore(regionId) {
@@ -543,8 +639,9 @@ async function selectRegionCore(regionId) {
   state.activeRegionId = displayRegionId;
   state.showBrainOutline = true;
   syncBrainOutlineButton();
+  syncRegionOutlinesButton();
   renderRegionDetail(displayRegionId);
-  void applyRegionFocus3D(displayRegionId, seq);
+  void applySelectedRegionsFocus3D(seq);
   if (state.activeView === "slice2d") {
     void jumpToRegionSlice(displayRegionId);
   }
@@ -1026,7 +1123,7 @@ async function loadSpatialData() {
 async function ensureViewer3d() {
   if (!state.viewer3d) {
     try {
-      const module = await import("./view3d.js?v=32");
+      const module = await import("./view3d.js?v=33");
       state.viewer3d = new module.PointsViewer3D(els.viewer3dCanvas);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1079,8 +1176,8 @@ async function load3DPoints() {
     els.viewer3dPlaceholder.style.display = "none";
     els.viewer3dPlaceholder.classList.remove("is-blocking");
     renderSavedViews();
-    if (state.activeRegionId) {
-      await applyRegionFocus3D(state.activeRegionId);
+    if (state.selectedRegionIds.size) {
+      await applySelectedRegionsFocus3D();
     }
     await new Promise((resolve) => requestAnimationFrame(resolve));
     viewer.resize();
@@ -1093,18 +1190,28 @@ async function load3DPoints() {
 }
 
 async function fetchRegionSubtree(regionId) {
+  const cached = state.regionSubtreeCache.get(Number(regionId));
+  if (cached) return cached;
   const params = new URLSearchParams({
     sample_dir: state.sampleDir,
     signal_ch: state.signalCh,
     region_id: String(regionId),
   });
   const response = await fetch(`/api/region/subtree?${params.toString()}`);
-  if (!response.ok) return [regionId];
+  if (!response.ok) {
+    const fallback = [regionId];
+    state.regionSubtreeCache.set(Number(regionId), fallback);
+    return fallback;
+  }
   const payload = await response.json();
-  return payload.member_region_ids || [regionId];
+  const members = payload.member_region_ids || [regionId];
+  state.regionSubtreeCache.set(Number(regionId), members);
+  return members;
 }
 
 async function fetchRegionSurface(regionId) {
+  const cached = state.regionSurfaceCache.get(Number(regionId));
+  if (cached) return cached;
   const params = new URLSearchParams({
     sample_dir: state.sampleDir,
     signal_ch: state.signalCh,
@@ -1112,7 +1219,11 @@ async function fetchRegionSurface(regionId) {
   });
   const response = await fetch(`/api/spatial/region-surface?${params.toString()}`);
   if (!response.ok) return null;
-  return response.json();
+  const payload = await response.json();
+  state.regionSurfaceCache.set(Number(regionId), payload);
+  state.cachedRegionSurface = payload;
+  state.cachedRegionSurfaceId = Number(regionId);
+  return payload;
 }
 
 async function fetchBrainOutlineSurface() {
@@ -1125,10 +1236,9 @@ async function fetchBrainOutlineSurface() {
   return response.json();
 }
 
-async function applyRegionFocus3D(regionId, seq = state.regionSelectionSeq) {
-  if (!state.bundle || !regionId) return;
-  state.highlightMemberIds = await fetchRegionSubtree(regionId);
-  if (seq !== state.regionSelectionSeq) return;
+async function applySelectedRegionsFocus3D(seq = state.regionSelectionSeq) {
+  const selectedIds = [...state.selectedRegionIds];
+  if (!state.bundle || !selectedIds.length) return;
 
   if (!state.viewer3d?.fullPayload) {
     if (state.activeView === "points3d") {
@@ -1137,13 +1247,26 @@ async function applyRegionFocus3D(regionId, seq = state.regionSelectionSeq) {
     return;
   }
 
-  let regionSurface = state.cachedRegionSurface;
-  if (state.cachedRegionSurfaceId !== regionId || !regionSurface) {
-    regionSurface = await fetchRegionSurface(regionId);
-    if (seq !== state.regionSelectionSeq) return;
-    state.cachedRegionSurface = regionSurface;
-    state.cachedRegionSurfaceId = regionId;
-  }
+  const { regionFocusColor } = await import("./view3d.js?v=33");
+  if (seq !== state.regionSelectionSeq) return;
+
+  const selections = await Promise.all(
+    selectedIds.map(async (regionId, index) => {
+      const [memberIds, surface] = await Promise.all([
+        fetchRegionSubtree(regionId),
+        fetchRegionSurface(regionId),
+      ]);
+      return {
+        regionId: Number(regionId),
+        memberIds,
+        color: regionFocusColor(index),
+        surface,
+      };
+    })
+  );
+  if (seq !== state.regionSelectionSeq) return;
+
+  state.highlightMemberIds = selections.flatMap((entry) => entry.memberIds);
 
   let brainOutline = null;
   if (state.showBrainOutline) {
@@ -1155,11 +1278,21 @@ async function applyRegionFocus3D(regionId, seq = state.regionSelectionSeq) {
   }
 
   if (seq !== state.regionSelectionSeq) return;
-  state.viewer3d.setRegionFocus(
-    state.highlightMemberIds,
-    regionSurface,
-    state.showBrainOutline ? brainOutline : null
-  );
+  state.viewer3d.setRegionFocus({
+    selections,
+    showOutlines: state.showRegionOutlines,
+    brainOutlinePayload: state.showBrainOutline ? brainOutline : null,
+  });
+  renderRegionColorLegend(selections);
+}
+
+async function applyRegionFocus3D(regionId, seq = state.regionSelectionSeq) {
+  if (!regionId) return;
+  if (!state.selectedRegionIds.has(Number(regionId))) {
+    state.selectedRegionIds = new Set([Number(regionId)]);
+    state.activeRegionId = Number(regionId);
+  }
+  await applySelectedRegionsFocus3D(seq);
 }
 
 function scheduleSliceRefresh(immediate = false) {
@@ -1728,10 +1861,15 @@ function applyLoadedBundle() {
   state.cachedRegionSurface = null;
   state.cachedRegionSurfaceId = null;
   state.showBrainOutline = false;
+  state.showRegionOutlines = true;
+  state.regionSurfaceCache = new Map();
+  state.regionSubtreeCache = new Map();
   state.sliceBookmarks = [];
   state.collapsedRegionIds = collectParentRegionIds(state.bundle.region_tree);
   rebuildRegionDescendantsIndex();
   syncBrainOutlineButton();
+  syncRegionOutlinesButton();
+  renderRegionColorLegend([]);
   renderSliceExportTable();
 
   syncGroupLevelOptions(groupEls, state.bundle.levels, state.defaultLevel);
@@ -1884,6 +2022,7 @@ function exportGroupDifferentialCsv() {
 }
 
 els.toggleBrainOutline?.addEventListener("click", toggleBrainOutline);
+els.toggleRegionOutlines?.addEventListener("click", toggleRegionOutlines);
 els.togglePanelLeft?.addEventListener("click", () => toggleSidePanel("left"));
 els.togglePanelRight?.addEventListener("click", () => toggleSidePanel("right"));
 els.regionSearch?.addEventListener("input", renderRegionTree);

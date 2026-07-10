@@ -1,6 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from pipeline_modules.utils.tiff_stack_io import (
+    iter_batch_ranges,
+    normalize_tiff_compression,
+    resolve_slice_batch,
+    resolve_stack_workers,
+    run_bounded_batches,
+    write_tiff_stack_batch,
+)
+
+_DATASET_CACHE: dict[str, Any] = {}
 
 
 def _require_zarr_stack():
@@ -81,18 +95,64 @@ def list_existing_chunk_indices(data_in):
     return sorted(existing)
 
 
+def _get_cached_dataset(input_zarr: str, dataset_name: str):
+    cache_key = f"{input_zarr}:{dataset_name}"
+    if cache_key not in _DATASET_CACHE:
+        _DATASET_CACHE[cache_key] = open_zarr_dataset(input_zarr, dataset_name=dataset_name)
+    return _DATASET_CACHE[cache_key]
+
+
+def _export_zarr_batch_job(job: dict[str, object]) -> int:
+    data_in = _get_cached_dataset(str(job["input_zarr"]), str(job["dataset_name"]))
+    start = int(job["start"])
+    end = int(job["end"])
+    batch = np.asarray(data_in[start:end])
+    write_tiff_stack_batch(
+        batch,
+        job["output_paths"],  # type: ignore[arg-type]
+        compression=job.get("compression"),  # type: ignore[arg-type]
+    )
+    return end - start
+
+
 def export_zarr_to_tiff(
     input_zarr,
     output_dir,
     *,
     dataset_name: str = "0",
     prefix: str = "mask_",
-):
-    np, tifffile, _, _ = _require_zarr_stack()
-    data_in = open_zarr_dataset(input_zarr, dataset_name=dataset_name)
+    workers: int = 0,
+    slice_batch: int | None = None,
+    compression: str | None = None,
+) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    for z_idx in range(int(data_in.shape[0])):
-        slice_2d = np.asarray(data_in[z_idx])
-        tifffile.imwrite(str(output_path / f"{prefix}{z_idx:04d}.tiff"), slice_2d)
+    data_in = open_zarr_dataset(input_zarr, dataset_name=dataset_name)
+    depth = int(data_in.shape[0])
+    read_batch = resolve_slice_batch(slice_batch, default=16)
+    worker_count = resolve_stack_workers(workers)
+    comp = normalize_tiff_compression(compression)
+
+    jobs: list[dict[str, object]] = []
+    for start, end in iter_batch_ranges(depth, read_batch):
+        output_paths = [output_path / f"{prefix}{z_idx:04d}.tiff" for z_idx in range(start, end)]
+        jobs.append(
+            {
+                "input_zarr": str(Path(input_zarr)),
+                "dataset_name": dataset_name,
+                "start": start,
+                "end": end,
+                "output_paths": output_paths,
+                "compression": comp,
+            }
+        )
+
+    run_bounded_batches(
+        jobs,
+        _export_zarr_batch_job,
+        worker_count=worker_count,
+        progress_total=depth,
+        desc="Export Zarr to TIFF",
+        unit="slice",
+    )
     return output_path

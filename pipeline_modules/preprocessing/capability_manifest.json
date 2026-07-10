@@ -42,7 +42,8 @@
         "sample_dir": { "type": "dir", "required": false, "description": "Sample root for batch conversion of ch0,ch1,..." },
         "channels": { "type": "string", "required": false, "examples": ["0,1,2,3"], "description": "Comma-separated channel labels for batch mode" },
         "chunk_size": { "type": "triplet_int", "default": [256, 256, 256] },
-        "workers": { "type": "int", "default": 0, "description": "Thread count for parallel TIFF chunk reads; 0 uses cpu_count // 4" },
+        "workers": { "type": "int", "default": 0, "description": "Thread count for parallel TIFF chunk reads; 0 auto-uses min(8, cpu_count // 4), capped at 2 when read batch matches z-chunk" },
+        "read_z_chunk": { "type": "int", "default": 0, "description": "Slices per read batch; 0 matches the Zarr z-chunk for fastest conversion" },
         "skip_existing": { "type": "bool", "default": false, "description": "In batch mode, skip channels whose chX.zarr already exists" },
         "compressor": { "type": "string", "default": "default" },
         "dataset_name": { "type": "string", "default": "0" }

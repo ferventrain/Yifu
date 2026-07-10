@@ -13,7 +13,7 @@
     }
   }
   </script>
-  <link rel="stylesheet" href="/styles.css?v=32" />
+  <link rel="stylesheet" href="/styles.css?v=35" />
 </head>
 <body>
   <header class="app-header">
@@ -88,10 +88,12 @@
 
         <div id="viewer3d-controls" class="control-row hidden">
           <button id="toggle-brain-outline" type="button" class="toggle-btn" disabled>Brain outline</button>
+          <button id="toggle-region-outlines" type="button" class="toggle-btn" disabled>Region outlines</button>
           <label class="checkbox inline"><input id="filter-in-brain-points" type="checkbox" checked /> In-brain points only</label>
           <button id="reset-camera" type="button">Reset camera</button>
           <button id="save-camera" type="button">Save view</button>
           <button id="screenshot-3d" type="button">Screenshot PNG</button>
+          <div id="region-color-legend" class="region-color-legend hidden" aria-label="Selected region colors"></div>
           <div id="saved-views-panel" class="saved-views-panel">
             <span class="saved-views-label">Saved views</span>
             <ul id="saved-views-list" class="saved-views-list"></ul>
@@ -231,6 +233,6 @@
   </main>
 
   <div id="chart-tooltip" class="chart-tooltip hidden" role="tooltip"></div>
-  <script type="module" src="/app.js?v=34"></script>
+  <script type="module" src="/app.js?v=35"></script>
 </body>
 </html>

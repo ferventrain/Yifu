@@ -59,7 +59,12 @@ def _coerce_chunk_size(value: str | tuple[int, int, int]) -> tuple[int, int, int
     return (int(parts[0]), int(parts[1]), int(parts[2]))
 
 
-def resolve_tiff_workers(workers: int) -> int:
+def resolve_tiff_workers(
+    workers: int,
+    *,
+    read_z_chunk: int | None = None,
+    zarr_z_chunk: int | None = None,
+) -> int:
     if workers < 0:
         raise PipelineError(
             ErrorCode.ARGUMENT_INVALID,
@@ -67,9 +72,19 @@ def resolve_tiff_workers(workers: int) -> int:
             {"workers": workers},
         )
     if workers == 0:
-        worker_count = max(1, (os.cpu_count() or 4) // 2)
+        # Network-backed TIFF stacks are usually I/O bound; cap auto workers to avoid
+        # dozens of threads fighting over the same disk (Windows max is 61).
+        worker_count = max(1, min(8, (os.cpu_count() or 4) // 4))
     else:
         worker_count = int(workers)
+    if (
+        read_z_chunk is not None
+        and zarr_z_chunk is not None
+        and read_z_chunk >= zarr_z_chunk
+        and workers == 0
+    ):
+        # Full z-slab reads are memory-heavy (often tens of GB per batch).
+        worker_count = min(worker_count, 2)
     if os.name == "nt" and worker_count > 61:
         worker_count = 61
     return worker_count
@@ -77,7 +92,9 @@ def resolve_tiff_workers(workers: int) -> int:
 
 def resolve_read_z_chunk(zarr_z_chunk: int, read_z_chunk: int | None) -> int:
     if read_z_chunk is None or read_z_chunk <= 0:
-        return max(1, min(16, int(zarr_z_chunk)))
+        # Match the Zarr z-chunk so each batch fills complete chunks and avoids
+        # read-modify-write amplification on partial z updates.
+        return max(1, int(zarr_z_chunk))
     read_z = int(read_z_chunk)
     if read_z <= 0:
         raise PipelineError(
@@ -86,6 +103,18 @@ def resolve_read_z_chunk(zarr_z_chunk: int, read_z_chunk: int | None) -> int:
             {"read_z_chunk": read_z_chunk},
         )
     return read_z
+
+
+def resolve_max_in_flight(
+    worker_count: int,
+    job_count: int,
+    read_z_chunk: int,
+    zarr_z_chunk: int,
+) -> int:
+    ceiling = max(1, min(worker_count + 1, job_count))
+    if read_z_chunk >= zarr_z_chunk:
+        return max(1, min(ceiling, 2))
+    return ceiling
 
 
 def resolve_compressor(compressor: Any) -> Any | None:
@@ -122,13 +151,15 @@ def _run_bounded_read_pipeline(
     *,
     worker_count: int,
     executor_kind: Literal["thread", "process"] = "thread",
+    max_in_flight: int | None = None,
 ) -> None:
     job_list = list(jobs)
     if not job_list:
         return
 
     executor_cls = ProcessPoolExecutor if executor_kind == "process" else ThreadPoolExecutor
-    max_in_flight = max(1, min(worker_count + 1, len(job_list)))
+    in_flight_limit = max_in_flight if max_in_flight is not None else max(1, min(worker_count + 1, len(job_list)))
+    in_flight_limit = max(1, min(in_flight_limit, len(job_list)))
     pending: dict[Future[np.ndarray], tuple[int, int]] = {}
     job_iter = iter(job_list)
 
@@ -140,7 +171,7 @@ def _run_bounded_read_pipeline(
         pending[pool.submit(_read_z_chunk, files)] = (start, end)
 
     with executor_cls(max_workers=worker_count) as pool:
-        for _ in range(max_in_flight):
+        for _ in range(in_flight_limit):
             submit_next(pool)
 
         progress = tqdm(total=len(job_list), desc="Converting to Zarr", unit="batch", leave=True)
@@ -176,7 +207,7 @@ def parse_channel_list(channels: str | list[str]) -> list[str]:
 def convert_tiff_to_zarr(
     input_dir: str | Path,
     output_zarr: str | Path,
-    chunk_size: tuple[int, int, int] = (128, 256, 256),
+    chunk_size: tuple[int, int, int] = (256, 256, 256),
     compressor: Any = "default",
     *,
     dataset_name: str = "0",
@@ -249,13 +280,20 @@ def convert_tiff_to_zarr(
     }]
 
     read_batch = resolve_read_z_chunk(chunk_size[0], read_z_chunk)
-    worker_count = resolve_tiff_workers(workers)
+    worker_count = resolve_tiff_workers(
+        workers,
+        read_z_chunk=read_batch,
+        zarr_z_chunk=chunk_size[0],
+    )
+    job_count = (int(shape[0]) + read_batch - 1) // read_batch
+    in_flight_limit = resolve_max_in_flight(worker_count, job_count, read_batch, chunk_size[0])
     logger.info(
-        "Using %d %s worker(s), read batch=%d slice(s), zarr z-chunk=%d",
+        "Using %d %s worker(s), read batch=%d slice(s), zarr z-chunk=%d, max in-flight batches=%d",
         worker_count,
         executor,
         read_batch,
         chunk_size[0],
+        in_flight_limit,
     )
 
     _run_bounded_read_pipeline(
@@ -263,6 +301,7 @@ def convert_tiff_to_zarr(
         _iter_read_jobs(shape[0], tiff_files, read_batch),
         worker_count=worker_count,
         executor_kind=executor,
+        max_in_flight=in_flight_limit,
     )
 
     result = {
@@ -374,13 +413,13 @@ def parse_args() -> argparse.Namespace:
         "--workers",
         type=int,
         default=0,
-        help="Parallel workers for TIFF reads. 0 uses cpu_count // 2 (default).",
+        help="Parallel workers for TIFF reads. 0 auto-uses min(8, cpu_count // 4).",
     )
     parser.add_argument(
         "--read-z-chunk",
         type=int,
         default=0,
-        help="Slices read per worker batch. 0 uses min(16, zarr z-chunk). Lower = less RAM, more CPU parallelism.",
+        help="Slices read per worker batch. 0 matches the Zarr z-chunk (fastest; uses more RAM).",
     )
     parser.add_argument(
         "--executor",

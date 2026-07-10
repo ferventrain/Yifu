@@ -19,12 +19,6 @@ import logging
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
-from typing import Any
-
-import numpy as np
-import tifffile
-from tqdm import tqdm as _tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +26,12 @@ try:
     from pipeline_modules.preprocessing.preprocessor import Preprocessor, apply_processing_steps
 except ImportError:  # pragma: no cover - fallback for package-relative execution
     from .preprocessor import Preprocessor, apply_processing_steps
+
+from pipeline_modules.utils.tiff_stack_io import (
+    iter_batch_ranges,
+    resolve_slice_batch,
+    resolve_stack_workers,
+)
 
 
 def _list_tiff_files(path: Path) -> list[Path]:
@@ -157,6 +157,23 @@ def _process_slice_task(args: tuple[Path, Path, Path, dict[str, Any], list[tuple
         }
 
 
+def _process_batch_task(
+    args: tuple[list[tuple[Path, Path, Path]], dict[str, Any], list[tuple[str, dict[str, Any]]]],
+) -> tuple[int, int, list[dict[str, Any]]]:
+    batch_items, cfg, preprocessing_steps = args
+    processed = 0
+    failed = 0
+    errors: list[dict[str, Any]] = []
+    for signal_path, label_path, output_path in batch_items:
+        result = _process_slice_task((signal_path, label_path, output_path, cfg, preprocessing_steps))
+        if result["success"]:
+            processed += 1
+        else:
+            failed += 1
+            errors.append(result)
+    return processed, failed, errors
+
+
 def remove_edge_signal(
     input_dir: str | Path,
     label_dir: str | Path,
@@ -169,6 +186,7 @@ def remove_edge_signal(
     smooth_sigma: float = 5.0,
     min_area_px: int = 50,
     max_workers: int | None = None,
+    slice_batch: int | None = None,
     resume: bool = True,
     preprocessing_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -206,38 +224,60 @@ def remove_edge_signal(
             for name, step_cfg in Preprocessor(preprocessing_config).steps
         ]
 
-    tasks = []
+    tasks: list[tuple[Path, Path, Path]] = []
     skipped_existing = 0
     for signal_file, label_file in zip(signal_files, label_files):
         output_file = output_path / signal_file.name
         if resume and output_file.exists():
             skipped_existing += 1
             continue
-        tasks.append((signal_file, label_file, output_file, cfg, preprocessing_steps))
+        tasks.append((signal_file, label_file, output_file))
 
-    workers = max_workers or 1
+    workers = resolve_stack_workers(0 if max_workers is None else int(max_workers))
+    read_batch = resolve_slice_batch(slice_batch, default=8)
     processed = 0
     failed = 0
     errors: list[dict[str, Any]] = []
 
     if tasks:
-        logger.info("Processing %d TIFF slices with %d workers", len(tasks), workers)
+        batch_jobs: list[tuple[list[tuple[Path, Path, Path]], dict[str, Any], list[tuple[str, dict[str, Any]]]]] = []
+        for start, end in iter_batch_ranges(len(tasks), read_batch):
+            batch_jobs.append((tasks[start:end], cfg, preprocessing_steps))
+        logger.info(
+            "Processing %d TIFF slices in %d batches with %d workers",
+            len(tasks),
+            len(batch_jobs),
+            workers,
+        )
+        max_in_flight = max(1, min(workers + 1, len(batch_jobs)))
+        pending: dict[Any, None] = {}
+        job_iter = iter(batch_jobs)
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_process_slice_task, task): task[0].name for task in tasks}
-            for future in _tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="2D edge signal removal",
-                unit="slice",
-                file=sys.stderr,
-            ):
-                result = future.result()
-                if result["success"]:
-                    processed += 1
-                else:
-                    failed += 1
-                    errors.append(result)
-                    logger.error("Failed processing %s: %s", futures[future], result.get("error", "unknown error"))
+            def submit_next() -> None:
+                try:
+                    pending[executor.submit(_process_batch_task, next(job_iter))] = None
+                except StopIteration:
+                    return
+
+            for _ in range(max_in_flight):
+                submit_next()
+            progress = _tqdm(total=len(tasks), desc="2D edge signal removal", unit="slice", file=sys.stderr)
+            try:
+                while pending:
+                    for future in as_completed(list(pending)):
+                        pending.pop(future)
+                        batch_processed, batch_failed, batch_errors = future.result()
+                        processed += batch_processed
+                        failed += batch_failed
+                        errors.extend(batch_errors)
+                        progress.update(batch_processed + batch_failed)
+                        submit_next()
+                        break
+            finally:
+                progress.close()
+        if failed:
+            for result in errors[:10]:
+                logger.error("Failed processing %s: %s", result.get("input"), result.get("error", "unknown error"))
 
     duration = time.time() - started_at
     return {
@@ -280,7 +320,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Gaussian blur on suppression mask per slice (default: 5)")
     parser.add_argument("--min_area_px", type=int, default=50,
                         help="Suppress only bright edge objects larger than this area in pixels (default: 50)")
-    parser.add_argument("--max_workers", type=int, default=8)
+    parser.add_argument("--max_workers", type=int, default=0, help="Worker processes; 0 caps at 4")
+    parser.add_argument("--slice_batch", type=int, default=0, help="Slices per worker batch; 0 uses 8")
     parser.add_argument("--no_resume", action="store_true", help="Reprocess existing output TIFF files")
     parser.add_argument("--preprocess_config", default=None,
                         help="Optional full JSON config; enabled 2D preprocessing steps run before edge removal")
@@ -304,6 +345,7 @@ def main() -> int:
         smooth_sigma=args.smooth_sigma,
         min_area_px=args.min_area_px,
         max_workers=args.max_workers,
+        slice_batch=args.slice_batch or None,
         resume=not args.no_resume,
         preprocessing_config=preprocessing_config,
     )

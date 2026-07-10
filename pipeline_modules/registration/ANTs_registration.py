@@ -19,6 +19,13 @@ try:
         load_label_array_preserving_ids,
     )
     from pipeline_modules.preprocessing.tiff_to_zarr import convert_tiff_to_zarr
+    from pipeline_modules.utils.tiff_stack_io import (
+        iter_batch_ranges,
+        normalize_tiff_compression,
+        resolve_slice_batch,
+        resolve_stack_workers,
+        run_bounded_batches,
+    )
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
 except ImportError:
@@ -64,6 +71,21 @@ def _ants_image_read(path):
     if path_str.lower().endswith((".nii", ".nii.gz")):
         return _load_nifti_as_ants(path)
     return ants.image_read(path_str)
+
+
+def _write_tiff_volume_batch(job: dict[str, object]) -> int:
+    arr = job["arr"]
+    start = int(job["start"])
+    end = int(job["end"])
+    output_dtype = job["dtype"]
+    compression = normalize_tiff_compression(job.get("compression"))  # type: ignore[arg-type]
+    for offset, z_index in enumerate(range(start, end)):
+        tifffile.imwrite(
+            str(job["paths"][offset]),
+            arr[z_index, :, :].astype(output_dtype, copy=False),
+            compression=compression,
+        )
+    return end - start
 
 
 class BidirectionalRegistration:
@@ -257,12 +279,29 @@ class BidirectionalRegistration:
         logger.info("Saving dtype for %s: %s", prefix, output_dtype)
             
         logger.info("Saving %s TIFFs to %s (shape: %s)...", prefix, output_dir, arr.shape)
-        for i in range(arr.shape[0]):
-            tifffile.imwrite(
-                str(output_dir / f"{prefix}_{i:04d}.tiff"),
-                arr[i, :, :].astype(output_dtype, copy=False),
-                compression='lzw'
+        read_batch = resolve_slice_batch(None, default=16)
+        worker_count = resolve_stack_workers(0)
+        jobs: list[dict[str, object]] = []
+        for start, end in iter_batch_ranges(int(arr.shape[0]), read_batch):
+            paths = [output_dir / f"{prefix}_{z_index:04d}.tiff" for z_index in range(start, end)]
+            jobs.append(
+                {
+                    "arr": arr,
+                    "start": start,
+                    "end": end,
+                    "paths": paths,
+                    "dtype": output_dtype,
+                    "compression": "lzw",
+                }
             )
+        run_bounded_batches(
+            jobs,
+            _write_tiff_volume_batch,
+            worker_count=worker_count,
+            progress_total=int(arr.shape[0]),
+            desc=f"Save {prefix} TIFFs",
+            unit="slice",
+        )
 
     def _perform_registration(self, fixed: ants.ANTsImage, moving: ants.ANTsImage, 
                             reg_type: str, **kwargs) -> Dict:

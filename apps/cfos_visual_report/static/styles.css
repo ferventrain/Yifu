@@ -281,6 +281,35 @@ button:disabled {
   cursor: not-allowed;
 }
 
+.region-color-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.65rem;
+  align-items: center;
+  max-width: 420px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.region-color-legend.hidden {
+  display: none;
+}
+
+.region-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+
+.region-legend-item i {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 2px;
+  display: inline-block;
+  border: 1px solid rgba(15, 23, 42, 0.2);
+}
+
 .bregma-label {
   display: block;
   margin-top: 0.15rem;
@@ -819,6 +848,14 @@ input[type="text"] {
   color: var(--accent-strong);
   font-weight: 600;
   min-width: 3rem;
+}
+
+.tree-color-swatch {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 2px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(15, 23, 42, 0.25);
 }
 
 .tree-item .count {

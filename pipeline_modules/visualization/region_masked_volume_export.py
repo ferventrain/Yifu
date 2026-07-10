@@ -9,13 +9,20 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import tifffile
 from tqdm import tqdm
 
-from pipeline_modules.preprocessing.tiff_to_zarr import parse_channel_list, resolve_tiff_workers
+from pipeline_modules.preprocessing.tiff_to_zarr import parse_channel_list
+from pipeline_modules.utils.tiff_stack_io import (
+    iter_batch_ranges,
+    normalize_tiff_compression,
+    resolve_slice_batch as resolve_batch_size,
+    resolve_stack_workers,
+    stack_tiff_paths,
+)
 from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
 from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
     _collect_subtree_ids,
@@ -172,7 +179,7 @@ def _resolve_source_mode(
     label_tiff_dir: Path | None,
     signal_zarr_path: Path | None,
     label_zarr_path: Path | None,
-) -> Literal["tiff", "zarr"]:
+) -> Literal["tiff", "tiff_zarr", "zarr"]:
     mode = str(source).strip().lower()
     if mode not in SOURCE_CHOICES:
         raise ValueError(f"source must be one of {SOURCE_CHOICES}, got: {source!r}")
@@ -182,27 +189,57 @@ def _resolve_source_mode(
     signal_zarr = signal_zarr_path or layout.signal_zarr
     label_zarr = label_zarr_path or layout.atlas_label_zarr
 
-    tiff_ready = signal_tiff.is_dir() and label_tiff.is_dir()
+    signal_tiff_ready = signal_tiff.is_dir()
+    label_tiff_ready = label_tiff.is_dir()
+    tiff_ready = signal_tiff_ready and label_tiff_ready
+    tiff_zarr_ready = signal_tiff_ready and label_zarr.exists()
     zarr_ready = label_zarr.exists() and (signal_zarr.exists() if signal_zarr else True)
 
     if mode == "tiff":
-        if not tiff_ready:
-            raise FileNotFoundError(
-                f"TIFF export requested but stacks are missing: signal={signal_tiff}, label={label_tiff}"
-            )
-        return "tiff"
+        if tiff_ready:
+            return "tiff"
+        if tiff_zarr_ready:
+            return "tiff_zarr"
+        raise FileNotFoundError(
+            "TIFF export requested but required inputs are missing. "
+            f"Need signal TIFF dir ({signal_tiff}) plus either label TIFF dir ({label_tiff}) "
+            f"or label Zarr ({label_zarr})."
+        )
     if mode == "zarr":
         if not label_zarr.exists():
             raise FileNotFoundError(f"Zarr export requested but label Zarr is missing: {label_zarr}")
         return "zarr"
     if tiff_ready:
         return "tiff"
+    if tiff_zarr_ready:
+        return "tiff_zarr"
     if zarr_ready:
         return "zarr"
     raise FileNotFoundError(
-        "Could not resolve export source. Expected TIFF stacks "
-        f"({signal_tiff} + {label_tiff}) or Zarr stores ({signal_zarr} + {label_zarr})."
+        "Could not resolve export source. Expected signal TIFF + label TIFF, "
+        f"signal TIFF + label Zarr, or Zarr stores ({signal_zarr} + {label_zarr}). "
+        f"Checked signal_tiff={signal_tiff}, label_tiff={label_tiff}, label_zarr={label_zarr}."
     )
+
+
+def _normalize_compression(compression: str | None) -> str | None:
+    return normalize_tiff_compression(compression)
+
+
+def resolve_export_workers(workers: int) -> int:
+    return resolve_stack_workers(workers)
+
+
+def resolve_slice_batch(read_batch: int | None, *, use_label_zarr: bool) -> int:
+    return resolve_batch_size(read_batch, default=16 if use_label_zarr else 8)
+
+
+def _stack_tiff_paths(paths: list[Path]) -> np.ndarray:
+    return stack_tiff_paths(paths)
+
+
+def _iter_batch_ranges(depth: int, batch_size: int):
+    return iter_batch_ranges(depth, batch_size)
 
 
 def _default_output_dir(
@@ -215,33 +252,161 @@ def _default_output_dir(
     return sample_dir / "visualization" / "region_masked" / f"{signal_ch}_{region_slug}_{export_mode}"
 
 
-def _process_tiff_slice_job(job: dict[str, object]) -> tuple[int, int, int]:
-    label_slice = np.asarray(tifffile.imread(str(job["label_path"])))
-    signal_slice = (
-        np.asarray(tifffile.imread(str(job["signal_path"])))
-        if job.get("signal_path") is not None
+def _get_cached_zarr_array(zarr_path: str, dataset_name: str = "0") -> Any:
+    cache_key = f"{zarr_path}:{dataset_name}"
+    if not hasattr(_get_cached_zarr_array, "_cache"):
+        _get_cached_zarr_array._cache = {}  # type: ignore[attr-defined]
+    cache: dict[str, Any] = _get_cached_zarr_array._cache  # type: ignore[attr-defined]
+    if cache_key not in cache:
+        cache[cache_key] = open_zarr_dataset(Path(zarr_path), dataset_name=dataset_name)
+    return cache[cache_key]
+
+
+def _get_cached_label_array(label_zarr_path: str, dataset_name: str = "0") -> Any:
+    return _get_cached_zarr_array(label_zarr_path, dataset_name)
+
+
+def _process_tiff_batch_job(job: dict[str, object]) -> tuple[int, int, int]:
+    start = int(job["start"])
+    end = int(job["end"])
+    export_mode = str(job["export_mode"])
+    region_id_array = job["region_id_array"]
+    save_dtype = job["save_dtype"]  # type: ignore[assignment]
+    foreground_label = int(job["foreground_label"])
+    compression = _normalize_compression(job.get("compression"))  # type: ignore[arg-type]
+
+    if job.get("label_zarr_path") is not None:
+        label_arr = _get_cached_label_array(
+            str(job["label_zarr_path"]),
+            str(job.get("label_dataset") or "0"),
+        )
+        label_batch = np.asarray(label_arr[start:end])
+    else:
+        label_batch = _stack_tiff_paths(job["label_paths"])  # type: ignore[arg-type]
+
+    signal_batch = (
+        _stack_tiff_paths(job["signal_paths"])  # type: ignore[arg-type]
+        if job.get("signal_paths") is not None
         else None
     )
-    mask_slice = (
-        np.asarray(tifffile.imread(str(job["mask_path"])))
-        if job.get("mask_path") is not None
+    mask_batch = (
+        _stack_tiff_paths(job["mask_paths"])  # type: ignore[arg-type]
+        if job.get("mask_paths") is not None
         else None
     )
-    slice_out = _render_masked_slice(
-        export_mode=str(job["export_mode"]),
-        label_slice=label_slice,
-        region_id_array=job["region_id_array"],  # type: ignore[arg-type]
-        save_dtype=job["save_dtype"],  # type: ignore[arg-type]
-        signal_slice=signal_slice,
-        mask_slice=mask_slice,
-        foreground_label=int(job["foreground_label"]),
-    )
-    tifffile.imwrite(str(job["output_path"]), slice_out, compression=job["compression"])
-    return (
-        int(job["z_index"]),
-        int(np.any(slice_out)),
-        int(np.count_nonzero(slice_out)),
-    )
+
+    written_slices = 0
+    nonempty_slices = 0
+    nonzero_voxels = 0
+    for offset, z_index in enumerate(range(start, end)):
+        label_slice = label_batch[offset]
+        signal_slice = signal_batch[offset] if signal_batch is not None else None
+        mask_slice = mask_batch[offset] if mask_batch is not None else None
+        slice_out = _render_masked_slice(
+            export_mode=export_mode,
+            label_slice=label_slice,
+            region_id_array=region_id_array,  # type: ignore[arg-type]
+            save_dtype=save_dtype,
+            signal_slice=signal_slice,
+            mask_slice=mask_slice,
+            foreground_label=foreground_label,
+        )
+        tifffile.imwrite(str(job["output_paths"][offset]), slice_out, compression=compression)
+        written_slices += 1
+        if np.any(slice_out):
+            nonempty_slices += 1
+            nonzero_voxels += int(np.count_nonzero(slice_out))
+    return written_slices, nonempty_slices, nonzero_voxels
+
+
+def _process_zarr_batch_job(job: dict[str, object]) -> tuple[int, int, int]:
+    start = int(job["start"])
+    end = int(job["end"])
+    export_mode = str(job["export_mode"])
+    region_id_array = job["region_id_array"]
+    save_dtype = job["save_dtype"]  # type: ignore[assignment]
+    foreground_label = int(job["foreground_label"])
+    compression = _normalize_compression(job.get("compression"))  # type: ignore[arg-type]
+
+    label_arr = _get_cached_zarr_array(str(job["label_zarr_path"]), str(job.get("label_dataset") or "0"))
+    label_batch = np.asarray(label_arr[start:end])
+    signal_batch = None
+    if job.get("signal_zarr_path") is not None:
+        signal_arr = _get_cached_zarr_array(str(job["signal_zarr_path"]), str(job.get("dataset_name") or "0"))
+        signal_batch = np.asarray(signal_arr[start:end])
+    mask_batch = None
+    if job.get("mask_zarr_path") is not None:
+        mask_arr = _get_cached_zarr_array(str(job["mask_zarr_path"]), str(job.get("dataset_name") or "0"))
+        mask_batch = np.asarray(mask_arr[start:end])
+
+    written_slices = 0
+    nonempty_slices = 0
+    nonzero_voxels = 0
+    for offset, z_index in enumerate(range(start, end)):
+        slice_out = _render_masked_slice(
+            export_mode=export_mode,
+            label_slice=label_batch[offset],
+            region_id_array=region_id_array,  # type: ignore[arg-type]
+            save_dtype=save_dtype,
+            signal_slice=signal_batch[offset] if signal_batch is not None else None,
+            mask_slice=mask_batch[offset] if mask_batch is not None else None,
+            foreground_label=foreground_label,
+        )
+        tifffile.imwrite(str(job["output_paths"][offset]), slice_out, compression=compression)
+        written_slices += 1
+        if np.any(slice_out):
+            nonempty_slices += 1
+            nonzero_voxels += int(np.count_nonzero(slice_out))
+    return written_slices, nonempty_slices, nonzero_voxels
+
+
+def _run_tiff_batch_jobs(
+    jobs: list[dict[str, object]],
+    *,
+    worker_count: int,
+    region_slug: str,
+    export_mode: str,
+    worker_fn=_process_tiff_batch_job,
+) -> tuple[int, int]:
+    written_slices = 0
+    nonzero_voxels = 0
+    total_slices = sum(int(job["end"]) - int(job["start"]) for job in jobs)
+    if worker_count <= 1:
+        iterator = jobs
+        if sys.stderr.isatty():
+            iterator = tqdm(jobs, desc=f"Export {region_slug} {export_mode}", unit="batch", leave=False, file=sys.stderr)
+        for job in iterator:
+            _, nonempty, nonzero = worker_fn(job)
+            written_slices += nonempty
+            nonzero_voxels += nonzero
+        return written_slices, nonzero_voxels
+
+    max_in_flight = max(1, min(worker_count + 1, len(jobs)))
+    pending: dict[object, None] = {}
+    job_iter = iter(jobs)
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        def submit_next() -> None:
+            try:
+                pending[pool.submit(worker_fn, next(job_iter))] = None
+            except StopIteration:
+                return
+
+        for _ in range(max_in_flight):
+            submit_next()
+        progress = tqdm(total=total_slices, desc=f"Export {region_slug} {export_mode}", unit="slice", leave=False, file=sys.stderr)
+        try:
+            while pending:
+                for future in as_completed(list(pending)):
+                    pending.pop(future)
+                    batch_written, nonempty, nonzero = future.result()
+                    progress.update(batch_written)
+                    written_slices += nonempty
+                    nonzero_voxels += nonzero
+                    submit_next()
+                    break
+        finally:
+            progress.close()
+    return written_slices, nonzero_voxels
 
 
 def export_region_masked_volume_tiffs_from_tiff(
@@ -252,7 +417,9 @@ def export_region_masked_volume_tiffs_from_tiff(
     cfg_path: str | Path | None = None,
     signal_tiff_dir: str | Path | None = None,
     label_tiff_dir: str | Path | None = None,
+    label_zarr_path: str | Path | None = None,
     mask_tiff_dir: str | Path | None = None,
+    dataset_name: str = "0",
     config_path: str | Path | None = None,
     signal_ch: str | None = None,
     foreground_label: int = 1,
@@ -262,6 +429,7 @@ def export_region_masked_volume_tiffs_from_tiff(
     output_dtype: str = "preserve",
     compression: str = "lzw",
     workers: int = 0,
+    slice_batch: int | None = None,
     mirror_input_filenames: bool = False,
 ) -> dict[str, object]:
     if export_mode not in EXPORT_MODES:
@@ -273,30 +441,57 @@ def export_region_masked_volume_tiffs_from_tiff(
     layout = SampleLayout(sample_dir=sample_dir, signal_ch=resolved_signal_ch, reg_ch=str(defaults["register_ch"]))
 
     signal_dir = Path(signal_tiff_dir or layout.signal_tiff_dir)
-    label_dir = Path(label_tiff_dir or layout.atlas_label_tiff_dir)
+    label_dir = Path(label_tiff_dir) if label_tiff_dir else layout.atlas_label_tiff_dir
+    label_zarr = Path(label_zarr_path or layout.atlas_label_zarr)
     mask_dir = Path(mask_tiff_dir) if mask_tiff_dir else None
     if export_mode == "mask" and mask_dir is None:
         mask_dir = layout.mask_tiff_dir
     if export_mode == "signal" and not signal_dir.is_dir():
         raise FileNotFoundError(f"Signal TIFF directory not found: {signal_dir}")
-    if not label_dir.is_dir():
-        raise FileNotFoundError(f"Atlas label TIFF directory not found: {label_dir}")
+
+    use_label_zarr = not label_dir.is_dir()
+    if use_label_zarr:
+        if not label_zarr.exists():
+            raise FileNotFoundError(
+                f"Atlas label TIFF directory not found ({label_dir}) and label Zarr missing: {label_zarr}"
+            )
+        label_arr = open_zarr_dataset(label_zarr, dataset_name=dataset_name)
+        label_files = None
+    else:
+        label_arr = None
+        label_files = _list_tiff_stack(label_dir)
 
     signal_files: list[Path] | None
+    mask_files: list[Path] | None = None
     if export_mode == "signal":
-        signal_files, label_files, mask_files = _pair_tiff_stacks(signal_dir, label_dir, mask_dir)
+        signal_files = _list_tiff_stack(signal_dir)
+        if use_label_zarr:
+            if label_arr is None:
+                raise RuntimeError("label Zarr array was not opened")
+            if len(signal_files) != int(label_arr.shape[0]):
+                raise ValueError(
+                    f"Signal TIFF count must match label Zarr depth, "
+                    f"got {len(signal_files)} vs {label_arr.shape[0]}"
+                )
+        else:
+            signal_files, label_files, mask_files = _pair_tiff_stacks(signal_dir, label_dir, mask_dir)
     else:
-        label_files = _list_tiff_stack(label_dir)
         signal_files = None
-        mask_files = _list_tiff_stack(mask_dir) if mask_dir is not None else None
-        if mask_files is not None and len(mask_files) != len(label_files):
-            raise ValueError(
-                f"Mask TIFF stack must match label slice count, got {len(mask_files)} vs {len(label_files)}"
-            )
+        if not use_label_zarr and label_files is not None:
+            mask_files = _list_tiff_stack(mask_dir) if mask_dir is not None else None
+            if mask_files is not None and len(mask_files) != len(label_files):
+                raise ValueError(
+                    f"Mask TIFF stack must match label slice count, got {len(mask_files)} vs {len(label_files)}"
+                )
+        elif use_label_zarr:
+            raise ValueError("export_mode=region/mask with label Zarr requires label TIFF stacks for now")
 
     region_cfg = Path(cfg_path or DEFAULT_REGION_CFG)
     subtree_ids, region_slug, region_name = resolve_region_subtree_ids(region_query, cfg_path=region_cfg)
-    label_sample = np.asarray(tifffile.imread(str(label_files[0])))
+    if use_label_zarr:
+        label_sample = np.asarray(label_arr[0])
+    else:
+        label_sample = np.asarray(tifffile.imread(str(label_files[0])))
     signal_sample = (
         np.asarray(tifffile.imread(str(signal_files[0])))
         if signal_files is not None
@@ -322,68 +517,48 @@ def export_region_masked_volume_tiffs_from_tiff(
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    slice_count = len(signal_files) if signal_files is not None else len(label_files or [])
+    read_batch = resolve_slice_batch(slice_batch, use_label_zarr=use_label_zarr)
     jobs: list[dict[str, object]] = []
-    for z_index, label_path in enumerate(label_files):
-        if mirror_input_filenames and signal_files is not None:
-            output_name = signal_files[z_index].name
+    for start, end in _iter_batch_ranges(slice_count, read_batch):
+        output_paths: list[Path] = []
+        for z_index in range(start, end):
+            if mirror_input_filenames and signal_files is not None:
+                output_name = signal_files[z_index].name
+            else:
+                output_name = f"{filename_prefix}{z_index:0{z_pad}d}.tiff"
+            output_paths.append(out_dir / output_name)
+
+        job: dict[str, object] = {
+            "start": start,
+            "end": end,
+            "signal_paths": signal_files[start:end] if signal_files is not None else None,
+            "mask_paths": mask_files[start:end] if mask_files is not None else None,
+            "output_paths": output_paths,
+            "export_mode": export_mode,
+            "region_id_array": region_id_array,
+            "save_dtype": save_dtype,
+            "foreground_label": foreground_label,
+            "compression": compression,
+        }
+        if use_label_zarr:
+            job["label_zarr_path"] = str(label_zarr)
+            job["label_dataset"] = dataset_name
         else:
-            output_name = f"{filename_prefix}{z_index:0{z_pad}d}.tiff"
-        jobs.append(
-            {
-                "z_index": z_index,
-                "label_path": label_path,
-                "signal_path": signal_files[z_index] if signal_files is not None else None,
-                "mask_path": mask_files[z_index] if mask_files is not None else None,
-                "output_path": out_dir / output_name,
-                "export_mode": export_mode,
-                "region_id_array": region_id_array,
-                "save_dtype": save_dtype,
-                "foreground_label": foreground_label,
-                "compression": compression,
-            }
-        )
+            job["label_paths"] = label_files[start:end]
+        jobs.append(job)
 
-    worker_count = resolve_tiff_workers(workers)
-    written_slices = 0
-    nonzero_voxels = 0
-    if worker_count <= 1:
-        iterator = jobs
-        if sys.stderr.isatty():
-            iterator = tqdm(jobs, desc=f"Export {region_slug} {export_mode}", unit="slice", leave=False, file=sys.stderr)
-        for job in iterator:
-            _, nonempty, nonzero = _process_tiff_slice_job(job)
-            written_slices += nonempty
-            nonzero_voxels += nonzero
-    else:
-        max_in_flight = max(1, min(worker_count + 1, len(jobs)))
-        pending: dict[object, None] = {}
-        job_iter = iter(jobs)
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            def submit_next() -> None:
-                try:
-                    pending[pool.submit(_process_tiff_slice_job, next(job_iter))] = None
-                except StopIteration:
-                    return
-
-            for _ in range(max_in_flight):
-                submit_next()
-            progress = tqdm(total=len(jobs), desc=f"Export {region_slug} {export_mode}", unit="slice", leave=False, file=sys.stderr)
-            try:
-                while pending:
-                    for future in as_completed(list(pending)):
-                        pending.pop(future)
-                        _, nonempty, nonzero = future.result()
-                        written_slices += nonempty
-                        nonzero_voxels += nonzero
-                        progress.update(1)
-                        submit_next()
-                        break
-            finally:
-                progress.close()
+    worker_count = resolve_export_workers(workers)
+    written_slices, nonzero_voxels = _run_tiff_batch_jobs(
+        jobs,
+        worker_count=worker_count,
+        region_slug=region_slug,
+        export_mode=export_mode,
+    )
 
     summary = {
         "sample_dir": str(sample_dir),
-        "source": "tiff",
+        "source": "tiff_zarr" if use_label_zarr else "tiff",
         "region_query": region_query,
         "region_name": region_name,
         "region_slug": region_slug,
@@ -391,16 +566,18 @@ def export_region_masked_volume_tiffs_from_tiff(
         "export_mode": export_mode,
         "signal_ch": resolved_signal_ch,
         "signal_tiff_dir": str(signal_dir) if export_mode == "signal" else None,
-        "label_tiff_dir": str(label_dir),
+        "label_tiff_dir": str(label_dir) if label_dir.is_dir() else None,
+        "label_zarr": str(label_zarr) if use_label_zarr else None,
         "mask_tiff_dir": str(mask_dir) if mask_dir else None,
         "output_dir": str(out_dir),
         "filename_prefix": filename_prefix,
         "mirror_input_filenames": mirror_input_filenames,
-        "slice_count": len(label_files),
+        "slice_count": slice_count,
         "nonempty_slices": written_slices,
         "nonzero_voxels": nonzero_voxels,
         "output_dtype": str(save_dtype),
         "workers": worker_count,
+        "slice_batch": read_batch,
     }
     summary_path = out_dir / f"{resolved_signal_ch}_{region_slug}_{export_mode}_summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
@@ -427,6 +604,8 @@ def export_region_masked_volume_tiffs_from_zarr(
     z_pad: int = 6,
     output_dtype: str = "preserve",
     compression: str = "lzw",
+    workers: int = 0,
+    slice_batch: int | None = None,
 ) -> dict[str, object]:
     if export_mode not in EXPORT_MODES:
         raise ValueError(f"export_mode must be one of {EXPORT_MODES}, got: {export_mode!r}")
@@ -476,26 +655,35 @@ def export_region_masked_volume_tiffs_from_zarr(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     depth = int(label_arr.shape[0])
-    written_slices = 0
-    nonzero_voxels = 0
-    for z_index in tqdm(range(depth), desc=f"Export {region_slug} {export_mode}", unit="slice", leave=False, file=sys.stderr):
-        label_slice = np.asarray(label_arr[z_index])
-        signal_slice = np.asarray(signal_arr[z_index]) if signal_arr is not None else None
-        mask_slice = np.asarray(mask_arr[z_index]) if mask_arr is not None else None
-        slice_out = _render_masked_slice(
-            export_mode=export_mode,
-            label_slice=label_slice,
-            region_id_array=region_id_array,
-            save_dtype=save_dtype,
-            signal_slice=signal_slice,
-            mask_slice=mask_slice,
-            foreground_label=foreground_label,
+    read_batch = resolve_batch_size(slice_batch, default=16)
+    worker_count = resolve_export_workers(workers)
+    jobs: list[dict[str, object]] = []
+    for start, end in _iter_batch_ranges(depth, read_batch):
+        output_paths = [out_dir / f"{filename_prefix}{z_index:0{z_pad}d}.tiff" for z_index in range(start, end)]
+        jobs.append(
+            {
+                "start": start,
+                "end": end,
+                "label_zarr_path": str(label_path),
+                "signal_zarr_path": str(signal_path) if signal_path else None,
+                "mask_zarr_path": str(mask_path) if mask_path else None,
+                "dataset_name": dataset_name,
+                "output_paths": output_paths,
+                "export_mode": export_mode,
+                "region_id_array": region_id_array,
+                "save_dtype": save_dtype,
+                "foreground_label": foreground_label,
+                "compression": compression,
+            }
         )
-        if np.any(slice_out):
-            written_slices += 1
-            nonzero_voxels += int(np.count_nonzero(slice_out))
-        output_path = out_dir / f"{filename_prefix}{z_index:0{z_pad}d}.tiff"
-        tifffile.imwrite(str(output_path), slice_out, compression=compression)
+
+    written_slices, nonzero_voxels = _run_tiff_batch_jobs(
+        jobs,
+        worker_count=worker_count,
+        region_slug=region_slug,
+        export_mode=export_mode,
+        worker_fn=_process_zarr_batch_job,
+    )
 
     summary = {
         "sample_dir": str(sample_dir),
@@ -515,6 +703,8 @@ def export_region_masked_volume_tiffs_from_zarr(
         "nonempty_slices": written_slices,
         "nonzero_voxels": nonzero_voxels,
         "output_dtype": str(save_dtype),
+        "workers": worker_count,
+        "slice_batch": read_batch,
     }
     summary_path = out_dir / f"{resolved_signal_ch}_{region_slug}_{export_mode}_summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
@@ -546,6 +736,7 @@ def export_region_masked_volume_tiffs(
     output_dtype: str = "preserve",
     compression: str = "lzw",
     workers: int = 0,
+    slice_batch: int | None = None,
     mirror_input_filenames: bool = False,
 ) -> dict[str, object]:
     sample_dir = Path(sample_dir)
@@ -560,17 +751,19 @@ def export_region_masked_volume_tiffs(
         signal_zarr_path=Path(signal_zarr_path) if signal_zarr_path else None,
         label_zarr_path=Path(label_zarr_path) if label_zarr_path else None,
     )
-    if resolved_source == "tiff":
+    if resolved_source in ("tiff", "tiff_zarr"):
         return export_region_masked_volume_tiffs_from_tiff(
             sample_dir=sample_dir,
             region_query=region_query,
             output_dir=output_dir,
             cfg_path=cfg_path,
             signal_tiff_dir=signal_tiff_dir,
-            label_tiff_dir=label_tiff_dir,
+            label_tiff_dir=label_tiff_dir if resolved_source == "tiff" else None,
+            label_zarr_path=label_zarr_path,
             mask_tiff_dir=mask_tiff_dir,
             config_path=config_path,
             signal_ch=resolved_signal_ch,
+            dataset_name=dataset_name,
             foreground_label=foreground_label,
             export_mode=export_mode,
             filename_prefix=filename_prefix,
@@ -578,6 +771,7 @@ def export_region_masked_volume_tiffs(
             output_dtype=output_dtype,
             compression=compression,
             workers=workers,
+            slice_batch=slice_batch,
             mirror_input_filenames=mirror_input_filenames,
         )
     return export_region_masked_volume_tiffs_from_zarr(
@@ -597,6 +791,8 @@ def export_region_masked_volume_tiffs(
         z_pad=z_pad,
         output_dtype=output_dtype,
         compression=compression,
+        workers=workers,
+        slice_batch=slice_batch,
     )
 
 
@@ -617,6 +813,7 @@ def export_region_masked_volume_tiffs_for_channels(
     output_dtype: str = "preserve",
     compression: str = "lzw",
     workers: int = 0,
+    slice_batch: int | None = None,
     source: str = "auto",
     mirror_input_filenames: bool = False,
     output_root: str | Path | None = None,
@@ -656,6 +853,7 @@ def export_region_masked_volume_tiffs_for_channels(
                 output_dtype=output_dtype,
                 compression=compression,
                 workers=workers,
+                slice_batch=slice_batch,
                 mirror_input_filenames=mirror_input_filenames,
             )
         except (FileNotFoundError, ValueError) as exc:
@@ -746,7 +944,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=0,
-        help="Parallel slice workers for TIFF mode. 0 uses cpu_count // 2.",
+        help="Parallel batch workers for TIFF mode. 0 caps at 4 to reduce disk contention on network drives.",
+    )
+    parser.add_argument(
+        "--slice-batch",
+        type=int,
+        default=0,
+        help="Slices processed per worker batch. 0 uses 16 with label Zarr, 8 with label TIFF.",
     )
     parser.add_argument(
         "--mirror-input-filenames",
@@ -763,7 +967,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compression",
         default="lzw",
-        help="TIFF compression passed to tifffile.imwrite (use '' for none)",
+        help="TIFF compression for tifffile.imwrite. Use 'none' or --no-compression for fastest writes.",
+    )
+    parser.add_argument(
+        "--no-compression",
+        action="store_true",
+        help="Write uncompressed TIFF slices (faster; larger files).",
     )
     return parser
 
@@ -771,6 +980,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    compression = None if args.no_compression else _normalize_compression(args.compression)
     common_kwargs = {
         "sample_dir": args.sample_dir,
         "region_query": args.region,
@@ -785,8 +995,9 @@ def main(argv: list[str] | None = None) -> int:
         "filename_prefix": args.filename_prefix,
         "z_pad": int(args.z_pad),
         "output_dtype": args.output_dtype,
-        "compression": args.compression or None,
+        "compression": compression,
         "workers": int(args.workers),
+        "slice_batch": int(args.slice_batch) or None,
         "mirror_input_filenames": bool(args.mirror_input_filenames),
     }
     if args.channels:

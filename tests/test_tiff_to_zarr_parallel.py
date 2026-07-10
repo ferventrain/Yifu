@@ -11,6 +11,8 @@ from pipeline_modules.preprocessing.tiff_to_zarr import (
     convert_tiff_to_zarr,
     normalize_channel_label,
     parse_channel_list,
+    resolve_max_in_flight,
+    resolve_read_z_chunk,
     resolve_tiff_workers,
 )
 
@@ -18,9 +20,23 @@ from pipeline_modules.preprocessing.tiff_to_zarr import (
 class TiffToZarrParallelTests(unittest.TestCase):
     def test_resolve_tiff_workers_auto(self):
         with mock.patch("pipeline_modules.preprocessing.tiff_to_zarr.os.cpu_count", return_value=16):
+            self.assertEqual(resolve_tiff_workers(0), 4)
+            self.assertEqual(resolve_tiff_workers(0, read_z_chunk=256, zarr_z_chunk=256), 2)
+        with mock.patch("pipeline_modules.preprocessing.tiff_to_zarr.os.cpu_count", return_value=128):
             self.assertEqual(resolve_tiff_workers(0), 8)
+            self.assertEqual(resolve_tiff_workers(0, read_z_chunk=256, zarr_z_chunk=256), 2)
         with mock.patch("pipeline_modules.preprocessing.tiff_to_zarr.os.cpu_count", return_value=2):
             self.assertEqual(resolve_tiff_workers(0), 1)
+
+    def test_resolve_read_z_chunk_aligns_with_zarr_chunk(self):
+        self.assertEqual(resolve_read_z_chunk(256, None), 256)
+        self.assertEqual(resolve_read_z_chunk(256, 0), 256)
+        self.assertEqual(resolve_read_z_chunk(128, None), 128)
+        self.assertEqual(resolve_read_z_chunk(256, 8), 8)
+
+    def test_resolve_max_in_flight_caps_full_z_slab_reads(self):
+        self.assertEqual(resolve_max_in_flight(8, 20, 256, 256), 2)
+        self.assertEqual(resolve_max_in_flight(1, 20, 8, 256), 2)
 
     def test_parse_channel_list(self):
         self.assertEqual(parse_channel_list("0,1,ch2"), ["ch0", "ch1", "ch2"])
@@ -43,6 +59,7 @@ class TiffToZarrParallelTests(unittest.TestCase):
             )
             self.assertTrue(result["success"])
             self.assertEqual(result["workers"], 2)
+            self.assertEqual(result["read_z_chunk"], 2)
             self.assertTrue(output_zarr.exists())
 
             import zarr
