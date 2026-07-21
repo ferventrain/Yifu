@@ -66,6 +66,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-dir", type=str, default=None, help="Override image directory. Default: <data-root>/image")
     parser.add_argument("--mask-dir", type=str, default=None, help="Override mask directory. Default: <data-root>/mask")
     parser.add_argument(
+        "--val-image-dir",
+        type=str,
+        default=None,
+        help="Optional fixed validation image directory. When set with --val-mask-dir, skips --val-ratio splitting.",
+    )
+    parser.add_argument(
+        "--val-mask-dir",
+        type=str,
+        default=None,
+        help="Optional fixed validation mask directory used with --val-image-dir.",
+    )
+    parser.add_argument(
         "--reference-image-dir",
         type=str,
         default=None,
@@ -179,6 +191,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ce-weight", type=float, default=0.5, help="Classification loss weight in total loss.")
     parser.add_argument("--dice-weight", type=float, default=0.5, help="Dice loss weight in total loss.")
+    parser.add_argument(
+        "--empty-fp-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for empty-mask false-positive penalty L_empty=mean(p_fg) on samples whose GT "
+            "foreground is empty. Set >0 to suppress vessel-like FPs on all-black masks."
+        ),
+    )
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma.")
     parser.add_argument(
         "--focal-alpha",
@@ -440,8 +461,10 @@ def find_mask_path(mask_dir: Path, image_path: Path) -> Path:
 
 def collect_samples(image_dir: Path, mask_dir: Path) -> List[Dict[str, str]]:
     image_paths = sorted(list(image_dir.glob("*.tif")) + list(image_dir.glob("*.tiff")))
+    # Allow image/mask to share one folder: ignore annotation files named *_mask.tif(f).
+    image_paths = [path for path in image_paths if not path.stem.lower().endswith("_mask")]
     if not image_paths:
-        raise FileNotFoundError("No .tif or .tiff files found in {}.".format(image_dir))
+        raise FileNotFoundError("No .tif or .tiff image files found in {}.".format(image_dir))
 
     samples = []
     for image_path in image_paths:
@@ -885,6 +908,45 @@ class DiceLoss(nn.Module):
         return torch.stack(dice_losses, dim=0).mean()
 
 
+def empty_false_positive_loss(logits: torch.Tensor, target: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """Penalize mean foreground probability on samples whose GT mask is empty.
+
+    L_empty = mean_b[ 1[sum(target_b)==0] * mean(p_fg_b) ]
+    Non-empty samples contribute 0. If the batch has no empty sample, returns 0.
+    """
+    if num_classes < 2:
+        return logits.new_zeros(())
+    probs = torch.softmax(logits, dim=1)
+    fg_prob = probs[:, 1]
+    flat_target = target.view(target.size(0), -1)
+    empty = flat_target.sum(dim=1) == 0
+    if not bool(empty.any()):
+        return logits.new_zeros(())
+    per_sample = fg_prob.view(fg_prob.size(0), -1).mean(dim=1)
+    return per_sample[empty].mean()
+
+
+def combine_segmentation_losses(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    cls_loss_fn: nn.Module,
+    dice_loss: DiceLoss,
+    num_classes: int,
+    ce_weight: float,
+    dice_weight: float,
+    empty_fp_weight: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    loss_cls = cls_loss_fn(logits, target)
+    loss_dice = dice_loss(logits, target)
+    if empty_fp_weight > 0:
+        loss_empty = empty_false_positive_loss(logits, target, num_classes)
+    else:
+        loss_empty = logits.new_zeros(())
+    loss = ce_weight * loss_cls + dice_weight * loss_dice + float(empty_fp_weight) * loss_empty
+    return loss, loss_cls, loss_dice, loss_empty
+
+
 class FocalLoss(nn.Module):
     def __init__(self, num_classes: int, gamma: float = 2.0, alpha: float = 0.85) -> None:
         super(FocalLoss, self).__init__()
@@ -1045,6 +1107,7 @@ def run_epoch(
     num_classes: int,
     ce_weight: float,
     dice_weight: float,
+    empty_fp_weight: float,
     use_amp: bool,
     accumulate_steps: int,
     phase_name: str,
@@ -1061,6 +1124,7 @@ def run_epoch(
     total_loss = 0.0
     total_cls = 0.0
     total_dice_loss = 0.0
+    total_empty_loss = 0.0
     total_metrics = {"dice": 0.0, "iou": 0.0, "precision": 0.0, "recall": 0.0}
     global_tp = global_fp = global_fn = 0.0
 
@@ -1075,9 +1139,16 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             with autocast_context(device_type=device_type, enabled=use_amp):
                 logits = model(images)
-                loss_cls = cls_loss_fn(logits, masks)
-                loss_dice = dice_loss(logits, masks)
-                loss = ce_weight * loss_cls + dice_weight * loss_dice
+                loss, loss_cls, loss_dice, loss_empty = combine_segmentation_losses(
+                    logits,
+                    masks,
+                    cls_loss_fn=cls_loss_fn,
+                    dice_loss=dice_loss,
+                    num_classes=num_classes,
+                    ce_weight=ce_weight,
+                    dice_weight=dice_weight,
+                    empty_fp_weight=empty_fp_weight,
+                )
 
             if is_train:
                 scaled_loss = loss / max(accumulate_steps, 1)
@@ -1101,6 +1172,7 @@ def run_epoch(
         total_loss += loss.item()
         total_cls += loss_cls.item()
         total_dice_loss += loss_dice.item()
+        total_empty_loss += float(loss_empty.item())
         for key in total_metrics:
             total_metrics[key] += batch_metrics[key]
 
@@ -1131,6 +1203,7 @@ def run_epoch(
         "loss": total_loss / num_batches,
         "loss_cls": total_cls / num_batches,
         "loss_dice": total_dice_loss / num_batches,
+        "loss_empty": total_empty_loss / num_batches,
     }
     for key in total_metrics:
         results[key] = total_metrics[key] / num_batches
@@ -1158,6 +1231,7 @@ def validate_sliding_window(
     device: torch.device,
     ce_weight: float,
     dice_weight: float,
+    empty_fp_weight: float,
     overlap: float,
     phase_name: str,
     epoch: int,
@@ -1170,7 +1244,7 @@ def validate_sliding_window(
     stride_w = max(1, int(round(tile_w * (1.0 - overlap))))
 
     dice_scores, iou_scores, prec_scores, recall_scores = [], [], [], []
-    loss_list, loss_cls_list, loss_dice_list = [], [], []
+    loss_list, loss_cls_list, loss_dice_list, loss_empty_list = [], [], [], []
     global_tp = global_fp = global_fn = 0.0
 
     iterator = tqdm(val_samples, desc="{} epoch {}".format(phase_name, epoch), leave=False) if show_progress_bar else val_samples
@@ -1205,9 +1279,16 @@ def validate_sliding_window(
         mask_t = torch.from_numpy(mask_np.astype(np.int64))[None, ...].to(device)
 
         with torch.no_grad():
-            loss_cls = cls_loss_fn(logits_full, mask_t)
-            loss_dice_val = dice_loss(logits_full, mask_t)
-            loss = ce_weight * loss_cls + dice_weight * loss_dice_val
+            loss, loss_cls, loss_dice_val, loss_empty = combine_segmentation_losses(
+                logits_full,
+                mask_t,
+                cls_loss_fn=cls_loss_fn,
+                dice_loss=dice_loss,
+                num_classes=num_classes,
+                ce_weight=ce_weight,
+                dice_weight=dice_weight,
+                empty_fp_weight=empty_fp_weight,
+            )
 
         m = compute_metrics(logits_full, mask_t, num_classes)
         pred = torch.argmax(logits_full, dim=1)
@@ -1222,6 +1303,7 @@ def validate_sliding_window(
         loss_list.append(loss.item())
         loss_cls_list.append(loss_cls.item())
         loss_dice_list.append(loss_dice_val.item())
+        loss_empty_list.append(float(loss_empty.item()))
 
         del image_t, logits_acc, count_acc, logits_full, mask_t
 
@@ -1229,6 +1311,7 @@ def validate_sliding_window(
         "loss": float(np.mean(loss_list)) if loss_list else 0.0,
         "loss_cls": float(np.mean(loss_cls_list)) if loss_cls_list else 0.0,
         "loss_dice": float(np.mean(loss_dice_list)) if loss_dice_list else 0.0,
+        "loss_empty": float(np.mean(loss_empty_list)) if loss_empty_list else 0.0,
         "dice": float(np.mean(dice_scores)) if dice_scores else 0.0,
         "iou": float(np.mean(iou_scores)) if iou_scores else 0.0,
         "precision": float(np.mean(prec_scores)) if prec_scores else 0.0,
@@ -1251,6 +1334,7 @@ def evaluate_sample_set(
     device: torch.device,
     ce_weight: float,
     dice_weight: float,
+    empty_fp_weight: float,
     overlap: float,
     phase_name: str,
     epoch: int,
@@ -1267,6 +1351,7 @@ def evaluate_sample_set(
             device=device,
             ce_weight=ce_weight,
             dice_weight=dice_weight,
+            empty_fp_weight=empty_fp_weight,
             overlap=overlap,
             phase_name=phase_name,
             epoch=epoch,
@@ -1283,6 +1368,7 @@ def evaluate_sample_set(
         num_classes=num_classes,
         ce_weight=ce_weight,
         dice_weight=dice_weight,
+        empty_fp_weight=empty_fp_weight,
         use_amp=False,
         accumulate_steps=1,
         phase_name=phase_name,
@@ -1374,9 +1460,15 @@ def main() -> None:
 
     if bool(args.reference_image_dir) != bool(args.reference_mask_dir):
         raise ValueError("--reference-image-dir and --reference-mask-dir must be provided together.")
+    if bool(args.val_image_dir) != bool(args.val_mask_dir):
+        raise ValueError("--val-image-dir and --val-mask-dir must be provided together.")
 
     samples = collect_samples(image_dir, mask_dir)
-    train_samples, val_samples = split_samples(samples, args.val_ratio, args.seed)
+    if args.val_image_dir and args.val_mask_dir:
+        train_samples = samples
+        val_samples = collect_samples(Path(args.val_image_dir), Path(args.val_mask_dir))
+    else:
+        train_samples, val_samples = split_samples(samples, args.val_ratio, args.seed)
     reference_samples: List[Dict[str, str]] = []
     if args.reference_image_dir and args.reference_mask_dir:
         reference_samples = collect_samples(Path(args.reference_image_dir), Path(args.reference_mask_dir))
@@ -1520,6 +1612,7 @@ def main() -> None:
             device=device,
             ce_weight=args.ce_weight,
             dice_weight=args.dice_weight,
+            empty_fp_weight=args.empty_fp_weight,
             overlap=args.val_overlap,
             phase_name="reference_baseline",
             epoch=0,
@@ -1581,6 +1674,9 @@ def main() -> None:
                 "cls_loss": args.cls_loss,
                 "focal_gamma": args.focal_gamma,
                 "focal_alpha": args.focal_alpha,
+                "ce_weight": args.ce_weight,
+                "dice_weight": args.dice_weight,
+                "empty_fp_weight": args.empty_fp_weight,
                 "warmup_epochs": args.warmup_epochs,
                 "min_lr_ratio": args.min_lr_ratio,
                 "val_ratio": args.val_ratio,
@@ -1630,6 +1726,7 @@ def main() -> None:
                 num_classes=args.num_classes,
                 ce_weight=args.ce_weight,
                 dice_weight=args.dice_weight,
+                empty_fp_weight=args.empty_fp_weight,
                 use_amp=use_amp,
                 accumulate_steps=args.accumulate_steps,
                 phase_name="train",
@@ -1653,6 +1750,7 @@ def main() -> None:
                     device=device,
                     ce_weight=args.ce_weight,
                     dice_weight=args.dice_weight,
+                    empty_fp_weight=args.empty_fp_weight,
                     overlap=args.val_overlap,
                     phase_name="val_sw" if args.val_mode == "sliding" else "val",
                     epoch=epoch,
@@ -1679,6 +1777,7 @@ def main() -> None:
                         device=device,
                         ce_weight=args.ce_weight,
                         dice_weight=args.dice_weight,
+                        empty_fp_weight=args.empty_fp_weight,
                         overlap=args.val_overlap,
                         phase_name="reference_val_sw" if args.val_mode == "sliding" else "reference_val",
                         epoch=epoch,
@@ -1693,6 +1792,7 @@ def main() -> None:
                 "train_loss_cls": train_stats["loss_cls"],
                 "train_loss_ce": train_stats["loss_cls"],
                 "train_loss_dice": train_stats["loss_dice"],
+                "train_loss_empty": train_stats.get("loss_empty", 0.0),
                 "train_dice": train_stats["dice"],
                 "train_iou": train_stats["iou"],
                 "lr": current_lr,
@@ -1704,6 +1804,7 @@ def main() -> None:
                         "val_loss_cls": val_stats["loss_cls"],
                         "val_loss_ce": val_stats["loss_cls"],
                         "val_loss_dice": val_stats["loss_dice"],
+                        "val_loss_empty": val_stats.get("loss_empty", 0.0),
                         "val_dice": val_stats["dice"],
                         "val_iou": val_stats["iou"],
                         "val_precision": val_stats["precision"],

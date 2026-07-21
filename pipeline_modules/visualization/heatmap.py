@@ -953,7 +953,7 @@ def generate_batch_region_metric_slices(
     cmap_name: str = "white_orange_red_black",
     dpi: int = 300,
     line_width: float = 0.16,
-    brain_outline_width: float = 0.42,
+    brain_outline_width: float = 0.0,
     show_region_contours: bool = True,
     colorbar_label: str | None = None,
     output_subdir: str = "",
@@ -1094,7 +1094,7 @@ def generate_batch_signal_count_diff_slices(
     cmap_name: str = "signal_count_diff",
     dpi: int = 300,
     line_width: float = 0.16,
-    brain_outline_width: float = 0.42,
+    brain_outline_width: float = 0.0,
     show_region_contours: bool = True,
     colorbar_label: str | None = None,
     output_subdir: str = "",
@@ -1244,7 +1244,7 @@ def generate_batch_cell_density_slices(
     cmap_name: str = "white_blue_red",
     dpi: int = 300,
     line_width: float = 0.16,
-    brain_outline_width: float = 0.42,
+    brain_outline_width: float = 0.0,
     show_region_contours: bool = True,
     colorbar_label: str = "cell density (cells/mm³)",
     output_subdir: str = "",
@@ -1627,77 +1627,74 @@ def _render_local_slice_array(
     background: str = "white",
     include_colorbar: bool = True,
 ) -> tuple[np.ndarray, dict[str, int]]:
-    height, width = label_slice.shape
-    if include_colorbar:
-        aspect = width / max(height, 1)
-        long_side = 6.2
-        figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    else:
-        fig, ax = plt.subplots(figsize=(width, height), dpi=1)
-    theme = _slice_figure_theme(background=background)
-    try:
-        fig.patch.set_facecolor(theme["background"])
-        ax.set_facecolor(theme["background"])
+    from pipeline_modules.visualization.slice_heatmap_render import (
+        DEFAULT_PIXEL_SCALE,
+        attach_colorbar_to_slice_rgb,
+        render_continuous_signal_slice_rgb,
+        render_labeled_value_slice_rgb,
+    )
 
-        cmap = _colormap_by_name(cmap_name).copy()
-        cmap.set_bad((0, 0, 0, 0))
-        masked_signal = np.ma.masked_where(label_slice <= 0, signal_slice)
-        image = ax.imshow(masked_signal, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    labels = np.asarray(label_slice)
+    signal = np.asarray(signal_slice, dtype=np.float32)
+    height, width = labels.shape
+    # File exports use high pixel scale; interactive/no-colorbar stays near native.
+    pixel_scale = 1 if not include_colorbar else max(DEFAULT_PIXEL_SCALE, max(int(dpi) // 75, 3))
 
-        region_lines = _label_contour_lines(label_slice, smoothing=1.4) if show_region_contours else []
-        if region_lines and line_width > 0:
-            from matplotlib.collections import LineCollection
-
-            ax.add_collection(
-                LineCollection(
-                    region_lines,
-                    colors=theme["contour"],
-                    linewidths=line_width,
-                    alpha=0.95,
-                    antialiaseds=True,
-                    capstyle="round",
-                    joinstyle="round",
-                )
-            )
-
-        brain_lines = _mask_contour_lines(label_slice > 0, smoothing=1.8)
-        if brain_lines and brain_outline_width > 0:
-            from matplotlib.collections import LineCollection
-
-            ax.add_collection(
-                LineCollection(
-                    brain_lines,
-                    colors=theme["contour"],
-                    linewidths=brain_outline_width,
-                    alpha=0.95,
-                    antialiaseds=True,
-                    capstyle="round",
-                    joinstyle="round",
-                )
-            )
-
-        ax.set_axis_off()
-        ax.set_xlim(-0.5, width - 0.5)
-        ax.set_ylim(height - 0.5, -0.5)
-        if include_colorbar:
-            cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
-            cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors=theme["cbar_tick"])
-            cbar.outline.set_linewidth(0.6)
-            cbar.outline.set_edgecolor(theme["cbar_edge"])
-            cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color=theme["cbar_label"])
-
-        return _export_slice_figure_png(
-            fig,
-            ax,
-            dpi=dpi,
-            width=width,
-            height=height,
-            theme=theme,
-            include_colorbar=include_colorbar,
+    # Discrete region-painted maps (few unique values) use vector fill; continuous volumes use LANCZOS path.
+    brain = labels > 0
+    finite = signal[brain & np.isfinite(signal)]
+    unique_n = int(np.unique(np.round(finite.astype(np.float64), decimals=6)).size) if finite.size else 0
+    if unique_n > 0 and unique_n <= 4000:
+        slice_rgb = render_labeled_value_slice_rgb(
+            signal,
+            labels,
+            vmin=float(vmin),
+            vmax=float(vmax),
+            cmap_name=cmap_name,
+            pixel_scale=pixel_scale,
+            line_width=float(line_width) if line_width > 0 else 0.7,
+            brain_outline_width=float(brain_outline_width),
+            show_region_contours=show_region_contours and line_width > 0,
+            background=background,
         )
-    finally:
-        plt.close(fig)
+    else:
+        slice_rgb = render_continuous_signal_slice_rgb(
+            signal,
+            labels,
+            vmin=float(vmin),
+            vmax=float(vmax),
+            cmap_name=cmap_name,
+            pixel_scale=pixel_scale,
+            line_width=float(line_width) if line_width > 0 else 0.7,
+            brain_outline_width=float(brain_outline_width),
+            show_region_contours=show_region_contours and line_width > 0,
+            background=background,
+        )
+
+    if include_colorbar:
+        rgba, layout = attach_colorbar_to_slice_rgb(
+            slice_rgb,
+            vmin=float(vmin),
+            vmax=float(vmax),
+            cmap_name=cmap_name,
+            colorbar_label=colorbar_label,
+            background=background,
+        )
+    else:
+        rgba = np.dstack([slice_rgb, np.full(slice_rgb.shape[:2], 255, dtype=np.uint8)])
+        layout = {
+            "image_width": int(slice_rgb.shape[1]),
+            "image_height": int(slice_rgb.shape[0]),
+            "slice_left": 0,
+            "slice_top": 0,
+            "slice_width": int(slice_rgb.shape[1]),
+            "slice_height": int(slice_rgb.shape[0]),
+            "atlas_width": int(width),
+            "atlas_height": int(height),
+        }
+    layout["atlas_width"] = int(width)
+    layout["atlas_height"] = int(height)
+    return rgba, layout
 
 
 def _render_region_metric_slice_array(
@@ -1716,7 +1713,14 @@ def _render_region_metric_slice_array(
     focus_only: bool = False,
     background: str = "white",
     include_colorbar: bool = True,
+    vcenter: float | None = None,
 ) -> tuple[np.ndarray, dict[str, int]]:
+    from pipeline_modules.visualization.slice_heatmap_render import (
+        DEFAULT_PIXEL_SCALE,
+        attach_colorbar_to_slice_rgb,
+        render_labeled_value_slice_rgb,
+    )
+
     label_arr = np.asarray(label_slice)
     focus_mask = None
     if focus_region_ids:
@@ -1726,93 +1730,80 @@ def _render_region_metric_slice_array(
 
     painted = _paint_region_values_on_slice(label_arr, region_values)
     height, width = label_arr.shape
-    if include_colorbar:
-        aspect = width / max(height, 1)
-        long_side = 6.2
-        figsize = (long_side, max(long_side / aspect, 1.0)) if aspect >= 1 else (max(long_side * aspect, 1.0), long_side)
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    else:
-        fig, ax = plt.subplots(figsize=(width, height), dpi=1)
-    theme = _slice_figure_theme(background=background)
-    try:
-        fig.patch.set_facecolor(theme["background"])
-        ax.set_facecolor(theme["background"])
+    pixel_scale = 1 if not include_colorbar else max(DEFAULT_PIXEL_SCALE, max(int(dpi) // 75, 3))
 
-        cmap = _colormap_by_name(cmap_name).copy()
-        cmap.set_bad((0, 0, 0, 0))
-        masked = np.ma.masked_where(label_arr <= 0, painted)
-        image = ax.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    slice_rgb = render_labeled_value_slice_rgb(
+        painted,
+        label_arr,
+        vmin=float(vmin),
+        vmax=float(vmax),
+        vcenter=vcenter,
+        cmap_name=cmap_name,
+        pixel_scale=pixel_scale,
+        line_width=float(line_width) if line_width > 0 else 0.7,
+        brain_outline_width=float(brain_outline_width),
+        show_region_contours=show_region_contours and line_width > 0,
+        background=background,
+    )
 
-        region_lines = _label_contour_lines(label_arr, smoothing=1.4) if show_region_contours else []
-        if region_lines and line_width > 0:
-            from matplotlib.collections import LineCollection
+    # Optional focus outline on top of the shared render.
+    if focus_mask is not None and np.any(focus_mask):
+        from pipeline_modules.visualization.atlas_slice import _mask_contour_lines
+        from matplotlib.collections import LineCollection
 
-            ax.add_collection(
-                LineCollection(
-                    region_lines,
-                    colors=theme["contour"],
-                    linewidths=line_width,
-                    alpha=0.95,
-                    antialiaseds=True,
-                    capstyle="round",
-                    joinstyle="round",
-                )
-            )
-
-        brain_lines = _mask_contour_lines(label_arr > 0, smoothing=1.8)
-        if brain_lines and brain_outline_width > 0:
-            from matplotlib.collections import LineCollection
-
-            ax.add_collection(
-                LineCollection(
-                    brain_lines,
-                    colors=theme["contour"],
-                    linewidths=brain_outline_width,
-                    alpha=0.95,
-                    antialiaseds=True,
-                    capstyle="round",
-                    joinstyle="round",
-                )
-            )
-
-        if focus_mask is not None and np.any(focus_mask):
-            from matplotlib.collections import LineCollection
-
-            focus_lines = _mask_contour_lines(focus_mask, smoothing=1.6)
+        theme = _slice_figure_theme(background=background)
+        fig_w = slice_rgb.shape[1] / 100.0
+        fig_h = slice_rgb.shape[0] / 100.0
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=100)
+        try:
+            ax.imshow(slice_rgb, extent=(-0.5, width - 0.5, height - 0.5, -0.5), origin="upper")
+            ax.set_xlim(-0.5, width - 0.5)
+            ax.set_ylim(height - 0.5, -0.5)
+            ax.set_axis_off()
+            focus_lines = _mask_contour_lines(focus_mask, smoothing=1.2)
             if focus_lines:
                 ax.add_collection(
                     LineCollection(
                         focus_lines,
                         colors=theme["focus"],
-                        linewidths=max(brain_outline_width * 2.2, 0.8),
-                        alpha=1.0,
-                        antialiaseds=True,
-                        capstyle="round",
-                        joinstyle="round",
+                        linewidths=max(float(brain_outline_width) * 2.2, 1.0),
+                        antialiased=True,
                     )
                 )
+            import io
 
-        ax.set_axis_off()
-        ax.set_xlim(-0.5, width - 0.5)
-        ax.set_ylim(height - 0.5, -0.5)
-        if include_colorbar:
-            cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, shrink=0.55)
-            cbar.ax.tick_params(labelsize=7, length=2, width=0.6, colors=theme["cbar_tick"])
-            cbar.outline.set_linewidth(0.6)
-            cbar.outline.set_edgecolor(theme["cbar_edge"])
-            cbar.set_label(colorbar_label, fontsize=8, labelpad=6, color=theme["cbar_label"])
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=100, pad_inches=0)
+            buf.seek(0)
+            slice_rgb = np.asarray(Image.open(buf).convert("RGB"), dtype=np.uint8)
+        finally:
+            plt.close(fig)
 
-        return _export_slice_figure_png(
-            fig,
-            ax,
-            dpi=dpi,
-            width=width,
-            height=height,
-            theme=theme,
-            include_colorbar=include_colorbar,
+    if include_colorbar:
+        rgba, layout = attach_colorbar_to_slice_rgb(
+            slice_rgb,
+            vmin=float(vmin),
+            vmax=float(vmax),
+            vcenter=vcenter,
+            cmap_name=cmap_name,
+            colorbar_label=colorbar_label,
+            background=background,
         )
-    finally:
-        plt.close(fig)
+    else:
+        rgba = np.dstack([slice_rgb, np.full(slice_rgb.shape[:2], 255, dtype=np.uint8)])
+        layout = {
+            "image_width": int(slice_rgb.shape[1]),
+            "image_height": int(slice_rgb.shape[0]),
+            "slice_left": 0,
+            "slice_top": 0,
+            "slice_width": int(slice_rgb.shape[1]),
+            "slice_height": int(slice_rgb.shape[0]),
+            "atlas_width": int(width),
+            "atlas_height": int(height),
+        }
+    layout["atlas_width"] = int(width)
+    layout["atlas_height"] = int(height)
+    return rgba, layout
 
 
 def render_region_metric_atlas_slice(
@@ -1826,7 +1817,7 @@ def render_region_metric_atlas_slice(
     vmax: float | None = None,
     dpi: int = 300,
     line_width: float = 0.16,
-    brain_outline_width: float = 0.42,
+    brain_outline_width: float = 0.0,
     show_region_contours: bool = True,
     colorbar_label: str = "Signal Count",
 ) -> Path:
@@ -1866,7 +1857,7 @@ def render_local_signal_atlas_slice(
     vmax: float | None = None,
     dpi: int = 300,
     line_width: float = 0.3,
-    brain_outline_width: float = 0.3,
+    brain_outline_width: float = 0.0,
     show_region_contours: bool = True,
     colorbar_label: str = "Signal Intensity",
 ) -> Path:
@@ -2230,7 +2221,7 @@ def generate_prv_sample(
                     vmax=1.0,
                     dpi=dpi,
                     line_width=0.3,
-                    brain_outline_width=0.3,
+                    brain_outline_width=0.0,
                     colorbar_label="Signal Intensity",
                 )
             )
@@ -2355,7 +2346,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmap", default="white_blue_red")
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--line-width", type=float, default=0.16)
-    parser.add_argument("--brain-outline-width", type=float, default=0.42)
+    parser.add_argument("--brain-outline-width", type=float, default=0.0, help="Brain outer outline width (0=off).")
     parser.add_argument(
         "--hide-region-contours",
         action="store_true",

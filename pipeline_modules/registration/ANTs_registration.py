@@ -9,7 +9,6 @@ from typing import Optional, Tuple, Union, Dict
 import numpy as np
 import ants
 import tifffile
-from tqdm import tqdm
 
 try:
     from pipeline_modules.registration.label_codec import (
@@ -86,6 +85,33 @@ def _write_tiff_volume_batch(job: dict[str, object]) -> int:
             compression=compression,
         )
     return end - start
+
+
+def _upsample_label_batch(job: dict[str, object]) -> int:
+    import cv2
+
+    source_volume = job["source_volume"]
+    z_indices = job["z_indices"]
+    target_start = int(job["target_start"])
+    target_xy = job["target_xy"]
+    output_dtype = job["dtype"]
+    output_dir = Path(job["output_dir"])
+    compression = normalize_tiff_compression(job.get("compression"))  # type: ignore[arg-type]
+    written = 0
+    for local_offset, source_z in enumerate(z_indices):
+        target_i = target_start + local_offset
+        resized_slice = cv2.resize(
+            source_volume[int(source_z)],
+            target_xy,
+            interpolation=cv2.INTER_NEAREST,
+        )
+        tifffile.imwrite(
+            str(output_dir / f"label_{target_i:06d}.tiff"),
+            np.rint(resized_slice).astype(output_dtype, copy=False),
+            compression=compression,
+        )
+        written += 1
+    return written
 
 
 class BidirectionalRegistration:
@@ -377,8 +403,12 @@ class BidirectionalRegistration:
 
     def upsample_label_chunked(self, label_image: ants.ANTsImage, output_dir: str, 
                              method: str = 'nearest', chunk_size: int = 50,
-                             label_id_lut: np.ndarray | None = None) -> None:
+                             label_id_lut: np.ndarray | None = None,
+                             *,
+                             max_workers: int = 0,
+                             slice_batch: int | None = None) -> None:
         """分块上采样标签图像 - 强制对齐到原始尺寸"""
+        _ = method, chunk_size
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
@@ -394,38 +424,40 @@ class BidirectionalRegistration:
         logger.debug("ANTs raw shape = %s, after transpose = %s", arr.shape, source_volume.shape)
         logger.info("Preserving label dtype as %s", output_dtype)
         
-        import cv2
-        
         # Z-axis mapping: For each target slice i, which source slice does it correspond to?
-        # Nearest neighbor mapping
-        # map: target_z -> source_z
         z_indices = np.round(np.linspace(0, source_shape[0] - 1, target_shape[0])).astype(int)
-        
-        # Process slice by slice (target z)
-        # This is extremely memory efficient and precise
-        for i, source_z in tqdm(enumerate(z_indices), total=len(z_indices), desc="Upsampling slices"):
-            
-            # Get the source slice
-            source_slice = source_volume[source_z] # (Y, X)
-            
-            # Resize in XY plane to target XY
-            # cv2.resize expects (width, height) -> (target_X, target_Y)
-            # source_slice is (Y, X)
-            target_xy = (target_shape[2], target_shape[1]) # (X, Y)
-            
-            # Use nearest neighbor for labels
-            resized_slice = cv2.resize(
-                source_slice,
-                target_xy, 
-                interpolation=cv2.INTER_NEAREST
+        target_xy = (target_shape[2], target_shape[1])  # (X, Y) for cv2.resize
+
+        read_batch = resolve_slice_batch(slice_batch, default=16)
+        worker_count = resolve_stack_workers(max_workers)
+        logger.info(
+            "Upsampling with %d worker(s), %d slice(s) per batch",
+            worker_count,
+            read_batch,
+        )
+
+        jobs: list[dict[str, object]] = []
+        for start, end in iter_batch_ranges(len(z_indices), read_batch):
+            jobs.append(
+                {
+                    "source_volume": source_volume,
+                    "z_indices": z_indices[start:end],
+                    "target_start": start,
+                    "target_xy": target_xy,
+                    "dtype": output_dtype,
+                    "output_dir": output_path,
+                    "compression": "lzw",
+                }
             )
-            
-            # Save
-            tifffile.imwrite(
-                str(output_path / f"label_{i:06d}.tiff"),
-                np.rint(resized_slice).astype(output_dtype, copy=False),
-                compression='lzw'
-            )
+
+        run_bounded_batches(
+            jobs,
+            _upsample_label_batch,
+            worker_count=worker_count,
+            progress_total=len(z_indices),
+            desc="Upsampling slices",
+            unit="slice",
+        )
             
         logger.info("Saved %d slices to %s", len(z_indices), output_path)
 
