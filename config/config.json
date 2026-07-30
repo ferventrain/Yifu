@@ -144,5 +144,21 @@
         "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
         "output_format": "xlsx",
         "use_hemisphere_label": false
+    },
+    "tubule_reconstruction": {
+        "enabled": false,
+        "dust_threshold": 100,
+        "save_skeleton": true,
+        "save_swc": false,
+        "chunkwise": true,
+        "chunk_workers": 8,
+        "process_existing_only": true,
+        "halo_zyx": [2, 4, 4],
+        "downsample_factor": 4,
+        "region_analysis": {
+            "enabled": true,
+            "all_regions": true,
+            "cfg": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        }
     }
 }

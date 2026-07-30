@@ -63,17 +63,23 @@ def discover_channel_pairs(
     cyto_channel: int,
 ) -> list[tuple[str, Path, Path]]:
     """Return sorted (slice_prefix, nuclei_path, cyto_path) tuples."""
-    by_prefix: dict[str, dict[int, Path]] = {}
+    import os
 
-    for path in sorted(input_dir.iterdir()):
-        if not path.is_file():
-            continue
-        match = CHANNEL_SUFFIX_RE.match(path.name)
-        if match is None:
-            continue
-        prefix = match.group("prefix")
-        channel = int(match.group("channel"))
-        by_prefix.setdefault(prefix, {})[channel] = path
+    by_prefix: dict[str, dict[int, Path]] = {}
+    input_dir = Path(input_dir)
+
+    # scandir reuses dirent metadata; much faster than Path.iterdir()+is_file()
+    # on large network folders.
+    with os.scandir(input_dir) as entries:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            match = CHANNEL_SUFFIX_RE.match(entry.name)
+            if match is None:
+                continue
+            prefix = match.group("prefix")
+            channel = int(match.group("channel"))
+            by_prefix.setdefault(prefix, {})[channel] = Path(entry.path)
 
     pairs: list[tuple[str, Path, Path]] = []
     for prefix in sorted(by_prefix):

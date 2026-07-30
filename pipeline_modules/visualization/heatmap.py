@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - only needed for registration mode
 from pipeline_modules.visualization.atlas_slice import (
     AXIS_NAMES,
     DEFAULT_ATLAS_LABEL,
+    DEFAULT_BREGMA_INDEX,
     PLANE_TO_FIXED_AXIS,
     AtlasSlice,
     AtlasSliceSpec,
@@ -41,10 +42,12 @@ from pipeline_modules.visualization.atlas_slice import (
     collect_regions_missing_metric_data,
     compute_symmetric_metric_limits,
     extract_atlas_slice,
+    paint_hemisphere_split_slice,
     resolve_slice_region_values,
     subtract_region_metric_values,
 )
 
+from pipeline_modules.utils.data_paths import resolve_atlas_label_path
 from pipeline_modules.utils.deliverable_paths import (
     brain_distribution_stats_xlsx,
     heatmap_2d_dir,
@@ -72,6 +75,13 @@ def default_reference_dir() -> Path:
     from pipeline_modules.utils.data_paths import reference_dir
 
     return reference_dir()
+
+
+def default_atlas_label_path() -> Path:
+    try:
+        return resolve_atlas_label_path()
+    except FileNotFoundError:
+        return Path(DEFAULT_ATLAS_LABEL)
 
 
 def load_json(path: str | Path) -> dict:
@@ -162,6 +172,76 @@ def linspace_bregma_coords(start_mm: float, end_mm: float, count: int) -> list[f
         return [float(start_mm)]
     values = np.linspace(float(start_mm), float(end_mm), int(count), dtype=np.float64)
     return [float(round(value, 4)) for value in values]
+
+
+def stepped_bregma_coords(start_mm: float, end_mm: float, step_mm: float) -> list[float]:
+    """AP walk from start toward end at a fixed step (mm), stopping at/before end."""
+    step = abs(float(step_mm))
+    if step <= 0:
+        raise ValueError("bregma step must be > 0")
+    start = float(start_mm)
+    end = float(end_mm)
+    if start == end:
+        return [start]
+    direction = -1.0 if start > end else 1.0
+    count = int(np.floor(abs(end - start) / step + 1e-9)) + 1
+    values = [float(round(start + direction * step * index, 4)) for index in range(count)]
+    # Drop any float-drifted point past the endpoint.
+    return [value for value in values if (value - end) * direction <= 1e-6]
+
+
+def resolve_batch_bregma_coords(
+    *,
+    bregma_start: float,
+    bregma_end: float,
+    slice_count: int | None = None,
+    bregma_step: float | None = None,
+) -> list[float]:
+    if bregma_step is not None:
+        return stepped_bregma_coords(bregma_start, bregma_end, float(bregma_step))
+    return linspace_bregma_coords(bregma_start, bregma_end, int(slice_count or 12))
+
+
+def _voxel_volume_mm3(resolution_xyz_um: tuple[float, float, float]) -> float:
+    x_um, y_um, z_um = (float(value) for value in resolution_xyz_um)
+    if min(x_um, y_um, z_um) <= 0:
+        raise ValueError(f"resolution_xyz must be positive, got {resolution_xyz_um}")
+    return (x_um * y_um * z_um) / 1e9
+
+
+def build_hemisphere_cell_density_lookups(
+    input_excel: str | Path,
+    *,
+    cfg_path: str | Path,
+    resolution_xyz_um: tuple[float, float, float],
+) -> tuple[dict[int, float], dict[int, float], dict[int, list[int]]]:
+    """Build left/right cell-density (count/mm³) lookups from Signal Count / volume."""
+    vox_mm3 = _voxel_volume_mm3(resolution_xyz_um)
+    left_count, path_by_region_id = build_region_metric_lookup(
+        input_excel, cfg_path=cfg_path, metric="Left Signal Count", direct_label_only=True
+    )
+    left_voxels, _ = build_region_metric_lookup(
+        input_excel, cfg_path=cfg_path, metric="Left Total Voxels", direct_label_only=True
+    )
+    right_count, _ = build_region_metric_lookup(
+        input_excel, cfg_path=cfg_path, metric="Right Signal Count", direct_label_only=True
+    )
+    right_voxels, _ = build_region_metric_lookup(
+        input_excel, cfg_path=cfg_path, metric="Right Total Voxels", direct_label_only=True
+    )
+
+    def _density(count_lookup: dict[int, float], voxel_lookup: dict[int, float]) -> dict[int, float]:
+        region_ids = set(count_lookup) | set(voxel_lookup)
+        out: dict[int, float] = {}
+        for region_id in region_ids:
+            voxels = float(voxel_lookup.get(region_id, 0.0))
+            if voxels <= 0:
+                out[int(region_id)] = 0.0
+            else:
+                out[int(region_id)] = float(count_lookup.get(region_id, 0.0)) / (voxels * vox_mm3)
+        return out
+
+    return _density(left_count, left_voxels), _density(right_count, right_voxels), path_by_region_id
 
 
 def sample_has_batch_inputs(sample_dir: str | Path, signal_ch: str = "ch1") -> bool:
@@ -943,6 +1023,7 @@ def generate_batch_region_metric_slices(
     bregma_start: float = 1.1,
     bregma_end: float = -5.2,
     slice_count: int = 12,
+    bregma_step: float | None = None,
     plane: str = "coronal",
     coord_system: str = "bregma-mm",
     atlas_resolution_um: float = 25.0,
@@ -959,9 +1040,14 @@ def generate_batch_region_metric_slices(
     output_subdir: str = "",
 ) -> dict[str, object]:
     sample_dirs = discover_sample_dirs(samples_root, require_volume=False)
-    label_path = Path(label_path or DEFAULT_ATLAS_LABEL)
+    label_path = Path(label_path or default_atlas_label_path())
     region_cfg_path = Path(region_cfg_path or default_region_cfg_path())
-    bregma_coords = linspace_bregma_coords(bregma_start, bregma_end, slice_count)
+    bregma_coords = resolve_batch_bregma_coords(
+        bregma_start=bregma_start,
+        bregma_end=bregma_end,
+        slice_count=slice_count,
+        bregma_step=bregma_step,
+    )
     region_name_by_id = build_region_name_lookup(region_cfg_path)
 
     lookups: dict[str, tuple[dict[int, float], dict[int, list[int]]]] = {}
@@ -972,6 +1058,7 @@ def generate_batch_region_metric_slices(
             excel_path,
             cfg_path=region_cfg_path,
             metric=region_metric,
+            direct_label_only=True,
         )
         lookups[str(sample_dir)] = (value_by_region_id, path_by_region_id)
         all_values.extend(float(value) for value in value_by_region_id.values())
@@ -1029,6 +1116,7 @@ def generate_batch_region_metric_slices(
                 atlas_slice.image,
                 value_by_region_id,
                 path_by_region_id,
+                inherit_ancestors=False,
             )
             output_path = out_dir / f"bregma_{ap_mm}mm.png"
             render_region_metric_atlas_slice(
@@ -1072,6 +1160,149 @@ def generate_batch_region_metric_slices(
     return payload
 
 
+def generate_batch_hemisphere_metric_slices(
+    *,
+    samples_root: str | Path,
+    resolution_xyz_um: tuple[float, float, float],
+    region_cfg_path: str | Path | None = None,
+    label_path: str | Path | None = None,
+    bregma_start: float = 1.1,
+    bregma_end: float = -5.2,
+    slice_count: int | None = 12,
+    bregma_step: float | None = None,
+    plane: str = "coronal",
+    coord_system: str = "bregma-mm",
+    atlas_resolution_um: float = 25.0,
+    bregma_index: tuple[int, int, int] = DEFAULT_BREGMA_INDEX,
+    density_vmin: float | None = None,
+    density_vmax: float | None = None,
+    density_percentile: float = BATCH_SLICE_DEFAULT_PERCENTILE,
+    cmap_name: str = "white_orange_red_black",
+    dpi: int = 300,
+    line_width: float = 0.16,
+    brain_outline_width: float = 0.0,
+    show_region_contours: bool = True,
+    colorbar_label: str | None = None,
+    output_subdir: str = "hemisphere_cell_density_slices",
+) -> dict[str, object]:
+    """Batch coronal heatmaps with left/right cell density (count/mm³) coloring."""
+    if plane != "coronal":
+        raise ValueError("Hemisphere split coloring currently supports coronal slices only.")
+
+    sample_dirs = discover_sample_dirs(samples_root, require_volume=False)
+    label_path = Path(label_path or default_atlas_label_path())
+    region_cfg_path = Path(region_cfg_path or default_region_cfg_path())
+    bregma_coords = resolve_batch_bregma_coords(
+        bregma_start=bregma_start,
+        bregma_end=bregma_end,
+        slice_count=slice_count,
+        bregma_step=bregma_step,
+    )
+    ml_mid_index = int(bregma_index[2])
+
+    lookups: dict[str, tuple[dict[int, float], dict[int, float], dict[int, list[int]]]] = {}
+    all_values: list[float] = []
+    for sample_dir in sample_dirs:
+        excel_path = resolve_density_excel_path(sample_dir)
+        left_lookup, right_lookup, path_by_region_id = build_hemisphere_cell_density_lookups(
+            excel_path,
+            cfg_path=region_cfg_path,
+            resolution_xyz_um=resolution_xyz_um,
+        )
+        lookups[str(sample_dir)] = (left_lookup, right_lookup, path_by_region_id)
+        all_values.extend(float(value) for value in left_lookup.values())
+        all_values.extend(float(value) for value in right_lookup.values())
+
+    shared_vmin, shared_vmax = _resolve_shared_metric_limits(
+        all_values,
+        density_vmin=density_vmin,
+        density_vmax=density_vmax,
+        density_percentile=density_percentile,
+        symmetric=False,
+    )
+    resolved_colorbar_label = colorbar_label or "cell density (count/mm³)"
+    print(
+        f"Shared hemisphere cell-density color scale: "
+        f"min={shared_vmin:g}, max={shared_vmax:g} (samples={len(sample_dirs)}, "
+        f"resolution_xyz_um={resolution_xyz_um})"
+    )
+
+    outputs_by_sample: dict[str, list[str]] = {}
+    for sample_dir in sample_dirs:
+        left_lookup, right_lookup, path_by_region_id = lookups[str(sample_dir)]
+        defaults = resolve_sample_stack_defaults(sample_dir)
+        out_dir = resolve_slice_output_dir(
+            sample_dir,
+            output_subdir=output_subdir or "hemisphere_cell_density_slices",
+            signal_ch=str(defaults["signal_ch"]),
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sample_outputs: list[str] = []
+        for ap_mm in bregma_coords:
+            spec = AtlasSliceSpec(
+                plane=plane,
+                coordinate_system=coord_system,
+                coordinate=ap_mm,
+                atlas_resolution_um=atlas_resolution_um,
+                bregma_index=bregma_index,
+            )
+            atlas_slice = extract_atlas_slice(label_path, spec)
+            left_on_slice = resolve_slice_region_values(
+                atlas_slice.image, left_lookup, path_by_region_id, inherit_ancestors=False
+            )
+            right_on_slice = resolve_slice_region_values(
+                atlas_slice.image, right_lookup, path_by_region_id, inherit_ancestors=False
+            )
+            painted = paint_hemisphere_split_slice(
+                atlas_slice.image,
+                left_on_slice,
+                right_on_slice,
+                path_by_region_id,
+                ml_mid_index=ml_mid_index,
+            )
+            output_path = out_dir / f"bregma_{ap_mm}mm.png"
+            rendered, _layout = _render_local_slice_array(
+                painted,
+                atlas_slice.image,
+                cmap_name=cmap_name,
+                vmin=float(shared_vmin),
+                vmax=float(shared_vmax),
+                dpi=int(dpi),
+                line_width=float(line_width),
+                brain_outline_width=float(brain_outline_width),
+                colorbar_label=resolved_colorbar_label,
+                show_region_contours=show_region_contours,
+                include_colorbar=True,
+            )
+            Image.fromarray(rendered).save(output_path)
+            sample_outputs.append(str(output_path))
+        outputs_by_sample[str(sample_dir)] = sample_outputs
+        print(f"Wrote {len(sample_outputs)} hemisphere density slices to: {out_dir}")
+
+    summary_path = Path(samples_root) / "visualization" / "batch_hemisphere_cell_density_slices.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mode": "batch-cell-density-slices",
+        "slice_color_mode": "hemisphere",
+        "samples_root": str(samples_root),
+        "sample_dirs": [str(path) for path in sample_dirs],
+        "metric": "cell_density_count_per_mm3",
+        "resolution_xyz_um": [float(value) for value in resolution_xyz_um],
+        "region_cfg_path": str(region_cfg_path),
+        "bregma_coords_mm": bregma_coords,
+        "shared_metric_vmin": float(shared_vmin),
+        "shared_metric_vmax": float(shared_vmax),
+        "cmap_name": cmap_name,
+        "colorbar_label": resolved_colorbar_label,
+        "show_region_contours": bool(show_region_contours),
+        "outputs_by_sample": outputs_by_sample,
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    payload["summary_json"] = str(summary_path)
+    return payload
+
+
 def generate_batch_signal_count_diff_slices(
     *,
     sample_dir: str | Path,
@@ -1084,6 +1315,7 @@ def generate_batch_signal_count_diff_slices(
     bregma_start: float = 1.1,
     bregma_end: float = -5.2,
     slice_count: int = 12,
+    bregma_step: float | None = None,
     plane: str = "coronal",
     coord_system: str = "bregma-mm",
     atlas_resolution_um: float = 25.0,
@@ -1103,12 +1335,21 @@ def generate_batch_signal_count_diff_slices(
     subtract_sample_dir = Path(subtract_sample_dir)
     label_path = Path(label_path or DEFAULT_ATLAS_LABEL)
     region_cfg_path = Path(region_cfg_path or default_region_cfg_path())
-    bregma_coords = linspace_bregma_coords(bregma_start, bregma_end, slice_count)
+    bregma_coords = resolve_batch_bregma_coords(
+        bregma_start=bregma_start,
+        bregma_end=bregma_end,
+        slice_count=slice_count,
+        bregma_step=bregma_step,
+    )
 
     excel_a = resolve_density_excel_path(sample_dir, input_excel)
     excel_b = resolve_density_excel_path(subtract_sample_dir, subtract_input_excel)
-    lookup_a, path_by_region_id = build_region_metric_lookup(excel_a, cfg_path=region_cfg_path, metric=region_metric)
-    lookup_b, path_by_region_id_b = build_region_metric_lookup(excel_b, cfg_path=region_cfg_path, metric=region_metric)
+    lookup_a, path_by_region_id = build_region_metric_lookup(
+        excel_a, cfg_path=region_cfg_path, metric=region_metric, direct_label_only=True
+    )
+    lookup_b, path_by_region_id_b = build_region_metric_lookup(
+        excel_b, cfg_path=region_cfg_path, metric=region_metric, direct_label_only=True
+    )
     diff_lookup = subtract_region_metric_values(lookup_a, lookup_b)
     region_name_by_id = build_region_name_lookup(region_cfg_path)
     missing_a = _accumulate_missing_regions_for_slices(
@@ -1177,6 +1418,7 @@ def generate_batch_signal_count_diff_slices(
             atlas_slice.image,
             diff_lookup,
             path_by_region_id,
+            inherit_ancestors=False,
         )
         output_path = out_dir / f"bregma_{ap_mm}mm_{sample_dir.name}_minus_{subtract_sample_dir.name}.png"
         render_region_metric_atlas_slice(
@@ -1231,6 +1473,7 @@ def generate_batch_cell_density_slices(
     bregma_start: float = 1.1,
     bregma_end: float = -5.2,
     slice_count: int = 12,
+    bregma_step: float | None = None,
     plane: str = "coronal",
     coord_system: str = "bregma-mm",
     atlas_resolution_um: float = 25.0,
@@ -1259,7 +1502,12 @@ def generate_batch_cell_density_slices(
     label_path = Path(label_path or DEFAULT_ATLAS_LABEL)
     labels = np.asarray(tifffile.imread(str(label_path)))
     atlas_image_path = Path(atlas_image or default_reference_dir() / "atlas.nii.gz")
-    bregma_coords = linspace_bregma_coords(bregma_start, bregma_end, slice_count)
+    bregma_coords = resolve_batch_bregma_coords(
+        bregma_start=bregma_start,
+        bregma_end=bregma_end,
+        slice_count=slice_count,
+        bregma_step=bregma_step,
+    )
 
     cell_density_volumes: dict[str, np.ndarray] = {}
     sample_summaries: dict[str, object] = {}
@@ -1746,7 +1994,7 @@ def _render_region_metric_slice_array(
         background=background,
     )
 
-    # Optional focus outline on top of the shared render.
+    # Optional focus outline only (no fill / no dimming of other regions).
     if focus_mask is not None and np.any(focus_mask):
         from pipeline_modules.visualization.atlas_slice import _mask_contour_lines
         from matplotlib.collections import LineCollection
@@ -1766,7 +2014,7 @@ def _render_region_metric_slice_array(
                     LineCollection(
                         focus_lines,
                         colors=theme["focus"],
-                        linewidths=max(float(brain_outline_width) * 2.2, 1.0),
+                        linewidths=max(float(brain_outline_width) * 2.2, 2.0),
                         antialiased=True,
                     )
                 )
@@ -2274,6 +2522,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bregma-end", type=float, default=-5.2, help="End AP coordinate in mm for batch slice mode")
     parser.add_argument("--slice-count", type=int, default=12, help="Number of evenly spaced bregma slices in batch mode")
     parser.add_argument(
+        "--bregma-step",
+        type=float,
+        default=None,
+        help="Fixed AP step in mm for batch slice mode (overrides --slice-count when set)",
+    )
+    parser.add_argument(
         "--density-percentile",
         type=float,
         default=BATCH_SLICE_DEFAULT_PERCENTILE,
@@ -2286,9 +2540,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--slice-color-mode",
-        choices=["signal", "region"],
+        choices=["signal", "region", "hemisphere"],
         default="signal",
-        help="signal=smoothed atlas-space density slices; region=fill Allen brain areas from density Excel metrics",
+        help="signal=smoothed atlas-space density; region=whole-region Excel fill; hemisphere=left/right cell density (count/mm³)",
     )
     parser.add_argument(
         "--subtract-sample-dir",
@@ -2335,7 +2589,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volume-mode", choices=("binary", "count"), default="binary")
     parser.add_argument("--output-volume", default="", help="Optional atlas-space volume TIFF written before heatmap rendering")
 
-    parser.add_argument("--label", default=str(DEFAULT_ATLAS_LABEL), help="3D atlas label TIFF path")
+    parser.add_argument("--label", default="", help="3D atlas label TIFF path (default: resolve from YIFU_DATA_DIR/config)")
     parser.add_argument("--plane", default="horizontal", choices=["coronal", "sagittal", "horizontal"], help="Atlas slice plane")
     parser.add_argument("--coord-system", default="index", choices=["bregma-mm", "ccf-um", "index"], help="Coordinate system")
     parser.add_argument("--coord", type=float, help="Coordinate value for atlas-slice mode")
@@ -2533,10 +2787,11 @@ def main(argv: list[str] | None = None) -> int:
                 batch_plane = "coronal"
                 batch_coord_system = "bregma-mm"
             batch_kwargs = dict(
-                label_path=args.label,
+                label_path=args.label or str(default_atlas_label_path()),
                 bregma_start=float(args.bregma_start),
                 bregma_end=float(args.bregma_end),
                 slice_count=int(args.slice_count),
+                bregma_step=float(args.bregma_step) if args.bregma_step is not None else None,
                 plane=batch_plane,
                 coord_system=batch_coord_system,
                 atlas_resolution_um=float(args.atlas_resolution_um),
@@ -2592,6 +2847,31 @@ def main(argv: list[str] | None = None) -> int:
                     output_subdir=args.output_subdir or "",
                     **{key: value for key, value in batch_kwargs.items() if value is not None},
                 )
+            elif args.slice_color_mode == "hemisphere":
+                if not args.samples_root:
+                    parser.error("--samples-root is required for --slice-color-mode hemisphere")
+                if not args.resolution_xyz:
+                    parser.error(
+                        "--resolution-xyz x,y,z (µm) is required for --slice-color-mode hemisphere "
+                        "to convert Signal Count into count/mm³"
+                    )
+                hemi_colorbar = (
+                    args.colorbar_label
+                    if args.colorbar_label != "Signal Intensity"
+                    else "cell density (count/mm³)"
+                )
+                hemi_kwargs = {
+                    key: value
+                    for key, value in batch_kwargs.items()
+                    if key not in {"region_metric"} and value is not None
+                }
+                payload = generate_batch_hemisphere_metric_slices(
+                    samples_root=args.samples_root,
+                    resolution_xyz_um=_parse_triplet(args.resolution_xyz),
+                    cmap_name=args.cmap if args.cmap != "white_blue_red" else "white_orange_red_black",
+                    colorbar_label=hemi_colorbar,
+                    **hemi_kwargs,
+                )
             else:
                 if not args.samples_root:
                     parser.error("--samples-root is required for --slice-color-mode signal")
@@ -2618,7 +2898,11 @@ def main(argv: list[str] | None = None) -> int:
                     min_voxels_per_point=int(args.min_voxels_per_point),
                     bin_workers=args.bin_workers,
                     dataset_name=args.dataset_name,
-                    **{key: value for key, value in batch_kwargs.items() if key not in {"region_metric", "region_cfg_path"} and value is not None},
+                    **{
+                        key: value
+                        for key, value in batch_kwargs.items()
+                        if key not in {"region_metric", "region_cfg_path"} and value is not None
+                    },
                 )
         else:
             outputs = generate_prv_sample(

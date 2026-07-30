@@ -994,6 +994,33 @@ def collect_subtree_region_ids(region_id: int, cfg_path: str | Path = DEFAULT_CF
     return frozenset(subtree)
 
 
+def collect_subtree_atlas_label_ids(region_id: int, cfg_path: str | Path = DEFAULT_CFG) -> frozenset[int]:
+    """Subtree ids expanded for float32-repaired reference atlas labels."""
+    from pipeline_modules.visualization.repair_atlas_label_float32 import (
+        expand_region_ids_for_atlas_labels,
+    )
+
+    return expand_region_ids_for_atlas_labels(collect_subtree_region_ids(region_id, cfg_path), cfg_path)
+
+
+def collect_focus_atlas_label_ids(region_id: int, cfg_path: str | Path = DEFAULT_CFG) -> frozenset[int]:
+    """Atlas label ids used for 2D focus outline / slice jump.
+
+    Root (997) is special: its atlas voxels are only interstitial gaps, while its
+    ontology subtree is the whole brain. Outlining the full subtree just redraws
+    the brain perimeter and looks like \"no highlight\". Use root's own label.
+    """
+    from pipeline_modules.visualization.cfos_report_spatial import ALLEN_ROOT_REGION_ID
+    from pipeline_modules.visualization.repair_atlas_label_float32 import (
+        expand_region_ids_for_atlas_labels,
+    )
+
+    target = int(region_id)
+    if target == int(ALLEN_ROOT_REGION_ID):
+        return expand_region_ids_for_atlas_labels({target}, cfg_path)
+    return collect_subtree_atlas_label_ids(target, cfg_path)
+
+
 def load_smoothed_signal_volume(
     atlas_volume_path: str | Path,
     atlas_label_path: str | Path,
@@ -1152,7 +1179,7 @@ def _cached_render_metric_slice_png_with_layout(
     resolved_atlas = atlas_label or None
     resolved_volume = atlas_volume_tiff or None
     focus_ids = (
-        collect_subtree_region_ids(focus_region_id, cfg_path) if focus_region_id else None
+        collect_focus_atlas_label_ids(focus_region_id, cfg_path) if focus_region_id else None
     )
     return _render_metric_slice_png_bytes_impl(
         input_excel=Path(input_excel),
@@ -1282,11 +1309,13 @@ def _render_metric_slice_png_bytes_impl(
             input_excel,
             cfg_path=cfg_path,
             metric=left_metric,
+            direct_label_only=True,
         )
         lookup_right, _ = build_region_metric_lookup(
             input_excel,
             cfg_path=cfg_path,
             metric=right_metric,
+            direct_label_only=True,
         )
         painted = paint_hemisphere_split_slice(
             atlas_slice.image,
@@ -1316,18 +1345,24 @@ def _render_metric_slice_png_bytes_impl(
             input_excel,
             cfg_path=cfg_path,
             metric=excel_metric,
+            direct_label_only=True,
         )
         lookup_b, _ = build_region_metric_lookup(
             Path(compare_input_excel),
             cfg_path=cfg_path,
             metric=excel_metric,
+            direct_label_only=True,
         )
         sample_a_label = str(sample_id or input_excel.parent.parent.name)
         sample_b_label = str(compare_sample_id or Path(compare_input_excel).parent.parent.name)
 
         if normalized_color_mode == "dual":
-            region_values_a = resolve_slice_region_values(atlas_slice.image, lookup_a, path_by_region_id)
-            region_values_b = resolve_slice_region_values(atlas_slice.image, lookup_b, path_by_region_id)
+            region_values_a = resolve_slice_region_values(
+                atlas_slice.image, lookup_a, path_by_region_id, inherit_ancestors=False
+            )
+            region_values_b = resolve_slice_region_values(
+                atlas_slice.image, lookup_b, path_by_region_id, inherit_ancestors=False
+            )
             finite = [
                 value
                 for mapping in (region_values_a, region_values_b)
@@ -1368,8 +1403,12 @@ def _render_metric_slice_png_bytes_impl(
         elif normalized_color_mode == "split_lr":
             if plane != "coronal":
                 raise ValueError("split_lr mode is currently supported for coronal slices only.")
-            region_values_a = resolve_slice_region_values(atlas_slice.image, lookup_a, path_by_region_id)
-            region_values_b = resolve_slice_region_values(atlas_slice.image, lookup_b, path_by_region_id)
+            region_values_a = resolve_slice_region_values(
+                atlas_slice.image, lookup_a, path_by_region_id, inherit_ancestors=False
+            )
+            region_values_b = resolve_slice_region_values(
+                atlas_slice.image, lookup_b, path_by_region_id, inherit_ancestors=False
+            )
             painted = paint_lr_sample_split_slice(
                 atlas_slice.image,
                 region_values_a,
@@ -1393,7 +1432,9 @@ def _render_metric_slice_png_bytes_impl(
             )
         elif normalized_color_mode == "diff":
             diff_lookup = subtract_region_metric_values(lookup_a, lookup_b)
-            region_values = resolve_slice_region_values(atlas_slice.image, diff_lookup, path_by_region_id)
+            region_values = resolve_slice_region_values(
+                atlas_slice.image, diff_lookup, path_by_region_id, inherit_ancestors=False
+            )
             vmin, vmax = compute_symmetric_metric_limits(list(region_values.values()))
             rendered, slice_layout = _render_region_metric_slice_array(
                 atlas_slice.image,
@@ -1411,7 +1452,9 @@ def _render_metric_slice_png_bytes_impl(
             )
         else:  # fold
             fold_lookup = fold_change_region_metric_values(lookup_a, lookup_b)
-            region_values = resolve_slice_region_values(atlas_slice.image, fold_lookup, path_by_region_id)
+            region_values = resolve_slice_region_values(
+                atlas_slice.image, fold_lookup, path_by_region_id, inherit_ancestors=False
+            )
             finite = [abs(value) for value in region_values.values() if np.isfinite(value)]
             limit = max(finite) if finite else 1.0
             rendered, slice_layout = _render_region_metric_slice_array(
@@ -1487,8 +1530,14 @@ def _render_metric_slice_png_bytes_impl(
                 input_excel,
                 cfg_path=cfg_path,
                 metric=excel_metric,
+                direct_label_only=True,
             )
-            region_values = resolve_slice_region_values(atlas_slice.image, value_by_region_id, path_by_region_id)
+            region_values = resolve_slice_region_values(
+                atlas_slice.image,
+                value_by_region_id,
+                path_by_region_id,
+                inherit_ancestors=False,
+            )
             finite = [value for value in region_values.values() if np.isfinite(value)]
             vmax = max(finite) if finite else 1.0
             colorbar_label = "Signal Density" if excel_metric == "Voxel Density" else excel_metric

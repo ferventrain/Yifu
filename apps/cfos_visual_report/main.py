@@ -25,7 +25,8 @@ from pipeline_modules.utils.data_paths import get_yifu_data_dir
 from pipeline_modules.visualization.cfos_report_data import (
     DEFAULT_CFG,
     build_report_bundle,
-    collect_subtree_region_ids,
+    collect_focus_atlas_label_ids,
+    collect_subtree_atlas_label_ids,
     export_region_metrics_csv,
     export_slice_bookmarks_zip,
     render_metric_slice_png_bytes,
@@ -58,7 +59,7 @@ from pipeline_modules.visualization.cfos_report_spatial import (
 from pipeline_modules.visualization.heatmap import sample_has_density_excel
 
 STATIC_DIR = APP_DIR / "static"
-ASSET_VERSION = "29"
+ASSET_VERSION = "37"
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -495,7 +496,7 @@ def get_region_subtree(
     signal_ch: str = Query("ch1"),
 ) -> dict[str, Any]:
     bundle = _load_bundle(sample_dir, input_excel=input_excel, signal_ch=signal_ch)
-    member_ids = collect_subtree_region_ids(region_id, bundle["parameters"]["cfg_path"])
+    member_ids = collect_subtree_atlas_label_ids(region_id, bundle["parameters"]["cfg_path"])
     return {
         "region_id": int(region_id),
         "member_region_ids": sorted(member_ids),
@@ -514,7 +515,7 @@ def get_region_slice_focus(
     if not bundle["parameters"].get("atlas_label_available", False):
         detail = bundle["parameters"].get("atlas_label_error") or "Allen atlas label TIFF not found."
         raise HTTPException(status_code=400, detail=detail)
-    member_ids = collect_subtree_region_ids(region_id, bundle["parameters"]["cfg_path"])
+    member_ids = collect_focus_atlas_label_ids(region_id, bundle["parameters"]["cfg_path"])
     params = bundle["parameters"]
     bregma_index = tuple(int(value) for value in params.get("bregma_index", [18, 216, 228]))
     resolution_um = float(params.get("atlas_resolution_um_dv_ap_ml", [25.0, 25.0, 25.0])[1])
@@ -692,7 +693,7 @@ def get_spatial_region_surface(
     if not bundle["parameters"].get("atlas_label_available", False):
         detail = bundle["parameters"].get("atlas_label_error") or "Allen atlas label TIFF not found."
         raise HTTPException(status_code=400, detail=detail)
-    member_ids = collect_subtree_region_ids(region_id, bundle["parameters"]["cfg_path"])
+    member_ids = collect_subtree_atlas_label_ids(region_id, bundle["parameters"]["cfg_path"])
     try:
         return build_region_surface_payload(
             atlas_label=bundle["parameters"]["atlas_label_tiff"],

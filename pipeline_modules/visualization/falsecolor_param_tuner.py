@@ -6,6 +6,7 @@ Sweeps or interactively tunes:
   - flatfield_cyto_scale
   - bg_nuc_factor
   - bg_cyto_factor
+  - sharpen_alpha
 
 Example (interactive, middle slice, center crop for speed):
   python pipeline_modules/visualization/falsecolor_param_tuner.py --middle 1 --crop 1536
@@ -74,6 +75,7 @@ def render_preview(
     flatfield_cyto_scale: float,
     bg_nuc_factor: float,
     bg_cyto_factor: float,
+    sharpen_alpha: float,
     args: argparse.Namespace,
 ) -> np.ndarray:
     nuclei, cyto = preprocess_colleague_tricks(
@@ -84,7 +86,7 @@ def render_preview(
         flatfield=True,
         bg_nuc_factor=bg_nuc_factor,
         bg_cyto_factor=bg_cyto_factor,
-        sharpen_alpha=args.sharpen_alpha,
+        sharpen_alpha=sharpen_alpha,
         clahe=args.clahe,
         clahe_clip_limit=args.clahe_clip_limit,
     )
@@ -120,46 +122,62 @@ def render_preview(
 
 
 def load_preview_pair(args: argparse.Namespace) -> tuple[str, np.ndarray, np.ndarray]:
-    input_dir = args.input_dir.resolve()
-    pairs = discover_channel_pairs(
-        input_dir,
-        nuclei_channel=args.nuclei_channel,
-        cyto_channel=args.cyto_channel,
-    )
-    if not pairs:
-        raise FileNotFoundError(f"No paired TIFF channels in {input_dir}")
-
-    if args.prefix:
-        matched = [item for item in pairs if item[0] == args.prefix]
-        if not matched:
-            raise FileNotFoundError(f"Prefix not found: {args.prefix}")
-        prefix, nuclei_path, cyto_path = matched[0]
-        index = pairs.index(matched[0])
-        print(f"Using slice [{index}] prefix={prefix}")
-    else:
-        selected, start, end = select_slice_pairs(
-            pairs,
-            slice_start=args.slice_start,
-            slice_count=1,
-            middle=max(args.middle, 0),
+    if args.nuclei_tiff is not None and args.cyto_tiff is not None:
+        nuclei_path = args.nuclei_tiff.resolve()
+        cyto_path = args.cyto_tiff.resolve()
+        prefix = nuclei_path.name
+        match = __import__("re").match(
+            r"^(?P<prefix>.+)_ch\d+\.tiff?$", nuclei_path.name, __import__("re").I
         )
-        if not selected:
-            selected = [pairs[len(pairs) // 2]]
-            start = pairs.index(selected[0])
-            end = start + 1
-        prefix, nuclei_path, cyto_path = selected[0]
-        print(f"Using slice [{start}:{end}] prefix={prefix}")
+        if match:
+            prefix = match.group("prefix")
+        print(f"Using explicit TIFF pair prefix={prefix}", flush=True)
+    else:
+        input_dir = args.input_dir.resolve()
+        print(f"Scanning {input_dir} ...", flush=True)
+        t0 = time.time()
+        pairs = discover_channel_pairs(
+            input_dir,
+            nuclei_channel=args.nuclei_channel,
+            cyto_channel=args.cyto_channel,
+        )
+        print(f"Found {len(pairs)} pairs in {time.time() - t0:.1f}s", flush=True)
+        if not pairs:
+            raise FileNotFoundError(f"No paired TIFF channels in {input_dir}")
 
-    print(f"  nuclei: {nuclei_path}")
-    print(f"  cyto:   {cyto_path}")
+        if args.prefix:
+            matched = [item for item in pairs if item[0] == args.prefix]
+            if not matched:
+                raise FileNotFoundError(f"Prefix not found: {args.prefix}")
+            prefix, nuclei_path, cyto_path = matched[0]
+            index = pairs.index(matched[0])
+            print(f"Using slice [{index}] prefix={prefix}", flush=True)
+        else:
+            selected, start, end = select_slice_pairs(
+                pairs,
+                slice_start=args.slice_start,
+                slice_count=1,
+                middle=max(args.middle, 0),
+            )
+            if not selected:
+                selected = [pairs[len(pairs) // 2]]
+                start = pairs.index(selected[0])
+                end = start + 1
+            prefix, nuclei_path, cyto_path = selected[0]
+            print(f"Using slice [{start}:{end}] prefix={prefix}", flush=True)
 
+    print(f"  nuclei: {nuclei_path}", flush=True)
+    print(f"  cyto:   {cyto_path}", flush=True)
+    print("Reading TIFFs ...", flush=True)
+    t0 = time.time()
     nuclei = imread(str(nuclei_path))
     cyto = imread(str(cyto_path))
+    print(f"Read done in {time.time() - t0:.1f}s, raw shape={nuclei.shape}", flush=True)
     nuclei = center_crop(nuclei, args.crop)
     cyto = center_crop(cyto, args.crop)
     nuclei = maybe_downscale(nuclei, args.downscale)
     cyto = maybe_downscale(cyto, args.downscale)
-    print(f"Preview shape: {nuclei.shape}, backend={args.backend}")
+    print(f"Preview shape: {nuclei.shape}, backend={args.backend}", flush=True)
     return prefix, nuclei, cyto
 
 
@@ -169,25 +187,28 @@ def run_interactive(prefix: str, nuclei: np.ndarray, cyto: np.ndarray, args: arg
         "cyto_scale": args.init_cyto_scale,
         "bg_nuc": args.init_bg_nuc_factor,
         "bg_cyto": args.init_bg_cyto_factor,
+        "sharpen_alpha": args.init_sharpen_alpha,
         "busy": False,
     }
 
-    fig, ax = plt.subplots(figsize=(9, 9))
-    plt.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.32)
+    fig, ax = plt.subplots(figsize=(9, 9.5))
+    plt.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.38)
     image_artist = ax.imshow(np.zeros((*nuclei.shape, 3), dtype=np.uint8))
     ax.set_axis_off()
     title = ax.set_title(prefix)
 
-    ax_nuc = plt.axes([0.12, 0.22, 0.65, 0.03])
-    ax_cyto = plt.axes([0.12, 0.17, 0.65, 0.03])
-    ax_bgn = plt.axes([0.12, 0.12, 0.65, 0.03])
-    ax_bgc = plt.axes([0.12, 0.07, 0.65, 0.03])
-    ax_btn = plt.axes([0.82, 0.12, 0.14, 0.08])
+    ax_nuc = plt.axes([0.14, 0.28, 0.62, 0.03])
+    ax_cyto = plt.axes([0.14, 0.23, 0.62, 0.03])
+    ax_bgn = plt.axes([0.14, 0.18, 0.62, 0.03])
+    ax_bgc = plt.axes([0.14, 0.13, 0.62, 0.03])
+    ax_sh = plt.axes([0.14, 0.08, 0.62, 0.03])
+    ax_btn = plt.axes([0.82, 0.14, 0.14, 0.08])
 
     s_nuc = Slider(ax_nuc, "nuc_scale", 0.2, 8.0, valinit=state["nuc_scale"], valstep=0.05)
     s_cyto = Slider(ax_cyto, "cyto_scale", 0.2, 10.0, valinit=state["cyto_scale"], valstep=0.05)
     s_bgn = Slider(ax_bgn, "bg_nuc", 0.0, 3.0, valinit=state["bg_nuc"], valstep=0.05)
     s_bgc = Slider(ax_bgc, "bg_cyto", 0.0, 6.0, valinit=state["bg_cyto"], valstep=0.05)
+    s_sh = Slider(ax_sh, "sharpen", 0.0, 2.0, valinit=state["sharpen_alpha"], valstep=0.05)
     btn = Button(ax_btn, "Render")
 
     status = fig.text(0.12, 0.02, "", fontsize=10)
@@ -200,6 +221,7 @@ def run_interactive(prefix: str, nuclei: np.ndarray, cyto: np.ndarray, args: arg
         state["cyto_scale"] = float(s_cyto.val)
         state["bg_nuc"] = float(s_bgn.val)
         state["bg_cyto"] = float(s_bgc.val)
+        state["sharpen_alpha"] = float(s_sh.val)
         status.set_text("Rendering...")
         fig.canvas.draw_idle()
         fig.canvas.flush_events()
@@ -212,12 +234,14 @@ def run_interactive(prefix: str, nuclei: np.ndarray, cyto: np.ndarray, args: arg
                 flatfield_cyto_scale=state["cyto_scale"],
                 bg_nuc_factor=state["bg_nuc"],
                 bg_cyto_factor=state["bg_cyto"],
+                sharpen_alpha=state["sharpen_alpha"],
                 args=args,
             )
             image_artist.set_data(rgb)
             title.set_text(
                 f"{prefix} | nuc={state['nuc_scale']:.2f} cyto={state['cyto_scale']:.2f} "
-                f"bgN={state['bg_nuc']:.2f} bgC={state['bg_cyto']:.2f} ({time.time() - t0:.1f}s)"
+                f"bgN={state['bg_nuc']:.2f} bgC={state['bg_cyto']:.2f} "
+                f"sh={state['sharpen_alpha']:.2f} ({time.time() - t0:.1f}s)"
             )
             status.set_text("Done. Drag sliders then click Render (or press R).")
             if args.autosave_dir is not None:
@@ -225,7 +249,8 @@ def run_interactive(prefix: str, nuclei: np.ndarray, cyto: np.ndarray, args: arg
                 out_dir.mkdir(parents=True, exist_ok=True)
                 name = (
                     f"{prefix}_nuc{state['nuc_scale']:.2f}_cyto{state['cyto_scale']:.2f}"
-                    f"_bgN{state['bg_nuc']:.2f}_bgC{state['bg_cyto']:.2f}.tif"
+                    f"_bgN{state['bg_nuc']:.2f}_bgC{state['bg_cyto']:.2f}"
+                    f"_sh{state['sharpen_alpha']:.2f}.tif"
                 )
                 imsave(str(out_dir / name), rgb, check_contrast=False)
                 status.set_text(f"Saved {name}")
@@ -259,34 +284,44 @@ def run_grid(prefix: str, nuclei: np.ndarray, cyto: np.ndarray, args: argparse.N
     cyto_scales = args.cyto_scales
     bg_nucs = args.bg_nuc_factors
     bg_cytos = args.bg_cyto_factors
+    sharpen_alphas = args.sharpen_alphas
 
-    total = len(nuc_scales) * len(cyto_scales) * len(bg_nucs) * len(bg_cytos)
+    total = (
+        len(nuc_scales)
+        * len(cyto_scales)
+        * len(bg_nucs)
+        * len(bg_cytos)
+        * len(sharpen_alphas)
+    )
     print(f"Rendering grid: {total} combinations -> {output_dir}")
     done = 0
     for nuc_scale in nuc_scales:
         for cyto_scale in cyto_scales:
             for bg_nuc in bg_nucs:
                 for bg_cyto in bg_cytos:
-                    done += 1
-                    t0 = time.time()
-                    rgb = render_preview(
-                        nuclei,
-                        cyto,
-                        flatfield_nuc_scale=nuc_scale,
-                        flatfield_cyto_scale=cyto_scale,
-                        bg_nuc_factor=bg_nuc,
-                        bg_cyto_factor=bg_cyto,
-                        args=args,
-                    )
-                    name = (
-                        f"{prefix}_nuc{nuc_scale:.2f}_cyto{cyto_scale:.2f}"
-                        f"_bgN{bg_nuc:.2f}_bgC{bg_cyto:.2f}.tif"
-                    )
-                    imsave(str(output_dir / name), rgb, check_contrast=False)
-                    print(
-                        f"[{done}/{total}] {name} ({time.time() - t0:.1f}s)",
-                        flush=True,
-                    )
+                    for sharpen_alpha in sharpen_alphas:
+                        done += 1
+                        t0 = time.time()
+                        rgb = render_preview(
+                            nuclei,
+                            cyto,
+                            flatfield_nuc_scale=nuc_scale,
+                            flatfield_cyto_scale=cyto_scale,
+                            bg_nuc_factor=bg_nuc,
+                            bg_cyto_factor=bg_cyto,
+                            sharpen_alpha=sharpen_alpha,
+                            args=args,
+                        )
+                        name = (
+                            f"{prefix}_nuc{nuc_scale:.2f}_cyto{cyto_scale:.2f}"
+                            f"_bgN{bg_nuc:.2f}_bgC{bg_cyto:.2f}"
+                            f"_sh{sharpen_alpha:.2f}.tif"
+                        )
+                        imsave(str(output_dir / name), rgb, check_contrast=False)
+                        print(
+                            f"[{done}/{total}] {name} ({time.time() - t0:.1f}s)",
+                            flush=True,
+                        )
     print(f"Done. Wrote {total} images to {output_dir}")
     return 0
 
@@ -301,6 +336,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path(
             r"Z:\YF2026061901\20260701_09_44_49_YF2026061901_CHYY_fei_Destripe_DONE\All_Channels"
         ),
+    )
+    parser.add_argument(
+        "--nuclei_tiff",
+        type=Path,
+        default=None,
+        help="Optional explicit nuclei TIFF; skip folder scan when used with --cyto_tiff.",
+    )
+    parser.add_argument(
+        "--cyto_tiff",
+        type=Path,
+        default=None,
+        help="Optional explicit cyto TIFF; skip folder scan when used with --nuclei_tiff.",
     )
     parser.add_argument("--output_dir", type=Path, default=None, help="Required for --mode grid.")
     parser.add_argument(
@@ -340,7 +387,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cyto_normfactor", type=int, default=2100)
     parser.add_argument("--flatfield_tile_size", type=int, default=256)
     parser.add_argument("--flatfield_scale", type=float, default=1.0)
-    parser.add_argument("--sharpen_alpha", type=float, default=0.5)
     parser.add_argument("--clahe", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--clahe_clip_limit", type=float, default=1.5)
     parser.add_argument(
@@ -356,6 +402,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--init_cyto_scale", type=float, default=3.72)
     parser.add_argument("--init_bg_nuc_factor", type=float, default=0.5)
     parser.add_argument("--init_bg_cyto_factor", type=float, default=3.0)
+    parser.add_argument("--init_sharpen_alpha", type=float, default=0.5)
 
     parser.add_argument(
         "--nuc_scales",
@@ -380,6 +427,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=parse_float_list,
         default=parse_float_list("0.0,3.0,4.5"),
         help="Grid values for bg_cyto_factor.",
+    )
+    parser.add_argument(
+        "--sharpen_alphas",
+        type=parse_float_list,
+        default=parse_float_list("0.0,0.5,1.0"),
+        help="Grid values for sharpen_alpha.",
     )
     return parser.parse_args(argv)
 

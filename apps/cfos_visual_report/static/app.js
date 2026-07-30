@@ -31,6 +31,7 @@ const state = {
   atlasShape: [456, 528, 320],
   bregmaIndex: [18, 216, 228],
   sliceRefreshTimer: null,
+  sliceRefreshSeq: 0,
   highlightMemberIds: null,
   collapsedRegionIds: new Set(),
   showBrainOutline: false,
@@ -300,8 +301,8 @@ function applyRegionSliceFocus(focus) {
   els.sliceIndex.value = String(apIndex);
   els.sliceIndexLabel.textContent = String(apIndex);
   syncSliceBregmaLabel();
+  scheduleSliceRefresh(true);
   if (state.activeView === "slice2d") {
-    scheduleSliceRefresh(true);
     renderAxisHistograms({ axis: "AP", coordinate: apIndex });
   }
   return true;
@@ -309,7 +310,11 @@ function applyRegionSliceFocus(focus) {
 
 function jumpToRegionSliceLocal(regionId) {
   if (!state.regionCentroidStats?.available) return false;
-  const centroid = computeSubtreeCentroid(collectSubtreeRegionIds(regionId));
+  const rid = Number(regionId);
+  // Root's ontology subtree is the whole brain; jump using root's own voxels only.
+  const memberIds =
+    rid === ALLEN_ROOT_REGION_ID ? [ALLEN_ROOT_REGION_ID] : collectSubtreeRegionIds(rid);
+  const centroid = computeSubtreeCentroid(memberIds);
   if (!centroid) return false;
   return applyRegionSliceFocus({
     recommended_plane: "coronal",
@@ -408,6 +413,9 @@ function clearRegionSelection() {
   }
   renderRegionTree();
   updateExportButton();
+  if (state.bundle && state.activeView === "slice2d") {
+    scheduleSliceRefresh(true);
+  }
 }
 
 function initRegionTreeInteractions() {
@@ -624,9 +632,7 @@ async function toggleMultiRegionSelection(regionId) {
   renderRegionTree();
   updateExportButton();
   void applySelectedRegionsFocus3D(seq);
-  if (state.activeView === "slice2d") {
-    void jumpToRegionSlice(state.activeRegionId);
-  }
+  showRegionOnSlice(state.activeRegionId);
 }
 
 async function selectRegionCore(regionId) {
@@ -642,9 +648,7 @@ async function selectRegionCore(regionId) {
   syncRegionOutlinesButton();
   renderRegionDetail(displayRegionId);
   void applySelectedRegionsFocus3D(seq);
-  if (state.activeView === "slice2d") {
-    void jumpToRegionSlice(displayRegionId);
-  }
+  showRegionOnSlice(displayRegionId);
   renderRegionTree();
   updateExportButton();
   if (state.groupAnalysis) {
@@ -669,11 +673,24 @@ async function fetchRegionSliceFocus(regionId) {
 }
 
 async function jumpToRegionSlice(regionId) {
-  if (!state.bundle || !regionId) return;
-  if (jumpToRegionSliceLocal(regionId)) return;
+  if (!state.bundle || !regionId) return false;
+  if (jumpToRegionSliceLocal(regionId)) return true;
   const focus = await fetchRegionSliceFocus(regionId);
-  if (!focus?.available) return;
-  applyRegionSliceFocus(focus);
+  if (!focus?.available) return false;
+  return applyRegionSliceFocus(focus);
+}
+
+function showRegionOnSlice(regionId) {
+  // Highlight must not depend on jump succeeding: paint outline on the current
+  // slice immediately, then optionally move the camera/slice index.
+  setActiveView("slice2d");
+  scheduleSliceRefresh(true);
+  void jumpToRegionSlice(regionId).then((moved) => {
+    if (!moved) {
+      // Jump failed; keep the immediate highlight refresh already issued.
+      scheduleSliceRefresh(true);
+    }
+  });
 }
 
 function toggleRegionSelection(regionId) {
@@ -1301,12 +1318,12 @@ function scheduleSliceRefresh(immediate = false) {
     state.sliceRefreshTimer = null;
   }
   if (immediate) {
-    refreshSliceImage();
+    void refreshSliceImage();
     return;
   }
   state.sliceRefreshTimer = setTimeout(() => {
     state.sliceRefreshTimer = null;
-    refreshSliceImage();
+    void refreshSliceImage();
   }, 250);
 }
 
@@ -1471,9 +1488,9 @@ function setActiveView(viewName) {
     requestAnimationFrame(() => {
       state.viewer3d?.resize();
       renderAxisHistograms();
-      if (!els.sliceImage.src || els.sliceImage.classList.contains("is-hidden")) {
-        refreshSliceImage();
-      }
+      // Always re-render so an active selection outline appears immediately on
+      // entering the 2D view (do not wait for a second tab switch).
+      refreshSliceImage();
       if (state.bundle?.spatial?.available && !state.spatialAxes) {
         loadSpatialData();
       }
@@ -1494,6 +1511,7 @@ function setActiveView(viewName) {
 
 async function refreshSliceImage() {
   if (!state.bundle) return;
+  const seq = ++state.sliceRefreshSeq;
   if (state.bundle.parameters?.atlas_label_available === false) {
     els.sliceImage.classList.add("is-hidden");
     els.slicePlaceholder.style.display = "block";
@@ -1532,14 +1550,17 @@ async function refreshSliceImage() {
 
   try {
     const response = await fetch(url);
+    if (seq !== state.sliceRefreshSeq) return;
     if (!response.ok) {
       const payload = await response.json().catch(() => ({ detail: `Slice render failed (${response.status})` }));
+      if (seq !== state.sliceRefreshSeq) return;
       const detail = payload.detail || `Slice render failed (${response.status})`;
       els.slicePlaceholder.textContent = typeof detail === "string" ? detail : JSON.stringify(detail);
       return;
     }
     state.sliceLayout = parseSliceLayoutHeaders(response.headers);
     const blob = await response.blob();
+    if (seq !== state.sliceRefreshSeq) return;
     if (state.sliceImageObjectUrl) {
       URL.revokeObjectURL(state.sliceImageObjectUrl);
     }
@@ -1549,10 +1570,12 @@ async function refreshSliceImage() {
       els.sliceImage.onerror = () => reject(new Error("Failed to display slice image."));
       els.sliceImage.src = state.sliceImageObjectUrl;
     });
+    if (seq !== state.sliceRefreshSeq) return;
     els.sliceImage.classList.remove("is-hidden");
     els.slicePlaceholder.style.display = "none";
     attachSliceImageInteractions();
   } catch (error) {
+    if (seq !== state.sliceRefreshSeq) return;
     els.slicePlaceholder.textContent =
       error instanceof Error ? error.message : "Failed to load 2D slice image.";
   }

@@ -1,5 +1,5 @@
 {
-  "project_name": "YF2026032001zzj_cfos_sham_rerun",
+  "project_name": "YF2026060302_M2_cfos",
   "input": {
     "resolution_xyz": [1.8, 1.8, 2.0],
     "channels": {
@@ -9,21 +9,35 @@
   },
   "preprocessing": {
     "channel_subtraction": {
-      "apply": true,
+      "apply": false,
       "background_channel": "ch0",
       "weight": 1.0,
       "adaptive": true,
-      "save_plots": true,
+      "save_plots": false,
       "sample_ratio": 0.01,
       "min_samples": 10,
       "max_samples": 50,
       "compression": "lzw"
     },
-    "tophat": {"apply": true, "kernel_size": 21},
+    "tophat": {"apply": false, "kernel_size": 21},
     "rolling_ball": {"apply": false, "radius": 50},
-    "scattering_removal": {"apply": true, "sigma": 25.0, "weight": 1.0},
-    "median_filter": {"apply": true, "kernel_size": 5},
+    "scattering_removal": {"apply": false, "sigma": 25.0, "weight": 1.0},
+    "median_filter": {"apply": false, "kernel_size": 5},
     "clahe": {"apply": false, "clip_limit": 2.0, "tile_grid_size": 8},
+    "edge_signal_removal": {
+      "apply": false,
+      "inward_px": 50,
+      "outward_px": 0,
+      "prior_curve_scale": 1.15,
+      "prior_curve_smooth_sigma": 2.0,
+      "contour_min_object_area_px": 50,
+      "contour_morph_radius_px": 2,
+      "contour_dilation_px": 2,
+      "brightness_pct": 90.0,
+      "min_area_px": 50,
+      "suppression_weight": 1.0,
+      "max_workers": 8
+    },
     "downsample": {
       "target_resolution_xyz": [25.0, 25.0, 25.0],
       "chunk_size": 100
@@ -43,14 +57,14 @@
     "flip_atlas": [false, false, false],
     "save_upsampled_label": false,
     "save_upsampled_label_zarr": true,
-    "save_upsampled_label_hemisphere_zarr": true
+    "save_upsampled_label_hemisphere_zarr": false
   },
   "segmentation": {
     "method": "cfos_unet",
     "export_mask_tiff": false,
     "cfos_unet": {
-      "checkpoint_path": "S:/Yifu/outputs/cfos_noise_finetune_v3/best_model.pt",
-      "save_probability": true,
+      "checkpoint_path": "${YIFU_DATA_DIR}/models/cfos/best_model.pt",
+      "save_probability": false,
       "probability_zarr": "",
       "dataset_name": "0",
       "patch_size": [256, 256, 256],
@@ -58,7 +72,7 @@
       "batch_size": 16,
       "device": "auto",
       "foreground_class": 1,
-      "probability_threshold": 0.4,
+      "probability_threshold": 0.5,
       "process_existing_only": false,
       "skip_below_threshold": 100.0,
       "rerun_if_model_updated": true,
@@ -71,6 +85,9 @@
   "analysis": {
     "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
     "output_format": "xlsx",
-    "use_hemisphere_label": true
+    "use_hemisphere_label": false
+  },
+  "tubule_reconstruction": {
+    "enabled": false
   }
 }

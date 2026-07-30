@@ -13,6 +13,7 @@ from pipeline_modules.visualization.atlas_slice import (
     lookup_region_metric_value,
     resolve_slice_region_values,
     subtract_region_metric_values,
+    to_direct_label_metric_values,
 )
 from pipeline_modules.visualization.heatmap import (
     _paint_region_values_on_slice,
@@ -129,6 +130,26 @@ class HeatmapCellDensityTests(unittest.TestCase):
         self.assertTrue(np.all(np.isnan(painted[0, :])))
         self.assertTrue(np.all(painted[2, 2:4] == 7.5))
         self.assertEqual(float(painted[4, 4]), 0.0)
+
+    def test_to_direct_label_metric_values_subtracts_children(self):
+        # root(1)=100 inclusive, child A(2)=60, child B(3)=30 → root exclusive=10
+        values = {1: 100.0, 2: 60.0, 3: 30.0}
+        paths = {1: [1], 2: [1, 2], 3: [1, 3]}
+        exclusive = to_direct_label_metric_values(values, paths)
+        self.assertAlmostEqual(exclusive[1], 10.0)
+        self.assertAlmostEqual(exclusive[2], 60.0)
+        self.assertAlmostEqual(exclusive[3], 30.0)
+
+    def test_resolve_slice_without_inheritance_keeps_missing_at_zero(self):
+        labels = np.array([[0, 5], [9, 0]], dtype=np.uint16)
+        resolved = resolve_slice_region_values(
+            labels,
+            {5: 12.0},
+            {5: [1, 5], 9: [1, 9]},
+            inherit_ancestors=False,
+        )
+        self.assertEqual(resolved[5], 12.0)
+        self.assertEqual(resolved[9], 0.0)
 
     def test_resolve_slice_region_values_defaults_missing_regions_to_zero(self):
         labels = np.array([[0, 5], [9, 0]], dtype=np.uint16)

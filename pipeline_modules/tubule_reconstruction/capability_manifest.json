@@ -1,13 +1,42 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "module": "tubule_reconstruction",
-  "description": "Vessel / tubule skeleton reconstruction from binary mask Zarr using kimimaro/TEASAR, with optional per-brain-region summary.",
+  "description": "Vessel / tubule skeleton reconstruction from binary mask Zarr using kimimaro/TEASAR, with optional per-brain-region morphology (branch points, path lengths, tortuosity, volume).",
+  "notes_for_agents": [
+    "save_skeleton=true is REQUIRED for multi-region morphology (branch points, tortuosity, path lengths). Outputs: skeleton_vertices.csv + skeleton_edges.csv.",
+    "save_swc is OPTIONAL visualization only (kimimaro view / PyVista). It is NOT required for region stats.",
+    "Default accelerated path: chunkwise + chunk_workers≈8 + dust_threshold=100 + downsample_factor=4 (max-pool) + process_existing_only.",
+    "For main.py embedding: set tubule_reconstruction.enabled=true and region_analysis.all_regions=true to run segmentation once then export all Allen regions.",
+    "Region volume uses the ORIGINAL full-resolution mask; skeleton topology uses the (possibly downsampled) mask. Coordinates stay in microns."
+  ],
+  "recommended_workflow": {
+    "id": "whole_brain_vessel_morphology",
+    "description": "One-shot: skeletonize mask then export every Allen region morphology row.",
+    "via_main": {
+      "config_keys": {
+        "tubule_reconstruction.enabled": true,
+        "tubule_reconstruction.save_skeleton": true,
+        "tubule_reconstruction.save_swc": false,
+        "tubule_reconstruction.dust_threshold": 100,
+        "tubule_reconstruction.downsample_factor": 4,
+        "tubule_reconstruction.chunkwise": true,
+        "tubule_reconstruction.chunk_workers": 8,
+        "tubule_reconstruction.region_analysis.enabled": true,
+        "tubule_reconstruction.region_analysis.all_regions": true
+      },
+      "powershell": "micromamba run -n yifu python S:\\Yifu\\main.py --config S:\\Yifu\\config\\config_template.json --sample_dir \"S:\\path\\to\\sample\""
+    },
+    "standalone_powershell": [
+      "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --chunk_workers 8 --save_skeleton",
+      "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
+    ]
+  },
   "entrypoints": [
     {
       "id": "analyze_binary_mask_zarr",
       "function": "pipeline_modules.tubule_reconstruction.kimimaro_reconstruction.analyze_binary_mask_zarr",
-      "cli": "python pipeline_modules/tubule_reconstruction/kimimaro_reconstruction.py",
-      "description": "Skeletonise a full-volume binary mask Zarr and compute network metrics.",
+      "cli": "python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --no_chunkwise",
+      "description": "Skeletonise a (optionally downsampled) binary mask Zarr in one shot and compute network metrics.",
       "prerequisites": [
         "Binary mask Zarr store must exist (e.g. SampleLayout.mask_zarr)"
       ],
@@ -18,12 +47,14 @@
         "resolution_xyz": {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
         "foreground_label": {"type": "int", "default": 1},
         "roi":            {"type": "object|null", "default": null, "description": "{\"z\":[lo,hi],\"y\":[lo,hi],\"x\":[lo,hi]}"},
-        "dust_threshold": {"type": "int", "default": 0},
+        "dust_threshold": {"type": "int", "default": 100},
         "fix_borders":    {"type": "bool", "default": true},
         "parallel":       {"type": "int", "default": 1},
         "teasar_params":  {"type": "TeasarParams", "default": null, "description": "Dict matching TeasarParams fields; null uses defaults"},
-        "save_skeleton":  {"type": "bool", "default": false},
-        "save_swc":       {"type": "bool", "default": false},
+        "save_skeleton":  {"type": "bool", "default": true, "description": "REQUIRED for region morphology"},
+        "save_swc":       {"type": "bool", "default": false, "description": "Optional visualization only; NOT required for region stats"},
+        "downsample_factor": {"type": "int", "default": 4, "description": "Isotropic max-pool downsample before skeletonization; 1=off"},
+        "keep_downsampled_mask": {"type": "bool", "default": false},
         "merge_branch_points_distance_um": {"type": "float", "default": 0.0, "description": "Merge branch points within this distance (um). 0=disabled"},
         "prune_spurs_max_length_um": {"type": "float", "default": 0.0, "description": "Prune terminal branches shorter than this (um). 0=disabled"}
       },
@@ -34,16 +65,21 @@
         "edge_csv_path":     {"type": "path", "optional": true, "description": "skeleton_edges.csv (requires save_skeleton)"},
         "swc_dir":           {"type": "path", "optional": true, "description": "SWC directory (requires save_swc)"},
         "manifest_path":     {"type": "path", "description": "_run_manifest.json"}
-      }
+      },
+      "common_commands": [
+        {
+          "description": "Full-volume skeletonization with 4x downsample (default accel)",
+          "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --no_chunkwise --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --save_skeleton"
+        }
+      ]
     },
     {
       "id": "analyze_binary_mask_zarr_chunkwise",
       "function": "pipeline_modules.tubule_reconstruction.kimimaro_reconstruction.analyze_binary_mask_zarr_chunkwise",
-      "cli": "python pipeline_modules/tubule_reconstruction/kimimaro_reconstruction.py --chunkwise",
-      "description": "Chunk-by-chunk skeletonisation with optional cross-chunk stitching. Use this for large volumes that do not fit in RAM.",
+      "cli": "python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction",
+      "description": "Default path: chunk-by-chunk skeletonisation with optional cross-chunk stitching. Prefer this for large volumes.",
       "prerequisites": [
-        "Binary mask Zarr store must exist",
-        "save_skeleton is implicitly true (skeleton tables are always written in chunkwise mode)"
+        "Binary mask Zarr store must exist"
       ],
       "inputs": {
         "mask_zarr_path": {"type": "path", "required": true},
@@ -51,19 +87,21 @@
         "dataset_name":   {"type": "string", "default": "0"},
         "resolution_xyz": {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
         "foreground_label": {"type": "int", "default": 1},
-        "dust_threshold": {"type": "int", "default": 0},
+        "dust_threshold": {"type": "int", "default": 100},
         "fix_borders":    {"type": "bool", "default": true},
         "parallel":       {"type": "int", "default": 1},
         "teasar_params":  {"type": "TeasarParams", "default": null},
-        "save_skeleton":  {"type": "bool", "default": false},
-        "save_swc":       {"type": "bool", "default": false},
-        "process_existing_only": {"type": "bool", "default": false},
-        "halo_zyx":       {"type": "triplet_int_vox", "default": [0, 0, 0]},
+        "save_skeleton":  {"type": "bool", "default": true, "description": "REQUIRED for region morphology"},
+        "save_swc":       {"type": "bool", "default": false, "description": "Optional visualization only"},
+        "process_existing_only": {"type": "bool", "default": true},
+        "halo_zyx":       {"type": "triplet_int_vox", "default": [2, 4, 4]},
         "stitch":         {"type": "bool", "default": true},
         "stitch_max_distance_um": {"type": "float", "default": 5.0},
-        "chunk_workers":  {"type": "int", "default": 1},
-        "merge_branch_points_distance_um": {"type": "float", "default": 0.0, "description": "Merge branch points within this distance (um). 0=disabled"},
-        "prune_spurs_max_length_um": {"type": "float", "default": 0.0, "description": "Prune terminal branches shorter than this (um). 0=disabled"}
+        "chunk_workers":  {"type": "int", "default": 8, "description": "Process pool size; auto-caps near CPU/2"},
+        "downsample_factor": {"type": "int", "default": 4},
+        "keep_downsampled_mask": {"type": "bool", "default": false},
+        "merge_branch_points_distance_um": {"type": "float", "default": 0.0},
+        "prune_spurs_max_length_um": {"type": "float", "default": 0.0}
       },
       "outputs": {
         "branch_csv_path":   {"type": "path", "description": "vessel_branch_metrics.csv"},
@@ -74,15 +112,21 @@
         "stitch_csv_path":   {"type": "path", "optional": true},
         "swc_dir":           {"type": "path", "optional": true},
         "manifest_path":     {"type": "path", "description": "_run_manifest.json"}
-      }
+      },
+      "common_commands": [
+        {
+          "description": "Recommended whole-brain skeletonization (defaults)",
+          "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --chunk_workers 8 --save_skeleton"
+        }
+      ]
     },
     {
       "id": "analyze_regions_from_skeleton",
       "function": "pipeline_modules.tubule_reconstruction.region_vessel_analysis.analyze_regions_from_skeleton",
-      "cli": "python pipeline_modules/tubule_reconstruction/region_vessel_analysis.py",
-      "description": "Compute per-brain-region vessel parameters from skeleton branch paths plus direct binary-mask vessel volume.",
+      "cli": "python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis",
+      "description": "Compute per-brain-region vessel parameters from skeleton tables. Use --all_regions for every Allen structure (branch points, path lengths, tortuosity, vessel volume).",
       "prerequisites": [
-        "skeleton_vertices.csv and skeleton_edges.csv must exist (outputs of analyze_binary_mask_zarr[_chunkwise] with save_skeleton=true)",
+        "skeleton_vertices.csv and skeleton_edges.csv must exist (save_skeleton=true). SWC is NOT required.",
         "Registered annotation label Zarr must exist (e.g. SampleLayout.atlas_label_zarr)",
         "Allen region CSV must exist (default: pipeline_modules/registration/Region_Csv_Rev1_updated.CSV)"
       ],
@@ -90,29 +134,55 @@
         "vertex_csv_path":            {"type": "path", "required": true, "description": "skeleton_vertices.csv"},
         "edge_csv_path":              {"type": "path", "required": true, "description": "skeleton_edges.csv"},
         "branch_csv_path":            {"type": "path|null", "default": null, "description": "vessel_branch_metrics.csv; defaults to skeleton CSV directory"},
-        "mask_zarr_path":             {"type": "path|null", "default": null, "description": "Binary vessel mask Zarr for direct volume statistics; defaults to sample_dir/<signal_ch>_mask.zarr"},
-        "annotation_zarr_path":       {"type": "path|null", "default": null, "description": "Registered annotation label Zarr; defaults to sample_dir/upsampled_atlas_label.zarr"},
+        "mask_zarr_path":             {"type": "path|null", "default": null, "description": "Full-resolution binary vessel mask for volume statistics"},
+        "annotation_zarr_path":       {"type": "path|null", "default": null, "description": "Registered annotation label Zarr"},
         "region_cfg_csv":             {"type": "path", "required": true, "description": "Allen region CSV"},
-        "regions":                    {"type": "string|list[string]", "required": true, "description": "Comma/semicolon list of region queries (acronym, full name, or integer id)"},
+        "regions":                    {"type": "string|list[string]|null", "default": null, "description": "Optional explicit region queries when all_regions=false"},
+        "all_regions":                {"type": "bool", "default": false, "description": "Export every region id in region_cfg_csv"},
+        "region_groups":              {"type": "object|string|null", "default": null},
         "output_dir":                 {"type": "path|null", "default": null, "description": "If set, write CSV/JSON + manifest here"},
         "mask_dataset_name":          {"type": "string", "default": "0"},
-        "foreground_label":           {"type": "int|null", "default": 1, "description": "Mask value treated as vessel foreground; null means any nonzero value"},
+        "foreground_label":           {"type": "int|null", "default": 1},
         "annotation_dataset_name":    {"type": "string", "default": "0"},
-        "annotation_resolution_xyz":  {"type": "triplet_float_um|null", "default": null, "description": "Defaults to input.resolution_xyz from config.json"},
-        "config_path":                {"type": "path|null", "default": null, "description": "Config JSON used to read input.resolution_xyz"}
+        "annotation_resolution_xyz":  {"type": "triplet_float_um|null", "default": null},
+        "config_path":                {"type": "path|null", "default": null}
       },
       "outputs": {
-        "summary_table":      {"type": "DataFrame", "description": "In-memory pandas DataFrame with per-region metrics"},
-        "summary_csv_path":   {"type": "path", "optional": true, "description": "region_vessel_summary.csv (only when output_dir set)"},
-        "summary_json_path":  {"type": "path", "optional": true, "description": "region_vessel_summary.json (only when output_dir set)"},
-        "manifest_path":      {"type": "path", "optional": true, "description": "_run_manifest.json (only when output_dir set)"}
-      }
+        "summary_table":      {"type": "DataFrame", "description": "In-memory pandas DataFrame with per-region metrics including num_branch_points"},
+        "summary_csv_path":   {"type": "path", "optional": true, "description": "region_vessel_summary.csv"},
+        "summary_json_path":  {"type": "path", "optional": true, "description": "region_vessel_summary.json"},
+        "manifest_path":      {"type": "path", "optional": true, "description": "_run_manifest.json"}
+      },
+      "common_commands": [
+        {
+          "description": "Whole-brain all-region morphology after skeletonization",
+          "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
+        }
+      ]
     }
   ],
   "configuration_models": {
     "TubuleReconstructionCfg": "pipeline_modules.tubule_reconstruction.config.TubuleReconstructionCfg",
     "RegionVesselAnalysisCfg": "pipeline_modules.tubule_reconstruction.config.RegionVesselAnalysisCfg",
     "TeasarParams":            "pipeline_modules.tubule_reconstruction.config.TeasarParams"
+  },
+  "config_section": {
+    "path": "tubule_reconstruction",
+    "template": "config/config_template.json",
+    "main_gate": "tubule_reconstruction.enabled",
+    "defaults_summary": {
+      "enabled": false,
+      "dust_threshold": 100,
+      "save_skeleton": true,
+      "save_swc": false,
+      "chunkwise": true,
+      "chunk_workers": 8,
+      "process_existing_only": true,
+      "downsample_factor": 4,
+      "halo_zyx": [2, 4, 4],
+      "region_analysis.enabled": true,
+      "region_analysis.all_regions": true
+    }
   },
   "sample_layout": {
     "class": "pipeline_modules.utils.sample_layout.SampleLayout",

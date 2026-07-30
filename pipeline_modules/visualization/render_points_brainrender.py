@@ -151,16 +151,121 @@ def load_points(csv_path: str | Path, columns: tuple[str, str, str] | None) -> n
     return coords
 
 
-def configure_brainrender(*, background: str, root_alpha: float, show_axes: bool, offscreen: bool) -> None:
-    settings.BACKGROUND_COLOR = background
+def normalize_background(background: str) -> str:
+    """Map CLI background names to brainrender BACKGROUND_COLOR values."""
+    value = str(background or "white").strip().lower()
+    aliases = {
+        "white": "white",
+        "w": "white",
+        "black": "black",
+        "k": "black",
+        "dark": "black",
+    }
+    if value in aliases:
+        return aliases[value]
+    return str(background).strip()
+
+
+def parse_color_rgb(value: str) -> list[float] | str:
+    """Accept a named color, #hex, or comma-separated 0-1 / 0-255 RGB."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Empty color value.")
+    if "," in text:
+        parts = [float(part.strip()) for part in text.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Expected 3 RGB components, got {len(parts)}: {value!r}")
+        if max(parts) > 1.0:
+            parts = [channel / 255.0 for channel in parts]
+        return [max(0.0, min(1.0, channel)) for channel in parts]
+    return text
+
+
+def default_root_color(background: str) -> list[float]:
+    """Brighter outline on dark scenes; mid-gray on white so the silhouette stays readable."""
+    bg = normalize_background(background)
+    if bg == "black":
+        return [0.92, 0.94, 0.98]
+    return [0.72, 0.72, 0.74]
+
+
+def configure_brainrender(
+    *,
+    background: str,
+    root_alpha: float,
+    show_axes: bool,
+    offscreen: bool,
+    shader_style: str = "glossy",
+    root_color: str | list[float] | None = None,
+) -> None:
+    bg = normalize_background(background)
+    settings.BACKGROUND_COLOR = bg
     settings.ROOT_ALPHA = float(root_alpha)
-    settings.ROOT_COLOR = [0.82, 0.82, 0.82]
-    settings.SHADER_STYLE = "plastic"
+    if root_color is None or root_color == "":
+        settings.ROOT_COLOR = default_root_color(bg)
+    elif isinstance(root_color, (list, tuple)):
+        settings.ROOT_COLOR = [float(channel) for channel in root_color]
+    else:
+        settings.ROOT_COLOR = parse_color_rgb(str(root_color))
+    settings.SHADER_STYLE = shader_style
     settings.SHOW_AXES = bool(show_axes)
     settings.OFFSCREEN = bool(offscreen)
     settings.WHOLE_SCREEN = False
     settings.INTERACTIVE = not offscreen
     settings.DEFAULT_CAMERA = "three_quarters"
+
+
+def install_lighting_controls(
+    scene: Scene,
+    *,
+    light_intensity: float = 1.0,
+    ambient: float | None = None,
+) -> None:
+    """Scale renderer lights and optionally override material ambient after style is applied."""
+    intensity = float(light_intensity)
+    if intensity <= 0:
+        raise ValueError(f"--light_intensity must be > 0, got {light_intensity}")
+    if ambient is not None and not (0.0 <= float(ambient) <= 1.0):
+        raise ValueError(f"--ambient must be in [0, 1], got {ambient}")
+
+    if abs(intensity - 1.0) < 1e-9 and ambient is None:
+        return
+
+    original_apply_style = scene._apply_style
+    base_intensities: dict[int, float] = {}
+
+    def _apply_style_with_lighting() -> None:
+        original_apply_style()
+        if ambient is not None:
+            ambient_value = float(ambient)
+            for actor in scene.clean_actors:
+                try:
+                    actor.mesh.properties.SetAmbient(ambient_value)
+                except Exception:
+                    pass
+                try:
+                    actor._mesh.properties.SetAmbient(ambient_value)
+                except Exception:
+                    pass
+        if abs(intensity - 1.0) < 1e-9:
+            return
+        if scene.plotter is None:
+            scene._get_plotter()
+        renderers = list(getattr(scene.plotter, "renderers", None) or [])
+        if not renderers and getattr(scene.plotter, "renderer", None) is not None:
+            renderers = [scene.plotter.renderer]
+        for ren in renderers:
+            lights = ren.GetLights()
+            lights.InitTraversal()
+            light = lights.GetNextItem()
+            while light is not None:
+                key = id(light)
+                if key not in base_intensities:
+                    base_intensities[key] = float(light.GetIntensity())
+                light.SetIntensity(base_intensities[key] * intensity)
+                light = lights.GetNextItem()
+
+    scene._apply_style = _apply_style_with_lighting
 
 
 def ensure_atlas_available(atlas_name: str) -> None:
@@ -1086,7 +1191,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Clip the whole-brain outline to the selected region's x/AP coronal extent.",
     )
     parser.add_argument("--hide_whole_brain", action="store_true", help="Hide the transparent whole-brain mesh.")
-    parser.add_argument("--region_alpha", type=float, default=0.18, help="Rendered region opacity.")
+    parser.add_argument("--region_alpha", type=float, default=0.35, help="Rendered region opacity.")
     parser.add_argument("--region_color", default="#4cc9f0", help="Rendered region color.")
     parser.add_argument("--hemisphere", choices=("both", "left", "right"), default="both", help="Region mesh hemisphere.")
     parser.add_argument("--region", default="", help=argparse.SUPPRESS)
@@ -1121,8 +1226,42 @@ def build_argparser() -> argparse.ArgumentParser:
         default="",
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--root_alpha", type=float, default=0.12, help="Brain transparency from 0 to 1.")
-    parser.add_argument("--background", default="white", help="Background color.")
+    parser.add_argument("--root_alpha", type=float, default=0.25, help="Brain transparency from 0 to 1.")
+    parser.add_argument(
+        "--root_color",
+        default="",
+        help=(
+            "Whole-brain outline color: name, #hex, or R,G,B (0-1 or 0-255). "
+            "Default is brighter near-white on black backgrounds."
+        ),
+    )
+    parser.add_argument(
+        "--light_intensity",
+        type=float,
+        default=1.0,
+        help="Scale scene light brightness (1.0=default, try 1.5–2.5 to brighten).",
+    )
+    parser.add_argument(
+        "--ambient",
+        type=float,
+        default=None,
+        help="Override material ambient fill in [0, 1] (higher = flatter, brighter fill light).",
+    )
+    parser.add_argument(
+        "--shader_style",
+        choices=("glossy", "shiny", "plastic", "metallic", "cartoon"),
+        default="glossy",
+        help=(
+            "Mesh lighting style. glossy≈glass highlight (default); shiny=bright specular; "
+            "plastic=matte; metallic=metal; cartoon=flat + black silhouette edges."
+        ),
+    )
+    parser.add_argument(
+        "--background",
+        choices=("white", "black"),
+        default="white",
+        help="Scene background: white (default) or black.",
+    )
     parser.add_argument("--camera", default="three_quarters", help="brainrender camera preset name.")
     parser.add_argument(
         "--camera_view",
@@ -1346,6 +1485,8 @@ def main() -> int:
         root_alpha=args.root_alpha,
         show_axes=args.show_axes,
         offscreen=not interactive_mode,
+        shader_style=args.shader_style,
+        root_color=args.root_color or None,
     )
 
     region_groups_for_mesh = selected_groups if selected_groups else None
@@ -1390,6 +1531,11 @@ def main() -> int:
                 region_groups=[group],
                 region_coronal_slab=args.region_coronal_slab,
             )
+            install_lighting_controls(
+                scene,
+                light_intensity=args.light_intensity,
+                ambient=args.ambient,
+            )
             output_file = output_dir / f"{group.name}_brainrender.png"
             saved_path = save_scene_screenshot(
                 scene,
@@ -1421,6 +1567,11 @@ def main() -> int:
         hemisphere=args.hemisphere,
         region_groups=region_groups_for_mesh,
         region_coronal_slab=args.region_coronal_slab,
+    )
+    install_lighting_controls(
+        scene,
+        light_intensity=args.light_intensity,
+        ambient=args.ambient,
     )
 
     if export_camera_path is not None:

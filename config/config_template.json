@@ -145,5 +145,47 @@
         "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
         "output_format": "xlsx",
         "use_hemisphere_label": false
+    },
+
+    "tubule_reconstruction": {
+        "enabled": true,
+        "mask_dataset_name": "0",
+        "foreground_label": 1,
+        "dust_threshold": 100,
+        "fix_borders": true,
+        "parallel": 1,
+        "save_skeleton": true,
+        "save_swc": false,
+        "chunkwise": true,
+        "chunk_workers": 8,
+        "process_existing_only": true,
+        "halo_zyx": [2, 4, 4],
+        "stitch": true,
+        "stitch_max_distance_um": 5.0,
+        "downsample_factor": 4,
+        "keep_downsampled_mask": false,
+        "merge_branch_points_distance_um": 0.0,
+        "prune_spurs_max_length_um": 0.0,
+        "output_dirname": "tubule_reconstruction",
+        "teasar_params": {
+            "scale": 1.5,
+            "const": 300,
+            "pdrf_scale": 100000,
+            "pdrf_exponent": 4,
+            "soma_acceptance_threshold": 3500,
+            "soma_detection_threshold": 750,
+            "soma_invalidation_scale": 1.0,
+            "soma_invalidation_const": 300,
+            "max_paths": null
+        },
+        "region_analysis": {
+            "enabled": true,
+            "all_regions": true,
+            "regions": [],
+            "cfg": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+            "mask_dataset_name": "0",
+            "foreground_label": 1,
+            "annotation_dataset_name": "0"
+        }
     }
 }
