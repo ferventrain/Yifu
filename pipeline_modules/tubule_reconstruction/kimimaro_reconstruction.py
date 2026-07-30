@@ -166,6 +166,88 @@ def expand_slices(core_slices, halo_zyx, shape):
     return tuple(expanded)
 
 
+def select_region_chunk_indices(
+    label_zarr_path,
+    region_cfg_path,
+    regions,
+    *,
+    mask_shape,
+    mask_chunks,
+    label_dataset_name="0",
+    chunk_margin=0,
+):
+    """Select mask chunks intersecting requested atlas regions and a chunk margin.
+
+    The label volume must share the mask volume's voxel coordinate system and
+    shape. The margin includes neighboring chunks so skeleton paths near a
+    region boundary retain local context.
+    """
+    from .region_vessel_analysis import (
+        _collect_subtree_ids,
+        load_region_tree_with_lookups,
+        parse_region_list,
+        resolve_region_query,
+    )
+
+    chunk_margin = int(chunk_margin)
+    if chunk_margin < 0:
+        raise ValueError(f"region_chunk_margin must be >= 0, got {chunk_margin}")
+
+    queries = parse_region_list(regions)
+    if not queries:
+        raise ValueError("At least one region query is required for region chunk filtering")
+
+    label_zarr = open_zarr_dataset(label_zarr_path, dataset_name=label_dataset_name)
+    mask_shape = tuple(int(value) for value in mask_shape)
+    mask_chunks = tuple(int(value) for value in mask_chunks)
+    if tuple(int(value) for value in label_zarr.shape) != mask_shape:
+        raise ValueError(
+            "Region label Zarr shape must match mask Zarr shape: "
+            f"label={tuple(label_zarr.shape)}, mask={mask_shape}"
+        )
+
+    nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(region_cfg_path)
+    region_ids = set()
+    for query in queries:
+        node = resolve_region_query(query, nodes_by_id, acronym_to_ids, name_to_ids)
+        region_ids.update(int(value) for value in _collect_subtree_ids(node))
+    region_id_array = np.asarray(sorted(region_ids), dtype=label_zarr.dtype)
+
+    matching = set()
+    for chunk_index in tqdm(
+        iter_all_chunk_indices(mask_shape, mask_chunks),
+        desc="Selecting region chunks",
+        unit="chunk",
+    ):
+        chunk_slices = chunk_index_to_slices(chunk_index, mask_chunks, mask_shape)
+        if np.isin(np.asarray(label_zarr[chunk_slices]), region_id_array).any():
+            matching.add(chunk_index)
+
+    if not matching:
+        raise ValueError(f"No mask chunks intersect the requested regions: {queries}")
+
+    grid_shape = tuple((dim + chunk - 1) // chunk for dim, chunk in zip(mask_shape, mask_chunks))
+    selected = set()
+    for chunk_index in matching:
+        for dz in range(-chunk_margin, chunk_margin + 1):
+            for dy in range(-chunk_margin, chunk_margin + 1):
+                for dx in range(-chunk_margin, chunk_margin + 1):
+                    neighbor = (chunk_index[0] + dz, chunk_index[1] + dy, chunk_index[2] + dx)
+                    if all(0 <= value < grid_shape[axis] for axis, value in enumerate(neighbor)):
+                        selected.add(neighbor)
+
+    metadata = {
+        "queries": queries,
+        "region_ids": sorted(region_ids),
+        "matching_chunks": int(len(matching)),
+        "selected_chunks": int(len(selected)),
+        "chunk_margin": chunk_margin,
+        "label_zarr_path": str(label_zarr_path),
+        "region_cfg_path": str(region_cfg_path),
+    }
+    return sorted(selected), metadata
+
+
 def _extract_binary_mask(mask_zarr, roi=None, foreground_label=1):
     if roi is None:
         mask = np.asarray(mask_zarr[:])
@@ -1873,6 +1955,11 @@ def analyze_binary_mask_zarr_chunkwise(
     chunk_workers=1,
     merge_branch_points_distance_um=0.0,
     prune_spurs_max_length_um=0.0,
+    region_label_zarr_path=None,
+    region_cfg_path=None,
+    regions=None,
+    region_label_dataset_name="0",
+    region_chunk_margin=0,
 ):
     _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
@@ -1886,6 +1973,36 @@ def analyze_binary_mask_zarr_chunkwise(
     chunks = mask_zarr.chunks
     shape = mask_zarr.shape
     chunk_indices = existing_chunks if process_existing_only else list(iter_all_chunk_indices(shape, chunks))
+    region_filter = None
+    requested_region_filter = any(
+        value is not None and str(value).strip()
+        for value in (region_label_zarr_path, region_cfg_path, regions)
+    )
+    if requested_region_filter:
+        if not all(value is not None and str(value).strip() for value in (region_label_zarr_path, region_cfg_path, regions)):
+            raise ValueError(
+                "Region filtering requires region_label_zarr_path, region_cfg_path, and regions together"
+            )
+        region_indices, region_filter = select_region_chunk_indices(
+            region_label_zarr_path,
+            region_cfg_path,
+            regions,
+            mask_shape=shape,
+            mask_chunks=chunks,
+            label_dataset_name=region_label_dataset_name,
+            chunk_margin=region_chunk_margin,
+        )
+        available_indices = set(chunk_indices)
+        chunk_indices = [chunk_index for chunk_index in region_indices if chunk_index in available_indices]
+        if not chunk_indices:
+            raise ValueError("No selected region chunks are available in the mask Zarr store")
+        region_filter["processed_chunks"] = int(len(chunk_indices))
+        logger.info(
+            "Region filter selected %d chunk(s) for %s (margin=%d)",
+            len(chunk_indices),
+            ", ".join(region_filter["queries"]),
+            region_filter["chunk_margin"],
+        )
     kimimaro_parallel = int(parallel) if chunk_workers <= 1 else 1
 
     task_payloads = [
@@ -1975,6 +2092,8 @@ def analyze_binary_mask_zarr_chunkwise(
     summary["stitch_max_distance_um"] = float(stitch_max_distance_um)
     summary["chunk_workers"] = int(chunk_workers)
     summary["kimimaro_parallel_per_chunk"] = int(kimimaro_parallel)
+    if region_filter:
+        summary["region_filter"] = region_filter
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -2066,6 +2185,7 @@ def analyze_binary_mask_zarr_chunkwise(
                 "save_swc": save_swc,
                 "stitch": stitch,
                 "stitch_max_distance_um": stitch_max_distance_um,
+                "region_filter": region_filter or {},
             },
             outputs=_output_files,
             started_at=_started_at,
@@ -2097,6 +2217,22 @@ def build_argparser():
         help="In chunkwise mode, only process chunks that physically exist in the store",
     )
     parser.add_argument("--halo_zyx", default="0,0,0", help="Halo overlap in voxels for chunkwise processing as z,y,x")
+    parser.add_argument(
+        "--region_label_zarr",
+        help="Registered atlas label Zarr used to limit chunkwise reconstruction to requested regions",
+    )
+    parser.add_argument("--region_label_dataset_name", default="0", help="Dataset name inside --region_label_zarr")
+    parser.add_argument("--region_cfg", help="Allen-style region CSV used with --regions")
+    parser.add_argument(
+        "--regions",
+        help="Comma/semicolon separated atlas regions to reconstruct, including all descendants; chunkwise only",
+    )
+    parser.add_argument(
+        "--region_chunk_margin",
+        type=int,
+        default=0,
+        help="Neighboring chunk margin around region-intersecting chunks; use 1 to retain boundary context",
+    )
     parser.add_argument("--no_stitch", action="store_true", help="Disable cross-chunk skeleton stitching in chunkwise mode")
     parser.add_argument("--stitch_max_distance_um", type=float, default=5.0, help="Maximum distance in microns for cross-chunk endpoint stitching")
     parser.add_argument("--merge_branch_points_distance_um", type=float, default=0.0, help="Merge branch points within this distance (um). 0=disabled")
@@ -2141,6 +2277,8 @@ def main():
 
     try:
         roi = parse_roi(args.roi) if args.roi else None
+        if args.regions and not args.chunkwise:
+            raise ValueError("--regions is only supported with --chunkwise")
         if args.test:
             result = analyze_binary_mask_zarr_test_mode(
                 mask_zarr_path=args.mask_zarr,
@@ -2174,6 +2312,11 @@ def main():
                 chunk_workers=args.chunk_workers,
                 merge_branch_points_distance_um=args.merge_branch_points_distance_um,
                 prune_spurs_max_length_um=args.prune_spurs_max_length_um,
+                region_label_zarr_path=args.region_label_zarr,
+                region_cfg_path=args.region_cfg,
+                regions=args.regions,
+                region_label_dataset_name=args.region_label_dataset_name,
+                region_chunk_margin=args.region_chunk_margin,
             )
         else:
             result = analyze_binary_mask_zarr(

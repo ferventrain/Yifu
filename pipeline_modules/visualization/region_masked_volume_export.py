@@ -523,8 +523,15 @@ def export_region_masked_volume_tiffs_from_tiff(
     for start, end in _iter_batch_ranges(slice_count, read_batch):
         output_paths: list[Path] = []
         for z_index in range(start, end):
-            if mirror_input_filenames and signal_files is not None:
-                output_name = signal_files[z_index].name
+            if mirror_input_filenames:
+                if signal_files is not None:
+                    output_name = signal_files[z_index].name
+                elif mask_files is not None:
+                    output_name = mask_files[z_index].name
+                elif label_files is not None:
+                    output_name = label_files[z_index].name
+                else:
+                    output_name = f"{filename_prefix}{z_index:0{z_pad}d}.tiff"
             else:
                 output_name = f"{filename_prefix}{z_index:0{z_pad}d}.tiff"
             output_paths.append(out_dir / output_name)

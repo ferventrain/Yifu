@@ -22,9 +22,9 @@ def print_pipeline_banner(sample_dir, config_path):
 
 
 def print_step(step_num, title):
-    print(f"\n{'─' * 60}")
+    print(f"\n{'-' * 60}")
     print(f"Step {step_num}/{PIPELINE_STEP_COUNT}: {title}")
-    print("─" * 60)
+    print("-" * 60)
 
 
 def print_skip(reason):
@@ -127,7 +127,22 @@ def spotiflow_model_mtime(model_cfg):
     model_path = Path(model_value)
     if not model_path.is_absolute():
         model_path = project_root / model_path
-    return newest_mtime(model_path)
+    if not model_path.exists():
+        return None
+
+    model_files = [
+        model_path / f"{model_cfg.get('which', 'best')}.pt",
+        model_path / "config.yaml",
+        model_path / "thresholds.yaml",
+    ]
+    existing_mtimes = [path.stat().st_mtime for path in model_files if path.exists()]
+    if existing_mtimes:
+        return max(existing_mtimes)
+
+    existing_file_mtimes = [path.stat().st_mtime for path in model_path.rglob("*") if path.is_file()]
+    if existing_file_mtimes:
+        return max(existing_file_mtimes)
+    return model_path.stat().st_mtime
 
 
 def spotiflow_outputs_are_stale(model_cfg, output_paths):
@@ -652,6 +667,98 @@ def run_density_analysis(
     run_command(cmd, "5.2 Region density analysis")
 
 
+def export_spotiflow_region_count_hierarchy(region_counts_csv, density_cfg_path, output_excel):
+    """Export Spotiflow per-region counts as Level_* Allen hierarchy sheets."""
+    import pandas as pd
+
+    from openpyxl.styles import Alignment, Font
+
+    from pipeline_modules.registration.region_signal_analysis_zarr_graph import load_region_tree
+
+    region_counts_csv = Path(region_counts_csv)
+    density_cfg_path = Path(density_cfg_path)
+    output_excel = Path(output_excel)
+
+    if not region_counts_csv.exists():
+        raise FileNotFoundError(f"Spotiflow region count CSV not found: {region_counts_csv}")
+
+    counts_df = pd.read_csv(region_counts_csv)
+    required_columns = {"region_id", "signal_count"}
+    missing_columns = required_columns.difference(counts_df.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Spotiflow region count CSV is missing columns: {sorted(missing_columns)}"
+        )
+
+    direct_counts = {}
+    for _, row in counts_df.iterrows():
+        region_id = int(row["region_id"])
+        if region_id <= 0:
+            continue
+        direct_counts[region_id] = direct_counts.get(region_id, 0) + int(row["signal_count"])
+
+    region_tree = load_region_tree(density_cfg_path)
+    mapped_region_ids = set()
+    rows = []
+
+    def visit(node):
+        label_id = node.get("id")
+        direct_count = 0
+        if isinstance(label_id, int) and label_id > 0:
+            direct_count = int(direct_counts.get(label_id, 0))
+            mapped_region_ids.add(label_id)
+
+        signal_count = direct_count
+        for child in node.get("children", []):
+            signal_count += visit(child)
+
+        if isinstance(label_id, int) and label_id > 0 and signal_count > 0:
+            rows.append(
+                {
+                    "Name": node.get("name") or str(label_id),
+                    "st_level": node.get("st_level"),
+                    "Signal Count": int(signal_count),
+                }
+            )
+        return int(signal_count)
+
+    tree_total = visit(region_tree)
+    output_excel.parent.mkdir(parents=True, exist_ok=True)
+    dataframe = pd.DataFrame(rows)
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+        if dataframe.empty:
+            pd.DataFrame(columns=["Name", "Signal Count"]).to_excel(writer, index=False, sheet_name="Level_0")
+        else:
+            dataframe = dataframe.sort_values(by=["st_level", "Name"], kind="stable").reset_index(drop=True)
+            unique_levels = [int(level) for level in sorted(dataframe["st_level"].dropna().unique().tolist())]
+            for level in unique_levels:
+                export_frame = dataframe[dataframe["st_level"] == level][["Name", "Signal Count"]].reset_index(drop=True)
+                sheet_name = f"Level_{level}"
+                export_frame.to_excel(writer, index=False, sheet_name=sheet_name)
+                worksheet = writer.sheets[sheet_name]
+                header_font = Font(name="Arial", size=11, bold=True)
+                body_font = Font(name="Arial", size=11)
+                for row in worksheet.iter_rows():
+                    for cell in row:
+                        cell.alignment = Alignment(horizontal="left", vertical="center")
+                        cell.font = header_font if cell.row == 1 else body_font
+                worksheet.column_dimensions["A"].width = 80
+                worksheet.column_dimensions["B"].width = 16
+
+    unmapped_counts = {
+        int(region_id): int(count)
+        for region_id, count in sorted(direct_counts.items())
+        if region_id not in mapped_region_ids
+    }
+    return {
+        "output_excel": output_excel,
+        "direct_region_count": int(sum(direct_counts.values())),
+        "hierarchy_region_count": int(tree_total),
+        "unmapped_counts": unmapped_counts,
+        "row_count": len(rows),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="LSFM main pipeline: preprocessing -> registration -> edge removal -> segmentation -> analysis"
@@ -798,6 +905,24 @@ def main():
             print_note(f"Per-region signal counts CSV: {region_counts_csv}")
         else:
             print_skip("Per-region counts skipped (atlas label Zarr unavailable).")
+        if Path(region_counts_csv).exists():
+            from pipeline_modules.utils.deliverable_paths import brain_distribution_stats_xlsx
+
+            output_excel = brain_distribution_stats_xlsx(sample_dir, f"ch{signal_ch}")
+            hierarchy_summary = export_spotiflow_region_count_hierarchy(
+                region_counts_csv,
+                density_cfg_path,
+                output_excel,
+            )
+            print_note(f"Spotiflow hierarchy Excel: {hierarchy_summary['output_excel']}")
+            if hierarchy_summary["unmapped_counts"]:
+                unmapped_total = sum(hierarchy_summary["unmapped_counts"].values())
+                print_note(
+                    "Unmapped region IDs were excluded from hierarchy total: "
+                    f"{len(hierarchy_summary['unmapped_counts'])} IDs, {unmapped_total} signals."
+                )
+        else:
+            print_skip("Spotiflow hierarchy Excel skipped (region count CSV unavailable).")
     else:
         mask_zarr_path, _ = ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg)
 
