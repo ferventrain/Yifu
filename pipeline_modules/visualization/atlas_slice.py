@@ -365,6 +365,15 @@ def load_region_metadata(cfg_path: str | Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# Excel density columns are ratios of inclusive aggregates; rebuild from exclusive
+# component columns when painting atlas label voxels.
+DENSITY_METRIC_COMPONENTS: dict[str, tuple[str, str]] = {
+    "Voxel Density": ("Signal Voxels", "Total Voxels"),
+    "Left Voxel Density": ("Left Signal Voxels", "Left Total Voxels"),
+    "Right Voxel Density": ("Right Signal Voxels", "Right Total Voxels"),
+}
+
+
 def load_excel_metric_by_name(input_excel: str | Path, metric: str) -> dict[str, float]:
     input_excel = Path(input_excel)
     if not input_excel.exists():
@@ -395,23 +404,94 @@ def load_excel_metric_by_name(input_excel: str | Path, metric: str) -> dict[str,
     return metric_by_name
 
 
+def children_by_region_id(path_by_region_id: dict[int, list[int]]) -> dict[int, list[int]]:
+    """Map each region to its direct children using Allen structure_id_path."""
+    children: dict[int, list[int]] = {}
+    for region_id, path in path_by_region_id.items():
+        if len(path) < 2:
+            continue
+        parent_id = int(path[-2])
+        children.setdefault(parent_id, []).append(int(region_id))
+    return children
+
+
+def to_direct_label_metric_values(
+    value_by_region_id: dict[int, float],
+    path_by_region_id: dict[int, list[int]],
+) -> dict[int, float]:
+    """Convert inclusive hierarchy aggregates to direct-label-only values.
+
+    Analysis Excel rows store subtree sums (parent = own voxels + all descendants).
+    Atlas voxels labeled as a parent (e.g. root interstitial gaps) must be painted
+    with only that label's exclusive count, not the whole-brain total.
+    """
+    children = children_by_region_id(path_by_region_id)
+    exclusive: dict[int, float] = {}
+    for region_id, value in value_by_region_id.items():
+        child_sum = 0.0
+        for child_id in children.get(int(region_id), []):
+            if child_id in value_by_region_id:
+                child_sum += float(value_by_region_id[child_id])
+        exclusive[int(region_id)] = max(0.0, float(value) - child_sum)
+    return exclusive
+
+
+def _match_metric_names_to_region_ids(
+    metric_by_name: dict[str, float],
+    region_table: pd.DataFrame,
+) -> dict[int, float]:
+    value_by_region_id: dict[int, float] = {}
+    for _, row in region_table.iterrows():
+        excel_name = str(row["excel_name"])
+        if excel_name in metric_by_name:
+            value_by_region_id[int(row["region_id"])] = float(metric_by_name[excel_name])
+    return value_by_region_id
+
+
 def build_region_metric_lookup(
     input_excel: str | Path,
     *,
     cfg_path: str | Path,
     metric: str,
+    direct_label_only: bool = False,
 ) -> tuple[dict[int, float], dict[int, list[int]]]:
-    region_table = load_region_metadata(cfg_path)
-    metric_by_name = load_excel_metric_by_name(input_excel, metric)
+    """Build region_id -> metric lookup from analysis Excel.
 
-    value_by_region_id: dict[int, float] = {}
-    path_by_region_id: dict[int, list[int]] = {}
-    for _, row in region_table.iterrows():
-        region_id = int(row["region_id"])
-        path_by_region_id[region_id] = [int(value) for value in row["structure_id_path"]]
-        excel_name = str(row["excel_name"])
-        if excel_name in metric_by_name:
-            value_by_region_id[region_id] = float(metric_by_name[excel_name])
+    When ``direct_label_only`` is True, convert inclusive subtree aggregates into
+    exclusive per-label values suitable for painting atlas voxels (so root gaps
+    show only gap cFos, not the whole-brain sum).
+    """
+    region_table = load_region_metadata(cfg_path)
+    path_by_region_id: dict[int, list[int]] = {
+        int(row["region_id"]): [int(value) for value in row["structure_id_path"]]
+        for _, row in region_table.iterrows()
+    }
+
+    if direct_label_only and metric in DENSITY_METRIC_COMPONENTS:
+        numerator_metric, denominator_metric = DENSITY_METRIC_COMPONENTS[metric]
+        numerator_by_id = _match_metric_names_to_region_ids(
+            load_excel_metric_by_name(input_excel, numerator_metric),
+            region_table,
+        )
+        denominator_by_id = _match_metric_names_to_region_ids(
+            load_excel_metric_by_name(input_excel, denominator_metric),
+            region_table,
+        )
+        numerator_by_id = to_direct_label_metric_values(numerator_by_id, path_by_region_id)
+        denominator_by_id = to_direct_label_metric_values(denominator_by_id, path_by_region_id)
+        value_by_region_id = {
+            region_id: (
+                float(numerator_by_id.get(region_id, 0.0)) / float(denominator_by_id[region_id])
+                if float(denominator_by_id.get(region_id, 0.0)) > 0
+                else 0.0
+            )
+            for region_id in set(numerator_by_id) | set(denominator_by_id)
+        }
+    else:
+        metric_by_name = load_excel_metric_by_name(input_excel, metric)
+        value_by_region_id = _match_metric_names_to_region_ids(metric_by_name, region_table)
+        if direct_label_only:
+            value_by_region_id = to_direct_label_metric_values(value_by_region_id, path_by_region_id)
 
     if not value_by_region_id:
         raise ValueError(f"Could not match any atlas regions to Excel values from {input_excel}")
@@ -445,6 +525,578 @@ def fold_change_region_metric_values(
         )
         for region_id in region_ids
     }
+
+
+def ratio_region_metric_values(
+    numerator_by_region_id: dict[int, float],
+    denominator_by_region_id: dict[int, float],
+    *,
+    pseudocount: float = 1.0,
+) -> dict[int, float]:
+    """Return per-region direct ratio: numerator / denominator (with pseudocount)."""
+    region_ids = set(numerator_by_region_id) | set(denominator_by_region_id)
+    pseudo = float(pseudocount)
+    return {
+        int(region_id): float(
+            (float(numerator_by_region_id.get(region_id, 0.0)) + pseudo)
+            / (float(denominator_by_region_id.get(region_id, 0.0)) + pseudo)
+        )
+        for region_id in region_ids
+    }
+
+
+def _as_integer_label_volume(label_volume: np.ndarray) -> np.ndarray:
+    volume = np.asarray(label_volume)
+    if np.issubdtype(volume.dtype, np.integer):
+        return volume
+    return np.rint(volume).astype(np.int32, copy=False)
+
+
+def count_region_connected_components(
+    label_volume: np.ndarray,
+    *,
+    connectivity: int = 26,
+    progress_every: int = 0,
+) -> dict[int, int]:
+    """Count 3D connected components for each non-zero atlas region id.
+
+    Uses a bounding-box crop per region so large atlases stay tractable.
+    Prefers ``cc3d`` (26-connect); falls back to ``scipy.ndimage.label``.
+    """
+    try:
+        import cc3d
+
+        use_cc3d = True
+    except ImportError:  # pragma: no cover - depends on environment
+        cc3d = None
+        use_cc3d = False
+
+    if connectivity not in (6, 18, 26):
+        raise ValueError(f"Unsupported connectivity={connectivity}; expected 6, 18, or 26")
+
+    # scipy structure: 6-connect = faces only; 26-connect = all neighbors.
+    if connectivity == 6:
+        structure = ndi.generate_binary_structure(3, 1)
+    else:
+        structure = ndi.generate_binary_structure(3, 3)
+
+    volume = _as_integer_label_volume(label_volume)
+    region_ids = [int(value) for value in np.unique(volume) if int(value) != 0]
+    counts: dict[int, int] = {}
+    total = len(region_ids)
+    for index, region_id in enumerate(region_ids, start=1):
+        mask = volume == region_id
+        if not np.any(mask):
+            counts[region_id] = 0
+            continue
+        coords = np.where(mask)
+        z0, z1 = int(coords[0].min()), int(coords[0].max()) + 1
+        y0, y1 = int(coords[1].min()), int(coords[1].max()) + 1
+        x0, x1 = int(coords[2].min()), int(coords[2].max()) + 1
+        cropped = mask[z0:z1, y0:y1, x0:x1]
+        if use_cc3d:
+            labeled = cc3d.connected_components(
+                cropped.astype(np.uint8, copy=False),
+                connectivity=int(connectivity),
+            )
+            counts[region_id] = int(labeled.max())
+        else:
+            labeled, n_features = ndi.label(cropped, structure=structure)
+            counts[region_id] = int(n_features)
+        if progress_every > 0 and (index % progress_every == 0 or index == total):
+            print(f"  CC progress: {index}/{total} regions", flush=True)
+    return counts
+
+
+def is_paired_region(n_cc: int) -> bool:
+    """Paired when atlas has at least two 3D connected components."""
+    return int(n_cc) >= 2
+
+
+def _label_components(
+    mask: np.ndarray,
+    *,
+    connectivity: int = 26,
+) -> tuple[np.ndarray, int]:
+    """Return (labeled, n_components) for a binary mask."""
+    try:
+        import cc3d
+
+        labeled = cc3d.connected_components(mask.astype(np.uint8, copy=False), connectivity=int(connectivity))
+        return labeled, int(labeled.max())
+    except ImportError:  # pragma: no cover - depends on environment
+        structure = ndi.generate_binary_structure(3, 1 if connectivity == 6 else 3)
+        labeled, n_features = ndi.label(mask, structure=structure)
+        return labeled, int(n_features)
+
+
+def analyze_region_cc_geometry(
+    label_volume: np.ndarray,
+    *,
+    ml_mid_index: int | None = None,
+    connectivity: int = 26,
+    resolution_um: float = 25.0,
+    min_cc_voxels: int = 50,
+    progress_every: int = 0,
+    name_by_region_id: dict[int, str] | None = None,
+) -> list[dict[str, object]]:
+    """Classify multi-CC regions as LR-pair vs AP/DV-split (not true hemispheric pairs).
+
+    Atlas axes are ``(DV, AP, ML)``. For each region with ``n_cc >= 2``, the two
+    largest components are compared:
+
+    - ``lr_pair``: centroids on opposite ML sides and ML separation dominates
+    - ``ap_split``: AP separation dominates (front/back components), often midline-crossing
+    - ``dv_split``: DV separation dominates
+    - ``same_side``: both centroids on the same ML side
+    - ``ambiguous``: mixed / weak geometry
+
+    Returns one record per multi-CC region (sorted with suspects first).
+    """
+    volume = _as_integer_label_volume(label_volume)
+    if ml_mid_index is None:
+        ml_mid_index = int(volume.shape[2] // 2)
+    ml_mid_index = int(ml_mid_index)
+    res = float(resolution_um)
+    min_cc_voxels = int(min_cc_voxels)
+
+    region_ids = [int(value) for value in np.unique(volume) if int(value) != 0]
+    records: list[dict[str, object]] = []
+    total = len(region_ids)
+
+    for index, region_id in enumerate(region_ids, start=1):
+        mask = volume == region_id
+        if not np.any(mask):
+            continue
+        coords = np.where(mask)
+        z0, z1 = int(coords[0].min()), int(coords[0].max()) + 1
+        y0, y1 = int(coords[1].min()), int(coords[1].max()) + 1
+        x0, x1 = int(coords[2].min()), int(coords[2].max()) + 1
+        cropped = mask[z0:z1, y0:y1, x0:x1]
+        labeled, n_cc = _label_components(cropped, connectivity=connectivity)
+        if n_cc < 2:
+            continue
+
+        cc_stats: list[dict[str, float | int | bool]] = []
+        for cc_id in range(1, n_cc + 1):
+            cc_mask = labeled == cc_id
+            n_vox = int(cc_mask.sum())
+            if n_vox < min_cc_voxels:
+                continue
+            zz, yy, xx = np.where(cc_mask)
+            # Convert cropped indices back to full-volume coordinates.
+            dv = zz.astype(np.float64) + z0
+            ap = yy.astype(np.float64) + y0
+            ml = xx.astype(np.float64) + x0
+            left_n = int(np.sum(ml < ml_mid_index))
+            right_n = int(np.sum(ml >= ml_mid_index))
+            cc_stats.append(
+                {
+                    "cc_id": int(cc_id),
+                    "n_voxels": n_vox,
+                    "centroid_dv": float(dv.mean()),
+                    "centroid_ap": float(ap.mean()),
+                    "centroid_ml": float(ml.mean()),
+                    "left_voxels": left_n,
+                    "right_voxels": right_n,
+                    "crosses_midline": bool(left_n > 0 and right_n > 0),
+                    "ml_side": "left" if float(ml.mean()) < ml_mid_index else "right",
+                }
+            )
+
+        if len(cc_stats) < 2:
+            # All but one CC were dust below min_cc_voxels.
+            continue
+
+        cc_stats.sort(key=lambda item: int(item["n_voxels"]), reverse=True)
+        a = cc_stats[0]
+        b = cc_stats[1]
+        d_dv = abs(float(a["centroid_dv"]) - float(b["centroid_dv"])) * res
+        d_ap = abs(float(a["centroid_ap"]) - float(b["centroid_ap"])) * res
+        d_ml = abs(float(a["centroid_ml"]) - float(b["centroid_ml"])) * res
+        opposite_sides = str(a["ml_side"]) != str(b["ml_side"])
+        either_crosses = bool(a["crosses_midline"] or b["crosses_midline"])
+        region_left = int(np.sum(coords[2] < ml_mid_index))
+        region_right = int(np.sum(coords[2] >= ml_mid_index))
+        region_crosses = region_left > 0 and region_right > 0
+
+        dominant = max(d_dv, d_ap, d_ml)
+        if opposite_sides and d_ml >= d_ap and d_ml >= d_dv and d_ml >= (0.5 * dominant if dominant > 0 else 0):
+            geometry = "lr_pair"
+        elif d_ap >= d_ml and d_ap >= d_dv:
+            geometry = "ap_split"
+        elif d_dv >= d_ml and d_dv >= d_ap:
+            geometry = "dv_split"
+        elif not opposite_sides:
+            geometry = "same_side"
+        else:
+            geometry = "ambiguous"
+
+        # Suspect: currently treated as paired by n_cc, but unlikely true L/R pair.
+        suspect_force_unpaired = geometry in {"ap_split", "dv_split", "same_side"} or (
+            geometry == "ambiguous" and (either_crosses or not opposite_sides)
+        )
+
+        record: dict[str, object] = {
+            "region_id": int(region_id),
+            "name": str(name_by_region_id.get(region_id, "")) if name_by_region_id else "",
+            "n_cc": int(n_cc),
+            "n_cc_kept": len(cc_stats),
+            "geometry": geometry,
+            "suspect_force_unpaired": bool(suspect_force_unpaired),
+            "delta_dv_um": round(d_dv, 1),
+            "delta_ap_um": round(d_ap, 1),
+            "delta_ml_um": round(d_ml, 1),
+            "opposite_ml_sides": bool(opposite_sides),
+            "either_cc_crosses_midline": bool(either_crosses),
+            "region_crosses_midline": bool(region_crosses),
+            "cc1_voxels": int(a["n_voxels"]),
+            "cc2_voxels": int(b["n_voxels"]),
+            "cc1_ml_side": str(a["ml_side"]),
+            "cc2_ml_side": str(b["ml_side"]),
+            "cc1_crosses_midline": bool(a["crosses_midline"]),
+            "cc2_crosses_midline": bool(b["crosses_midline"]),
+        }
+        records.append(record)
+
+        if progress_every > 0 and (index % progress_every == 0 or index == total):
+            print(f"  geometry progress: {index}/{total} regions", flush=True)
+
+    def _sort_key(item: dict[str, object]) -> tuple:
+        return (
+            0 if item.get("suspect_force_unpaired") else 1,
+            str(item.get("geometry") or ""),
+            -float(item.get("delta_ap_um") or 0.0),
+            int(item.get("region_id") or 0),
+        )
+
+    records.sort(key=_sort_key)
+    return records
+
+
+def find_midplane_bisected_paired_regions(
+    label_volume: np.ndarray,
+    paired_by_region_id: dict[int, bool],
+    *,
+    ml_mid_index: int | None = None,
+    min_region_slice_pixels: int = 20,
+    min_side_fraction: float = 0.15,
+    min_bisected_fraction: float = 0.15,
+    min_bisected_slices: int = 3,
+    progress_every: int = 0,
+    name_by_region_id: dict[int, str] | None = None,
+) -> list[dict[str, object]]:
+    """Detect paired regions that are often one continuous blob across the midplane.
+
+    Current heatmap painting uses a geometric ML cut: left columns get ``A_L/B_L``,
+    right columns get ``A_R/B_R``. That looks artificial when a paired region appears
+    on a coronal slice as a single 2D connected component spanning both hemispheres.
+
+    A coronal slice is counted as bisected when any 2D CC of the region has both
+    sides of the midplane occupied above ``min_side_fraction``.
+    """
+    volume = _as_integer_label_volume(label_volume)
+    if ml_mid_index is None:
+        ml_mid_index = int(volume.shape[2] // 2)
+    ml_mid_index = int(ml_mid_index)
+    structure_2d = ndi.generate_binary_structure(2, 2)
+
+    paired_ids = sorted(int(rid) for rid, paired in paired_by_region_id.items() if paired)
+    records: list[dict[str, object]] = []
+    total = len(paired_ids)
+    n_ap = int(volume.shape[1])
+
+    for index, region_id in enumerate(paired_ids, start=1):
+        mask3d = volume == region_id
+        if not np.any(mask3d):
+            continue
+        ap_indices = np.flatnonzero(np.any(mask3d, axis=(0, 2)))
+        n_visible = 0
+        n_bisected = 0
+        max_cross_frac = 0.0
+        for ap in ap_indices:
+            slice2d = mask3d[:, int(ap), :]
+            n_pix = int(slice2d.sum())
+            if n_pix < int(min_region_slice_pixels):
+                continue
+            n_visible += 1
+            labeled, n_cc = ndi.label(slice2d, structure=structure_2d)
+            slice_bisected = False
+            for cc_id in range(1, int(n_cc) + 1):
+                cc = labeled == cc_id
+                cols = np.where(cc)[1]
+                if cols.size == 0:
+                    continue
+                left_n = int(np.sum(cols < ml_mid_index))
+                right_n = int(np.sum(cols >= ml_mid_index))
+                cc_n = left_n + right_n
+                if cc_n <= 0:
+                    continue
+                left_frac = left_n / cc_n
+                right_frac = right_n / cc_n
+                if left_frac >= float(min_side_fraction) and right_frac >= float(min_side_fraction):
+                    slice_bisected = True
+                    max_cross_frac = max(max_cross_frac, min(left_frac, right_frac))
+            if slice_bisected:
+                n_bisected += 1
+
+        if n_visible <= 0:
+            continue
+        frac = float(n_bisected) / float(n_visible)
+        flagged = n_bisected >= int(min_bisected_slices) and frac >= float(min_bisected_fraction)
+        if not flagged:
+            continue
+        records.append(
+            {
+                "region_id": int(region_id),
+                "name": str(name_by_region_id.get(region_id, "")) if name_by_region_id else "",
+                "n_visible_coronal_slices": int(n_visible),
+                "n_bisected_slices": int(n_bisected),
+                "bisected_fraction": round(frac, 4),
+                "max_minor_side_fraction": round(float(max_cross_frac), 4),
+                "suggest_force_unpaired": True,
+                "reason": "paired_but_often_one_2d_blob_crossing_midplane",
+            }
+        )
+        if progress_every > 0 and (index % progress_every == 0 or index == total):
+            print(f"  midplane-bisect progress: {index}/{total} paired regions", flush=True)
+
+    records.sort(key=lambda row: (-float(row["bisected_fraction"]), -int(row["n_bisected_slices"]), int(row["region_id"])))
+    return records
+
+
+def paint_hemisphere_ratio_slice(
+    label_slice: np.ndarray,
+    left_values: dict[int, float],
+    right_values: dict[int, float],
+    paired_by_region_id: dict[int, bool],
+    *,
+    ml_mid_index: int,
+    min_side_fraction: float = 0.15,
+) -> np.ndarray:
+    """Paint A/B ratios without geometrically sawing continuous midplane-crossing blobs.
+
+    - Unpaired / same L&R value: whole region one color
+    - Paired with separate L/R 2D blobs: each blob colored by its centroid side
+    - Paired but a 2D blob spans both hemispheres: keep one color (mean of L/R)
+      so the midplane does not invent a hard color cut through continuous tissue
+    """
+    labels = np.asarray(label_slice)
+    painted = np.full(labels.shape, np.nan, dtype=np.float32)
+    ml_mid_index = int(max(ml_mid_index, 0))
+    structure_2d = ndi.generate_binary_structure(2, 2)
+
+    for region_id in np.unique(labels):
+        rid = int(region_id)
+        if rid == 0:
+            continue
+        if rid not in left_values and rid not in right_values:
+            continue
+        left_val = float(left_values.get(rid, right_values.get(rid, 0.0)))
+        right_val = float(right_values.get(rid, left_values.get(rid, 0.0)))
+        mask = labels == rid
+        paired = bool(paired_by_region_id.get(rid, False))
+        if (not paired) or abs(left_val - right_val) <= 1e-12:
+            painted[mask] = left_val
+            continue
+
+        labeled, n_cc = ndi.label(mask, structure=structure_2d)
+        for cc_id in range(1, int(n_cc) + 1):
+            cc = labeled == cc_id
+            cols = np.where(cc)[1]
+            if cols.size == 0:
+                continue
+            left_n = int(np.sum(cols < ml_mid_index))
+            right_n = int(np.sum(cols >= ml_mid_index))
+            total = left_n + right_n
+            if total <= 0:
+                continue
+            left_frac = left_n / total
+            right_frac = right_n / total
+            if left_frac >= float(min_side_fraction) and right_frac >= float(min_side_fraction):
+                painted[cc] = 0.5 * (left_val + right_val)
+            elif float(cols.mean()) < ml_mid_index:
+                painted[cc] = left_val
+            else:
+                painted[cc] = right_val
+
+    inside_brain = labels > 0
+    painted[inside_brain & np.isnan(painted)] = 0.0
+    return painted
+
+
+def default_region_pairing_reference_path() -> Path:
+    """Preferred cache path next to the resolved Allen atlas label."""
+    try:
+        from pipeline_modules.utils.data_paths import get_yifu_data_dir
+
+        data_dir = get_yifu_data_dir(required=False)
+        if data_dir is not None:
+            return Path(data_dir) / "reference" / "region_pairing.json"
+    except Exception:
+        pass
+    return Path(__file__).resolve().parents[2] / "data" / "reference" / "region_pairing.json"
+
+
+def build_region_pairing_records(
+    n_cc_by_region_id: dict[int, int],
+    *,
+    name_by_region_id: dict[int, str] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Serialize region_id -> {n_cc, paired, optional name} for JSON."""
+    records: dict[str, dict[str, object]] = {}
+    for region_id, n_cc in sorted((int(rid), int(count)) for rid, count in n_cc_by_region_id.items()):
+        record: dict[str, object] = {
+            "n_cc": int(n_cc),
+            "paired": bool(is_paired_region(n_cc)),
+        }
+        if name_by_region_id and region_id in name_by_region_id:
+            record["name"] = str(name_by_region_id[region_id])
+        records[str(region_id)] = record
+    return records
+
+
+def save_region_pairing_reference(
+    output_path: str | Path,
+    n_cc_by_region_id: dict[int, int],
+    *,
+    atlas_label: str | Path | None = None,
+    connectivity: int = 26,
+    name_by_region_id: dict[int, str] | None = None,
+    extra_meta: dict[str, object] | None = None,
+) -> Path:
+    """Write a reusable region pairing reference JSON."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "atlas_label": str(atlas_label) if atlas_label is not None else "",
+        "connectivity": int(connectivity),
+        "paired_rule": "n_cc >= 2",
+        "regions": build_region_pairing_records(n_cc_by_region_id, name_by_region_id=name_by_region_id),
+    }
+    if extra_meta:
+        payload.update(extra_meta)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    return output_path
+
+
+def load_region_pairing_reference(path: str | Path) -> tuple[dict[int, int], dict[int, bool]]:
+    """Load ``region_id -> n_cc`` and ``region_id -> paired`` from a reference JSON."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Region pairing reference not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    n_cc_by_region_id: dict[int, int] = {}
+    paired_by_region_id: dict[int, bool] = {}
+
+    if isinstance(payload, dict) and "regions" in payload:
+        regions = payload["regions"]
+    else:
+        regions = payload
+
+    if not isinstance(regions, dict):
+        raise ValueError(f"Invalid region pairing reference format: {path}")
+
+    for key, value in regions.items():
+        region_id = int(key)
+        if isinstance(value, dict):
+            if "n_cc" in value:
+                n_cc = int(value["n_cc"])
+            elif "paired" in value:
+                n_cc = 2 if bool(value["paired"]) else 1
+            else:
+                raise ValueError(f"Region {region_id} entry missing n_cc/paired in {path}")
+            paired = bool(value["paired"]) if "paired" in value else is_paired_region(n_cc)
+        else:
+            n_cc = int(value)
+            paired = is_paired_region(n_cc)
+        n_cc_by_region_id[region_id] = n_cc
+        paired_by_region_id[region_id] = paired
+    return n_cc_by_region_id, paired_by_region_id
+
+
+def build_hemisphere_ab_ratio_lookups(
+    *,
+    a_left: dict[int, float],
+    a_right: dict[int, float],
+    b_left: dict[int, float],
+    b_right: dict[int, float],
+    n_cc_by_region_id: dict[int, int] | None = None,
+    paired_by_region_id: dict[int, bool] | None = None,
+    pseudocount: float = 1.0,
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Build left/right A/B ratio maps using paired vs midline (single-CC) rules.
+
+    - Paired (``n_cc >= 2`` or ``paired=True``): left = A_L/B_L, right = A_R/B_R
+    - Unpaired (single CC): left = right = (A_L+A_R)/(B_L+B_R)
+    - Missing from pairing maps: treated as unpaired (conservative whole-region color)
+    """
+    pseudo = float(pseudocount)
+    region_ids = set(a_left) | set(a_right) | set(b_left) | set(b_right)
+    if n_cc_by_region_id:
+        region_ids |= set(n_cc_by_region_id)
+    if paired_by_region_id:
+        region_ids |= set(paired_by_region_id)
+
+    left_values: dict[int, float] = {}
+    right_values: dict[int, float] = {}
+    for region_id in region_ids:
+        rid = int(region_id)
+        if paired_by_region_id is not None and rid in paired_by_region_id:
+            paired = bool(paired_by_region_id[rid])
+        elif n_cc_by_region_id is not None and rid in n_cc_by_region_id:
+            paired = is_paired_region(n_cc_by_region_id[rid])
+        else:
+            paired = False
+
+        a_l = float(a_left.get(rid, 0.0))
+        a_r = float(a_right.get(rid, 0.0))
+        b_l = float(b_left.get(rid, 0.0))
+        b_r = float(b_right.get(rid, 0.0))
+
+        if paired:
+            left_values[rid] = (a_l + pseudo) / (b_l + pseudo)
+            right_values[rid] = (a_r + pseudo) / (b_r + pseudo)
+        else:
+            whole = (a_l + a_r + pseudo) / (b_l + b_r + pseudo)
+            left_values[rid] = whole
+            right_values[rid] = whole
+    return left_values, right_values
+
+
+def compute_ratio_color_limits(
+    values: list[float] | tuple[float, ...],
+    *,
+    percentile: float = 99.0,
+    explicit_vmax: float | None = None,
+    center: float = 1.0,
+) -> tuple[float, float]:
+    """Symmetric multiplicative limits around ``center`` (default 1.0 for A/B)."""
+    center = float(center)
+    if explicit_vmax is not None:
+        upper = abs(float(explicit_vmax))
+        if upper <= center:
+            upper = center * 2.0 if center > 0 else center + 1.0
+        lower = (center * center / upper) if center > 0 else center - (upper - center)
+        if lower <= 0:
+            lower = min(center * 0.5, upper * 0.25) if center > 0 else lower
+        return float(lower), float(upper)
+
+    finite = [float(value) for value in values if np.isfinite(value) and float(value) > 0]
+    if not finite:
+        return 0.5, 2.0
+    factors = [max(value / center, center / value) for value in finite]
+    factor = float(np.percentile(factors, float(percentile)))
+    if not np.isfinite(factor) or factor < 1.0:
+        factor = max(factors) if factors else 2.0
+    if factor < 1.0 + 1e-6:
+        factor = 1.0 + 1e-6
+    lower = center / factor
+    upper = center * factor
+    return float(lower), float(upper)
 
 
 def paint_hemisphere_split_slice(
@@ -522,10 +1174,14 @@ def lookup_region_metric_value(
     region_id: int,
     value_by_region_id: dict[int, float],
     path_by_region_id: dict[int, list[int]],
+    *,
+    inherit_ancestors: bool = True,
 ) -> float | None:
     """Return direct or inherited metric value, or None when no data exists."""
     if region_id in value_by_region_id:
         return float(value_by_region_id[region_id])
+    if not inherit_ancestors:
+        return None
     path = path_by_region_id.get(region_id, [])
     for ancestor_id in reversed(path[:-1]):
         if ancestor_id in value_by_region_id:
@@ -537,6 +1193,8 @@ def collect_regions_missing_metric_data(
     label_image: np.ndarray,
     value_by_region_id: dict[int, float],
     path_by_region_id: dict[int, list[int]],
+    *,
+    inherit_ancestors: bool = True,
 ) -> list[int]:
     """Brain region ids visible on the slice that have no metric data."""
     missing: list[int] = []
@@ -544,7 +1202,15 @@ def collect_regions_missing_metric_data(
         region_id = int(label)
         if region_id == 0:
             continue
-        if lookup_region_metric_value(region_id, value_by_region_id, path_by_region_id) is None:
+        if (
+            lookup_region_metric_value(
+                region_id,
+                value_by_region_id,
+                path_by_region_id,
+                inherit_ancestors=inherit_ancestors,
+            )
+            is None
+        ):
             missing.append(region_id)
     return missing
 
@@ -558,13 +1224,20 @@ def resolve_slice_region_values(
     label_image: np.ndarray,
     value_by_region_id: dict[int, float],
     path_by_region_id: dict[int, list[int]],
+    *,
+    inherit_ancestors: bool = True,
 ) -> dict[int, float]:
     resolved: dict[int, float] = {}
     for label in np.unique(np.asarray(label_image)):
         region_id = int(label)
         if region_id == 0:
             continue
-        value = lookup_region_metric_value(region_id, value_by_region_id, path_by_region_id)
+        value = lookup_region_metric_value(
+            region_id,
+            value_by_region_id,
+            path_by_region_id,
+            inherit_ancestors=inherit_ancestors,
+        )
         resolved[region_id] = 0.0 if value is None else float(value)
     return resolved
 
@@ -583,8 +1256,14 @@ def build_atlas_slice_heatmap(
         input_excel,
         cfg_path=cfg_path,
         metric=metric,
+        direct_label_only=True,
     )
-    region_values = resolve_slice_region_values(atlas_slice.image, value_by_region_id, path_by_region_id)
+    region_values = resolve_slice_region_values(
+        atlas_slice.image,
+        value_by_region_id,
+        path_by_region_id,
+        inherit_ancestors=False,
+    )
     upper = float(vmax) if vmax is not None else max(value_by_region_id.values())
     if upper <= float(vmin):
         upper = float(vmin) + 1e-12
@@ -812,7 +1491,7 @@ def _render_svg(
     region_d_paths: list[str],
     *,
     line_width: float = 0.3,
-    brain_outline_width: float = 0.3,
+    brain_outline_width: float = 0.0,
 ) -> Path:
     root = ET.Element(f"{{{SVG_NS}}}svg", {
         "width": str(width),
@@ -859,7 +1538,7 @@ def render_atlas_slice_heatmap(
     output_path: str | Path,
     *,
     line_width: float = 0.3,
-    brain_outline_width: float = 0.3,
+    brain_outline_width: float = 0.0,
     colorbar_width: int = 48,
     colorbar_padding: int = 14,
     font_size: int = 9,
@@ -990,7 +1669,7 @@ def render_atlas_slice(
     *,
     dpi: int = 300,
     line_width: float = 0.3,
-    brain_outline_width: float = 0.3,
+    brain_outline_width: float = 0.0,
     contour_smoothing: float = 1.8,
     show_regions: bool = True,
 ) -> Path:
@@ -1097,7 +1776,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dpi", type=int, default=300, help="Output DPI for raster formats")
     parser.add_argument("--line-width", type=float, default=0.12, help="Region boundary line width in points")
-    parser.add_argument("--brain-outline-width", type=float, default=0.28, help="Outer brain boundary line width in points")
+    parser.add_argument("--brain-outline-width", type=float, default=0.0, help="Outer brain boundary line width in points (0=off)")
     parser.add_argument("--contour-smoothing", type=float, default=1.8, help="Gaussian smoothing sigma for contour coordinates")
     parser.add_argument("--hide-regions", action="store_true", help="Draw only the outer brain outline")
     parser.add_argument("--input-excel", default=None, help="Excel workbook with Level_* sheets for region metrics")

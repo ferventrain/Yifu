@@ -624,6 +624,159 @@ def ensure_hemisphere_label_zarr(warped_label_zarr_path, hemisphere_zarr_path, z
     run_command(cmd, "Step 2.3: Convert Atlas Label Zarr to Hemisphere Zarr")
 
 
+def ensure_tubule_reconstruction(
+    sample_dir,
+    signal_ch,
+    mask_zarr_path,
+    tubule_cfg,
+    input_resolution_xyz,
+    annotation_zarr_path=None,
+    density_cfg_path=None,
+    config_path=None,
+):
+    """Run vessel skeletonization (+ optional whole-brain region morphology).
+
+    Requires ``tubule_reconstruction.save_skeleton=true`` for region morphology.
+    ``save_swc`` is optional visualization only and is not required for stats.
+    """
+    from pipeline_modules.tubule_reconstruction.config import TubuleReconstructionCfg
+
+    cfg = TubuleReconstructionCfg(**tubule_cfg) if not isinstance(tubule_cfg, TubuleReconstructionCfg) else tubule_cfg
+    if not cfg.enabled:
+        print_skip("Tubule reconstruction disabled (tubule_reconstruction.enabled=false).")
+        return None
+
+    if not cfg.save_skeleton and cfg.region_analysis.enabled:
+        print(
+            "Error: tubule_reconstruction.region_analysis requires save_skeleton=true "
+            "(save_swc is optional and only for visualization)."
+        )
+        sys.exit(1)
+
+    sample_dir = Path(sample_dir)
+    output_dir = sample_dir / cfg.output_dirname
+    resolution_xyz = cfg.resolution_xyz or tuple(float(v) for v in input_resolution_xyz)
+
+    halo = ",".join(str(v) for v in cfg.halo_zyx)
+    res = ",".join(str(v) for v in resolution_xyz)
+
+    if cfg.chunkwise:
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction '
+            f'--mask_zarr "{mask_zarr_path}" '
+            f'--output_dir "{output_dir}" '
+            f'--dataset_name "{cfg.mask_dataset_name}" '
+            f'--resolution_xyz "{res}" '
+            f'--foreground_label {cfg.foreground_label} '
+            f'--dust_threshold {cfg.dust_threshold} '
+            f'--parallel {cfg.parallel} '
+            f'--chunk_workers {cfg.chunk_workers} '
+            f'--halo_zyx "{halo}" '
+            f'--downsample_factor {cfg.downsample_factor} '
+            f'--stitch_max_distance_um {cfg.stitch_max_distance_um} '
+            f'--merge_branch_points_distance_um {cfg.merge_branch_points_distance_um} '
+            f'--prune_spurs_max_length_um {cfg.prune_spurs_max_length_um}'
+        )
+        if not cfg.fix_borders:
+            cmd += " --no_fix_borders"
+        if cfg.save_skeleton:
+            cmd += " --save_skeleton"
+        else:
+            cmd += " --no_save_skeleton"
+        if cfg.save_swc:
+            cmd += " --save_swc"
+        if not cfg.process_existing_only:
+            cmd += " --no_existing_only"
+        if not cfg.stitch:
+            cmd += " --no_stitch"
+        if cfg.keep_downsampled_mask:
+            cmd += " --keep_downsampled_mask"
+    else:
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction '
+            f'--mask_zarr "{mask_zarr_path}" '
+            f'--output_dir "{output_dir}" '
+            f'--dataset_name "{cfg.mask_dataset_name}" '
+            f'--resolution_xyz "{res}" '
+            f'--foreground_label {cfg.foreground_label} '
+            f'--dust_threshold {cfg.dust_threshold} '
+            f'--parallel {cfg.parallel} '
+            f'--downsample_factor {cfg.downsample_factor} '
+            f'--no_chunkwise '
+            f'--merge_branch_points_distance_um {cfg.merge_branch_points_distance_um} '
+            f'--prune_spurs_max_length_um {cfg.prune_spurs_max_length_um}'
+        )
+        if not cfg.fix_borders:
+            cmd += " --no_fix_borders"
+        if cfg.save_skeleton:
+            cmd += " --save_skeleton"
+        else:
+            cmd += " --no_save_skeleton"
+        if cfg.save_swc:
+            cmd += " --save_swc"
+        if cfg.keep_downsampled_mask:
+            cmd += " --keep_downsampled_mask"
+
+    run_command(cmd, "6.1 Vessel skeleton reconstruction")
+
+    region_cfg = cfg.region_analysis
+    if not region_cfg.enabled:
+        print_skip("Region vessel analysis disabled (tubule_reconstruction.region_analysis.enabled=false).")
+        return output_dir
+
+    if annotation_zarr_path is None or not Path(annotation_zarr_path).exists():
+        print_skip("Region vessel analysis skipped (atlas label Zarr unavailable).")
+        return output_dir
+
+    region_csv = resolve_project_path(region_cfg.cfg) if region_cfg.cfg else density_cfg_path
+    if region_csv is None or not Path(region_csv).exists():
+        print(f"Error: Region CSV not found for vessel analysis: {region_csv}")
+        sys.exit(1)
+
+    vertex_csv = output_dir / "skeleton_vertices.csv"
+    edge_csv = output_dir / "skeleton_edges.csv"
+    branch_csv = output_dir / "vessel_branch_metrics.csv"
+    if not vertex_csv.exists() or not edge_csv.exists():
+        print("Error: skeleton_vertices.csv / skeleton_edges.csv missing; cannot run region vessel analysis.")
+        sys.exit(1)
+
+    cmd = (
+        f'"{PYTHON_EXE}" -m pipeline_modules.tubule_reconstruction.region_vessel_analysis '
+        f'--vertex_csv "{vertex_csv}" '
+        f'--edge_csv "{edge_csv}" '
+        f'--branch_csv "{branch_csv}" '
+        f'--mask_zarr "{mask_zarr_path}" '
+        f'--mask_dataset_name "{region_cfg.mask_dataset_name}" '
+        f'--annotation_zarr "{annotation_zarr_path}" '
+        f'--annotation_dataset_name "{region_cfg.annotation_dataset_name}" '
+        f'--cfg "{region_csv}" '
+        f'--output_dir "{output_dir}"'
+    )
+    if region_cfg.foreground_label is None:
+        cmd += ' --foreground_label ""'
+    else:
+        cmd += f" --foreground_label {region_cfg.foreground_label}"
+    if region_cfg.annotation_resolution_xyz is not None:
+        ann_res = ",".join(str(v) for v in region_cfg.annotation_resolution_xyz)
+        cmd += f' --annotation_resolution_xyz "{ann_res}"'
+    elif config_path is not None:
+        cmd += f' --config "{config_path}"'
+    if region_cfg.all_regions:
+        cmd += " --all_regions"
+    if region_cfg.regions:
+        cmd += f' --regions "{";".join(region_cfg.regions)}"'
+    if region_cfg.region_groups:
+        groups = region_cfg.region_groups
+        if isinstance(groups, str):
+            cmd += f' --region_groups "{groups}"'
+        else:
+            import json as _json
+            cmd += f" --region_groups {_json.dumps(groups, ensure_ascii=False)}"
+
+    run_command(cmd, "6.2 Whole-brain region vessel morphology")
+    return output_dir
+
+
 def run_density_analysis(
     sample_dir,
     signal_ch,
@@ -942,6 +1095,23 @@ def main():
         else:
             print_step(5, "Region density analysis")
             print_skip("Density analysis skipped (atlas label Zarr unavailable).")
+
+        tubule_cfg = cfg.get("tubule_reconstruction", {})
+        if tubule_cfg.get("enabled"):
+            print_step(6, "Vessel network reconstruction and region morphology")
+            ensure_tubule_reconstruction(
+                sample_dir=sample_dir,
+                signal_ch=f"ch{signal_ch}",
+                mask_zarr_path=mask_zarr_path,
+                tubule_cfg=tubule_cfg,
+                input_resolution_xyz=cfg["input"]["resolution_xyz"],
+                annotation_zarr_path=warped_label_zarr,
+                density_cfg_path=density_cfg_path,
+                config_path=config_path,
+            )
+        else:
+            print_step(6, "Vessel network reconstruction and region morphology")
+            print_skip("Tubule reconstruction disabled (tubule_reconstruction.enabled=false).")
 
     print("\n" + "=" * 60)
     print("Pipeline completed successfully.")

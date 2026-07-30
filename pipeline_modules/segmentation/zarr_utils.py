@@ -121,6 +121,7 @@ def export_zarr_to_tiff(
     *,
     dataset_name: str = "0",
     prefix: str = "mask_",
+    slice_names: list[str] | None = None,
     workers: int = 0,
     slice_batch: int | None = None,
     compression: str | None = None,
@@ -129,13 +130,20 @@ def export_zarr_to_tiff(
     output_path.mkdir(parents=True, exist_ok=True)
     data_in = open_zarr_dataset(input_zarr, dataset_name=dataset_name)
     depth = int(data_in.shape[0])
+    if slice_names is not None and len(slice_names) != depth:
+        raise ValueError(
+            f"slice_names length ({len(slice_names)}) must match Zarr depth ({depth})"
+        )
     read_batch = resolve_slice_batch(slice_batch, default=16)
     worker_count = resolve_stack_workers(workers)
     comp = normalize_tiff_compression(compression)
 
     jobs: list[dict[str, object]] = []
     for start, end in iter_batch_ranges(depth, read_batch):
-        output_paths = [output_path / f"{prefix}{z_idx:04d}.tiff" for z_idx in range(start, end)]
+        if slice_names is None:
+            output_paths = [output_path / f"{prefix}{z_idx:04d}.tiff" for z_idx in range(start, end)]
+        else:
+            output_paths = [output_path / slice_names[z_idx] for z_idx in range(start, end)]
         jobs.append(
             {
                 "input_zarr": str(Path(input_zarr)),

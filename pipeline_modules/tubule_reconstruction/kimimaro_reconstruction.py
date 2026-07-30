@@ -2,6 +2,8 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -10,6 +12,13 @@ import pandas as pd
 import zarr
 from scipy import ndimage
 from tqdm import tqdm
+
+try:
+    from pipeline_modules.tubule_reconstruction.config import default_chunk_workers
+except ImportError:  # running the file directly without project root on sys.path
+    def default_chunk_workers():
+        cpu = os.cpu_count() or 4
+        return max(1, min(8, cpu // 2))
 
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
@@ -1570,6 +1579,8 @@ def stitch_skeleton_edges_across_chunks(vertex_table, edge_table, max_distance_u
         ("touch_x_max", "touch_x_min", (0, 0, 1)),
     ]
 
+    from scipy.spatial import cKDTree
+
     for chunk_index in sorted(chunk_set):
         chunk_rows = endpoints.loc[endpoints["chunk_index_tuple"] == chunk_index]
         for face_a, face_b, delta in face_pairs:
@@ -1588,21 +1599,24 @@ def stitch_skeleton_edges_across_chunks(vertex_table, edge_table, max_distance_u
             if b_rows.empty:
                 continue
 
-            candidate_pairs = []
-            for a in a_rows.itertuples(index=False):
-                a_key = (int(a.skeleton_id), int(a.node_id))
-                if a_key in used_nodes:
-                    continue
-                a_point = np.array([a.z_um, a.y_um, a.x_um], dtype=np.float64)
+            a_list = list(a_rows.itertuples(index=False))
+            b_list = list(b_rows.itertuples(index=False))
+            a_coords = np.array([[a.z_um, a.y_um, a.x_um] for a in a_list], dtype=np.float64)
+            b_coords = np.array([[b.z_um, b.y_um, b.x_um] for b in b_list], dtype=np.float64)
+            tree = cKDTree(b_coords)
+            distances, indices = tree.query(a_coords, distance_upper_bound=float(max_distance_um))
 
-                for b in b_rows.itertuples(index=False):
-                    b_key = (int(b.skeleton_id), int(b.node_id))
-                    if b_key in used_nodes:
-                        continue
-                    b_point = np.array([b.z_um, b.y_um, b.x_um], dtype=np.float64)
-                    distance_um = float(np.linalg.norm(a_point - b_point))
-                    if distance_um <= float(max_distance_um):
-                        candidate_pairs.append((distance_um, a, b))
+            candidate_pairs = []
+            for a_idx, (distance_um, b_idx) in enumerate(zip(distances, indices)):
+                if not np.isfinite(distance_um) or int(b_idx) >= len(b_list):
+                    continue
+                a = a_list[a_idx]
+                b = b_list[int(b_idx)]
+                a_key = (int(a.skeleton_id), int(a.node_id))
+                b_key = (int(b.skeleton_id), int(b.node_id))
+                if a_key in used_nodes or b_key in used_nodes:
+                    continue
+                candidate_pairs.append((float(distance_um), a, b))
 
             candidate_pairs.sort(key=lambda item: item[0])
             for distance_um, a, b in candidate_pairs:
@@ -1644,6 +1658,106 @@ def stitch_skeleton_edges_across_chunks(vertex_table, edge_table, max_distance_u
 
     combined_edge_table = pd.concat([edge_table, stitch_edge_table], ignore_index=True, sort=False)
     return vertex_table, combined_edge_table, stitch_edge_table
+
+
+def _block_reduce_max_binary(binary_mask, factor):
+    """Isotropic max-pool downsample of a binary mask (preserves thin vessels)."""
+    factor = int(factor)
+    if factor <= 1:
+        return binary_mask.astype(bool, copy=False)
+
+    shape = np.asarray(binary_mask.shape, dtype=np.int64)
+    pad = [(-int(dim) % factor) for dim in shape]
+    if any(pad):
+        binary_mask = np.pad(
+            binary_mask.astype(bool, copy=False),
+            ((0, pad[0]), (0, pad[1]), (0, pad[2])),
+            mode="constant",
+            constant_values=False,
+        )
+    padded_shape = binary_mask.shape
+    reshaped = binary_mask.reshape(
+        padded_shape[0] // factor,
+        factor,
+        padded_shape[1] // factor,
+        factor,
+        padded_shape[2] // factor,
+        factor,
+    )
+    return reshaped.any(axis=(1, 3, 5))
+
+
+def downsample_binary_mask_zarr(
+    mask_zarr_path,
+    output_zarr_path,
+    factor=4,
+    dataset_name="0",
+    foreground_label=1,
+    chunks=None,
+):
+    """Write an isotropically downsampled binary mask Zarr (max-pool).
+
+    Returns ``(output_path, out_shape, out_chunks)``.
+    """
+    factor = int(factor)
+    if factor < 1:
+        raise ValueError(f"downsample factor must be >= 1, got {factor}")
+
+    src = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
+    if src.ndim != 3:
+        raise ValueError(f"Expected 3D mask, got shape={src.shape}")
+
+    out_shape = tuple(int(np.ceil(dim / factor)) for dim in src.shape)
+    src_chunks = tuple(int(v) for v in (chunks or getattr(src, "chunks", None) or (64, 64, 64)))
+    # Keep chunk size in the same ballpark after downsample.
+    out_chunks = tuple(max(1, int(np.ceil(c / factor))) for c in src_chunks)
+    out_chunks = tuple(min(out_chunks[i], out_shape[i]) for i in range(3))
+
+    output_path = Path(output_zarr_path)
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    root = zarr.open_group(str(output_path), mode="w")
+    out = root.create_dataset(
+        "0",
+        shape=out_shape,
+        chunks=out_chunks,
+        dtype=np.uint8,
+        overwrite=True,
+    )
+
+    # Iterate output chunks; read the corresponding source block and max-pool.
+    for out_index in tqdm(list(iter_all_chunk_indices(out_shape, out_chunks)), desc="Downsample mask"):
+        out_slices = chunk_index_to_slices(out_index, out_chunks, out_shape)
+        src_slices = tuple(
+            slice(int(s.start) * factor, min(int(s.stop) * factor, int(src.shape[axis])))
+            for axis, s in enumerate(out_slices)
+        )
+        block = np.asarray(src[src_slices])
+        if foreground_label is None:
+            binary = block > 0
+        else:
+            binary = block == foreground_label
+        if not np.any(binary):
+            continue
+
+        reduced = _block_reduce_max_binary(binary, factor)
+        # Trim pad introduced by block reduce to exact output slice size.
+        target_shape = tuple(s.stop - s.start for s in out_slices)
+        reduced = reduced[: target_shape[0], : target_shape[1], : target_shape[2]]
+        out[out_slices] = reduced.astype(np.uint8)
+
+    root.attrs["downsample_factor"] = int(factor)
+    root.attrs["source_mask"] = str(mask_zarr_path)
+    root.attrs["method"] = "max_pool_binary"
+    return output_path, out_shape, out_chunks
+
+
+def scale_resolution_xyz(resolution_xyz, downsample_factor):
+    resolution_xyz = parse_resolution_xyz(resolution_xyz)
+    factor = float(downsample_factor)
+    return tuple(float(v) * factor for v in resolution_xyz)
 
 
 def summarize_vessel_network(binary_mask, skeletons, branch_table, resolution_xyz=(1.0, 1.0, 1.0)):
@@ -1801,6 +1915,7 @@ def _write_summary_json(summary, output_path):
         json.dump(sanitized, handle, indent=2, ensure_ascii=False)
 
 
+
 def analyze_binary_mask_zarr(
     mask_zarr_path,
     output_dir,
@@ -1808,23 +1923,57 @@ def analyze_binary_mask_zarr(
     resolution_xyz=(1.0, 1.0, 1.0),
     foreground_label=1,
     roi=None,
-    dust_threshold=0,
+    dust_threshold=100,
     fix_borders=True,
     parallel=1,
     teasar_params=None,
-    save_skeleton=False,
+    save_skeleton=True,
     save_swc=False,
     merge_branch_points_distance_um=0.0,
     prune_spurs_max_length_um=0.0,
+    downsample_factor=4,
+    keep_downsampled_mask=False,
 ):
     _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
-    mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
-    binary_mask = _extract_binary_mask(mask_zarr, roi=roi, foreground_label=foreground_label)
+    downsample_factor = max(1, int(downsample_factor))
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    working_mask_path = Path(mask_zarr_path)
+    working_resolution = resolution_xyz
+    working_foreground = foreground_label
+    downsampled_path = None
+    if downsample_factor > 1:
+        downsampled_path = output_root / f"mask_ds{downsample_factor}.zarr"
+        logger.info(
+            "Downsampling mask by %dx (max-pool) -> %s",
+            downsample_factor,
+            downsampled_path,
+        )
+        downsample_binary_mask_zarr(
+            mask_zarr_path=mask_zarr_path,
+            output_zarr_path=downsampled_path,
+            factor=downsample_factor,
+            dataset_name=dataset_name,
+            foreground_label=foreground_label,
+        )
+        working_mask_path = downsampled_path
+        working_resolution = scale_resolution_xyz(resolution_xyz, downsample_factor)
+        working_foreground = 1
+        if roi is not None:
+            logger.warning("ROI is ignored when downsample_factor > 1")
+            roi = None
+
+    mask_zarr = open_zarr_dataset(
+        working_mask_path,
+        dataset_name="0" if downsampled_path else dataset_name,
+    )
+    binary_mask = _extract_binary_mask(mask_zarr, roi=roi, foreground_label=working_foreground)
 
     skeletons, meta = skeletonize_binary_mask(
         binary_mask=binary_mask,
-        resolution_xyz=resolution_xyz,
+        resolution_xyz=working_resolution,
         dust_threshold=dust_threshold,
         fix_borders=fix_borders,
         parallel=parallel,
@@ -1836,12 +1985,11 @@ def analyze_binary_mask_zarr(
         binary_mask=binary_mask,
         skeletons=skeletons,
         branch_table=branch_table,
-        resolution_xyz=resolution_xyz,
+        resolution_xyz=working_resolution,
     )
     summary["connected_components"] = meta["num_components"]
-
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    summary["downsample_factor"] = int(downsample_factor)
+    summary["resolution_xyz_um"] = list(working_resolution)
 
     branch_csv_path = output_root / "vessel_branch_metrics.csv"
     summary_json_path = output_root / "vessel_network_summary.json"
@@ -1858,15 +2006,17 @@ def analyze_binary_mask_zarr(
     if save_skeleton:
         vertex_table, edge_table = skeleton_tables_from_skeletons(skeletons)
 
-        postprocess_active = (merge_branch_points_distance_um > 0 or prune_spurs_max_length_um > 0)
+        postprocess_active = (
+            merge_branch_points_distance_um > 0 or prune_spurs_max_length_um > 0
+        )
         if postprocess_active:
             vertex_table, edge_table, branch_table, cleanup_stats = postprocess_skeleton_tables(
-                vertex_table, edge_table,
+                vertex_table,
+                edge_table,
                 merge_branch_points_distance_um=merge_branch_points_distance_um,
                 prune_spurs_max_length_um=prune_spurs_max_length_um,
             )
             summary.update(cleanup_stats)
-            # Rewrite branch CSV with cleaned data
             branch_table.to_csv(branch_csv_path, index=False)
             result["branch_table"] = branch_table
             _update_summary_from_branch_table(summary, branch_table)
@@ -1880,6 +2030,11 @@ def analyze_binary_mask_zarr(
             swc_dir, swc_paths = write_swc_files(vertex_table, edge_table, output_root)
             result["swc_dir"] = swc_dir
             result["swc_paths"] = swc_paths
+
+    if downsampled_path is not None and not keep_downsampled_mask:
+        shutil.rmtree(downsampled_path, ignore_errors=True)
+    elif downsampled_path is not None:
+        result["downsampled_mask_zarr"] = downsampled_path
 
     if write_run_manifest is not None:
         _output_files = [v for k, v in result.items() if k.endswith("_path") or k == "swc_dir"]
@@ -1896,6 +2051,7 @@ def analyze_binary_mask_zarr(
                 "fix_borders": fix_borders,
                 "save_skeleton": save_skeleton,
                 "save_swc": save_swc,
+                "downsample_factor": downsample_factor,
             },
             outputs=_output_files,
             started_at=_started_at,
@@ -1910,12 +2066,14 @@ def analyze_binary_mask_zarr_test_mode(
     dataset_name="0",
     resolution_xyz=(1.0, 1.0, 1.0),
     foreground_label=1,
-    dust_threshold=0,
+    dust_threshold=100,
     fix_borders=True,
     parallel=1,
     teasar_params=None,
-    save_skeleton=False,
+    save_skeleton=True,
     save_swc=False,
+    downsample_factor=4,
+    keep_downsampled_mask=False,
 ):
     return analyze_binary_mask_zarr_chunkwise(
         mask_zarr_path=mask_zarr_path,
@@ -1932,6 +2090,8 @@ def analyze_binary_mask_zarr_test_mode(
         process_existing_only=True,
         halo_zyx=(0, 0, 0),
         mode_name="test_chunkwise",
+        downsample_factor=downsample_factor,
+        keep_downsampled_mask=keep_downsampled_mask,
     )
 
 
@@ -1941,18 +2101,18 @@ def analyze_binary_mask_zarr_chunkwise(
     dataset_name="0",
     resolution_xyz=(1.0, 1.0, 1.0),
     foreground_label=1,
-    dust_threshold=0,
+    dust_threshold=100,
     fix_borders=True,
     parallel=1,
     teasar_params=None,
-    save_skeleton=False,
+    save_skeleton=True,
     save_swc=False,
-    process_existing_only=False,
-    halo_zyx=(0, 0, 0),
+    process_existing_only=True,
+    halo_zyx=(2, 4, 4),
     mode_name="chunkwise",
     stitch=True,
     stitch_max_distance_um=5.0,
-    chunk_workers=1,
+    chunk_workers=None,
     merge_branch_points_distance_um=0.0,
     prune_spurs_max_length_um=0.0,
     region_label_zarr_path=None,
@@ -1960,12 +2120,44 @@ def analyze_binary_mask_zarr_chunkwise(
     regions=None,
     region_label_dataset_name="0",
     region_chunk_margin=0,
+    downsample_factor=4,
+    keep_downsampled_mask=False,
 ):
     _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
+    downsample_factor = max(1, int(downsample_factor))
+    if chunk_workers is None:
+        chunk_workers = default_chunk_workers()
     chunk_workers = max(1, int(chunk_workers))
-    mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=dataset_name)
     halo_zyx = parse_triplet_int(halo_zyx)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    working_mask_path = Path(mask_zarr_path)
+    working_dataset_name = dataset_name
+    working_resolution = resolution_xyz
+    working_foreground = foreground_label
+    downsampled_path = None
+    if downsample_factor > 1:
+        downsampled_path = output_root / f"mask_ds{downsample_factor}.zarr"
+        logger.info(
+            "Downsampling mask by %dx (max-pool) -> %s",
+            downsample_factor,
+            downsampled_path,
+        )
+        downsample_binary_mask_zarr(
+            mask_zarr_path=mask_zarr_path,
+            output_zarr_path=downsampled_path,
+            factor=downsample_factor,
+            dataset_name=dataset_name,
+            foreground_label=foreground_label,
+        )
+        working_mask_path = downsampled_path
+        working_dataset_name = "0"
+        working_resolution = scale_resolution_xyz(resolution_xyz, downsample_factor)
+        working_foreground = 1
+
+    mask_zarr = open_zarr_dataset(working_mask_path, dataset_name=working_dataset_name)
     existing_chunks = list_existing_chunk_indices(mask_zarr)
     if not existing_chunks and process_existing_only:
         raise ValueError("No physical chunks found in the input mask Zarr store.")
@@ -2007,10 +2199,10 @@ def analyze_binary_mask_zarr_chunkwise(
 
     task_payloads = [
         {
-            "mask_zarr_path": str(mask_zarr_path),
-            "dataset_name": dataset_name,
-            "resolution_xyz": resolution_xyz,
-            "foreground_label": foreground_label,
+            "mask_zarr_path": str(working_mask_path),
+            "dataset_name": working_dataset_name,
+            "resolution_xyz": working_resolution,
+            "foreground_label": working_foreground,
             "dust_threshold": dust_threshold,
             "fix_borders": fix_borders,
             "kimimaro_parallel": kimimaro_parallel,
@@ -2085,7 +2277,9 @@ def analyze_binary_mask_zarr_chunkwise(
     summary["processed_chunks"] = int(len(chunk_indices))
     summary["connected_components"] = int(total_components)
     summary["mask_voxels"] = int(total_mask_voxels)
-    summary["vessel_volume_um3"] = float(total_mask_voxels * np.prod(tuple(float(v) for v in resolution_xyz)))
+    summary["vessel_volume_um3"] = float(
+        total_mask_voxels * np.prod(tuple(float(v) for v in working_resolution))
+    )
     summary["halo_zyx"] = [int(v) for v in halo_zyx]
     summary["process_existing_only"] = bool(process_existing_only)
     summary["stitch_enabled"] = bool(stitch)
@@ -2094,9 +2288,8 @@ def analyze_binary_mask_zarr_chunkwise(
     summary["kimimaro_parallel_per_chunk"] = int(kimimaro_parallel)
     if region_filter:
         summary["region_filter"] = region_filter
-
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    summary["downsample_factor"] = int(downsample_factor)
+    summary["resolution_xyz_um"] = list(working_resolution)
 
     branch_csv_path = output_root / "vessel_branch_metrics.csv"
     chunk_csv_path = output_root / "vessel_chunk_metrics.csv"
@@ -2124,7 +2317,9 @@ def analyze_binary_mask_zarr_chunkwise(
         else:
             combined_edge_table = _normalize_edge_table_schema(combined_edge_table)
 
-        vertex_csv_path, edge_csv_path = _write_skeleton_tables(combined_vertex_table, combined_edge_table, output_root)
+        vertex_csv_path, edge_csv_path = _write_skeleton_tables(
+            combined_vertex_table, combined_edge_table, output_root
+        )
         result["vertex_table"] = combined_vertex_table
         result["edge_table"] = combined_edge_table
         result["vertex_csv_path"] = vertex_csv_path
@@ -2139,34 +2334,49 @@ def analyze_binary_mask_zarr_chunkwise(
         else:
             summary["num_stitch_edges"] = 0
 
-        postprocess_active = (merge_branch_points_distance_um > 0 or prune_spurs_max_length_um > 0)
+        postprocess_active = (
+            merge_branch_points_distance_um > 0 or prune_spurs_max_length_um > 0
+        )
         if postprocess_active:
-            combined_vertex_table, combined_edge_table, cleaned_branch_table, cleanup_stats = postprocess_skeleton_tables(
-                combined_vertex_table, combined_edge_table,
-                merge_branch_points_distance_um=merge_branch_points_distance_um,
-                prune_spurs_max_length_um=prune_spurs_max_length_um,
+            combined_vertex_table, combined_edge_table, cleaned_branch_table, cleanup_stats = (
+                postprocess_skeleton_tables(
+                    combined_vertex_table,
+                    combined_edge_table,
+                    merge_branch_points_distance_um=merge_branch_points_distance_um,
+                    prune_spurs_max_length_um=prune_spurs_max_length_um,
+                )
             )
             summary.update(cleanup_stats)
             combined_branch_table = cleaned_branch_table
             combined_branch_table.to_csv(branch_csv_path, index=False)
             result["branch_table"] = combined_branch_table
             _update_summary_from_branch_table(summary, combined_branch_table)
-            # Rewrite skeleton tables with cleaned data
-            vertex_csv_path, edge_csv_path = _write_skeleton_tables(combined_vertex_table, combined_edge_table, output_root)
+            vertex_csv_path, edge_csv_path = _write_skeleton_tables(
+                combined_vertex_table, combined_edge_table, output_root
+            )
             result["vertex_table"] = combined_vertex_table
             result["edge_table"] = combined_edge_table
             result["vertex_csv_path"] = vertex_csv_path
             result["edge_csv_path"] = edge_csv_path
 
         if save_swc:
-            swc_dir, swc_paths = write_swc_files(combined_vertex_table, combined_edge_table, output_root)
+            swc_dir, swc_paths = write_swc_files(
+                combined_vertex_table, combined_edge_table, output_root
+            )
             result["swc_dir"] = swc_dir
             result["swc_paths"] = swc_paths
 
-        graph_summary = summarize_graph_from_skeleton_tables(combined_vertex_table, combined_edge_table)
+        graph_summary = summarize_graph_from_skeleton_tables(
+            combined_vertex_table, combined_edge_table
+        )
         summary["num_branch_points"] = graph_summary["num_branch_points"]
 
     _write_summary_json(summary, summary_json_path)
+
+    if downsampled_path is not None and not keep_downsampled_mask:
+        shutil.rmtree(downsampled_path, ignore_errors=True)
+    elif downsampled_path is not None:
+        result["downsampled_mask_zarr"] = downsampled_path
 
     if write_run_manifest is not None:
         _output_files = [v for k, v in result.items() if k.endswith("_path") or k == "swc_dir"]
@@ -2186,6 +2396,8 @@ def analyze_binary_mask_zarr_chunkwise(
                 "stitch": stitch,
                 "stitch_max_distance_um": stitch_max_distance_um,
                 "region_filter": region_filter or {},
+                "downsample_factor": downsample_factor,
+                "chunk_workers": chunk_workers,
             },
             outputs=_output_files,
             started_at=_started_at,
@@ -2195,26 +2407,109 @@ def analyze_binary_mask_zarr_chunkwise(
 
 
 def build_argparser():
-    parser = argparse.ArgumentParser(description="Reconstruct vessel network metrics from a binary mask Zarr using kimimaro.")
+    parser = argparse.ArgumentParser(
+        description="Reconstruct vessel network metrics from a binary mask Zarr using kimimaro."
+    )
     parser.add_argument("--mask_zarr", required=True, help="Path to input binary mask Zarr")
     parser.add_argument("--output_dir", required=True, help="Directory for CSV and JSON outputs")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
     parser.add_argument("--resolution_xyz", default="1,1,1", help="Voxel size in microns as x,y,z")
     parser.add_argument("--foreground_label", type=int, default=1, help="Foreground label value in the mask")
-    parser.add_argument("--roi", default="", help="Optional ROI JSON string, e.g. {\"z\":[0,100],\"y\":[0,256],\"x\":[0,256]}")
-    parser.add_argument("--dust_threshold", type=int, default=0, help="Minimum component size for kimimaro")
-    parser.add_argument("--parallel", type=int, default=1, help="Kimimaro worker count")
+    parser.add_argument(
+        "--roi",
+        default="",
+        help='Optional ROI JSON string, e.g. {"z":[0,100],"y":[0,256],"x":[0,256]}',
+    )
+    parser.add_argument("--dust_threshold", type=int, default=100, help="Minimum component size for kimimaro")
+    parser.add_argument("--parallel", type=int, default=1, help="Kimimaro worker count per chunk")
     parser.add_argument("--no_fix_borders", action="store_true", help="Disable border fixing in kimimaro")
-    parser.add_argument("--save_skeleton", action="store_true", help="Export skeleton vertices and edges as CSV")
-    parser.add_argument("--save_swc", action="store_true", help="Export one SWC file per skeleton")
-    parser.add_argument("--chunkwise", action="store_true", help="Process the mask chunk-by-chunk instead of loading the full volume")
-    parser.add_argument("--chunk_workers", type=int, default=1, help="Number of worker processes for chunkwise processing")
+    parser.add_argument(
+        "--save_skeleton",
+        action="store_true",
+        default=True,
+        help="Export skeleton vertices/edges CSV (default: on; required for region morphology)",
+    )
+    parser.add_argument(
+        "--no_save_skeleton",
+        action="store_false",
+        dest="save_skeleton",
+        help="Disable skeleton CSV export",
+    )
+    parser.add_argument(
+        "--save_swc",
+        action="store_true",
+        help="Export one SWC file per skeleton (optional visualization only; not required for region stats)",
+    )
+    parser.add_argument(
+        "--chunkwise",
+        action="store_true",
+        default=True,
+        help="Process the mask chunk-by-chunk (default: on)",
+    )
+    parser.add_argument(
+        "--no_chunkwise",
+        action="store_false",
+        dest="chunkwise",
+        help="Load the full volume instead of chunkwise",
+    )
+    parser.add_argument(
+        "--chunk_workers",
+        type=int,
+        default=None,
+        help=f"Worker processes for chunkwise mode (default: {default_chunk_workers()})",
+    )
     parser.add_argument(
         "--existing_only",
         "--process_existing_only",
         dest="existing_only",
         action="store_true",
-        help="In chunkwise mode, only process chunks that physically exist in the store",
+        default=True,
+        help="In chunkwise mode, only process chunks that physically exist (default: on)",
+    )
+    parser.add_argument(
+        "--no_existing_only",
+        action="store_false",
+        dest="existing_only",
+        help="Process the full logical chunk grid",
+    )
+    parser.add_argument(
+        "--halo_zyx",
+        default="2,4,4",
+        help="Halo overlap in voxels for chunkwise processing as z,y,x",
+    )
+    parser.add_argument(
+        "--no_stitch",
+        action="store_true",
+        help="Disable cross-chunk skeleton stitching in chunkwise mode",
+    )
+    parser.add_argument(
+        "--stitch_max_distance_um",
+        type=float,
+        default=5.0,
+        help="Maximum distance in microns for cross-chunk endpoint stitching",
+    )
+    parser.add_argument(
+        "--downsample_factor",
+        type=int,
+        default=4,
+        help="Isotropic max-pool downsample factor before skeletonization (1=off)",
+    )
+    parser.add_argument(
+        "--keep_downsampled_mask",
+        action="store_true",
+        help="Keep intermediate downsampled mask Zarr under output_dir",
+    )
+    parser.add_argument(
+        "--merge_branch_points_distance_um",
+        type=float,
+        default=0.0,
+        help="Merge branch points within this distance (um). 0=disabled",
+    )
+    parser.add_argument(
+        "--prune_spurs_max_length_um",
+        type=float,
+        default=0.0,
+        help="Prune terminal branches shorter than this (um). 0=disabled",
     )
     parser.add_argument("--halo_zyx", default="0,0,0", help="Halo overlap in voxels for chunkwise processing as z,y,x")
     parser.add_argument(
@@ -2260,11 +2555,14 @@ def main():
         class _JsonFormatter(logging.Formatter):
             def format(self, record):
                 import json as _json
-                return _json.dumps({
-                    "level": record.levelname,
-                    "logger": record.name,
-                    "message": record.getMessage(),
-                })
+
+                return _json.dumps(
+                    {
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "message": record.getMessage(),
+                    }
+                )
 
         _handler = logging.StreamHandler(sys.stderr)
         _handler.setFormatter(_JsonFormatter())
@@ -2291,6 +2589,8 @@ def main():
                 parallel=args.parallel,
                 save_skeleton=args.save_skeleton,
                 save_swc=args.save_swc,
+                downsample_factor=args.downsample_factor,
+                keep_downsampled_mask=args.keep_downsampled_mask,
             )
         elif args.chunkwise:
             result = analyze_binary_mask_zarr_chunkwise(
@@ -2317,6 +2617,8 @@ def main():
                 regions=args.regions,
                 region_label_dataset_name=args.region_label_dataset_name,
                 region_chunk_margin=args.region_chunk_margin,
+                downsample_factor=args.downsample_factor,
+                keep_downsampled_mask=args.keep_downsampled_mask,
             )
         else:
             result = analyze_binary_mask_zarr(
@@ -2333,6 +2635,8 @@ def main():
                 save_swc=args.save_swc,
                 merge_branch_points_distance_um=args.merge_branch_points_distance_um,
                 prune_spurs_max_length_um=args.prune_spurs_max_length_um,
+                downsample_factor=args.downsample_factor,
+                keep_downsampled_mask=args.keep_downsampled_mask,
             )
 
         logger.info("Vessel reconstruction completed.")
@@ -2351,7 +2655,11 @@ def main():
     except Exception as exc:
         if PipelineError is not None and isinstance(exc, PipelineError):
             import json as _json
-            print(_json.dumps({"error_code": exc.code.value, "message": str(exc.message)}), file=_sys.stderr)
+
+            print(
+                _json.dumps({"error_code": exc.code.value, "message": str(exc.message)}),
+                file=_sys.stderr,
+            )
             _sys.exit(exc.exit_code)
         logger.exception("Unhandled error: %s", exc)
         _sys.exit(1)

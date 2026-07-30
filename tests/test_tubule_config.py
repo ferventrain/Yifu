@@ -49,9 +49,15 @@ class TestTubuleReconstructionCfg:
     def test_defaults(self):
         cfg = TubuleReconstructionCfg()
         assert cfg.enabled is False
-        assert cfg.resolution_xyz == (1.0, 1.0, 1.0)
-        assert cfg.chunkwise is False
+        assert cfg.resolution_xyz is None
+        assert cfg.chunkwise is True
+        assert cfg.dust_threshold == 100
+        assert cfg.save_skeleton is True
+        assert cfg.save_swc is False
+        assert cfg.downsample_factor == 4
+        assert cfg.process_existing_only is True
         assert cfg.output_dirname == "tubule_reconstruction"
+        assert cfg.region_analysis.all_regions is True
 
     def test_resolution_xyz_from_string(self):
         cfg = TubuleReconstructionCfg(resolution_xyz="0.5,0.5,1.0")
@@ -92,8 +98,10 @@ class TestTubuleReconstructionCfg:
 class TestRegionVesselAnalysisCfg:
     def test_defaults(self):
         cfg = RegionVesselAnalysisCfg()
-        assert cfg.annotation_resolution_xyz == (1.0, 1.0, 1.0)
+        assert cfg.annotation_resolution_xyz is None
         assert cfg.regions == ()
+        assert cfg.all_regions is True
+        assert cfg.enabled is True
 
     def test_regions_from_comma_string(self):
         cfg = RegionVesselAnalysisCfg(regions="CA1, CA2, DG")
@@ -176,8 +184,12 @@ class TestLoadCapabilityManifest:
         manifest = load_capability_manifest()
         ids = {e["id"] for e in manifest["entrypoints"]}
         assert "analyze_binary_mask_zarr" in ids
+        assert "analyze_binary_mask_zarr_chunkwise" in ids
         assert "analyze_regions_from_skeleton" in ids
+        assert "notes_for_agents" in manifest
+        assert "recommended_workflow" in manifest
 
     def test_schema_version_present(self):
         manifest = load_capability_manifest()
         assert "schema_version" in manifest
+        assert int(manifest["schema_version"]) >= 2

@@ -8,18 +8,20 @@ These models are the ground truth for:
 
 Model design notes
 ------------------
-- All parameters have sensible defaults so the module can run from a bare
-  ``TubuleReconstructionCfg()`` instance.
-- ``resolution_xyz`` accepts either a 3-tuple or a ``"x,y,z"`` string, matching
-  the existing CLI ergonomics.
+- Defaults favour the accelerated whole-brain path: chunkwise + multi-process,
+  dust filtering, 4× mask downsample before skeletonization, and
+  ``save_skeleton=true`` (required for per-region morphology).
+- ``save_swc`` is optional and only needed for SWC viewers / PyVista rendering;
+  it is **not** required for multi-region morphology stats.
 - Models are frozen (``model_config = ConfigDict(frozen=True)``) so they are
   safe to pass around as value objects; callers mutate via ``model_copy``.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence, Tuple, Union
 
 try:
     from typing import Annotated
@@ -38,6 +40,12 @@ _Triplet = Annotated[
     Tuple[float, float, float],
     Field(description="Three-value tuple in (x, y, z) order"),
 ]
+
+
+def default_chunk_workers() -> int:
+    """Sensible process count for chunkwise skeletonization."""
+    cpu = os.cpu_count() or 4
+    return max(1, min(8, cpu // 2))
 
 
 def _coerce_triplet(value: Any) -> tuple[float, float, float]:
@@ -77,60 +85,24 @@ class TeasarParams(BaseModel):
     max_paths: Optional[int] = Field(None, description="Per-component path cap; None disables it")
 
 
-class TubuleReconstructionCfg(BaseModel):
-    """Top-level configuration for vessel-skeleton reconstruction.
+class RegionVesselAnalysisCfg(BaseModel):
+    """Configuration for ``region_vessel_analysis.analyze_regions_from_skeleton``.
 
-    Corresponds to the ``tubule_reconstruction`` section of ``config.json``.
+    When embedded under ``tubule_reconstruction.region_analysis``, the default
+    whole-brain path sets ``all_regions=true`` so every Allen structure in
+    ``cfg`` is exported (branch points, path lengths, tortuosity, volume, …).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    enabled: bool = Field(False, description="Whether the main pipeline should run this stage")
-    mask_dataset_name: str = Field("0", description="Dataset name inside the mask Zarr group")
-    foreground_label: int = Field(1, description="Voxel value treated as vessel foreground")
-    resolution_xyz: _Triplet = Field((1.0, 1.0, 1.0), description="Mask voxel size in um as (x, y, z)")
-    dust_threshold: int = Field(0, ge=0, description="Minimum connected-component size passed to kimimaro")
-    fix_borders: bool = Field(True, description="Enable kimimaro border fixing")
-    parallel: int = Field(1, ge=1, description="kimimaro worker count per chunk")
-
-    save_skeleton: bool = Field(False, description="Export skeleton vertex/edge CSV tables")
-    save_swc: bool = Field(False, description="Export one SWC file per skeleton (requires save_skeleton)")
-
-    chunkwise: bool = Field(False, description="Process the mask chunk-by-chunk instead of loading it whole")
-    chunk_workers: int = Field(1, ge=1, description="Worker processes for chunkwise mode")
-    process_existing_only: bool = Field(
-        False, description="In chunkwise mode, only process chunks that physically exist in the store"
+    enabled: bool = Field(
+        True,
+        description="Whether to run per-region vessel summary after skeletonization",
     )
-    halo_zyx: Tuple[int, int, int] = Field((0, 0, 0), description="Halo overlap in voxels as (z, y, x)")
-    stitch: bool = Field(True, description="Stitch endpoints across chunk boundaries in chunkwise mode")
-    stitch_max_distance_um: float = Field(5.0, ge=0.0, description="Max distance for cross-chunk endpoint stitching")
-
-    merge_branch_points_distance_um: float = Field(0.0, ge=0.0, description="Merge branch points within this distance (um). 0=disabled")
-    prune_spurs_max_length_um: float = Field(0.0, ge=0.0, description="Prune terminal branches shorter than this (um). 0=disabled")
-
-    teasar_params: TeasarParams = Field(default_factory=TeasarParams)
-
-    output_dirname: str = Field(
-        "tubule_reconstruction",
-        description="Subdirectory under sample_dir that receives this module's outputs",
+    all_regions: bool = Field(
+        True,
+        description="If true, export every region id in the Allen CSV (ignores empty regions list)",
     )
-
-    @field_validator("resolution_xyz", mode="before")
-    @classmethod
-    def _validate_resolution_xyz(cls, value: Any) -> tuple[float, float, float]:
-        return _coerce_triplet(value)
-
-    @field_validator("halo_zyx", mode="before")
-    @classmethod
-    def _validate_halo_zyx(cls, value: Any) -> tuple[int, int, int]:
-        return _coerce_int_triplet(value)
-
-
-class RegionVesselAnalysisCfg(BaseModel):
-    """Configuration for ``region_vessel_analysis.analyze_regions_from_skeleton``."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
     annotation_dataset_name: str = Field("0", description="Dataset name inside the annotation Zarr group")
     mask_dataset_name: str = Field("0", description="Dataset name inside the binary vessel mask Zarr group")
     foreground_label: Optional[int] = Field(
@@ -145,21 +117,33 @@ class RegionVesselAnalysisCfg(BaseModel):
         None,
         description="Optional binary vessel mask Zarr path; defaults to sample_dir/<signal_ch>_mask.zarr",
     )
-    annotation_resolution_xyz: _Triplet = Field(
-        (1.0, 1.0, 1.0),
-        description="Annotation voxel size in um as (x, y, z); default should match config input.resolution_xyz",
+    annotation_resolution_xyz: Optional[_Triplet] = Field(
+        None,
+        description=(
+            "Annotation voxel size in um as (x, y, z); null means use input.resolution_xyz from config.json"
+        ),
+    )
+    cfg: str = Field(
+        "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+        description="Allen region CSV used for id/acronym/name lookups and all_regions export",
     )
     regions: Tuple[str, ...] = Field(
         default_factory=tuple,
         description=(
-            "Region queries; each entry is an Allen acronym, full name, or integer id "
-            "(as string). Sub-tree is automatically included."
+            "Region queries when all_regions=false; each entry is an Allen acronym, "
+            "full name, or integer id (as string). Sub-tree is automatically included."
         ),
+    )
+    region_groups: Optional[Union[str, dict[str, list[str]]]] = Field(
+        None,
+        description="Optional JSON/dict of named region groups to merge into single summary rows",
     )
 
     @field_validator("annotation_resolution_xyz", mode="before")
     @classmethod
-    def _validate_annotation_resolution(cls, value: Any) -> tuple[float, float, float]:
+    def _validate_annotation_resolution(cls, value: Any) -> Optional[tuple[float, float, float]]:
+        if value is None:
+            return None
         return _coerce_triplet(value)
 
     @field_validator("regions", mode="before")
@@ -176,6 +160,120 @@ class RegionVesselAnalysisCfg(BaseModel):
         else:
             raise TypeError(f"Cannot coerce {value!r} to a region list")
         return tuple(str(p).strip() for p in parts if str(p).strip())
+
+
+class TubuleReconstructionCfg(BaseModel):
+    """Top-level configuration for vessel-skeleton reconstruction.
+
+    Corresponds to the ``tubule_reconstruction`` section of ``config.json``.
+
+    Notes for agents / main.py
+    --------------------------
+    - ``save_skeleton=true`` is required for per-region morphology (branch points,
+      tortuosity, path lengths). ``save_swc`` is **not** required for those stats;
+      enable it only when SWC/PyVista visualization is needed.
+    - Default path: chunkwise + multi-process + dust_threshold=100 + 4× downsample.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = Field(False, description="Whether the main pipeline should run this stage")
+    mask_dataset_name: str = Field("0", description="Dataset name inside the mask Zarr group")
+    foreground_label: int = Field(1, description="Voxel value treated as vessel foreground")
+    resolution_xyz: Optional[_Triplet] = Field(
+        None,
+        description="Mask voxel size in um as (x, y, z); null means use input.resolution_xyz",
+    )
+    dust_threshold: int = Field(
+        100,
+        ge=0,
+        description="Minimum connected-component size passed to kimimaro",
+    )
+    fix_borders: bool = Field(True, description="Enable kimimaro border fixing")
+    parallel: int = Field(
+        1,
+        ge=1,
+        description="kimimaro worker count per chunk (keep 1 when chunk_workers>1)",
+    )
+
+    save_skeleton: bool = Field(
+        True,
+        description=(
+            "Export skeleton vertex/edge CSV tables. Required for region morphology "
+            "(branch points, tortuosity, path lengths)."
+        ),
+    )
+    save_swc: bool = Field(
+        False,
+        description=(
+            "Export one SWC file per skeleton (requires save_skeleton). "
+            "Optional visualization only — not required for multi-region stats."
+        ),
+    )
+
+    chunkwise: bool = Field(
+        True,
+        description="Process the mask chunk-by-chunk instead of loading it whole",
+    )
+    chunk_workers: int = Field(
+        default_factory=default_chunk_workers,
+        ge=1,
+        description="Worker processes for chunkwise mode",
+    )
+    process_existing_only: bool = Field(
+        True,
+        description="In chunkwise mode, only process chunks that physically exist in the store",
+    )
+    halo_zyx: Tuple[int, int, int] = Field(
+        (2, 4, 4),
+        description="Halo overlap in voxels as (z, y, x) applied on the (possibly downsampled) grid",
+    )
+    stitch: bool = Field(True, description="Stitch endpoints across chunk boundaries in chunkwise mode")
+    stitch_max_distance_um: float = Field(5.0, ge=0.0, description="Max distance for cross-chunk endpoint stitching")
+
+    downsample_factor: int = Field(
+        4,
+        ge=1,
+        description=(
+            "Isotropic integer downsample factor applied to the binary mask before "
+            "skeletonization (max-pool). 1 = no downsample. Coordinates remain in um."
+        ),
+    )
+    keep_downsampled_mask: bool = Field(
+        False,
+        description="If true, keep the intermediate downsampled mask Zarr under the output directory",
+    )
+
+    merge_branch_points_distance_um: float = Field(
+        0.0, ge=0.0, description="Merge branch points within this distance (um). 0=disabled"
+    )
+    prune_spurs_max_length_um: float = Field(
+        0.0, ge=0.0, description="Prune terminal branches shorter than this (um). 0=disabled"
+    )
+
+    teasar_params: TeasarParams = Field(default_factory=TeasarParams)
+
+    region_analysis: RegionVesselAnalysisCfg = Field(
+        default_factory=RegionVesselAnalysisCfg,
+        description="Per-brain-region vessel summary after skeletonization",
+    )
+
+    output_dirname: str = Field(
+        "tubule_reconstruction",
+        description="Subdirectory under sample_dir that receives this module's outputs",
+    )
+
+    @field_validator("resolution_xyz", mode="before")
+    @classmethod
+    def _validate_resolution_xyz(cls, value: Any) -> Optional[tuple[float, float, float]]:
+        if value is None:
+            return None
+        return _coerce_triplet(value)
+
+    @field_validator("halo_zyx", mode="before")
+    @classmethod
+    def _validate_halo_zyx(cls, value: Any) -> tuple[int, int, int]:
+        return _coerce_int_triplet(value)
 
 
 def layout_for_sample(

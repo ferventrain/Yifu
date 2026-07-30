@@ -195,6 +195,25 @@ class TestAnalyzeRegionsFromSkeleton:
                 output_dir=None,
             )
 
+    def test_all_regions_exports_every_csv_id(
+        self, tiny_skeleton_csvs, tiny_annotation_zarr, tiny_mask_zarr, tiny_region_csv
+    ):
+        vertex_csv, edge_csv = tiny_skeleton_csvs
+        result = analyze_regions_from_skeleton(
+            vertex_csv_path=vertex_csv,
+            edge_csv_path=edge_csv,
+            mask_zarr_path=tiny_mask_zarr,
+            annotation_zarr_path=tiny_annotation_zarr,
+            region_cfg_csv=tiny_region_csv,
+            all_regions=True,
+            output_dir=None,
+            annotation_resolution_xyz=(25.0, 25.0, 25.0),
+        )
+        df = result["summary_table"]
+        assert "num_branch_points" in df.columns
+        assert len(df) >= 3
+        assert set(df["query"]).issuperset({"1", "10", "20"})
+
     def test_missing_vertex_csv_raises(
         self, tmp_path, tiny_annotation_zarr, tiny_mask_zarr, tiny_region_csv
     ):

@@ -348,27 +348,19 @@ def _attach_branch_midpoints(branch_table, vertex_table):
     return table
 
 
-def _compute_region_mask_volumes(
+def _accumulate_vessel_label_histogram(
     mask_zarr,
     annotation_zarr,
-    resolved,
-    resolution_xyz,
     foreground_label=1,
 ):
-    if mask_zarr is None:
-        return {entry["query"]: {"mask_voxels": None, "vessel_volume_um3": np.nan} for entry in resolved}
+    """Single-pass histogram of annotation labels on vessel voxels."""
     if tuple(mask_zarr.shape) != tuple(annotation_zarr.shape):
         raise ValueError(
             f"Mask and annotation Zarr shapes must match for direct region volume statistics: "
             f"mask={mask_zarr.shape}, annotation={annotation_zarr.shape}"
         )
 
-    subtree_by_query = {
-        entry["query"]: np.asarray([int(v) for v in entry["subtree_ids"]], dtype=np.int64)
-        for entry in resolved
-    }
-    voxel_counts = {entry["query"]: 0 for entry in resolved}
-
+    counts: dict[int, int] = {}
     chunks = tuple(int(v) for v in getattr(mask_zarr, "chunks", mask_zarr.shape))
     for chunk_index in tqdm(
         list(iter_all_chunk_indices(mask_zarr.shape, chunks)),
@@ -390,16 +382,149 @@ def _compute_region_mask_volumes(
             continue
         label_chunk = np.asarray(annotation_zarr[slices])
         vessel_labels = label_chunk[vessel_mask]
-        for query, subtree_ids in subtree_by_query.items():
-            voxel_counts[query] += int(np.isin(vessel_labels, subtree_ids).sum())
+        if vessel_labels.size == 0:
+            continue
+        unique, unique_counts = np.unique(vessel_labels, return_counts=True)
+        for label_id, count in zip(unique.tolist(), unique_counts.tolist()):
+            lid = int(label_id)
+            if lid == 0:
+                continue
+            counts[lid] = counts.get(lid, 0) + int(count)
+    return counts
 
+
+def _compute_region_mask_volumes(
+    mask_zarr,
+    annotation_zarr,
+    resolved,
+    resolution_xyz,
+    foreground_label=1,
+):
+    if mask_zarr is None:
+        return {entry["query"]: {"mask_voxels": None, "vessel_volume_um3": np.nan} for entry in resolved}
+
+    label_counts = _accumulate_vessel_label_histogram(
+        mask_zarr=mask_zarr,
+        annotation_zarr=annotation_zarr,
+        foreground_label=foreground_label,
+    )
     voxel_volume = float(np.prod(tuple(float(v) for v in resolution_xyz)))
-    return {
-        query: {
-            "mask_voxels": int(count),
-            "vessel_volume_um3": float(count * voxel_volume),
+    out = {}
+    for entry in resolved:
+        total = 0
+        for lid in entry["subtree_ids"]:
+            total += int(label_counts.get(int(lid), 0))
+        out[entry["query"]] = {
+            "mask_voxels": int(total),
+            "vessel_volume_um3": float(total * voxel_volume),
         }
-        for query, count in voxel_counts.items()
+    return out
+
+
+def _preaggregate_topology_by_label(vertex_table, edge_table, vertex_labels, branch_table, branch_labels):
+    """Aggregate branch-point / branch metrics per annotation leaf label."""
+    from collections import defaultdict
+
+    local_degrees = _compute_degrees(edge_table)
+    branch_points_by_label = defaultdict(int)
+    if not vertex_table.empty and vertex_labels.size and not local_degrees.empty:
+        deg_values = local_degrees.reindex(
+            pd.MultiIndex.from_frame(vertex_table[["skeleton_id", "node_id"]]),
+            fill_value=0,
+        ).to_numpy(dtype=np.int64)
+        for label_id, is_bp in zip(vertex_labels.tolist(), (deg_values >= 3).tolist()):
+            if is_bp and int(label_id) != 0:
+                branch_points_by_label[int(label_id)] += 1
+
+    path_sum = defaultdict(float)
+    path_count = defaultdict(int)
+    path_sq_sum = defaultdict(float)
+    tort_sum = defaultdict(float)
+    tort_count = defaultdict(int)
+    depth_sum = defaultdict(float)
+    depth_count = defaultdict(int)
+
+    if not branch_table.empty and branch_labels.size:
+        b2b = _branch_to_branch_mask(branch_table)
+        lengths = (
+            branch_table["branch_length_um"].to_numpy(dtype=np.float64)
+            if "branch_length_um" in branch_table.columns
+            else np.full(len(branch_table), np.nan)
+        )
+        tort = (
+            branch_table["tortuosity"].to_numpy(dtype=np.float64)
+            if "tortuosity" in branch_table.columns
+            else np.full(len(branch_table), np.nan)
+        )
+        depths = (
+            branch_table["branch_depth"].to_numpy(dtype=np.float64)
+            if "branch_depth" in branch_table.columns
+            else np.full(len(branch_table), np.nan)
+        )
+        for idx, label_id in enumerate(branch_labels.tolist()):
+            lid = int(label_id)
+            if lid == 0:
+                continue
+            if b2b[idx] and np.isfinite(lengths[idx]):
+                path_sum[lid] += float(lengths[idx])
+                path_sq_sum[lid] += float(lengths[idx]) ** 2
+                path_count[lid] += 1
+            if np.isfinite(tort[idx]):
+                tort_sum[lid] += float(tort[idx])
+                tort_count[lid] += 1
+            if np.isfinite(depths[idx]):
+                depth_sum[lid] += float(depths[idx])
+                depth_count[lid] += 1
+
+    return {
+        "branch_points_by_label": dict(branch_points_by_label),
+        "path_sum": dict(path_sum),
+        "path_count": dict(path_count),
+        "path_sq_sum": dict(path_sq_sum),
+        "tort_sum": dict(tort_sum),
+        "tort_count": dict(tort_count),
+        "depth_sum": dict(depth_sum),
+        "depth_count": dict(depth_count),
+    }
+
+
+def _regional_summary_from_preagg(region_node, subtree_ids, preagg, volume_stats):
+    subtree_list = [int(v) for v in subtree_ids]
+    num_branch_points = sum(
+        int(preagg["branch_points_by_label"].get(lid, 0)) for lid in subtree_list
+    )
+    path_sum = sum(float(preagg["path_sum"].get(lid, 0.0)) for lid in subtree_list)
+    path_count = sum(int(preagg["path_count"].get(lid, 0)) for lid in subtree_list)
+    path_sq_sum = sum(float(preagg["path_sq_sum"].get(lid, 0.0)) for lid in subtree_list)
+    tort_sum = sum(float(preagg["tort_sum"].get(lid, 0.0)) for lid in subtree_list)
+    tort_count = sum(int(preagg["tort_count"].get(lid, 0)) for lid in subtree_list)
+    depth_sum = sum(float(preagg["depth_sum"].get(lid, 0.0)) for lid in subtree_list)
+    depth_count = sum(int(preagg["depth_count"].get(lid, 0)) for lid in subtree_list)
+
+    if path_count > 0:
+        path_mean = path_sum / path_count
+        if path_count > 1:
+            variance = max(0.0, (path_sq_sum - (path_sum ** 2) / path_count) / (path_count - 1))
+            path_sd = float(np.sqrt(variance))
+        else:
+            path_sd = np.nan
+    else:
+        path_mean = np.nan
+        path_sd = np.nan
+
+    return {
+        "region_id": int(region_node["id"]),
+        "region_acronym": region_node["acronym"],
+        "region_name": region_node["name"],
+        "num_subtree_ids": int(len(subtree_list)),
+        "num_branch_points": int(num_branch_points),
+        "branch_point_path_length_sum_um": float(path_sum) if path_count else 0.0,
+        "branch_point_path_length_mean_um": float(path_mean),
+        "branch_point_path_length_sd_um": float(path_sd) if path_count > 1 else np.nan,
+        "mask_voxels": volume_stats.get("mask_voxels"),
+        "vessel_volume_um3": volume_stats.get("vessel_volume_um3", np.nan),
+        "mean_tortuosity": float(tort_sum / tort_count) if tort_count else np.nan,
+        "mean_branch_depth": float(depth_sum / depth_count) if depth_count else np.nan,
     }
 
 
@@ -471,6 +596,7 @@ def analyze_regions_from_skeleton(
     region_cfg_csv=None,
     regions=None,
     region_groups=None,
+    all_regions=False,
     output_dir=None,
     mask_dataset_name="0",
     foreground_label=1,
@@ -478,26 +604,41 @@ def analyze_regions_from_skeleton(
     annotation_resolution_xyz=None,
     config_path=None,
 ):
-    """Compute per-region vessel parameters from existing skeleton CSV outputs."""
+    """Compute per-region vessel parameters from existing skeleton CSV outputs.
+
+    Parameters
+    ----------
+    all_regions:
+        If True, export every region id present in ``region_cfg_csv`` (whole-brain
+        morphology table). Overrides an empty ``regions`` list.
+    """
     if region_cfg_csv is None:
         raise ValueError("region_cfg_csv is required.")
-    if regions is None and region_groups is None:
-        raise ValueError("regions or region_groups is required.")
     region_queries = parse_region_list(regions) if regions else []
     if region_groups is not None:
         region_groups = parse_region_groups(region_groups)
-    if not region_queries and not region_groups:
-        raise ValueError("No regions or region groups provided.")
+    if not all_regions and not region_queries and not region_groups:
+        raise ValueError("regions, region_groups, or all_regions=True is required.")
 
     logger.info("Loading region tree from %s", region_cfg_csv)
     nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(region_cfg_csv)
+    resolved = []
+    if all_regions:
+        logger.info("Resolving all %d regions from CSV", len(nodes_by_id))
+        for region_id in sorted(nodes_by_id):
+            node = nodes_by_id[region_id]
+            subtree_ids = _collect_subtree_ids(node)
+            resolved.append({
+                "query": str(region_id),
+                "node": node,
+                "subtree_ids": subtree_ids,
+            })
     if region_queries:
         logger.info("Resolving %d region query(ies): %s", len(region_queries), region_queries)
-    resolved = []
-    for query in region_queries:
-        node = resolve_region_query(query, nodes_by_id, acronym_to_ids, name_to_ids)
-        subtree_ids = _collect_subtree_ids(node)
-        resolved.append({"query": query, "node": node, "subtree_ids": subtree_ids})
+        for query in region_queries:
+            node = resolve_region_query(query, nodes_by_id, acronym_to_ids, name_to_ids)
+            subtree_ids = _collect_subtree_ids(node)
+            resolved.append({"query": query, "node": node, "subtree_ids": subtree_ids})
     if region_groups:
         logger.info("Resolving %d region group(s): %s", len(region_groups), list(region_groups.keys()))
         for group_name, sub_queries in region_groups.items():
@@ -606,6 +747,7 @@ def analyze_regions_from_skeleton(
                 "region_cfg_csv": str(region_cfg_csv),
                 "regions": regions,
                 "region_groups": region_groups,
+                "all_regions": all_regions,
                 "mask_dataset_name": mask_dataset_name,
                 "foreground_label": foreground_label,
                 "annotation_dataset_name": annotation_dataset_name,
@@ -678,17 +820,24 @@ def _finalize_region_analysis(
         foreground_label=foreground_label,
     )
 
+    # Pre-aggregate topology by leaf label once, then sum over each region's subtree.
+    # Critical for all_regions (hundreds–thousands of queries).
+    logger.info("Pre-aggregating topology metrics by annotation label ...")
+    preagg = _preaggregate_topology_by_label(
+        vertex_table=vertex_table,
+        edge_table=edge_table,
+        vertex_labels=vertex_labels,
+        branch_table=branch_table,
+        branch_labels=branch_labels,
+    )
+
     rows = []
     logger.info("Computing per-region vessel statistics ...")
     for entry in tqdm(resolved, desc="Regions"):
-        summary_row = _regional_summary(
+        summary_row = _regional_summary_from_preagg(
             region_node=entry["node"],
             subtree_ids=entry["subtree_ids"],
-            vertex_table=vertex_table,
-            edge_table=edge_table,
-            vertex_labels=vertex_labels,
-            branch_table=branch_table,
-            branch_labels=branch_labels,
+            preagg=preagg,
             volume_stats=volume_stats_by_query.get(entry["query"], {}),
         )
         summary_row["query"] = entry["query"]
@@ -785,6 +934,11 @@ def build_argparser():
             "All sub-regions of listed queries are merged into a single output row."
         ),
     )
+    parser.add_argument(
+        "--all_regions",
+        action="store_true",
+        help="Export every region id in --cfg (whole-brain morphology table)",
+    )
     parser.add_argument("--output_dir", required=True, help="Directory for summary CSV/JSON outputs")
     parser.add_argument(
         "--json_logs",
@@ -825,6 +979,7 @@ def main():
             region_cfg_csv=args.cfg,
             regions=args.regions,
             region_groups=args.region_groups,
+            all_regions=args.all_regions,
             output_dir=args.output_dir,
             mask_dataset_name=args.mask_dataset_name,
             foreground_label=None if str(args.foreground_label).strip() == "" else int(args.foreground_label),
