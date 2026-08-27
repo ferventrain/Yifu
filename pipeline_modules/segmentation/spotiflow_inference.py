@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from tqdm import tqdm
 
 try:
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[2] / "model" / "spotiflow"
 DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
 DEFAULT_CHECKPOINT_TILES = 32
+DEFAULT_BATCH_SIZE = 1
 
 
 def _configure_logging(json_logs: bool) -> None:
@@ -441,6 +443,115 @@ def _export_tile_qc_previews(
     return updated_rows
 
 
+def _predict_tiles_batch(
+    model: Any,
+    tiles: list[np.ndarray],
+    *,
+    prob_thresh: float | None,
+    min_distance: int,
+    peak_mode: str,
+    normalizer: Any,
+    subpix_radius: int,
+    device: str,
+    use_tuned_tile_overlap: bool,
+) -> list[tuple[np.ndarray, Any]]:
+    from spotiflow.utils import center_crop, center_pad, flow_to_vector, normalize, prob_to_points, subpixel_offset
+
+    actual_n_dims = 3
+    corr_grid = np.asarray(model.config.grid, dtype=np.float64)
+    div_by = tuple(
+        model.config.downsample_factors[0][0] ** model.config.levels for _ in range(actual_n_dims)
+    ) + (1,)
+    if model.config.is_3d and any(int(g) > 1 for g in model.config.grid):
+        div_by = tuple(int(g) * int(d) for g, d in zip((*model.config.grid, 1), div_by))
+
+    normalizer_fn = normalizer
+    if isinstance(normalizer, str) and normalizer == "auto":
+        normalizer_fn = normalize
+
+    prepared: list[np.ndarray] = []
+    paddings: list[Any] = []
+    for tile in tiles:
+        x = tile.astype(np.float32)
+        x = x[..., None]
+        if callable(normalizer_fn):
+            x = normalizer_fn(x)
+        pad_shape = tuple(int(int(d) * np.ceil(s / int(d))) for s, d in zip(x.shape, div_by))
+        x, padding = center_pad(x, pad_shape, mode="reflect")
+        prepared.append(x)
+        paddings.append(padding)
+
+    img_t = torch.from_numpy(np.stack(prepared)).to(device)
+    img_t = img_t.permute(0, 4, 1, 2, 3)
+
+    model.eval()
+    with torch.inference_mode():
+        out = model(img_t)
+
+    resolved_thresh: float
+    if prob_thresh is None:
+        _pt = getattr(model, "_prob_thresh", 0.5)
+        if isinstance(_pt, (list, tuple, np.ndarray)):
+            resolved_thresh = float(_pt[0])
+        else:
+            resolved_thresh = float(_pt)
+    elif isinstance(prob_thresh, (list, tuple, np.ndarray)):
+        resolved_thresh = float(prob_thresh[0])
+    else:
+        resolved_thresh = float(prob_thresh)
+
+    # flow[0] has shape (4, D', H', W') regardless of batch size (no batch dim)
+    flow_3d_t = out["flow"][0].permute(1, 2, 3, 0).detach().cpu().numpy() if subpix_radius >= 0 else None
+
+    results: list[tuple[np.ndarray, Any]] = []
+    for i, tile in enumerate(tiles):
+        padding = paddings[i]
+        orig_shape = np.asarray(tile.shape[:actual_n_dims], dtype=np.int64)
+
+        if model.config.is_3d and int(model.config.out_channels) > 1:
+            y = model._sigmoid(out["heatmaps"][0][i]).detach().cpu().numpy()
+        else:
+            y = model._sigmoid(out["heatmaps"][0][i].squeeze(0)).detach().cpu().numpy()
+
+        out_shape = tuple(int(s) // int(g) for s, g in zip(orig_shape, corr_grid))
+        y = center_crop(y, out_shape)
+
+        pts = prob_to_points(
+            y,
+            prob_thresh=resolved_thresh,
+            exclude_border=False,
+            mode=peak_mode,
+            min_distance=min_distance,
+        )
+        probs = y[tuple(pts.astype(int).T)].tolist() if pts.size else []
+
+        subpix_out: Any = None
+        if subpix_radius >= 0 and pts.size and flow_3d_t is not None:
+            subpix_tile = flow_to_vector(flow_3d_t, sigma=model.config.sigma)
+            subpix_tile = center_crop(subpix_tile, out_shape)
+            offset = subpixel_offset(pts, subpix_tile, y, radius=subpix_radius)
+            pts = pts + offset
+            subpix_out = subpix_tile
+
+        pad_correction = np.array([int(p[0]) for p in padding[:actual_n_dims]], dtype=np.float64)[None] / corr_grid
+        pts = pts - pad_correction
+
+        if model.config.is_3d and any(int(g) > 1 for g in model.config.grid):
+            pts = pts * np.asarray(model.config.grid, dtype=np.float64)
+
+        from types import SimpleNamespace
+
+        details = SimpleNamespace(
+            prob=np.asarray(probs, dtype=np.float64),
+            heatmap=y,
+            subpix=subpix_out,
+            flow=None,
+        )
+        results.append((pts, details))
+
+    return results
+
+
 def _append_timing_row(timing_csv: Path, row: dict[str, Any]) -> None:
     timing_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -562,6 +673,7 @@ def run_spotiflow_inference(
     normalizer: str | None = "auto",
     subpix: bool | None = None,
     use_tuned_tile_overlap: bool = False,
+    batch_size: int = DEFAULT_BATCH_SIZE,
     checkpoint_tiles: int = DEFAULT_CHECKPOINT_TILES,
     qc_top_n: int = 0,
     qc_tile_csv: str | Path | None = None,
@@ -697,6 +809,93 @@ def run_spotiflow_inference(
         predict_seconds = 0.0
         post_seconds = 0.0
         batch_skipped_tiles = 0
+        subpix_is_false = subpix is False
+        subpix_is_true = subpix is True
+        if subpix_is_false:
+            subpix_radius = -1
+        elif subpix_is_true:
+            subpix_radius = 0
+        elif subpix is None:
+            subpix_radius = 0 if getattr(model.config, "compute_flow", True) else -1
+        else:
+            subpix_radius = 0
+
+        batched_pending: list[tuple[np.ndarray, int, tuple[slice, slice, slice]]] = []
+
+        def _flush_batched() -> None:
+            nonlocal predict_seconds, post_seconds
+            if not batched_pending:
+                return
+            tiles_batch = [p[0] for p in batched_pending]
+            pred_started = time.perf_counter()
+            batch_results = _predict_tiles_batch(
+                model,
+                tiles_batch,
+                prob_thresh=prob_thresh,
+                min_distance=int(min_distance),
+                peak_mode=peak_mode,
+                normalizer=normalizer,
+                subpix_radius=subpix_radius,
+                device=device,
+                use_tuned_tile_overlap=use_tuned_tile_overlap,
+            )
+            predict_seconds += time.perf_counter() - pred_started
+
+            post_started = time.perf_counter()
+            for (pred_pts, det), (_tile, ti, sl) in zip(batch_results, batched_pending):
+                _predicted_points = np.asarray(pred_pts)
+                _point_count = 0
+                if _predicted_points.size == 0:
+                    if qc_top_n > 0:
+                        batch_qc_rows.append(
+                            _tile_qc_row(
+                                tile_index=ti, batch_index=batch_index, slices=sl, shape=shape, tile=_tile,
+                                point_count=0, details=det, prob_thresh=resolved_prob_thresh, skipped=False,
+                            )
+                        )
+                    continue
+                if _predicted_points.ndim == 1:
+                    _predicted_points = _predicted_points.reshape(1, -1)
+                _point_count = int(_predicted_points.shape[0])
+
+                tile_origin = np.array([int(slc.start or 0) for slc in sl], dtype=np.float64)
+                label_tile = np.asarray(label_data[sl]) if label_data is not None else None
+                for local_point in _predicted_points[:, :3]:
+                    if not _point_inside_keep_window(local_point, sl, shape, int(tile_overlap)):
+                        continue
+                    global_point = local_point.astype(np.float64, copy=False) + tile_origin
+                    rounded = np.rint(global_point).astype(np.int64)
+                    if np.any(rounded < 0) or np.any(rounded >= np.asarray(shape)):
+                        continue
+                    region_id = 0
+                    region_name = ""
+                    region_acronym = ""
+                    if label_tile is not None:
+                        local_rounded = np.rint(local_point).astype(np.int64)
+                        if np.any(local_rounded < 0) or np.any(local_rounded >= np.asarray(label_tile.shape)):
+                            continue
+                        region_id = int(label_tile[tuple(local_rounded.tolist())])
+                        region_info = region_lookup.get(region_id)
+                        if region_info:
+                            region_name = region_info["region_name"]
+                            region_acronym = region_info["region_acronym"]
+                    batch_points.append(
+                        {
+                            "z": float(global_point[0]), "y": float(global_point[1]), "x": float(global_point[2]),
+                            "region_id": region_id, "region_name": region_name, "region_acronym": region_acronym,
+                            "tile_z0": int(tile_origin[0]), "tile_y0": int(tile_origin[1]), "tile_x0": int(tile_origin[2]),
+                        }
+                    )
+                if qc_top_n > 0:
+                    batch_qc_rows.append(
+                        _tile_qc_row(
+                            tile_index=ti, batch_index=batch_index, slices=sl, shape=shape, tile=_tile,
+                            point_count=_point_count, details=det, prob_thresh=resolved_prob_thresh, skipped=False,
+                        )
+                    )
+            post_seconds += time.perf_counter() - post_started
+            batched_pending.clear()
+
         for tile_index, slices in enumerate(tile_slices[start_idx:end_idx], start=start_idx):
             read_started = time.perf_counter()
             tile = np.asarray(data_in[slices])
@@ -707,110 +906,94 @@ def run_spotiflow_inference(
                 if qc_top_n > 0:
                     batch_qc_rows.append(
                         _tile_qc_row(
-                            tile_index=tile_index,
-                            batch_index=batch_index,
-                            slices=slices,
-                            shape=shape,
-                            tile=tile,
-                            point_count=0,
-                            details=None,
-                            prob_thresh=resolved_prob_thresh,
-                            skipped=True,
+                            tile_index=tile_index, batch_index=batch_index,
+                            slices=slices, shape=shape, tile=tile,
+                            point_count=0, details=None,
+                            prob_thresh=resolved_prob_thresh, skipped=True,
                         )
                     )
                 continue
 
-            predict_started = time.perf_counter()
-            predicted_points, details = model.predict(
-                tile,
-                prob_thresh=prob_thresh,
-                min_distance=int(min_distance),
-                exclude_border=False,
-                peak_mode=peak_mode,
-                normalizer=normalizer,
-                subpix=subpix,
-                verbose=False,
-                device=device,
-                use_tuned_tile_overlap=use_tuned_tile_overlap,
-            )
-            predict_seconds += time.perf_counter() - predict_started
+            if batch_size > 1 and subpix_radius < 0:
+                batched_pending.append((tile, tile_index, slices))
+                if len(batched_pending) >= batch_size:
+                    _flush_batched()
+            else:
+                predict_started = time.perf_counter()
+                predicted_points, details = model.predict(
+                    tile,
+                    prob_thresh=prob_thresh,
+                    min_distance=int(min_distance),
+                    exclude_border=False,
+                    peak_mode=peak_mode,
+                    normalizer=normalizer,
+                    subpix=subpix,
+                    verbose=False,
+                    device=device,
+                    use_tuned_tile_overlap=use_tuned_tile_overlap,
+                )
+                predict_seconds += time.perf_counter() - predict_started
 
-            post_started = time.perf_counter()
-            predicted_points = np.asarray(predicted_points)
-            point_count_before_keep_window = 0
-            if predicted_points.size == 0:
+                post_started = time.perf_counter()
+                predicted_points = np.asarray(predicted_points)
+                point_count_before_keep_window = 0
+                if predicted_points.size == 0:
+                    if qc_top_n > 0:
+                        batch_qc_rows.append(
+                            _tile_qc_row(
+                                tile_index=tile_index, batch_index=batch_index,
+                                slices=slices, shape=shape, tile=tile,
+                                point_count=0, details=details,
+                                prob_thresh=resolved_prob_thresh, skipped=False,
+                            )
+                        )
+                    post_seconds += time.perf_counter() - post_started
+                    continue
+                if predicted_points.ndim == 1:
+                    predicted_points = predicted_points.reshape(1, -1)
+                point_count_before_keep_window = int(predicted_points.shape[0])
+
+                tile_origin = np.array([int(slc.start or 0) for slc in slices], dtype=np.float64)
+                label_tile = np.asarray(label_data[slices]) if label_data is not None else None
+                for local_point in predicted_points[:, :3]:
+                    if not _point_inside_keep_window(local_point, slices, shape, int(tile_overlap)):
+                        continue
+                    global_point = local_point.astype(np.float64, copy=False) + tile_origin
+                    rounded = np.rint(global_point).astype(np.int64)
+                    if np.any(rounded < 0) or np.any(rounded >= np.asarray(shape)):
+                        continue
+                    region_id = 0
+                    region_name = ""
+                    region_acronym = ""
+                    if label_tile is not None:
+                        local_rounded = np.rint(local_point).astype(np.int64)
+                        if np.any(local_rounded < 0) or np.any(local_rounded >= np.asarray(label_tile.shape)):
+                            continue
+                        region_id = int(label_tile[tuple(local_rounded.tolist())])
+                        region_info = region_lookup.get(region_id)
+                        if region_info:
+                            region_name = region_info["region_name"]
+                            region_acronym = region_info["region_acronym"]
+                    batch_points.append(
+                        {
+                            "z": float(global_point[0]), "y": float(global_point[1]), "x": float(global_point[2]),
+                            "region_id": region_id, "region_name": region_name, "region_acronym": region_acronym,
+                            "tile_z0": int(tile_origin[0]), "tile_y0": int(tile_origin[1]), "tile_x0": int(tile_origin[2]),
+                        }
+                    )
                 if qc_top_n > 0:
                     batch_qc_rows.append(
                         _tile_qc_row(
-                            tile_index=tile_index,
-                            batch_index=batch_index,
-                            slices=slices,
-                            shape=shape,
-                            tile=tile,
-                            point_count=0,
-                            details=details,
-                            prob_thresh=resolved_prob_thresh,
-                            skipped=False,
+                            tile_index=tile_index, batch_index=batch_index,
+                            slices=slices, shape=shape, tile=tile,
+                            point_count=point_count_before_keep_window, details=details,
+                            prob_thresh=resolved_prob_thresh, skipped=False,
                         )
                     )
                 post_seconds += time.perf_counter() - post_started
-                continue
-            if predicted_points.ndim == 1:
-                predicted_points = predicted_points.reshape(1, -1)
-            point_count_before_keep_window = int(predicted_points.shape[0])
 
-            tile_origin = np.array([int(slc.start or 0) for slc in slices], dtype=np.float64)
-            label_tile = np.asarray(label_data[slices]) if label_data is not None else None
-            for local_point in predicted_points[:, :3]:
-                if not _point_inside_keep_window(local_point, slices, shape, int(tile_overlap)):
-                    continue
-
-                global_point = local_point.astype(np.float64, copy=False) + tile_origin
-                rounded = np.rint(global_point).astype(np.int64)
-                if np.any(rounded < 0) or np.any(rounded >= np.asarray(shape)):
-                    continue
-
-                region_id = 0
-                region_name = ""
-                region_acronym = ""
-                if label_tile is not None:
-                    local_rounded = np.rint(local_point).astype(np.int64)
-                    if np.any(local_rounded < 0) or np.any(local_rounded >= np.asarray(label_tile.shape)):
-                        continue
-                    region_id = int(label_tile[tuple(local_rounded.tolist())])
-                    region_info = region_lookup.get(region_id)
-                    if region_info:
-                        region_name = region_info["region_name"]
-                        region_acronym = region_info["region_acronym"]
-
-                batch_points.append(
-                    {
-                        "z": float(global_point[0]),
-                        "y": float(global_point[1]),
-                        "x": float(global_point[2]),
-                        "region_id": region_id,
-                        "region_name": region_name,
-                        "region_acronym": region_acronym,
-                        "tile_z0": int(tile_origin[0]),
-                        "tile_y0": int(tile_origin[1]),
-                        "tile_x0": int(tile_origin[2]),
-                    }
-                )
-            if qc_top_n > 0:
-                batch_qc_rows.append(
-                    _tile_qc_row(
-                        tile_index=tile_index,
-                        batch_index=batch_index,
-                        slices=slices,
-                        shape=shape,
-                        tile=tile,
-                        point_count=point_count_before_keep_window,
-                        details=details,
-                        prob_thresh=resolved_prob_thresh,
-                        skipped=False,
-                    )
-                )
-            post_seconds += time.perf_counter() - post_started
+        if batch_size > 1 and batched_pending:
+            _flush_batched()
 
         write_started = time.perf_counter()
         _write_points_batch_csv(batch_points, batch_path)
@@ -874,6 +1057,7 @@ def run_spotiflow_inference(
         "processed_tiles": len(tile_slices) - skipped_tiles,
         "checkpoint_dir": str(checkpoint_dir),
         "checkpoint_tiles": checkpoint_tiles,
+        "batch_size": batch_size,
         "batch_timing_csv": str(timing_csv),
         "qc_tile_csv": str(qc_tile_path) if qc_top_n > 0 else "",
         "qc_top_csv": str(qc_top_path) if qc_top_n > 0 else "",
@@ -941,6 +1125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subpix", choices=["auto", "true", "false"], default="auto")
     parser.add_argument("--use_tuned_tile_overlap", action="store_true")
     parser.add_argument("--checkpoint_tiles", type=int, default=DEFAULT_CHECKPOINT_TILES, help="Number of tiles per resumable checkpoint batch")
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Number of tiles processed in a single GPU forward pass; higher values improve GPU utilization")
     parser.add_argument("--qc_top_n", type=int, default=0, help="Write tile-level QC and export top-N uncertain tile previews")
     parser.add_argument("--qc_tile_csv", default="", help="Optional output CSV path for all tile-level Spotiflow QC rows")
     parser.add_argument("--qc_top_csv", default="", help="Optional output CSV path for top uncertain Spotiflow tile rows")
@@ -982,6 +1167,7 @@ def main() -> int:
             subpix=_parse_subpix(args.subpix),
             use_tuned_tile_overlap=args.use_tuned_tile_overlap,
             checkpoint_tiles=args.checkpoint_tiles,
+            batch_size=args.batch_size,
             qc_top_n=args.qc_top_n,
             qc_tile_csv=args.qc_tile_csv or None,
             qc_top_csv=args.qc_top_csv or None,
