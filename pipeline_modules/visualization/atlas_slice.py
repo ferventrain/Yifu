@@ -365,15 +365,6 @@ def load_region_metadata(cfg_path: str | Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# Excel density columns are ratios of inclusive aggregates; rebuild from exclusive
-# component columns when painting atlas label voxels.
-DENSITY_METRIC_COMPONENTS: dict[str, tuple[str, str]] = {
-    "Voxel Density": ("Signal Voxels", "Total Voxels"),
-    "Left Voxel Density": ("Left Signal Voxels", "Left Total Voxels"),
-    "Right Voxel Density": ("Right Signal Voxels", "Right Total Voxels"),
-}
-
-
 def load_excel_metric_by_name(input_excel: str | Path, metric: str) -> dict[str, float]:
     input_excel = Path(input_excel)
     if not input_excel.exists():
@@ -404,94 +395,23 @@ def load_excel_metric_by_name(input_excel: str | Path, metric: str) -> dict[str,
     return metric_by_name
 
 
-def children_by_region_id(path_by_region_id: dict[int, list[int]]) -> dict[int, list[int]]:
-    """Map each region to its direct children using Allen structure_id_path."""
-    children: dict[int, list[int]] = {}
-    for region_id, path in path_by_region_id.items():
-        if len(path) < 2:
-            continue
-        parent_id = int(path[-2])
-        children.setdefault(parent_id, []).append(int(region_id))
-    return children
-
-
-def to_direct_label_metric_values(
-    value_by_region_id: dict[int, float],
-    path_by_region_id: dict[int, list[int]],
-) -> dict[int, float]:
-    """Convert inclusive hierarchy aggregates to direct-label-only values.
-
-    Analysis Excel rows store subtree sums (parent = own voxels + all descendants).
-    Atlas voxels labeled as a parent (e.g. root interstitial gaps) must be painted
-    with only that label's exclusive count, not the whole-brain total.
-    """
-    children = children_by_region_id(path_by_region_id)
-    exclusive: dict[int, float] = {}
-    for region_id, value in value_by_region_id.items():
-        child_sum = 0.0
-        for child_id in children.get(int(region_id), []):
-            if child_id in value_by_region_id:
-                child_sum += float(value_by_region_id[child_id])
-        exclusive[int(region_id)] = max(0.0, float(value) - child_sum)
-    return exclusive
-
-
-def _match_metric_names_to_region_ids(
-    metric_by_name: dict[str, float],
-    region_table: pd.DataFrame,
-) -> dict[int, float]:
-    value_by_region_id: dict[int, float] = {}
-    for _, row in region_table.iterrows():
-        excel_name = str(row["excel_name"])
-        if excel_name in metric_by_name:
-            value_by_region_id[int(row["region_id"])] = float(metric_by_name[excel_name])
-    return value_by_region_id
-
-
 def build_region_metric_lookup(
     input_excel: str | Path,
     *,
     cfg_path: str | Path,
     metric: str,
-    direct_label_only: bool = False,
 ) -> tuple[dict[int, float], dict[int, list[int]]]:
-    """Build region_id -> metric lookup from analysis Excel.
-
-    When ``direct_label_only`` is True, convert inclusive subtree aggregates into
-    exclusive per-label values suitable for painting atlas voxels (so root gaps
-    show only gap cFos, not the whole-brain sum).
-    """
     region_table = load_region_metadata(cfg_path)
-    path_by_region_id: dict[int, list[int]] = {
-        int(row["region_id"]): [int(value) for value in row["structure_id_path"]]
-        for _, row in region_table.iterrows()
-    }
+    metric_by_name = load_excel_metric_by_name(input_excel, metric)
 
-    if direct_label_only and metric in DENSITY_METRIC_COMPONENTS:
-        numerator_metric, denominator_metric = DENSITY_METRIC_COMPONENTS[metric]
-        numerator_by_id = _match_metric_names_to_region_ids(
-            load_excel_metric_by_name(input_excel, numerator_metric),
-            region_table,
-        )
-        denominator_by_id = _match_metric_names_to_region_ids(
-            load_excel_metric_by_name(input_excel, denominator_metric),
-            region_table,
-        )
-        numerator_by_id = to_direct_label_metric_values(numerator_by_id, path_by_region_id)
-        denominator_by_id = to_direct_label_metric_values(denominator_by_id, path_by_region_id)
-        value_by_region_id = {
-            region_id: (
-                float(numerator_by_id.get(region_id, 0.0)) / float(denominator_by_id[region_id])
-                if float(denominator_by_id.get(region_id, 0.0)) > 0
-                else 0.0
-            )
-            for region_id in set(numerator_by_id) | set(denominator_by_id)
-        }
-    else:
-        metric_by_name = load_excel_metric_by_name(input_excel, metric)
-        value_by_region_id = _match_metric_names_to_region_ids(metric_by_name, region_table)
-        if direct_label_only:
-            value_by_region_id = to_direct_label_metric_values(value_by_region_id, path_by_region_id)
+    value_by_region_id: dict[int, float] = {}
+    path_by_region_id: dict[int, list[int]] = {}
+    for _, row in region_table.iterrows():
+        region_id = int(row["region_id"])
+        path_by_region_id[region_id] = [int(value) for value in row["structure_id_path"]]
+        excel_name = str(row["excel_name"])
+        if excel_name in metric_by_name:
+            value_by_region_id[region_id] = float(metric_by_name[excel_name])
 
     if not value_by_region_id:
         raise ValueError(f"Could not match any atlas regions to Excel values from {input_excel}")
@@ -1174,14 +1094,10 @@ def lookup_region_metric_value(
     region_id: int,
     value_by_region_id: dict[int, float],
     path_by_region_id: dict[int, list[int]],
-    *,
-    inherit_ancestors: bool = True,
 ) -> float | None:
     """Return direct or inherited metric value, or None when no data exists."""
     if region_id in value_by_region_id:
         return float(value_by_region_id[region_id])
-    if not inherit_ancestors:
-        return None
     path = path_by_region_id.get(region_id, [])
     for ancestor_id in reversed(path[:-1]):
         if ancestor_id in value_by_region_id:
@@ -1193,8 +1109,6 @@ def collect_regions_missing_metric_data(
     label_image: np.ndarray,
     value_by_region_id: dict[int, float],
     path_by_region_id: dict[int, list[int]],
-    *,
-    inherit_ancestors: bool = True,
 ) -> list[int]:
     """Brain region ids visible on the slice that have no metric data."""
     missing: list[int] = []
@@ -1202,15 +1116,7 @@ def collect_regions_missing_metric_data(
         region_id = int(label)
         if region_id == 0:
             continue
-        if (
-            lookup_region_metric_value(
-                region_id,
-                value_by_region_id,
-                path_by_region_id,
-                inherit_ancestors=inherit_ancestors,
-            )
-            is None
-        ):
+        if lookup_region_metric_value(region_id, value_by_region_id, path_by_region_id) is None:
             missing.append(region_id)
     return missing
 
@@ -1224,20 +1130,13 @@ def resolve_slice_region_values(
     label_image: np.ndarray,
     value_by_region_id: dict[int, float],
     path_by_region_id: dict[int, list[int]],
-    *,
-    inherit_ancestors: bool = True,
 ) -> dict[int, float]:
     resolved: dict[int, float] = {}
     for label in np.unique(np.asarray(label_image)):
         region_id = int(label)
         if region_id == 0:
             continue
-        value = lookup_region_metric_value(
-            region_id,
-            value_by_region_id,
-            path_by_region_id,
-            inherit_ancestors=inherit_ancestors,
-        )
+        value = lookup_region_metric_value(region_id, value_by_region_id, path_by_region_id)
         resolved[region_id] = 0.0 if value is None else float(value)
     return resolved
 
@@ -1256,14 +1155,8 @@ def build_atlas_slice_heatmap(
         input_excel,
         cfg_path=cfg_path,
         metric=metric,
-        direct_label_only=True,
     )
-    region_values = resolve_slice_region_values(
-        atlas_slice.image,
-        value_by_region_id,
-        path_by_region_id,
-        inherit_ancestors=False,
-    )
+    region_values = resolve_slice_region_values(atlas_slice.image, value_by_region_id, path_by_region_id)
     upper = float(vmax) if vmax is not None else max(value_by_region_id.values())
     if upper <= float(vmin):
         upper = float(vmin) + 1e-12

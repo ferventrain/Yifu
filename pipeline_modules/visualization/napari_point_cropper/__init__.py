@@ -10,6 +10,37 @@ import numpy as np
 
 
 DEFAULT_CROP_SIZE = (256, 256, 256)
+PREVIEW_LAYER_NAME = "crop_preview"
+PREVIEW_EDGE_COLOR_VALID = "cyan"
+PREVIEW_EDGE_COLOR_INVALID = "orange"
+PREVIEW_EDGE_WIDTH = 2
+
+
+def intended_crop_bounds(
+    point_zyx: tuple[float, float, float] | list[float] | np.ndarray,
+    crop_size: tuple[int, int, int] = DEFAULT_CROP_SIZE,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Return [start, stop) crop bounds without validating against image shape."""
+    if len(point_zyx) < 3:
+        raise ValueError("point_zyx must contain z,y,x coordinates")
+    start = tuple(int(round(float(value))) for value in point_zyx[:3])
+    crop = tuple(int(value) for value in crop_size)
+    if any(value <= 0 for value in crop):
+        raise ValueError("crop_size values must be positive")
+    stop = tuple(start[axis] + crop[axis] for axis in range(3))
+    return start, stop
+
+
+def crop_bounds_in_shape(
+    start: tuple[int, int, int],
+    stop: tuple[int, int, int],
+    shape: tuple[int, int, int],
+) -> bool:
+    if len(shape) != 3:
+        raise ValueError("Only 3D images are supported")
+    if any(value < 0 for value in start):
+        return False
+    return all(stop[axis] <= int(shape[axis]) for axis in range(3))
 
 
 def crop_bounds_from_point(
@@ -17,25 +48,60 @@ def crop_bounds_from_point(
     shape: tuple[int, int, int],
     crop_size: tuple[int, int, int] = DEFAULT_CROP_SIZE,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    if len(point_zyx) < 3:
-        raise ValueError("point_zyx must contain z,y,x coordinates")
     if len(shape) != 3:
         raise ValueError("Only 3D images are supported")
 
-    start = tuple(int(round(float(value))) for value in point_zyx[:3])
-    crop = tuple(int(value) for value in crop_size)
-    if any(value <= 0 for value in crop):
-        raise ValueError("crop_size values must be positive")
+    start, stop = intended_crop_bounds(point_zyx, crop_size)
     if any(value < 0 for value in start):
         raise ValueError(f"Crop start must be non-negative, got {start}")
-
-    stop = tuple(start[axis] + crop[axis] for axis in range(3))
-    if any(stop[axis] > int(shape[axis]) for axis in range(3)):
+    if not crop_bounds_in_shape(start, stop, shape):
         raise ValueError(
             f"Crop {start}->{stop} exceeds image shape {tuple(int(v) for v in shape)}. "
             "Move the point farther from the lower/right/back edge or reduce crop size."
         )
     return start, stop
+
+
+def crop_box_face_rects(
+    start: tuple[int, int, int] | list[int],
+    stop: tuple[int, int, int] | list[int],
+) -> list[np.ndarray]:
+    """Build 6 rectangular faces for a [start, stop) crop box in z,y,x order."""
+    z0, y0, x0 = (float(value) for value in start)
+    z1, y1, x1 = (float(value) for value in stop)
+    faces = (
+        ((z0, y0, x0), (z0, y0, x1), (z0, y1, x1), (z0, y1, x0)),
+        ((z1, y0, x0), (z1, y0, x1), (z1, y1, x1), (z1, y1, x0)),
+        ((z0, y0, x0), (z0, y0, x1), (z1, y0, x1), (z1, y0, x0)),
+        ((z0, y1, x0), (z0, y1, x1), (z1, y1, x1), (z1, y1, x0)),
+        ((z0, y0, x0), (z0, y1, x0), (z1, y1, x0), (z1, y0, x0)),
+        ((z0, y0, x1), (z0, y1, x1), (z1, y1, x1), (z1, y0, x1)),
+    )
+    return [np.asarray(face, dtype=np.float64) for face in faces]
+
+
+def preview_shapes_from_points(
+    points_zyx: np.ndarray | list[list[float]],
+    crop_size: tuple[int, int, int],
+    shape: tuple[int, int, int] | None = None,
+) -> tuple[list[np.ndarray], list[str]]:
+    """Return rectangle faces and edge colors for each crop preview box."""
+    points = np.asarray(points_zyx, dtype=np.float64)
+    if points.size == 0:
+        return [], []
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError("points_zyx must be an (N, >=3) array of z,y,x coordinates")
+
+    shapes: list[np.ndarray] = []
+    edge_colors: list[str] = []
+    for point in points:
+        start, stop = intended_crop_bounds(point[:3], crop_size)
+        valid = True if shape is None else crop_bounds_in_shape(start, stop, shape)
+        color = PREVIEW_EDGE_COLOR_VALID if valid else PREVIEW_EDGE_COLOR_INVALID
+        for face in crop_box_face_rects(start, stop):
+            shapes.append(face)
+            edge_colors.append(color)
+    return shapes, edge_colors
 
 
 def crop_array_from_point(
@@ -180,6 +246,37 @@ def ensure_crop_points_layer(viewer: Any) -> Any:
     )
 
 
+def ensure_crop_preview_layer(viewer: Any) -> Any:
+    existing = _layer_by_name(viewer, PREVIEW_LAYER_NAME)
+    if existing is not None:
+        return existing
+    layer = viewer.add_shapes(
+        [],
+        name=PREVIEW_LAYER_NAME,
+        ndim=3,
+        shape_type="rectangle",
+        edge_color=PREVIEW_EDGE_COLOR_VALID,
+        face_color=[0, 0, 0, 0],
+        edge_width=PREVIEW_EDGE_WIDTH,
+        opacity=0.9,
+    )
+    # Preview is driven by points + crop size; keep it non-interactive.
+    if hasattr(layer, "editable"):
+        layer.editable = False
+    return layer
+
+
+def _set_preview_shapes(preview_layer: Any, shapes: list[np.ndarray], edge_colors: list[str]) -> None:
+    if not shapes:
+        preview_layer.data = []
+        return
+    preview_layer.data = shapes
+    preview_layer.shape_type = ["rectangle"] * len(shapes)
+    preview_layer.edge_color = edge_colors
+    preview_layer.face_color = [[0, 0, 0, 0]] * len(shapes)
+    preview_layer.edge_width = PREVIEW_EDGE_WIDTH
+
+
 def _build_cropper(viewer: Any) -> Any:
     try:
         from magicgui import magicgui
@@ -187,6 +284,8 @@ def _build_cropper(viewer: Any) -> Any:
         raise ModuleNotFoundError("magicgui is required to use the napari point cropper widget.") from exc
 
     points_layer = ensure_crop_points_layer(viewer)
+    ensure_crop_preview_layer(viewer)
+    preview_connections: dict[str, Any] = {"points": None}
 
     def _image_layer_names(widget=None) -> list[str]:
         return [layer.name for layer in viewer.layers if layer.__class__.__name__ == "Image"]
@@ -260,6 +359,84 @@ def _build_cropper(viewer: Any) -> Any:
             print(f"Saved crop: {output_path}")
         print(f"Saved {len(saved_paths)} crop(s).")
 
+    def _active_points_layer() -> Any | None:
+        name = cropper.points_layer_name.value
+        if name:
+            layer = _layer_by_name(viewer, name)
+            if layer is not None:
+                return layer
+        return points_layer
+
+    def _active_image_shape() -> tuple[int, int, int] | None:
+        name = cropper.image_layer.value
+        image = _layer_by_name(viewer, name) if name else _current_image_layer()
+        if image is None:
+            return None
+        data = getattr(image, "data", None)
+        if data is None or len(getattr(data, "shape", ())) < 3:
+            return None
+        return tuple(int(value) for value in data.shape[:3])
+
+    def _update_preview(*_args: Any, **_kwargs: Any) -> None:
+        pts = _active_points_layer()
+        preview = _layer_by_name(viewer, PREVIEW_LAYER_NAME) or ensure_crop_preview_layer(viewer)
+        if pts is None:
+            _set_preview_shapes(preview, [], [])
+            return
+        data = np.asarray(pts.data, dtype=np.float64)
+        if data.size == 0:
+            _set_preview_shapes(preview, [], [])
+            return
+        crop_size = (
+            int(cropper.size_z.value),
+            int(cropper.size_y.value),
+            int(cropper.size_x.value),
+        )
+        if any(value <= 0 for value in crop_size):
+            _set_preview_shapes(preview, [], [])
+            return
+        shapes, edge_colors = preview_shapes_from_points(data, crop_size, _active_image_shape())
+        _set_preview_shapes(preview, shapes, edge_colors)
+
+    def _disconnect_points_preview() -> None:
+        connected = preview_connections.get("points")
+        if connected is None:
+            return
+        layer, callback = connected
+        try:
+            layer.events.data.disconnect(callback)
+        except (TypeError, RuntimeError, ValueError):
+            pass
+        preview_connections["points"] = None
+
+    def _connect_points_preview(layer: Any | None) -> None:
+        _disconnect_points_preview()
+        if layer is None:
+            return
+
+        def _on_points_changed(*_args: Any, **_kwargs: Any) -> None:
+            _update_preview()
+
+        layer.events.data.connect(_on_points_changed)
+        preview_connections["points"] = (layer, _on_points_changed)
+
+    def _on_points_layer_changed(event: Any = None) -> None:
+        _connect_points_preview(_active_points_layer())
+        _update_preview()
+
+    cropper.size_z.changed.connect(_update_preview)
+    cropper.size_y.changed.connect(_update_preview)
+    cropper.size_x.changed.connect(_update_preview)
+    cropper.image_layer.changed.connect(_update_preview)
+    cropper.points_layer_name.changed.connect(_on_points_layer_changed)
+    viewer.layers.events.inserted.connect(_update_preview)
+    viewer.layers.events.removed.connect(_update_preview)
+
+    _connect_points_preview(_active_points_layer())
+    _update_preview()
+    # Keep the interactive points layer selected after creating the preview overlay.
+    if points_layer in viewer.layers:
+        viewer.layers.selection.active = points_layer
     return cropper
 
 

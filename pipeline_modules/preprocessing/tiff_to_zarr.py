@@ -131,6 +131,42 @@ def resolve_compressor(compressor: Any) -> Any | None:
     return compressor
 
 
+def _open_output_group(zarr_mod: Any, output_path: Path) -> Any:
+    """Create an empty Zarr group compatible with both zarr v2 and v3."""
+    if hasattr(zarr_mod, "DirectoryStore"):
+        store = zarr_mod.DirectoryStore(str(output_path))
+        return zarr_mod.group(store=store, overwrite=True)
+    # zarr>=3 removed DirectoryStore / create_dataset; keep format-2 on-disk layout
+    # so the rest of the pipeline can still open the result.
+    return zarr_mod.open_group(str(output_path), mode="w", zarr_format=2)
+
+
+def _create_array(
+    root: Any,
+    dataset_name: str,
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    dtype: Any,
+    compressor: Any,
+) -> Any:
+    if hasattr(root, "create_dataset"):
+        return root.create_dataset(
+            dataset_name,
+            shape=shape,
+            chunks=chunks,
+            dtype=dtype,
+            compressor=compressor,
+        )
+    return root.create_array(
+        dataset_name,
+        shape=shape,
+        chunks=chunks,
+        dtype=dtype,
+        compressors=compressor,
+    )
+
+
 def _read_z_chunk(tiff_files: list[Path]) -> np.ndarray:
     return np.stack([tifffile.imread(str(path)) for path in tiff_files])
 
@@ -264,10 +300,9 @@ def convert_tiff_to_zarr(
     shape = (len(tiff_files),) + sample.shape
     logger.info("Converting %d TIFF slices from %s into %s", len(tiff_files), input_path, output_path)
 
-    store = zarr.DirectoryStore(str(output_path))
-    root = zarr.group(store=store, overwrite=True)
-
-    dataset = root.create_dataset(
+    root = _open_output_group(zarr, output_path)
+    dataset = _create_array(
+        root,
         dataset_name,
         shape=shape,
         chunks=chunk_size,

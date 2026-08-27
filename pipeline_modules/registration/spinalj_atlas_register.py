@@ -121,6 +121,44 @@ def list_channel_tiffs(tiff_dir: Path, channel_token: str = "_C0_") -> list[Path
     return files
 
 
+def _resize_yx_preserve_peaks(
+    img: np.ndarray,
+    *,
+    out_w: int,
+    out_h: int,
+    peak_blend: float = 0.65,
+) -> np.ndarray:
+    """Downsample a 2D plane while keeping bright landmarks visible.
+
+    INTER_AREA alone averages sparse bright spots into neighbors and makes
+    landmark features hard to see. Blend area (anti-aliased mean) with a
+    max-pool nearest resize so peaks survive without fully abandoning
+    anti-aliasing for registration.
+    """
+    import cv2
+
+    img_f = np.asarray(img, dtype=np.float32)
+    mean_ds = cv2.resize(img_f, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    if peak_blend <= 0.0:
+        return mean_ds
+
+    # Integer-ish max pool when reducing a lot; then nearest to exact size.
+    h0, w0 = img_f.shape
+    fy = max(int(round(h0 / out_h)), 1)
+    fx = max(int(round(w0 / out_w)), 1)
+    if fy > 1 or fx > 1:
+        # Trim to whole blocks so reshape-max is exact.
+        h_use = (h0 // fy) * fy
+        w_use = (w0 // fx) * fx
+        block = img_f[:h_use, :w_use].reshape(h_use // fy, fy, w_use // fx, fx).max(axis=(1, 3))
+        peak_ds = cv2.resize(block, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        peak_ds = cv2.resize(img_f, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+    blend = float(np.clip(peak_blend, 0.0, 1.0))
+    return (1.0 - blend) * mean_ds + blend * np.maximum(mean_ds, peak_ds)
+
+
 def downsample_reorient_lsfm_stack(
     tiff_dir: Path,
     out_nii: Path,
@@ -132,6 +170,8 @@ def downsample_reorient_lsfm_stack(
     # Default maps long in-plane axis -> atlas Z (rostrocaudal).
     permute_zyx_to_atlas_zyx: tuple[int, int, int] = (1, 0, 2),
     max_rc_mm: float | None = None,
+    preserve_peaks: bool = True,
+    peak_blend: float = 0.65,
 ) -> dict:
     """Stream-downsample LSFM TIFF stack and reorient into atlas-like ZYX.
 
@@ -140,8 +180,11 @@ def downsample_reorient_lsfm_stack(
       - stack Z is the other transverse axis (~2.9 mm)
       - SpinalJ atlas is coronal: Z=RC (~31 mm), Y=~2.5 mm, X=~3.2 mm
     Default permute (1,0,2): atlas_z<-sample_y, atlas_y<-sample_z, atlas_x<-sample_x
+
+    Intensity is kept as float32 (not 8-bit). With preserve_peaks=True (default),
+    Z uses max-reduce over each slice window and XY blends area+peak so sparse
+    bright landmarks stay visible after downsampling.
     """
-    import cv2
     import nibabel as nib
     from scipy import ndimage
 
@@ -164,33 +207,60 @@ def downsample_reorient_lsfm_stack(
     # Keep atlas-like target spacing after permute: build an intermediate volume in
     # sample ZYX at approximately isotropic target spacing, then permute.
     # Use the minimum target spacing for intermediate axes so later permute is accurate.
-    # z_step = how many source slices to skip so that stack-Z spacing ≈ tgt_iso.
+    # z_step = how many source slices per output Z plane so stack-Z spacing ≈ tgt_iso.
     tgt_iso = float(min(target_spacing_xyz_um))
     z_step = max(int(round(tgt_iso / src_spacing_zyx[0])), 1)
     y_out = max(int(round(y0 * src_spacing_zyx[1] / tgt_iso)), 1)
     x_out = max(int(round(x0 * src_spacing_zyx[2] / tgt_iso)), 1)
-    z_indices = list(range(0, n_z, z_step))
+    z_starts = list(range(0, n_z, z_step))
     effective_z_spacing = float(src_spacing_zyx[0] * z_step)
 
     logger.info(
-        "Intermediate iso≈%.2fum (stack-Z effective=%.2fum) out_ZYX~=%d x %d x %d (z_step=%d)",
+        "Intermediate iso≈%.2fum (stack-Z effective=%.2fum) out_ZYX~=%d x %d x %d "
+        "(z_step=%d, preserve_peaks=%s peak_blend=%.2f)",
         tgt_iso,
         effective_z_spacing,
-        len(z_indices),
+        len(z_starts),
         y_out,
         x_out,
         z_step,
+        preserve_peaks,
+        peak_blend if preserve_peaks else 0.0,
     )
 
+    import cv2
+
     slices: list[np.ndarray] = []
-    for i, zi in enumerate(z_indices):
-        img = tifffile.imread(str(files[zi]))
-        if img.shape != (y0, x0):
-            raise ValueError(f"Slice shape mismatch at {files[zi]}: {img.shape}")
-        resized = cv2.resize(img, (x_out, y_out), interpolation=cv2.INTER_AREA)
-        slices.append(resized.astype(np.float32, copy=False))
-        if (i + 1) % 50 == 0 or i + 1 == len(z_indices):
-            logger.info("  read/resize %d/%d", i + 1, len(z_indices))
+    for i, z0 in enumerate(z_starts):
+        z1 = min(z0 + z_step, n_z)
+        if preserve_peaks and (z1 - z0) > 1:
+            # Max across the Z window so bright landmarks in skipped slices survive.
+            acc = None
+            for zi in range(z0, z1):
+                img = tifffile.imread(str(files[zi]))
+                if img.shape != (y0, x0):
+                    raise ValueError(f"Slice shape mismatch at {files[zi]}: {img.shape}")
+                img_f = np.asarray(img, dtype=np.float32)
+                acc = img_f if acc is None else np.maximum(acc, img_f)
+            plane = acc
+        else:
+            plane = tifffile.imread(str(files[z0]))
+            if plane.shape != (y0, x0):
+                raise ValueError(f"Slice shape mismatch at {files[z0]}: {plane.shape}")
+
+        if preserve_peaks:
+            resized = _resize_yx_preserve_peaks(
+                plane, out_w=x_out, out_h=y_out, peak_blend=peak_blend
+            )
+        else:
+            resized = cv2.resize(
+                np.asarray(plane, dtype=np.float32),
+                (x_out, y_out),
+                interpolation=cv2.INTER_AREA,
+            )
+        slices.append(np.asarray(resized, dtype=np.float32))
+        if (i + 1) % 50 == 0 or i + 1 == len(z_starts):
+            logger.info("  read/resize %d/%d", i + 1, len(z_starts))
 
     vol_zyx = np.stack(slices, axis=0)
     del slices
@@ -213,6 +283,7 @@ def downsample_reorient_lsfm_stack(
     spacing_after = spacing_sample_zyx[list(permute_zyx_to_atlas_zyx)]
 
     # Resample to exact atlas target spacing (Z,Y,X of atlas).
+    # order=1 keeps edges sharper than cubic blur; peaks already boosted upstream.
     zoom = spacing_after / tgt_spacing_zyx_atlas
     if not np.allclose(zoom, 1.0, rtol=0.02, atol=0.02):
         logger.info("Zoom to atlas spacing with factors ZYX=%s (from spacing %s)", zoom, spacing_after)
@@ -232,20 +303,23 @@ def downsample_reorient_lsfm_stack(
         "source_spacing_xyz_um": list(source_spacing_xyz_um),
         "target_spacing_xyz_um": list(target_spacing_xyz_um),
         "permute_zyx_to_atlas_zyx": list(permute_zyx_to_atlas_zyx),
+        "preserve_peaks": bool(preserve_peaks),
+        "peak_blend": float(peak_blend) if preserve_peaks else 0.0,
+        "z_reduce": "max" if preserve_peaks else "stride",
         "output_shape_zyx": list(vol_atlas_zyx.shape),
         "output_physical_mm_xyz": [
             vol_atlas_zyx.shape[2] * sx / 1000.0,
             vol_atlas_zyx.shape[1] * sy / 1000.0,
             vol_atlas_zyx.shape[0] * sz / 1000.0,
         ],
+        "output_dtype": "float32",
         "output_nii": str(out_nii),
     }
-    meta_path = out_nii.with_suffix("").with_suffix(".json")
-    # volume.nii.gz -> volume.json
+    # volume.nii.gz -> volume_meta.json
     meta_path = out_nii.parent / (out_nii.name.replace(".nii.gz", "") + "_meta.json")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     logger.info(
-        "Wrote %s shape_zyx=%s physical_mm=%s",
+        "Wrote %s shape_zyx=%s dtype=float32 physical_mm=%s",
         out_nii,
         vol_atlas_zyx.shape,
         meta["output_physical_mm_xyz"],
@@ -377,21 +451,223 @@ def mask_and_crop_volume_nii(
     return {"volume": out_vol, "mask": out_mask, "meta": out_dir / "mask_meta.json"}
 
 
+def load_landmark_pairs(landmarks_json: Path) -> list[dict]:
+    """Return complete sample/atlas voxel pairs from landmark UI JSON."""
+    payload = json.loads(Path(landmarks_json).read_text(encoding="utf-8"))
+    pairs: list[dict] = []
+    for item in payload.get("landmarks", []):
+        sample = item.get("sample") or {}
+        atlas = item.get("atlas") or {}
+        if not all(k in sample and k in atlas for k in ("x", "y", "z")):
+            continue
+        pairs.append(
+            {
+                "id": str(item.get("id", "")),
+                "label": str(item.get("label", item.get("id", ""))),
+                "sample": {k: float(sample[k]) for k in ("x", "y", "z")},
+                "atlas": {k: float(atlas[k]) for k in ("x", "y", "z")},
+            }
+        )
+    if len(pairs) < 2:
+        raise ValueError(f"Need >=2 complete landmark pairs in {landmarks_json}, got {len(pairs)}")
+    return pairs
+
+
+def _scale_landmark_z(
+    z: float,
+    *,
+    src_n: int | None,
+    dst_n: int | None,
+) -> float:
+    if not src_n or not dst_n or src_n == dst_n or src_n <= 1 or dst_n <= 1:
+        return float(z)
+    return float(z) * float(dst_n - 1) / float(src_n - 1)
+
+
+def _zyx_vox_to_phys(img, x: float, y: float, z: float) -> np.ndarray:
+    """Convert landmark UI ZYX voxels to ANTs physical XYZ (spacing units)."""
+    index = np.array([float(x), float(y), float(z)], dtype=np.float64)
+    spacing = np.asarray(img.spacing, dtype=np.float64)
+    origin = np.asarray(img.origin, dtype=np.float64)
+    direction = np.asarray(img.direction, dtype=np.float64).reshape(3, 3)
+    return origin + direction @ (index * spacing)
+
+
+def write_landmark_initial_transform(
+    *,
+    landmarks_json: Path,
+    fixed_img,
+    moving_img,
+    out_path: Path,
+    transform_type: str = "similarity",
+) -> dict:
+    """Fit moving(atlas)→fixed(sample) linear transform from landmark pairs."""
+    import ants
+
+    payload = json.loads(Path(landmarks_json).read_text(encoding="utf-8"))
+    pairs = load_landmark_pairs(landmarks_json)
+    src_z = None
+    shape = payload.get("sample_shape_zyx") or []
+    if len(shape) >= 1:
+        src_z = int(shape[0])
+    dst_z = int(fixed_img.shape[2])
+    src_atlas_z = None
+    atlas_shape = payload.get("atlas_shape_zyx") or []
+    if len(atlas_shape) >= 1:
+        src_atlas_z = int(atlas_shape[0])
+    dst_atlas_z = int(moving_img.shape[2])
+
+    moving_pts = []
+    fixed_pts = []
+    used = []
+    for pair in pairs:
+        sx, sy, sz = pair["sample"]["x"], pair["sample"]["y"], pair["sample"]["z"]
+        ax, ay, az = pair["atlas"]["x"], pair["atlas"]["y"], pair["atlas"]["z"]
+        sz = _scale_landmark_z(sz, src_n=src_z, dst_n=dst_z)
+        az = _scale_landmark_z(az, src_n=src_atlas_z, dst_n=dst_atlas_z)
+        fixed_pts.append(_zyx_vox_to_phys(fixed_img, sx, sy, sz))
+        moving_pts.append(_zyx_vox_to_phys(moving_img, ax, ay, az))
+        used.append(
+            {
+                "id": pair["id"],
+                "label": pair["label"],
+                "sample_xyz_vox": [sx, sy, sz],
+                "atlas_xyz_vox": [ax, ay, az],
+                "sample_phys": [float(v) for v in fixed_pts[-1]],
+                "atlas_phys": [float(v) for v in moving_pts[-1]],
+            }
+        )
+
+    moving_pts = np.vstack(moving_pts)
+    fixed_pts = np.vstack(fixed_pts)
+    tx_type = str(transform_type).strip().lower()
+    if tx_type not in ("rigid", "similarity", "affine"):
+        raise ValueError("landmark transform_type must be rigid, similarity, or affine")
+    logger.info(
+        "Fitting landmark %s from %d pairs (sample Z %s→%s)",
+        tx_type,
+        len(used),
+        src_z,
+        dst_z,
+    )
+    tx = ants.fit_transform_to_paired_points(
+        moving_pts,
+        fixed_pts,
+        transform_type=tx_type,
+    )
+    if isinstance(tx, (list, tuple)):
+        tx = tx[0]
+    # fit_transform_to_paired_points returns fixed→moving; ANTs -r wants moving→fixed.
+    tx = ants.invert_ants_transform(tx)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ants.write_transform(tx, str(out_path))
+
+    mapped = np.array(
+        [ants.apply_ants_transform_to_point(tx, list(p)) for p in moving_pts],
+        dtype=np.float64,
+    )
+    err = mapped - fixed_pts
+    rmse = float(np.sqrt(np.mean(np.sum(err * err, axis=1))))
+    rmse_z = float(np.sqrt(np.mean((err[:, 2]) ** 2)))
+    meta = {
+        "landmarks_json": str(landmarks_json),
+        "transform_type": tx_type,
+        "n_pairs": len(used),
+        "pairs": used,
+        "rmse_mm": rmse / 1000.0 if rmse > 50 else rmse,
+        "rmse_phys": rmse,
+        "rmse_z_phys": rmse_z,
+        "transform": str(out_path),
+        "sample_z_scaled": src_z not in (None, dst_z),
+    }
+    logger.info(
+        "Landmark init RMSE=%.3f (Z=%.3f) → %s",
+        rmse,
+        rmse_z,
+        out_path,
+    )
+    return meta
+
+
+def _flip_ants_volume_z(img):
+    import ants
+
+    data = np.ascontiguousarray(img.numpy()[:, :, ::-1])
+    return ants.from_numpy(
+        data.astype(np.float32, copy=False),
+        spacing=img.spacing,
+        origin=img.origin,
+        direction=np.asarray(img.direction, dtype=np.float64).copy(),
+    )
+
+
+def _landmarks_need_moving_z_flip(landmarks_json: Path) -> bool:
+    payload = json.loads(Path(landmarks_json).read_text(encoding="utf-8"))
+    sz, az = [], []
+    for item in payload.get("landmarks", []):
+        sample = item.get("sample") or {}
+        atlas = item.get("atlas") or {}
+        if "z" in sample and "z" in atlas:
+            sz.append(float(sample["z"]))
+            az.append(float(atlas["z"]))
+    if len(sz) < 2:
+        return False
+    a = np.asarray(az, dtype=np.float64)
+    s = np.asarray(sz, dtype=np.float64)
+    A = np.column_stack([a, np.ones_like(a)])
+    scale, _shift = np.linalg.lstsq(A, s, rcond=None)[0]
+    return bool(scale < 0)
+
+
+def _rewrite_landmarks_after_moving_z_flip(
+    landmarks_json: Path,
+    *,
+    moving_z_n: int,
+    out_path: Path,
+) -> Path:
+    payload = json.loads(Path(landmarks_json).read_text(encoding="utf-8"))
+    n = int(moving_z_n)
+    for item in payload.get("landmarks", []):
+        atlas = item.get("atlas") or {}
+        if "z" in atlas:
+            atlas["z"] = float((n - 1) - float(atlas["z"]))
+            item["atlas"] = atlas
+    payload["moving_z_flipped_to_match_landmarks"] = True
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
+
+
 def run_ants_registration(
     fixed_nii: Path,
     moving_template_nii: Path,
     moving_annotation_nii: Path,
     out_dir: Path,
     *,
-    transform: str = "Affine",
+    transform: str = "SyNRA",
     fixed_mask_nii: Path | None = None,
+    allow_reflection: bool = False,
+    direction_y: float = 1.0,
+    landmarks_json: Path | None = None,
+    landmark_transform_type: str = "similarity",
 ) -> dict:
     import ants
     import nibabel as nib
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Sample (fixed) direction: diag(1, direction_y, 1). Default +1 = no Y flip vs atlas.
+    # Pass direction_y=-1 only if sample appears mirrored along Y relative to atlas.
+    fixed_direction = np.diag([1.0, float(direction_y), 1.0]).astype(np.float64)
+    moving_direction = np.eye(3, dtype=np.float64)
 
-    def load_nii(path: Path, *, as_float: bool = True) -> "ants.ANTsImage":
+    def load_nii(
+        path: Path,
+        *,
+        as_float: bool = True,
+        direction: np.ndarray,
+    ) -> "ants.ANTsImage":
         nii = nib.load(str(path))
         data = np.asanyarray(nii.dataobj)
         if as_float and not np.issubdtype(data.dtype, np.floating):
@@ -399,31 +675,85 @@ def run_ants_registration(
         elif not as_float:
             data = (data > 0).astype(np.float32)
         spacing = tuple(float(abs(nii.affine[i, i])) for i in range(3))
-        img = ants.from_numpy(data.astype(np.float32, copy=False), spacing=spacing)
-        img.set_direction(np.eye(3))
-        return img
+        data_f = data.astype(np.float32, copy=False)
+        # Keep physical FOV on the +Y side when direction_yy is negative.
+        origin = [0.0, 0.0, 0.0]
+        if float(direction[1, 1]) < 0:
+            origin[1] = float((data_f.shape[1] - 1) * spacing[1])
+        return ants.from_numpy(
+            data_f,
+            spacing=spacing,
+            origin=tuple(origin),
+            direction=np.asarray(direction, dtype=np.float64).copy(),
+        )
 
-    fixed = load_nii(fixed_nii)
-    moving = load_nii(moving_template_nii)
-    label = load_nii(moving_annotation_nii)
-    fixed_mask = load_nii(fixed_mask_nii, as_float=False) if fixed_mask_nii is not None else None
+    fixed = load_nii(fixed_nii, direction=fixed_direction)
+    moving = load_nii(moving_template_nii, direction=moving_direction)
+    label = load_nii(moving_annotation_nii, direction=moving_direction)
+    flipped_moving_z = False
+    lm_path = Path(landmarks_json) if landmarks_json is not None else None
+    if lm_path is not None:
+        if not lm_path.exists():
+            raise FileNotFoundError(f"landmarks_json not found: {lm_path}")
+        if _landmarks_need_moving_z_flip(lm_path):
+            logger.info(
+                "Landmark Z mapping is reversed (sample high-Z ↔ atlas low-Z); "
+                "flipping moving atlas along Z before registration"
+            )
+            moving = _flip_ants_volume_z(moving)
+            label = _flip_ants_volume_z(label)
+            lm_path = _rewrite_landmarks_after_moving_z_flip(
+                lm_path,
+                moving_z_n=int(moving.shape[2]),
+                out_path=out_dir / "landmarks_after_moving_z_flip.json",
+            )
+            flipped_moving_z = True
+
+    fixed_mask = (
+        load_nii(fixed_mask_nii, as_float=False, direction=fixed_direction)
+        if fixed_mask_nii is not None
+        else None
+    )
     # Atlas foreground mask helps ignore empty template margins.
     moving_mask = ants.threshold_image(moving, 1e-6, 1e12, 1, 0)
 
-    logger.info("Fixed shape/spacing=%s/%s", fixed.shape, fixed.spacing)
-    logger.info("Moving shape/spacing=%s/%s", moving.shape, moving.spacing)
+    logger.info("Fixed shape/spacing=%s/%s direction=\n%s", fixed.shape, fixed.spacing, fixed.direction)
+    logger.info("Moving shape/spacing=%s/%s direction=\n%s", moving.shape, moving.spacing, moving.direction)
     if fixed_mask is not None:
         logger.info("Using fixed tissue mask fg_frac=%.3f", float(np.mean(fixed_mask.numpy() > 0)))
 
+    landmark_meta = None
+    initial_transform = None
+    if lm_path is not None:
+        landmark_meta = write_landmark_initial_transform(
+            landmarks_json=lm_path,
+            fixed_img=fixed,
+            moving_img=moving,
+            out_path=out_dir / "landmark_init.mat",
+            transform_type=landmark_transform_type,
+        )
+        landmark_meta["moving_z_flipped"] = bool(flipped_moving_z)
+        initial_transform = landmark_meta["transform"]
+
     fixed_matched = ants.histogram_match_image(fixed, moving)
-    logger.info("Running ANTs registration type=%s (atlas -> image, metric=mattes MI)", transform)
+    # SyNRA = Rigid + Affine + SyN: rigid stage can recover ~180° in-plane rotations.
+    logger.info(
+        "Running ANTs registration type=%s (atlas -> image, metric=mattes MI, "
+        "aff_do_reflection=%s, direction_y=%s, landmark_init=%s)",
+        transform,
+        allow_reflection,
+        direction_y,
+        initial_transform,
+    )
     reg_kwargs = dict(
         fixed=fixed_matched,
         moving=moving,
         type_of_transform=transform,
-        aff_do_reflection=False,
+        aff_do_reflection=bool(allow_reflection),
         moving_mask=moving_mask,
     )
+    if initial_transform is not None:
+        reg_kwargs["initial_transform"] = initial_transform
     if fixed_mask is not None:
         reg_kwargs["mask"] = fixed_mask
     reg = ants.registration(**reg_kwargs)
@@ -468,6 +798,10 @@ def run_ants_registration(
 
     summary = {
         "transform": transform,
+        "allow_reflection": bool(allow_reflection),
+        "direction_y": float(direction_y),
+        "fixed_direction": fixed_direction.tolist(),
+        "moving_direction": moving_direction.tolist(),
         "fixed": str(fixed_nii),
         "moving_template": str(moving_template_nii),
         "warped_template": str(warped_template_path),
@@ -475,6 +809,7 @@ def run_ants_registration(
         "fwdtransforms": saved_transforms,
         "fixed_shape": list(fixed.shape),
         "moving_shape": list(moving.shape),
+        "landmarks": landmark_meta,
     }
     (out_dir / "registration_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     logger.info("Registration finished. QC slices in %s", qc_dir)
@@ -552,9 +887,35 @@ def main() -> None:
         default=(1, 0, 2),
         help="Permute sample Z,Y,X axes into atlas-like Z,Y,X (default matches WT jisui physical axes)",
     )
-    parser.add_argument("--transform", default="Affine", help="ANTs transform type, e.g. Affine or SyN")
+    parser.add_argument(
+        "--transform",
+        default="SyNRA",
+        help="ANTs type_of_transform: SyNRA (Rigid+Affine+SyN, default), SyN, Affine, Rigid, ...",
+    )
+    parser.add_argument(
+        "--allow_reflection",
+        action="store_true",
+        help="Allow affine reflection (det=-1 flips). Off by default; use if LR appears mirrored.",
+    )
+    parser.add_argument(
+        "--direction_y",
+        type=float,
+        default=1.0,
+        help="ANTs direction matrix YY when loading fixed NIfTI (default +1 = no Y flip; use -1 to flip Y)",
+    )
     parser.add_argument("--skip_downsample", action="store_true")
     parser.add_argument("--skip_register", action="store_true")
+    parser.add_argument(
+        "--no_preserve_peaks",
+        action="store_true",
+        help="Disable peak-preserving downsample (old INTER_AREA + Z stride only)",
+    )
+    parser.add_argument(
+        "--peak_blend",
+        type=float,
+        default=0.65,
+        help="XY blend of max-pool peaks vs area mean (0=area only, 1=strong peaks; default 0.65)",
+    )
     parser.add_argument(
         "--apply_mask",
         action="store_true",
@@ -587,6 +948,8 @@ def main() -> None:
             target_spacing_xyz_um=args.target_spacing_xyz_um,
             channel_token=args.channel_token,
             permute_zyx_to_atlas_zyx=args.permute_zyx_to_atlas_zyx,
+            preserve_peaks=not bool(args.no_preserve_peaks),
+            peak_blend=float(args.peak_blend),
         )
 
     fixed_mask_nii = None
@@ -647,6 +1010,8 @@ def main() -> None:
             out_dir / "ants_out",
             transform=args.transform,
             fixed_mask_nii=fixed_mask_nii,
+            allow_reflection=bool(args.allow_reflection),
+            direction_y=float(args.direction_y),
         )
 
 

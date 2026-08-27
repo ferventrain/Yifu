@@ -6,6 +6,70 @@ import tifffile
 import argparse
 
 
+def clahe_array(
+    image: np.ndarray,
+    *,
+    clip_limit: float = 2.0,
+    grid_size: int | tuple[int, int] = 16,
+    use_mask: bool = False,
+) -> np.ndarray:
+    """
+    Apply CLAHE to a 2D grayscale (or single-channel) array and return the result.
+
+    Preserves input dtype. For uint16 inputs OpenCV CLAHE is applied on uint16.
+    """
+    if image.ndim == 3 and image.shape[-1] in (1, 3, 4):
+        if image.shape[-1] == 1:
+            gray = image[..., 0]
+        else:
+            raise ValueError("clahe_array expects 2D grayscale; got multi-channel image")
+    elif image.ndim == 2:
+        gray = image
+    else:
+        raise ValueError(f"clahe_array expects 2D image, got shape={image.shape}")
+
+    if isinstance(grid_size, int):
+        tile = (grid_size, grid_size)
+    else:
+        tile = (int(grid_size[0]), int(grid_size[1]))
+
+    original_dtype = gray.dtype
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tile)
+
+    if np.issubdtype(original_dtype, np.integer) and np.iinfo(original_dtype).max > 255:
+        work = gray.astype(np.uint16, copy=False)
+    else:
+        # Map to uint8 for OpenCV when low bit-depth / float
+        if np.issubdtype(original_dtype, np.floating):
+            finite = gray[np.isfinite(gray)]
+            vmax = float(finite.max()) if finite.size else 1.0
+            vmax = vmax if vmax > 0 else 1.0
+            work = np.clip(gray / vmax * 255.0, 0, 255).astype(np.uint8)
+        else:
+            work = gray.astype(np.uint8, copy=False)
+
+    if use_mask:
+        if work.dtype == np.uint16:
+            norm = (work / max(int(work.max()), 1) * 255).astype(np.uint8)
+        else:
+            norm = work
+        _, mask = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        enhanced = clahe.apply(work)
+        result = work.copy()
+        result[mask > 0] = enhanced[mask > 0]
+    else:
+        result = clahe.apply(work)
+
+    if original_dtype == result.dtype:
+        return result
+    if np.issubdtype(original_dtype, np.floating):
+        return result.astype(original_dtype) / 255.0
+    max_in = np.iinfo(original_dtype).max
+    max_work = np.iinfo(result.dtype).max
+    scaled = result.astype(np.float64) / max_work * max_in
+    return np.clip(scaled, 0, max_in).astype(original_dtype)
+
+
 def clahe_enhance(image_path: str, clip_limit: float = 2.0, grid_size: tuple = (8, 8), use_mask: bool = False) -> None:
     """
     CLAHE对比度增强。默认直接全局增强，适合已经做过去背景的图像（比如Tophat后）。
@@ -26,9 +90,9 @@ def clahe_enhance(image_path: str, clip_limit: float = 2.0, grid_size: tuple = (
         raise FileNotFoundError(f"无法读取图像: {image_path}")
     
     dtype = img.dtype
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
-    
     if len(img.shape) == 3 and img.shape[2] == 3:
+        # Keep BGR path behavior for color images via file CLI.
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l_channel = lab[:, :, 0]
         
@@ -45,35 +109,32 @@ def clahe_enhance(image_path: str, clip_limit: float = 2.0, grid_size: tuple = (
             
             full_eq = clahe.apply(l_channel)
             l_channel[mask > 0] = full_eq[mask > 0]
+            mask_output = mask
         else:
             l_channel = clahe.apply(l_channel)
+            mask_output = None
         
         lab[:, :, 0] = l_channel
         result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-        mask_output = None
     else:
         if len(img.shape) == 3:
             gray = img[:, :, 0]
         else:
             gray = img
-        
+        result = clahe_array(
+            gray,
+            clip_limit=clip_limit,
+            grid_size=grid_size,
+            use_mask=use_mask,
+        )
+        mask_output = None
         if use_mask:
-            if gray.max() > 0:
-                if gray.max() > 255:
-                    gray_norm = (gray / gray.max() * 255).astype(np.uint8)
-                else:
-                    gray_norm = gray.astype(np.uint8)
-                _, mask = cv2.threshold(gray_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            work = gray
+            if work.max() > 255:
+                gray_norm = (work / work.max() * 255).astype(np.uint8)
             else:
-                mask = np.zeros_like(gray, dtype=np.uint8)
-            
-            full_eq = clahe.apply(gray.astype(np.uint16))
-            result = gray.copy()
-            result[mask > 0] = full_eq[mask > 0]
-            mask_output = mask
-        else:
-            result = clahe.apply(gray.astype(np.uint16))
-            mask_output = None
+                gray_norm = work.astype(np.uint8)
+            _, mask_output = cv2.threshold(gray_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
     result = result.astype(dtype)
     
