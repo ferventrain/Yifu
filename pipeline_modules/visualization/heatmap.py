@@ -218,16 +218,16 @@ def build_hemisphere_cell_density_lookups(
     """Build left/right cell-density (count/mm³) lookups from Signal Count / volume."""
     vox_mm3 = _voxel_volume_mm3(resolution_xyz_um)
     left_count, path_by_region_id = build_region_metric_lookup(
-        input_excel, cfg_path=cfg_path, metric="Left Signal Count", direct_label_only=True
+        input_excel, cfg_path=cfg_path, metric="Left Signal Count"
     )
     left_voxels, _ = build_region_metric_lookup(
-        input_excel, cfg_path=cfg_path, metric="Left Total Voxels", direct_label_only=True
+        input_excel, cfg_path=cfg_path, metric="Left Total Voxels"
     )
     right_count, _ = build_region_metric_lookup(
-        input_excel, cfg_path=cfg_path, metric="Right Signal Count", direct_label_only=True
+        input_excel, cfg_path=cfg_path, metric="Right Signal Count"
     )
     right_voxels, _ = build_region_metric_lookup(
-        input_excel, cfg_path=cfg_path, metric="Right Total Voxels", direct_label_only=True
+        input_excel, cfg_path=cfg_path, metric="Right Total Voxels"
     )
 
     def _density(count_lookup: dict[int, float], voxel_lookup: dict[int, float]) -> dict[int, float]:
@@ -1058,7 +1058,6 @@ def generate_batch_region_metric_slices(
             excel_path,
             cfg_path=region_cfg_path,
             metric=region_metric,
-            direct_label_only=True,
         )
         lookups[str(sample_dir)] = (value_by_region_id, path_by_region_id)
         all_values.extend(float(value) for value in value_by_region_id.values())
@@ -1116,7 +1115,6 @@ def generate_batch_region_metric_slices(
                 atlas_slice.image,
                 value_by_region_id,
                 path_by_region_id,
-                inherit_ancestors=False,
             )
             output_path = out_dir / f"bregma_{ap_mm}mm.png"
             render_region_metric_atlas_slice(
@@ -1248,10 +1246,10 @@ def generate_batch_hemisphere_metric_slices(
             )
             atlas_slice = extract_atlas_slice(label_path, spec)
             left_on_slice = resolve_slice_region_values(
-                atlas_slice.image, left_lookup, path_by_region_id, inherit_ancestors=False
+                atlas_slice.image, left_lookup, path_by_region_id
             )
             right_on_slice = resolve_slice_region_values(
-                atlas_slice.image, right_lookup, path_by_region_id, inherit_ancestors=False
+                atlas_slice.image, right_lookup, path_by_region_id
             )
             painted = paint_hemisphere_split_slice(
                 atlas_slice.image,
@@ -1344,12 +1342,8 @@ def generate_batch_signal_count_diff_slices(
 
     excel_a = resolve_density_excel_path(sample_dir, input_excel)
     excel_b = resolve_density_excel_path(subtract_sample_dir, subtract_input_excel)
-    lookup_a, path_by_region_id = build_region_metric_lookup(
-        excel_a, cfg_path=region_cfg_path, metric=region_metric, direct_label_only=True
-    )
-    lookup_b, path_by_region_id_b = build_region_metric_lookup(
-        excel_b, cfg_path=region_cfg_path, metric=region_metric, direct_label_only=True
-    )
+    lookup_a, path_by_region_id = build_region_metric_lookup(excel_a, cfg_path=region_cfg_path, metric=region_metric)
+    lookup_b, path_by_region_id_b = build_region_metric_lookup(excel_b, cfg_path=region_cfg_path, metric=region_metric)
     diff_lookup = subtract_region_metric_values(lookup_a, lookup_b)
     region_name_by_id = build_region_name_lookup(region_cfg_path)
     missing_a = _accumulate_missing_regions_for_slices(
@@ -1418,7 +1412,6 @@ def generate_batch_signal_count_diff_slices(
             atlas_slice.image,
             diff_lookup,
             path_by_region_id,
-            inherit_ancestors=False,
         )
         output_path = out_dir / f"bregma_{ap_mm}mm_{sample_dir.name}_minus_{subtract_sample_dir.name}.png"
         render_region_metric_atlas_slice(
@@ -1994,7 +1987,7 @@ def _render_region_metric_slice_array(
         background=background,
     )
 
-    # Optional focus outline only (no fill / no dimming of other regions).
+    # Optional focus outline on top of the shared render.
     if focus_mask is not None and np.any(focus_mask):
         from pipeline_modules.visualization.atlas_slice import _mask_contour_lines
         from matplotlib.collections import LineCollection
@@ -2014,7 +2007,7 @@ def _render_region_metric_slice_array(
                     LineCollection(
                         focus_lines,
                         colors=theme["focus"],
-                        linewidths=max(float(brain_outline_width) * 2.2, 2.0),
+                        linewidths=max(float(brain_outline_width) * 2.2, 1.0),
                         antialiased=True,
                     )
                 )

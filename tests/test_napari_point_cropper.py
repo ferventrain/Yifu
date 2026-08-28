@@ -6,12 +6,17 @@ import numpy as np
 import pytest
 
 from pipeline_modules.visualization.napari_point_cropper import (
+    PREVIEW_EDGE_COLOR_INVALID,
+    PREVIEW_EDGE_COLOR_VALID,
     _all_points,
     _save_crop,
-    default_crop_output_dir,
-    image_layer_stem,
     crop_array_from_point,
     crop_bounds_from_point,
+    crop_box_face_rects,
+    default_crop_output_dir,
+    image_layer_stem,
+    intended_crop_bounds,
+    preview_shapes_from_points,
 )
 
 
@@ -58,3 +63,28 @@ def test_all_points_returns_every_point():
     points = _all_points(layer)
     assert points.shape == (2, 3)
     np.testing.assert_array_equal(points, np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float64))
+
+
+def test_intended_crop_bounds_matches_start_corner_semantics():
+    start, stop = intended_crop_bounds((2.2, 3.4, 4.5), (5, 6, 7))
+    assert start == (2, 3, 4)
+    assert stop == (7, 9, 11)
+
+
+def test_crop_box_face_rects_has_six_faces():
+    faces = crop_box_face_rects((1, 2, 3), (5, 8, 10))
+    assert len(faces) == 6
+    assert all(face.shape == (4, 3) for face in faces)
+    # Far z-face should sit at stop z.
+    np.testing.assert_allclose(faces[1][:, 0], 5)
+
+
+def test_preview_shapes_mark_out_of_bounds_orange():
+    shapes, colors = preview_shapes_from_points(
+        [[1, 2, 3], [8, 8, 8]],
+        (4, 4, 4),
+        shape=(10, 10, 10),
+    )
+    assert len(shapes) == 12
+    assert colors[:6] == [PREVIEW_EDGE_COLOR_VALID] * 6
+    assert colors[6:] == [PREVIEW_EDGE_COLOR_INVALID] * 6

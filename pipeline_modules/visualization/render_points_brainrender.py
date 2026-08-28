@@ -50,7 +50,7 @@ _prepare_brainrender_runtime()
 
 from brainrender import Scene, settings  # noqa: E402
 from brainrender.actors import Points  # noqa: E402
-from brainrender.camera import check_camera_param, get_camera_params  # noqa: E402
+from brainrender.camera import check_camera_param  # noqa: E402
 from brainglobe_atlasapi.bg_atlas import BrainGlobeAtlas  # noqa: E402
 from brainglobe_atlasapi.list_atlases import get_downloaded_atlases  # noqa: E402
 from pipeline_modules.visualization.coarse_region_metric_plot import DEFAULT_REGION_IDS  # noqa: E402
@@ -392,9 +392,21 @@ def resolve_region_id(atlas: BrainGlobeAtlas, region: str, region_id: int | None
 
     query = region.strip()
     lookup = atlas.lookup_df
+    acronyms = lookup["acronym"].astype(str)
+    names = lookup["name"].astype(str)
+
+    # Prefer exact acronym (case-sensitive) so CM != cm in Allen atlas.
+    exact_acronym = lookup[acronyms == query]
+    if len(exact_acronym) == 1:
+        return int(exact_acronym.iloc[0]["id"])
+
+    exact_name = lookup[names == query]
+    if len(exact_name) == 1:
+        return int(exact_name.iloc[0]["id"])
+
     normalized = lookup.assign(
-        acronym_norm=lookup["acronym"].astype(str).map(normalize_name),
-        name_norm=lookup["name"].astype(str).map(normalize_name),
+        acronym_norm=acronyms.map(normalize_name),
+        name_norm=names.map(normalize_name),
     )
     query_norm = normalize_name(query)
     matches = normalized[(normalized["acronym_norm"] == query_norm) | (normalized["name_norm"] == query_norm)]
@@ -406,6 +418,10 @@ def resolve_region_id(atlas: BrainGlobeAtlas, region: str, region_id: int | None
     if matches.empty:
         raise ValueError(f"Could not find atlas region matching: {region}")
     if len(matches) > 1:
+        # If case-insensitive search is ambiguous, fall back to exact acronym among matches.
+        exact_among = matches[matches["acronym"].astype(str) == query]
+        if len(exact_among) == 1:
+            return int(exact_among.iloc[0]["id"])
         preview = ", ".join(f"{row.acronym}({int(row.id)})" for row in matches.head(10).itertuples())
         raise ValueError(f"Region query matched multiple regions. Use --region_id. Matches: {preview}")
     return int(matches.iloc[0]["id"])
@@ -566,7 +582,7 @@ def load_region_groups(path: str | Path) -> dict[str, RegionGroup]:
     if not path.exists():
         raise FileNotFoundError(f"Region groups JSON not found: {path}")
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict):
         raise ValueError(f"Region groups JSON must be an object, got: {type(payload).__name__}")
 
@@ -731,6 +747,59 @@ def color_points_by_groups(
     return points, colors, counts
 
 
+def _clean_camera_value(val):
+    if isinstance(val, tuple):
+        return tuple(round(float(v), 4) if isinstance(v, float) else int(round(v)) for v in val)
+    if isinstance(val, float):
+        return round(float(val), 4)
+    return val
+
+
+def extract_camera_params(scene: Scene) -> dict:
+    """Capture camera params including ViewAngle (mouse-wheel zoom).
+
+    brainrender's get_camera_params omits ViewAngle, so interactive zoom is lost
+    when replaying a saved camera JSON into offscreen screenshots.
+    """
+    if not scene.is_rendered:
+        scene.render(interactive=False)
+    cam = scene.plotter.camera
+    params = {
+        "pos": _clean_camera_value(cam.GetPosition()),
+        "focal_point": _clean_camera_value(cam.GetFocalPoint()),
+        "viewup": _clean_camera_value(cam.GetViewUp()),
+        "distance": _clean_camera_value(cam.GetDistance()),
+        "clipping_range": _clean_camera_value(cam.GetClippingRange()),
+        "view_angle": _clean_camera_value(cam.GetViewAngle()),
+    }
+    window_size = getattr(scene.plotter, "window_size", None) or getattr(scene.plotter, "size", None)
+    if window_size is not None:
+        try:
+            params["window_size"] = [int(window_size[0]), int(window_size[1])]
+        except Exception:
+            pass
+    return params
+
+
+def apply_camera_params(scene: Scene, camera: str | dict) -> dict:
+    """Apply camera dict/preset, including optional view_angle from our JSON format."""
+    from brainrender.camera import set_camera_params
+
+    if isinstance(camera, str):
+        params = check_camera_param(camera)
+    else:
+        params = dict(camera)
+        check_camera_param(params)
+
+    if scene.plotter is None:
+        scene._get_plotter()
+    set_camera_params(scene.plotter.camera, params)
+    view_angle = params.get("view_angle")
+    if view_angle is not None:
+        scene.plotter.camera.SetViewAngle(float(view_angle))
+    return params
+
+
 def load_camera_view(path: str | Path) -> dict:
     path = Path(path)
     if not path.exists():
@@ -738,7 +807,11 @@ def load_camera_view(path: str | Path) -> dict:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Camera view JSON must be an object, got: {type(payload).__name__}")
-    return check_camera_param(payload)
+    # Keep extended keys (view_angle, window_size) while validating required fields.
+    validated = check_camera_param(dict(payload))
+    for key, value in payload.items():
+        validated.setdefault(key, value)
+    return validated
 
 
 def save_camera_view(path: str | Path, params: dict, *, name: str | None = None) -> Path:
@@ -798,9 +871,11 @@ def install_camera_export_hook(scene: Scene, output_path: str | Path) -> None:
         def on_key_press(evt) -> None:
             if str(getattr(evt, "keypress", "")).lower() != "v":
                 return
-            params = get_camera_params(scene=scene)
+            params = extract_camera_params(scene)
             saved = save_camera_view(output_path, params, name=output_path.stem)
             print(f"Saved camera view to: {saved}")
+            if "view_angle" in params:
+                print(f"  view_angle={params['view_angle']} (mouse-wheel zoom)")
             print("Reuse with: --camera_view", saved)
 
         original_show = plotter.show
@@ -1333,13 +1408,21 @@ def save_scene_screenshot(
     camera: str | dict,
     screenshot_scale: int,
 ) -> str:
+    """Render offscreen and save PNG, preserving extended camera fields like view_angle."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     scene.screenshots_folder = output_path.parent
-    return scene.screenshot(
-        name=output_path.name,
-        scale=screenshot_scale,
-        camera=camera,
-    )
+
+    # Force a controlled render path so we can re-apply ViewAngle after brainrender's
+    # set_camera_params (which only knows pos/viewup/clipping/focal/distance).
+    if not scene.is_rendered:
+        scene.render(interactive=False, camera=camera, zoom=1)
+    if isinstance(camera, dict):
+        apply_camera_params(scene, camera)
+
+    print(f"\nSaving new screenshot at {output_path.name}\n")
+    savepath = str(output_path)
+    scene.plotter.screenshot(filename=savepath, scale=screenshot_scale)
+    return savepath
 
 
 def main() -> int:

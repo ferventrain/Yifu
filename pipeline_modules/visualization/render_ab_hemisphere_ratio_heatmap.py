@@ -156,18 +156,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     left_metric, right_metric = METRIC_COLUMNS[str(args.metric)]
-    a_left, path_by_region_id = build_region_metric_lookup(
-        excel_a, cfg_path=cfg_path, metric=left_metric, direct_label_only=True
-    )
-    a_right, _ = build_region_metric_lookup(
-        excel_a, cfg_path=cfg_path, metric=right_metric, direct_label_only=True
-    )
-    b_left, _ = build_region_metric_lookup(
-        excel_b, cfg_path=cfg_path, metric=left_metric, direct_label_only=True
-    )
-    b_right, _ = build_region_metric_lookup(
-        excel_b, cfg_path=cfg_path, metric=right_metric, direct_label_only=True
-    )
+    a_left, path_by_region_id = build_region_metric_lookup(excel_a, cfg_path=cfg_path, metric=left_metric)
+    a_right, _ = build_region_metric_lookup(excel_a, cfg_path=cfg_path, metric=right_metric)
+    b_left, _ = build_region_metric_lookup(excel_b, cfg_path=cfg_path, metric=left_metric)
+    b_right, _ = build_region_metric_lookup(excel_b, cfg_path=cfg_path, metric=right_metric)
 
     n_cc_by_region_id, paired_by_region_id = load_region_pairing_reference(pairing_path)
     left_ratios, right_ratios = build_hemisphere_ab_ratio_lookups(
@@ -189,12 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         bregma_index=bregma_index,
     )
     atlas_slice = extract_atlas_slice(atlas_label, spec)
-    left_resolved = resolve_slice_region_values(
-        atlas_slice.image, left_ratios, path_by_region_id, inherit_ancestors=False
-    )
-    right_resolved = resolve_slice_region_values(
-        atlas_slice.image, right_ratios, path_by_region_id, inherit_ancestors=False
-    )
+    left_resolved = resolve_slice_region_values(atlas_slice.image, left_ratios, path_by_region_id)
+    right_resolved = resolve_slice_region_values(atlas_slice.image, right_ratios, path_by_region_id)
     painted = paint_hemisphere_ratio_slice(
         atlas_slice.image,
         left_resolved,
