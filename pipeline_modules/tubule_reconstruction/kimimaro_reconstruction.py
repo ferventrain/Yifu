@@ -191,7 +191,7 @@ def select_region_chunk_indices(
     shape. The margin includes neighboring chunks so skeleton paths near a
     region boundary retain local context.
     """
-    from .region_vessel_analysis import (
+    from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
         _collect_subtree_ids,
         load_region_tree_with_lookups,
         parse_region_list,
@@ -2138,6 +2138,7 @@ def analyze_binary_mask_zarr_chunkwise(
     working_resolution = resolution_xyz
     working_foreground = foreground_label
     downsampled_path = None
+
     if downsample_factor > 1:
         downsampled_path = output_root / f"mask_ds{downsample_factor}.zarr"
         logger.info(
@@ -2511,7 +2512,6 @@ def build_argparser():
         default=0.0,
         help="Prune terminal branches shorter than this (um). 0=disabled",
     )
-    parser.add_argument("--halo_zyx", default="0,0,0", help="Halo overlap in voxels for chunkwise processing as z,y,x")
     parser.add_argument(
         "--region_label_zarr",
         help="Registered atlas label Zarr used to limit chunkwise reconstruction to requested regions",
@@ -2528,10 +2528,6 @@ def build_argparser():
         default=0,
         help="Neighboring chunk margin around region-intersecting chunks; use 1 to retain boundary context",
     )
-    parser.add_argument("--no_stitch", action="store_true", help="Disable cross-chunk skeleton stitching in chunkwise mode")
-    parser.add_argument("--stitch_max_distance_um", type=float, default=5.0, help="Maximum distance in microns for cross-chunk endpoint stitching")
-    parser.add_argument("--merge_branch_points_distance_um", type=float, default=0.0, help="Merge branch points within this distance (um). 0=disabled")
-    parser.add_argument("--prune_spurs_max_length_um", type=float, default=0.0, help="Prune terminal branches shorter than this (um). 0=disabled")
     parser.add_argument(
         "--test",
         action="store_true",

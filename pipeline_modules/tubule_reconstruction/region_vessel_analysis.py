@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from .kimimaro_reconstruction import (
+from pipeline_modules.tubule_reconstruction.kimimaro_reconstruction import (
     _branch_table_from_tables,
     iter_all_chunk_indices,
     open_zarr_dataset,
