@@ -1,13 +1,14 @@
-"""Comprehensive vessel network analysis report from kimimaro reconstruction outputs.
+"""Comprehensive vessel network analysis report from skeleton reconstruction outputs.
 
 Computes length / diameter / tortuosity / branch-point / volume / surface / loop
-metrics from the skeleton CSVs produced by ``kimimaro_reconstruction_fast.py``
-and writes a per-mouse statistics workbook plus distribution figures.
+metrics from kimimaro CSVs or EDT polyline ``skeleton_edges.csv`` and writes a
+per-mouse statistics workbook plus distribution figures.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import sys
 from pathlib import Path
 
@@ -26,6 +27,8 @@ DEFAULT_TORT_BIN_EDGES = (1.0, 1.1, 1.2, 1.5, 2.0, 3.0, 5.0)
 EDGE_CHUNK = 5_000_000
 VERTEX_CHUNK = 5_000_000
 BRANCH_CHUNK = 1_000_000
+EDT_BRANCH_CHUNK = 500_000
+SPILL_DIRNAME = "_chunk_spill"
 
 
 def parse_resolution_xyz(value):
@@ -43,15 +46,55 @@ def bincount_with_nan(values):
     return clean, np.bincount(clean.astype(np.int64), minlength=0)
 
 
+def csv_columns(path):
+    return list(pd.read_csv(path, nrows=0).columns)
+
+
+def is_edt_polyline_edges(edge_csv):
+    cols = set(csv_columns(edge_csv))
+    return "length_um" in cols and "edge_length_um" not in cols
+
+
+def jsonable(value):
+    if isinstance(value, dict):
+        return {str(key): jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        number = float(value)
+        return number if np.isfinite(number) else None
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def empty_vertex_stats():
+    return {
+        "num_vertices": 0,
+        "num_endpoints": 0,
+        "num_endpoints_non_boundary": 0,
+        "num_branch_points": 0,
+        "degree_histogram": {},
+        "branch_point_degree_histogram": {},
+    }
+
+
 def stream_edges(edge_csv):
     total_length = 0.0
     num_edges = 0
     num_stitch = 0
     stitch_length = 0.0
-    stitch_columns = [c for c in ("edge_length_um", "is_stitch") if c]
-    usecols = stitch_columns
+    cols = set(csv_columns(edge_csv))
+    length_col = "length_um" if "length_um" in cols else "edge_length_um"
+    usecols = [length_col]
+    if "is_stitch" in cols:
+        usecols.append("is_stitch")
     for chunk in pd.read_csv(edge_csv, usecols=usecols, chunksize=EDGE_CHUNK, low_memory=False):
-        length = pd.to_numeric(chunk["edge_length_um"], errors="coerce").to_numpy(dtype=np.float64)
+        length = pd.to_numeric(chunk[length_col], errors="coerce").to_numpy(dtype=np.float64)
         length = np.nan_to_num(length, nan=0.0)
         total_length += float(length.sum())
         num_edges += int(len(chunk))
@@ -106,6 +149,135 @@ def stream_vertices(vertex_csv):
         "degree_histogram": degree_hist,
         "branch_point_degree_histogram": branch_degree_hist,
     }
+
+
+def stream_edt_branches(edge_csv):
+    """Build a kimimaro-like branch table from EDT polyline skeleton_edges.csv."""
+    usecols = [
+        "source_z_um",
+        "source_y_um",
+        "source_x_um",
+        "target_z_um",
+        "target_y_um",
+        "target_x_um",
+        "length_um",
+        "mean_radius_um",
+        "is_stitch",
+    ]
+    length_parts = []
+    radius_parts = []
+    tort_parts = []
+    loop_parts = []
+    total_length = 0.0
+    num_rows = 0
+    num_stitch = 0
+    stitch_length = 0.0
+    n_chunks = 0
+    for chunk in pd.read_csv(edge_csv, usecols=usecols, chunksize=EDT_BRANCH_CHUNK, low_memory=False):
+        n_chunks += 1
+        if n_chunks == 1 or n_chunks % 10 == 0:
+            print(f"  EDT branch chunk {n_chunks}, rows so far {num_rows + len(chunk)}", flush=True)
+        length = pd.to_numeric(chunk["length_um"], errors="coerce").to_numpy(dtype=np.float64)
+        length = np.nan_to_num(length, nan=0.0)
+        stitch = chunk["is_stitch"].fillna(False).astype(bool).to_numpy()
+        total_length += float(length.sum())
+        num_rows += int(len(chunk))
+        num_stitch += int(stitch.sum())
+        stitch_length += float(length[stitch].sum())
+        keep = ~stitch
+        if not keep.any():
+            continue
+        src = chunk.loc[keep, ["source_z_um", "source_y_um", "source_x_um"]].to_numpy(dtype=np.float64)
+        dst = chunk.loc[keep, ["target_z_um", "target_y_um", "target_x_um"]].to_numpy(dtype=np.float64)
+        path = length[keep]
+        euclidean = np.linalg.norm(dst - src, axis=1)
+        tortuosity = np.divide(path, euclidean, out=np.full_like(path, np.nan), where=euclidean > 1e-12)
+        radius = pd.to_numeric(chunk.loc[keep, "mean_radius_um"], errors="coerce").to_numpy(dtype=np.float64)
+        length_parts.append(path)
+        radius_parts.append(radius)
+        tort_parts.append(tortuosity)
+        loop_parts.append(euclidean <= 1e-6)
+    if length_parts:
+        branch_length = np.concatenate(length_parts)
+        mean_radius = np.concatenate(radius_parts)
+        tortuosity = np.concatenate(tort_parts)
+        is_loop = np.concatenate(loop_parts)
+    else:
+        branch_length = np.array([], dtype=np.float64)
+        mean_radius = np.array([], dtype=np.float64)
+        tortuosity = np.array([], dtype=np.float64)
+        is_loop = np.array([], dtype=bool)
+    branch_table = pd.DataFrame(
+        {
+            "branch_length_um": branch_length,
+            "mean_radius_um": mean_radius,
+            "tortuosity": tortuosity,
+            "is_loop": is_loop,
+            "is_branch_to_branch": np.ones(len(branch_length), dtype=bool),
+            "is_terminal_branch": np.zeros(len(branch_length), dtype=bool),
+        }
+    )
+    return {
+        "edge_stats": {
+            "total_vessel_length_um": total_length,
+            "num_edges": num_rows,
+            "num_stitch_edges": num_stitch,
+            "stitch_length_um": stitch_length,
+        },
+        "branch_table": branch_table,
+    }
+
+
+def spill_degree_stats(spill_dir):
+    """Degree histograms from EDT chunk spill pickles (core skeleton voxels)."""
+    stats = empty_vertex_stats()
+    spill_path = Path(spill_dir)
+    if not spill_path.is_dir():
+        return stats
+    degree_hist = {}
+    branch_degree_hist = {}
+    num_vertices = 0
+    num_endpoints = 0
+    num_branch_points = 0
+    n_spill = 0
+    paths = sorted(spill_path.glob("*.pkl"))
+    for path in paths:
+        n_spill += 1
+        if n_spill == 1 or n_spill % 1000 == 0 or n_spill == len(paths):
+            print(f"  spill {n_spill}/{len(paths)}", flush=True)
+        with path.open("rb") as handle:
+            payload = pickle.load(handle)
+        degrees = payload.get("degrees")
+        if degrees is None or len(degrees) == 0:
+            continue
+        degree_int = np.asarray(degrees, dtype=np.int64)
+        degree_int = degree_int[degree_int >= 0]
+        if degree_int.size == 0:
+            continue
+        num_vertices += int(degree_int.size)
+        hist = np.bincount(degree_int, minlength=0)
+        for k, count in enumerate(hist):
+            if count:
+                degree_hist[int(k)] = degree_hist.get(int(k), 0) + int(count)
+        branch_mask = degree_int >= 3
+        num_branch_points += int(branch_mask.sum())
+        if branch_mask.any():
+            sub_hist = np.bincount(degree_int[branch_mask], minlength=0)
+            for k, count in enumerate(sub_hist):
+                if count:
+                    branch_degree_hist[int(k)] = branch_degree_hist.get(int(k), 0) + int(count)
+        num_endpoints += int((degree_int == 1).sum())
+    stats.update(
+        {
+            "num_vertices": num_vertices,
+            "num_endpoints": num_endpoints,
+            "num_endpoints_non_boundary": num_endpoints,
+            "num_branch_points": num_branch_points,
+            "degree_histogram": degree_hist,
+            "branch_point_degree_histogram": branch_degree_hist,
+        }
+    )
+    return stats
 
 
 def bin_stats(values, bin_edges):
@@ -297,7 +469,7 @@ def plot_tortuosity_histogram(tortuosity, output_path):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compute comprehensive vessel network analysis report")
-    parser.add_argument("--run_dir", required=True, help="Directory containing skeleton_*.csv and vessel_branch_metrics.csv")
+    parser.add_argument("--run_dir", required=True, help="Directory containing skeleton_edges.csv (kimimaro or EDT)")
     parser.add_argument("--sample_id", default="", help="Sample / mouse identifier")
     parser.add_argument("--output_dir", required=True, help="Directory for report outputs")
     parser.add_argument("--resolution_xyz", default="1.8,1.8,2.0", help="Voxel size in um as x,y,z")
@@ -317,17 +489,28 @@ def main() -> int:
     edge_csv = run_dir / "skeleton_edges.csv"
     vertex_csv = run_dir / "skeleton_vertices.csv"
     branch_csv = run_dir / "vessel_branch_metrics.csv"
+    edt_mode = is_edt_polyline_edges(edge_csv)
 
     summary = {}
     summary["sample_id"] = args.sample_id
     summary["resolution_xyz_um"] = list(resolution)
+    summary["skeleton_source"] = "edt_polyline" if edt_mode else "kimimaro"
 
-    print("Streaming edges ...")
-    edge_stats = stream_edges(edge_csv)
-    summary.update(edge_stats)
+    if edt_mode:
+        print("EDT polyline edges detected; streaming branches ...")
+        edt = stream_edt_branches(edge_csv)
+        summary.update(edt["edge_stats"])
+        branch_table = edt["branch_table"]
+        print("Reading chunk spill degrees ...")
+        vertex_stats = spill_degree_stats(run_dir / SPILL_DIRNAME)
+    else:
+        print("Streaming edges ...")
+        summary.update(stream_edges(edge_csv))
+        print("Streaming vertices ...")
+        vertex_stats = stream_vertices(vertex_csv)
+        print("Loading branch table ...")
+        branch_table = pd.read_csv(branch_csv, low_memory=False)
 
-    print("Streaming vertices ...")
-    vertex_stats = stream_vertices(vertex_csv)
     summary.update(
         {
             key: vertex_stats[key]
@@ -335,8 +518,6 @@ def main() -> int:
         }
     )
 
-    print("Loading branch table ...")
-    branch_table = pd.read_csv(branch_csv, low_memory=False)
     length_um = pd.to_numeric(branch_table["branch_length_um"], errors="coerce").to_numpy(dtype=np.float64)
     radius_um = pd.to_numeric(branch_table["mean_radius_um"], errors="coerce").to_numpy(dtype=np.float64)
     tortuosity = pd.to_numeric(branch_table["tortuosity"], errors="coerce").to_numpy(dtype=np.float64)
@@ -402,6 +583,7 @@ def main() -> int:
     plot_tortuosity_histogram(tortuosity, figures_dir / "tortuosity_distribution.png")
 
     summary_path = output_dir / "vessel_analysis_summary.json"
+    summary = jsonable(summary)
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     xlsx_path = output_dir / "vessel_analysis_table.xlsx"

@@ -3,8 +3,10 @@ import concurrent.futures
 import json
 import logging
 import os
+import pickle
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +31,184 @@ except ImportError:  # running the file directly without project root on sys.pat
     write_run_manifest = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+CHUNK_SPILL_DIRNAME = "_chunk_spill"
+MODULE_PROGRESS_FILENAME = "_progress.json"
+DEFAULT_SPILL_BATCH_SIZE = 256
+DEFAULT_CHUNK_TIMEOUT_S = 1200
+DEFAULT_MAX_COMPONENT_VOXELS = 1_500_000
+DEFAULT_MAX_INFLIGHT_MULTIPLIER = 4
+
+
+def _write_module_progress(output_root: Path, payload: dict) -> None:
+    path = Path(output_root) / MODULE_PROGRESS_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _progress_now_iso() -> str:
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def _chunk_spill_key(chunk_index) -> str:
+    z, y, x = (int(v) for v in chunk_index)
+    return f"z{z:05d}_y{y:05d}_x{x:05d}"
+
+
+def _parse_chunk_spill_key(name: str):
+    stem = Path(name).stem
+    parts = stem.split("_")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid spill key: {name}")
+    return (int(parts[0][1:]), int(parts[1][1:]), int(parts[2][1:]))
+
+
+def _spill_chunk_result(spill_dir: Path, chunk_result: dict) -> dict:
+    """Write heavy per-chunk tables to disk; return a lightweight metadata record."""
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    key = _chunk_spill_key(chunk_result["chunk_index"])
+    path = spill_dir / f"{key}.pkl"
+    payload = {
+        "chunk_index": tuple(int(v) for v in chunk_result["chunk_index"]),
+        "core_mask_voxels": int(chunk_result["core_mask_voxels"]),
+        "connected_components": int(chunk_result["connected_components"]),
+        "num_skeletons": int(chunk_result["num_skeletons"]),
+        "chunk_summary": chunk_result["chunk_summary"],
+        "branch_table": chunk_result["branch_table"],
+        "vertex_table": chunk_result["vertex_table"],
+        "edge_table": chunk_result["edge_table"],
+    }
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    return {
+        "chunk_index": payload["chunk_index"],
+        "core_mask_voxels": payload["core_mask_voxels"],
+        "connected_components": payload["connected_components"],
+        "num_skeletons": payload["num_skeletons"],
+        "chunk_summary": payload["chunk_summary"],
+        "spill_path": str(path),
+    }
+
+
+def _load_spilled_chunk(meta: dict) -> dict:
+    with Path(meta["spill_path"]).open("rb") as handle:
+        return pickle.load(handle)
+
+
+def _resume_metas_from_spill(spill_dir: Path) -> list[dict]:
+    """Build lightweight metas from existing spill pickles (resume support)."""
+    if not spill_dir.is_dir():
+        return []
+    metas: list[dict] = []
+    for path in sorted(spill_dir.glob("*.pkl")):
+        try:
+            chunk_index = _parse_chunk_spill_key(path.name)
+        except ValueError:
+            continue
+        metas.append(
+            {
+                "chunk_index": chunk_index,
+                "core_mask_voxels": 0,
+                "connected_components": 0,
+                "num_skeletons": 0,
+                "chunk_summary": {"resumed": True, "chunk_index": ".".join(str(v) for v in chunk_index)},
+                "spill_path": str(path),
+            }
+        )
+    return metas
+
+
+def _empty_tables():
+    return branch_table_from_skeletons({}), pd.DataFrame(), pd.DataFrame()
+
+
+def _make_skipped_chunk_result(task: dict, *, reason: str, core_mask_voxels: int = 0, connected_components: int = 0) -> dict:
+    chunk_index = tuple(task["chunk_index"])
+    chunks = tuple(task["chunks"])
+    shape = tuple(task["shape"])
+    halo_zyx = tuple(task["halo_zyx"])
+    chunk_slices = chunk_index_to_slices(chunk_index, chunks, shape)
+    expanded_slices = expand_slices(chunk_slices, halo_zyx, shape)
+    metadata = _make_chunk_metadata(chunk_index, chunk_slices, expanded_slices)
+    branch_table, vertex_table, edge_table = _empty_tables()
+    chunk_summary = {
+        **metadata,
+        "mask_voxels": int(core_mask_voxels),
+        "expanded_mask_voxels": int(core_mask_voxels),
+        "connected_components": int(connected_components),
+        "num_skeletons": 0,
+        "num_branches": 0,
+        "total_branch_length_um": 0.0,
+        "skip_reason": str(reason),
+    }
+    return {
+        "chunk_index": chunk_index,
+        "core_mask_voxels": int(core_mask_voxels),
+        "connected_components": int(connected_components),
+        "branch_table": branch_table,
+        "vertex_table": vertex_table,
+        "edge_table": edge_table,
+        "chunk_summary": chunk_summary,
+        "num_skeletons": 0,
+    }
+
+
+def _largest_component_voxels(binary_mask) -> tuple[int, int]:
+    labeled, num_features = ndimage.label(binary_mask.astype(np.uint8, copy=False))
+    if num_features <= 0:
+        return 0, 0
+    sizes = np.bincount(labeled.ravel())
+    if sizes.size <= 1:
+        return 0, int(num_features)
+    sizes[0] = 0
+    return int(sizes.max()), int(num_features)
+
+
+def _force_stop_executor(executor: concurrent.futures.ProcessPoolExecutor) -> None:
+    """Best-effort kill of pool workers after a per-chunk timeout."""
+    processes = getattr(executor, "_processes", None) or {}
+    for proc in list(processes.values()):
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        executor.shutdown(wait=False)
+    for proc in list(processes.values()):
+        try:
+            proc.join(timeout=5)
+        except Exception:
+            pass
+
+
+def _concat_tables_batched(tables, *, batch_size: int = DEFAULT_SPILL_BATCH_SIZE) -> pd.DataFrame:
+    """Concat many DataFrames without holding one giant list of tiny frames."""
+    batch_size = max(1, int(batch_size))
+    batch: list[pd.DataFrame] = []
+    parts: list[pd.DataFrame] = []
+    for table in tables:
+        if table is None or (isinstance(table, pd.DataFrame) and table.empty):
+            continue
+        batch.append(table)
+        if len(batch) >= batch_size:
+            parts.append(pd.concat(batch, ignore_index=True))
+            batch.clear()
+    if batch:
+        parts.append(pd.concat(batch, ignore_index=True))
+        batch.clear()
+    if not parts:
+        return pd.DataFrame()
+    if len(parts) == 1:
+        return parts[0]
+    out = pd.concat(parts, ignore_index=True)
+    parts.clear()
+    return out
 
 
 DEFAULT_TEASAR_PARAMS = {
@@ -286,6 +466,9 @@ def _process_chunk_task(task):
     chunks = tuple(task["chunks"])
     shape = tuple(task["shape"])
     halo_zyx = tuple(task["halo_zyx"])
+    max_component_voxels = int(task.get("max_component_voxels") or 0)
+    spill_dir_value = task.get("spill_dir")
+    spill_dir = Path(spill_dir_value) if spill_dir_value else None
 
     chunk_slices = chunk_index_to_slices(chunk_index, chunks, shape)
     expanded_slices = expand_slices(chunk_slices, halo_zyx, shape)
@@ -298,6 +481,11 @@ def _process_chunk_task(task):
     )
     core_mask_voxels = int(np.count_nonzero(core_binary_mask))
 
+    def _finish(result: dict) -> dict:
+        if spill_dir is not None:
+            return _spill_chunk_result(spill_dir, result)
+        return result
+
     if core_mask_voxels == 0:
         chunk_summary = {
             **metadata,
@@ -308,16 +496,18 @@ def _process_chunk_task(task):
             "num_branches": 0,
             "total_branch_length_um": 0.0,
         }
-        return {
-            "chunk_index": chunk_index,
-            "core_mask_voxels": 0,
-            "connected_components": 0,
-            "branch_table": branch_table_from_skeletons({}),
-            "vertex_table": pd.DataFrame(),
-            "edge_table": pd.DataFrame(),
-            "chunk_summary": chunk_summary,
-            "num_skeletons": 0,
-        }
+        return _finish(
+            {
+                "chunk_index": chunk_index,
+                "core_mask_voxels": 0,
+                "connected_components": 0,
+                "branch_table": branch_table_from_skeletons({}),
+                "vertex_table": pd.DataFrame(),
+                "edge_table": pd.DataFrame(),
+                "chunk_summary": chunk_summary,
+                "num_skeletons": 0,
+            }
+        )
 
     if expanded_slices == chunk_slices:
         binary_mask = core_binary_mask
@@ -339,16 +529,33 @@ def _process_chunk_task(task):
             "num_branches": 0,
             "total_branch_length_um": 0.0,
         }
-        return {
-            "chunk_index": chunk_index,
-            "core_mask_voxels": core_mask_voxels,
-            "connected_components": 0,
-            "branch_table": branch_table_from_skeletons({}),
-            "vertex_table": pd.DataFrame(),
-            "edge_table": pd.DataFrame(),
-            "chunk_summary": chunk_summary,
-            "num_skeletons": 0,
-        }
+        return _finish(
+            {
+                "chunk_index": chunk_index,
+                "core_mask_voxels": core_mask_voxels,
+                "connected_components": 0,
+                "branch_table": branch_table_from_skeletons({}),
+                "vertex_table": pd.DataFrame(),
+                "edge_table": pd.DataFrame(),
+                "chunk_summary": chunk_summary,
+                "num_skeletons": 0,
+            }
+        )
+
+    if max_component_voxels > 0:
+        largest_cc, num_components = _largest_component_voxels(binary_mask)
+        if largest_cc > max_component_voxels:
+            reason = f"largest_cc={largest_cc}>{max_component_voxels}"
+            logger.warning("Skipping chunk %s (%s)", chunk_index, reason)
+            skipped = _make_skipped_chunk_result(
+                task,
+                reason=reason,
+                core_mask_voxels=core_mask_voxels,
+                connected_components=num_components,
+            )
+            skipped["chunk_summary"]["expanded_mask_voxels"] = expanded_mask_voxels
+            skipped["chunk_summary"]["largest_component_voxels"] = int(largest_cc)
+            return _finish(skipped)
 
     skeletons, meta = skeletonize_binary_mask(
         binary_mask=binary_mask,
@@ -390,16 +597,18 @@ def _process_chunk_task(task):
     chunk_summary["expanded_mask_voxels"] = expanded_mask_voxels
     chunk_summary["connected_components"] = int(meta["num_components"])
 
-    return {
-        "chunk_index": chunk_index,
-        "core_mask_voxels": core_mask_voxels,
-        "connected_components": int(meta["num_components"]),
-        "branch_table": branch_table,
-        "vertex_table": vertex_table,
-        "edge_table": edge_table,
-        "chunk_summary": chunk_summary,
-        "num_skeletons": len(skeletons),
-    }
+    return _finish(
+        {
+            "chunk_index": chunk_index,
+            "core_mask_voxels": core_mask_voxels,
+            "connected_components": int(meta["num_components"]),
+            "branch_table": branch_table,
+            "vertex_table": vertex_table,
+            "edge_table": edge_table,
+            "chunk_summary": chunk_summary,
+            "num_skeletons": len(skeletons),
+        }
+    )
 
 
 def _binary_to_component_labels(binary_mask):
@@ -2122,6 +2331,9 @@ def analyze_binary_mask_zarr_chunkwise(
     region_chunk_margin=0,
     downsample_factor=4,
     keep_downsampled_mask=False,
+    spill_chunks=True,
+    keep_chunk_spill=False,
+    spill_batch_size=DEFAULT_SPILL_BATCH_SIZE,
 ):
     _started_at = time.time()
     resolution_xyz = parse_resolution_xyz(resolution_xyz)
@@ -2129,9 +2341,13 @@ def analyze_binary_mask_zarr_chunkwise(
     if chunk_workers is None:
         chunk_workers = default_chunk_workers()
     chunk_workers = max(1, int(chunk_workers))
+    spill_batch_size = max(1, int(spill_batch_size))
     halo_zyx = parse_triplet_int(halo_zyx)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    spill_dir = output_root / CHUNK_SPILL_DIRNAME
+    if spill_chunks and spill_dir.exists():
+        shutil.rmtree(spill_dir, ignore_errors=True)
 
     working_mask_path = Path(mask_zarr_path)
     working_dataset_name = dataset_name
@@ -2217,62 +2433,175 @@ def analyze_binary_mask_zarr_chunkwise(
         for chunk_index in chunk_indices
     ]
 
+    if spill_chunks:
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Chunk table spill enabled -> %s", spill_dir)
+
+    phase_started = _progress_now_iso()
+    total_chunks = len(task_payloads)
+    progress_every = max(1, min(25, total_chunks // 200 or 1))
+
+    def _emit_chunk_progress(done: int) -> None:
+        _write_module_progress(
+            output_root,
+            {
+                "phase": "Processing chunks",
+                "unit_done": int(done),
+                "unit_total": int(total_chunks),
+                "phase_started_at": phase_started,
+                "updated_at": _progress_now_iso(),
+                "downsample_factor": int(downsample_factor),
+                "chunk_workers": int(chunk_workers),
+                "spill_chunks": bool(spill_chunks),
+            },
+        )
+
+    _emit_chunk_progress(0)
+
     if chunk_workers <= 1:
-        chunk_results = [_process_chunk_task(task) for task in tqdm(task_payloads, desc="Processing chunks")]
+        chunk_metas = []
+        for task in tqdm(task_payloads, desc="Processing chunks"):
+            chunk_result = _process_chunk_task(task)
+            if spill_chunks:
+                chunk_metas.append(_spill_chunk_result(spill_dir, chunk_result))
+            else:
+                chunk_metas.append(chunk_result)
+            del chunk_result
+            if len(chunk_metas) % progress_every == 0 or len(chunk_metas) == total_chunks:
+                _emit_chunk_progress(len(chunk_metas))
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=chunk_workers) as executor:
             futures = {executor.submit(_process_chunk_task, task): task["chunk_index"] for task in task_payloads}
-            chunk_results = []
+            chunk_metas = []
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing chunks"):
-                chunk_results.append(future.result())
+                chunk_result = future.result()
+                if spill_chunks:
+                    chunk_metas.append(_spill_chunk_result(spill_dir, chunk_result))
+                else:
+                    chunk_metas.append(chunk_result)
+                del chunk_result
+                if len(chunk_metas) % progress_every == 0 or len(chunk_metas) == total_chunks:
+                    _emit_chunk_progress(len(chunk_metas))
 
-    chunk_results.sort(key=lambda item: tuple(item["chunk_index"]))
+    chunk_metas.sort(key=lambda item: tuple(item["chunk_index"]))
 
-    all_branch_tables = []
-    all_vertex_tables = []
-    all_edge_tables = []
+    def _emit_merge_progress(phase: str, done: int, total: int, started: str) -> None:
+        _write_module_progress(
+            output_root,
+            {
+                "phase": phase,
+                "unit_done": int(done),
+                "unit_total": int(total),
+                "phase_started_at": started,
+                "updated_at": _progress_now_iso(),
+                "downsample_factor": int(downsample_factor),
+                "chunk_workers": int(chunk_workers),
+                "spill_chunks": bool(spill_chunks),
+            },
+        )
+
     chunk_rows = []
-    skeleton_offset = 0
+    skeleton_offset_box = {"value": 0}
     total_mask_voxels = 0
     total_components = 0
 
-    for chunk_result in chunk_results:
-        total_mask_voxels += int(chunk_result["core_mask_voxels"])
-        total_components += int(chunk_result["connected_components"])
+    def _iter_loaded_chunks():
+        if spill_chunks:
+            for meta in chunk_metas:
+                yield _load_spilled_chunk(meta)
+        else:
+            for item in chunk_metas:
+                yield item
 
-        branch_table = _reindex_branch_table(
-            chunk_result["branch_table"],
-            skeleton_offset=skeleton_offset,
-        )
-        all_branch_tables.append(branch_table)
-
-        if save_skeleton:
-            vertex_table, edge_table = _reindex_skeleton_tables(
-                chunk_result["vertex_table"],
-                chunk_result["edge_table"],
-                skeleton_offset=skeleton_offset,
+    def _iter_reindexed_branch_tables():
+        nonlocal total_mask_voxels, total_components
+        skeleton_offset_box["value"] = 0
+        total_mask_voxels = 0
+        total_components = 0
+        chunk_rows.clear()
+        merge_started = _progress_now_iso()
+        done = 0
+        _emit_merge_progress("Merging branch tables", 0, len(chunk_metas), merge_started)
+        for chunk_result in tqdm(_iter_loaded_chunks(), total=len(chunk_metas), desc="Merging branch tables"):
+            total_mask_voxels += int(chunk_result["core_mask_voxels"])
+            total_components += int(chunk_result["connected_components"])
+            chunk_rows.append(chunk_result["chunk_summary"])
+            yield _reindex_branch_table(
+                chunk_result["branch_table"],
+                skeleton_offset=skeleton_offset_box["value"],
             )
-            all_vertex_tables.append(vertex_table)
-            all_edge_tables.append(edge_table)
+            skeleton_offset_box["value"] += int(chunk_result["num_skeletons"])
+            done += 1
+            if done % progress_every == 0 or done == len(chunk_metas):
+                _emit_merge_progress("Merging branch tables", done, len(chunk_metas), merge_started)
 
-        chunk_rows.append(chunk_result["chunk_summary"])
-        skeleton_offset += int(chunk_result["num_skeletons"])
+    combined_branch_table = _concat_tables_batched(
+        _iter_reindexed_branch_tables(),
+        batch_size=spill_batch_size,
+    )
+    if combined_branch_table.empty:
+        combined_branch_table = branch_table_from_skeletons({})
 
-    combined_branch_table = (
-        pd.concat(all_branch_tables, ignore_index=True)
-        if all_branch_tables
-        else branch_table_from_skeletons({})
+    combined_vertex_table = pd.DataFrame()
+    combined_edge_table = pd.DataFrame()
+    if save_skeleton:
+        def _iter_reindexed_vertex_tables():
+            skeleton_offset = 0
+            merge_started = _progress_now_iso()
+            done = 0
+            _emit_merge_progress("Merging vertex tables", 0, len(chunk_metas), merge_started)
+            for chunk_result in tqdm(_iter_loaded_chunks(), total=len(chunk_metas), desc="Merging vertex tables"):
+                vertex_table, _edge_table = _reindex_skeleton_tables(
+                    chunk_result["vertex_table"],
+                    chunk_result["edge_table"],
+                    skeleton_offset=skeleton_offset,
+                )
+                skeleton_offset += int(chunk_result["num_skeletons"])
+                yield vertex_table
+                done += 1
+                if done % progress_every == 0 or done == len(chunk_metas):
+                    _emit_merge_progress("Merging vertex tables", done, len(chunk_metas), merge_started)
+
+        def _iter_reindexed_edge_tables():
+            skeleton_offset = 0
+            merge_started = _progress_now_iso()
+            done = 0
+            _emit_merge_progress("Merging edge tables", 0, len(chunk_metas), merge_started)
+            for chunk_result in tqdm(_iter_loaded_chunks(), total=len(chunk_metas), desc="Merging edge tables"):
+                _vertex_table, edge_table = _reindex_skeleton_tables(
+                    chunk_result["vertex_table"],
+                    chunk_result["edge_table"],
+                    skeleton_offset=skeleton_offset,
+                )
+                skeleton_offset += int(chunk_result["num_skeletons"])
+                yield edge_table
+                done += 1
+                if done % progress_every == 0 or done == len(chunk_metas):
+                    _emit_merge_progress("Merging edge tables", done, len(chunk_metas), merge_started)
+
+        combined_vertex_table = _concat_tables_batched(
+            _iter_reindexed_vertex_tables(),
+            batch_size=spill_batch_size,
+        )
+        combined_edge_table = _concat_tables_batched(
+            _iter_reindexed_edge_tables(),
+            batch_size=spill_batch_size,
+        )
+
+    _write_module_progress(
+        output_root,
+        {
+            "phase": "Writing outputs",
+            "unit_done": 1,
+            "unit_total": 1,
+            "phase_started_at": _progress_now_iso(),
+            "updated_at": _progress_now_iso(),
+            "downsample_factor": int(downsample_factor),
+            "chunk_workers": int(chunk_workers),
+            "spill_chunks": bool(spill_chunks),
+        },
     )
-    combined_vertex_table = (
-        pd.concat(all_vertex_tables, ignore_index=True)
-        if all_vertex_tables
-        else pd.DataFrame()
-    )
-    combined_edge_table = (
-        pd.concat(all_edge_tables, ignore_index=True)
-        if all_edge_tables
-        else pd.DataFrame()
-    )
+
     summary = summarize_branch_table(combined_branch_table)
     summary["mode"] = mode_name
     summary["processed_chunks"] = int(len(chunk_indices))
@@ -2287,6 +2616,8 @@ def analyze_binary_mask_zarr_chunkwise(
     summary["stitch_max_distance_um"] = float(stitch_max_distance_um)
     summary["chunk_workers"] = int(chunk_workers)
     summary["kimimaro_parallel_per_chunk"] = int(kimimaro_parallel)
+    summary["spill_chunks"] = bool(spill_chunks)
+    summary["spill_batch_size"] = int(spill_batch_size)
     if region_filter:
         summary["region_filter"] = region_filter
     summary["downsample_factor"] = int(downsample_factor)
@@ -2399,10 +2730,17 @@ def analyze_binary_mask_zarr_chunkwise(
                 "region_filter": region_filter or {},
                 "downsample_factor": downsample_factor,
                 "chunk_workers": chunk_workers,
+                "spill_chunks": spill_chunks,
+                "spill_batch_size": spill_batch_size,
             },
             outputs=_output_files,
             started_at=_started_at,
         )
+
+    if spill_chunks and not keep_chunk_spill and spill_dir.exists():
+        shutil.rmtree(spill_dir, ignore_errors=True)
+    elif spill_chunks and spill_dir.exists():
+        result["chunk_spill_dir"] = spill_dir
 
     return result
 
@@ -2499,6 +2837,22 @@ def build_argparser():
         "--keep_downsampled_mask",
         action="store_true",
         help="Keep intermediate downsampled mask Zarr under output_dir",
+    )
+    parser.add_argument(
+        "--no_spill_chunks",
+        action="store_true",
+        help="Keep all chunk tables in memory instead of spilling to disk during chunkwise runs",
+    )
+    parser.add_argument(
+        "--keep_chunk_spill",
+        action="store_true",
+        help="Keep _chunk_spill/ under output_dir after a successful chunkwise run",
+    )
+    parser.add_argument(
+        "--spill_batch_size",
+        type=int,
+        default=DEFAULT_SPILL_BATCH_SIZE,
+        help="DataFrame concat batch size when merging spilled chunk tables",
     )
     parser.add_argument(
         "--merge_branch_points_distance_um",
@@ -2615,6 +2969,9 @@ def main():
                 region_chunk_margin=args.region_chunk_margin,
                 downsample_factor=args.downsample_factor,
                 keep_downsampled_mask=args.keep_downsampled_mask,
+                spill_chunks=not args.no_spill_chunks,
+                keep_chunk_spill=args.keep_chunk_spill,
+                spill_batch_size=args.spill_batch_size,
             )
         else:
             result = analyze_binary_mask_zarr(
