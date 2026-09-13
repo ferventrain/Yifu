@@ -69,12 +69,14 @@
     {
       "id": "tubule_reconstruction",
       "path": "pipeline_modules/tubule_reconstruction",
-      "description": "Vessel skeleton reconstruction from binary mask Zarr (kimimaro/TEASAR) with per-brain-region vessel parameter summaries.",
+      "description": "Vessel skeleton reconstruction from binary mask Zarr (VesselExpress Lee + native EDT; kimimaro optional) with per-brain-region vessel parameter summaries.",
       "agent_native": true,
       "capability_manifest": "pipeline_modules/tubule_reconstruction/capability_manifest.json",
       "primary_scripts": [
         "pipeline_modules/tubule_reconstruction/kimimaro_reconstruction.py",
-        "pipeline_modules/tubule_reconstruction/region_vessel_analysis.py"
+        "pipeline_modules/tubule_reconstruction/region_vessel_analysis.py",
+        "pipeline_modules/tubule_reconstruction/vessel_express_reconstruction.py",
+        "pipeline_modules/tubule_reconstruction/mask_downsample.py"
       ],
       "python_package": "pipeline_modules.tubule_reconstruction",
       "config_models": {
@@ -124,6 +126,20 @@
       "python_package": "pipeline_modules.qc",
       "inputs_from": ["signal_zarr"],
       "outputs_to": ["qc_report_json"]
+    },
+    {
+      "id": "harness",
+      "path": "pipeline_modules/harness",
+      "description": "Local Active-queue runner for main.py with a simple operator UI, progress.json, historical step ETAs, and SampleLayout result listing.",
+      "agent_native": true,
+      "capability_manifest": "pipeline_modules/harness/capability_manifest.json",
+      "primary_scripts": [
+        "pipeline_modules/harness/queue.py",
+        "pipeline_modules/harness/runner.py",
+        "apps/pipeline_harness/main.py"
+      ],
+      "python_package": "pipeline_modules.harness",
+      "outputs_to": ["active_queue", "progress_json"]
     },
     {
       "id": "utils",

@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from .kimimaro_reconstruction import (
+from pipeline_modules.tubule_reconstruction.kimimaro_reconstruction import (
     _branch_table_from_tables,
     iter_all_chunk_indices,
     open_zarr_dataset,
@@ -318,21 +318,46 @@ def _branch_to_branch_mask(branch_table):
     return np.ones(len(branch_table), dtype=bool)
 
 
+def _normalize_branch_table(branch_table: pd.DataFrame) -> pd.DataFrame:
+    """Accept VesselExpress branch columns (length_um, endpoint coords) as well as kimimaro."""
+    table = branch_table.copy()
+    if "branch_length_um" not in table.columns and "length_um" in table.columns:
+        table["branch_length_um"] = table["length_um"]
+    if "tortuosity" not in table.columns and {"source_z_um", "target_z_um", "branch_length_um"}.issubset(table.columns):
+        src = table[["source_z_um", "source_y_um", "source_x_um"]].to_numpy(dtype=np.float64)
+        dst = table[["target_z_um", "target_y_um", "target_x_um"]].to_numpy(dtype=np.float64)
+        euclidean = np.linalg.norm(dst - src, axis=1)
+        length = table["branch_length_um"].to_numpy(dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tort = np.where(euclidean > 0, length / euclidean, np.nan)
+        table["tortuosity"] = tort
+    return table
+
+
 def _attach_branch_midpoints(branch_table, vertex_table):
     if branch_table.empty:
         table = branch_table.copy()
         for col in ("mid_z_um", "mid_y_um", "mid_x_um"):
             table[col] = pd.Series(dtype=np.float64)
         return table
+    table = _normalize_branch_table(branch_table)
+    coord_cols = {"source_z_um", "source_y_um", "source_x_um", "target_z_um", "target_y_um", "target_x_um"}
+    if coord_cols.issubset(table.columns):
+        src = table[["source_z_um", "source_y_um", "source_x_um"]].to_numpy(dtype=np.float64)
+        dst = table[["target_z_um", "target_y_um", "target_x_um"]].to_numpy(dtype=np.float64)
+        midpoints = (src + dst) / 2.0
+        table["mid_z_um"] = midpoints[:, 0]
+        table["mid_y_um"] = midpoints[:, 1]
+        table["mid_x_um"] = midpoints[:, 2]
+        return table
     required = {"skeleton_id", "start_node", "end_node"}
-    if not required.issubset(branch_table.columns):
-        raise ValueError(f"Branch CSV is missing required columns: {sorted(required - set(branch_table.columns))}")
+    if not required.issubset(table.columns):
+        raise ValueError(f"Branch CSV is missing required columns: {sorted(required - set(table.columns))}")
 
     coords = vertex_table.drop_duplicates(
         subset=["skeleton_id", "node_id"], keep="last"
     ).set_index(["skeleton_id", "node_id"])[["z_um", "y_um", "x_um"]]
 
-    table = branch_table.copy()
     start_index = pd.MultiIndex.from_frame(
         table[["skeleton_id", "start_node"]].rename(columns={"start_node": "node_id"})
     )
@@ -669,6 +694,7 @@ def analyze_regions_from_skeleton(
         logger.info("Branch CSV not provided/found; reconstructing branch metrics from vertex/edge tables")
         branch_table = _branch_table_from_tables(vertex_table, edge_table)
     logger.info("Loaded %d branch paths", len(branch_table))
+    branch_table = _normalize_branch_table(branch_table)
 
     required_vertex_cols = {"skeleton_id", "node_id", "z_um", "y_um", "x_um"}
     missing_vcols = required_vertex_cols - set(vertex_table.columns)

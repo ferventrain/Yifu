@@ -1,3 +1,4 @@
+import argparse
 import h5py
 import os
 import re
@@ -70,12 +71,12 @@ def process_ims(ims_path, output_root, target_channel_idx):
             # Check structure
             if "DataSet" not in f or "ResolutionLevel 0" not in f["DataSet"]:
                  print(f"Error: Invalid IMS structure in {ims_path}")
-                 return
+                 return False
 
             res0 = f["DataSet"]["ResolutionLevel 0"]
             if "TimePoint 0" not in res0:
                 print("Error: TimePoint 0 not found.")
-                return
+                return False
             
             tp0 = res0["TimePoint 0"]
             
@@ -93,7 +94,7 @@ def process_ims(ims_path, output_root, target_channel_idx):
             
             if not target_channel_key:
                 print(f"Channel {target_channel_idx} not found in {ims_path}")
-                return
+                return False
 
             # Create output subdirectory
             ch_dir = os.path.join(output_root, f"ch{target_channel_idx}")
@@ -104,7 +105,7 @@ def process_ims(ims_path, output_root, target_channel_idx):
             # Get Data
             if "Data" not in tp0[target_channel_key]:
                 print(f"Error: Data not found in {target_channel_key}")
-                return
+                return False
 
             dataset = tp0[target_channel_key]["Data"]
             data_shape = dataset.shape
@@ -113,7 +114,7 @@ def process_ims(ims_path, output_root, target_channel_idx):
                 z_dim, y_dim, x_dim = data_shape
             else:
                 print(f"Unexpected data shape: {data_shape}")
-                return
+                return False
 
             print(f"Processing Channel {target_channel_idx} in {os.path.basename(ims_path)}")
             print(f"Dimensions: Z={z_dim}, Y={y_dim}, X={x_dim}")
@@ -181,19 +182,86 @@ def process_ims(ims_path, output_root, target_channel_idx):
 
             print(f"\nFinished {os.path.basename(ims_path)} Channel {target_channel_idx} in {(time.time() - start_time)/60:.1f} min")
             print(f"Summary: {exists_count} existed, {skipped_count} empty skipped.")
+            return True
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
-        return
+        raise
     except Exception as e:
         print(f"Error processing {ims_path}: {e}")
         import traceback
         traceback.print_exc()
+        return False
 
 
-def main():
+def list_channel_indices(ims_path):
+    """Return sorted channel indices from ResolutionLevel 0 / TimePoint 0."""
+    with h5py.File(ims_path, "r") as f:
+        if "DataSet" not in f or "ResolutionLevel 0" not in f["DataSet"] or "TimePoint 0" not in f["DataSet"]["ResolutionLevel 0"]:
+            return []
+        tp0 = f["DataSet"]["ResolutionLevel 0"]["TimePoint 0"]
+        channels = [k for k in tp0.keys() if str(k).startswith("Channel")]
+        indices = []
+        for key in channels:
+            parts = str(key).split(" ")
+            if len(parts) > 1:
+                indices.append(int(parts[1]))
+        return sorted(indices)
+
+
+def parse_channel_spec(spec, available):
+    spec = (spec or "").strip().lower()
+    if spec in ("", "all"):
+        if not available:
+            raise ValueError("No channels found in IMS file")
+        return available
+    parts = re.split(r"[,\s]+", spec)
+    indices = [int(p) for p in parts if p.strip()]
+    if not indices:
+        raise ValueError("No channel indices parsed from: %s" % spec)
+    return indices
+
+
+def convert_ims_file(ims_path, output_dir, channel_indices):
+    """Convert one IMS file, one channel after another. Returns False on failure."""
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\n===== {os.path.basename(ims_path)} =====")
+    print(f"IMS: {ims_path}")
+    print(f"OUT: {output_dir}")
+    print(f"Channels (sequential): {channel_indices}")
+    for channel_idx in channel_indices:
+        ok = process_ims(ims_path, output_dir, channel_idx)
+        if not ok:
+            print(f"FAILED: {os.path.basename(ims_path)} channel {channel_idx}")
+            return False
+    return True
+
+
+def run_cli(args):
+    ims_files = get_ims_files(os.path.normpath(args.input))
+    if not ims_files:
+        print("No .ims files found.")
+        return 1
+    output_dir = os.path.normpath(args.output)
+    os.makedirs(output_dir, exist_ok=True)
+    available = list_channel_indices(ims_files[0])
+    print(f"Found {len(ims_files)} IMS file(s). Available channels: {available}")
+    try:
+        target_channels = parse_channel_spec(args.channels, available)
+    except ValueError as exc:
+        print(f"Invalid --channels: {exc}")
+        return 1
+    print(f"Starting sequential conversion for channels: {target_channels}")
+    for ims_file in ims_files:
+        if not convert_ims_file(ims_file, output_dir, target_channels):
+            return 1
+    print("\nAll done!")
+    return 0
+
+
+def run_interactive():
     print("--- IMS to TIFF Converter (Interactive & Fast) ---")
-    
+
     # 1. Input IMS address
     while True:
         print("\n提示：支持输入本地路径 (如 D:\\Data) 或 NAS 路径 (如 \\\\192.168.110.31\\Yifu\\...)")
@@ -205,13 +273,13 @@ def main():
             # Normalize path for Windows/NAS
             ims_input = os.path.normpath(ims_input)
             break
-            
+
     ims_files = get_ims_files(ims_input)
-    
+
     if not ims_files:
         print("未找到.ims文件 (No .ims files found).")
         input("按回车键退出 (Press Enter to exit)...")
-        return
+        return 1
 
     print(f"找到 {len(ims_files)} 个IMS文件 (Found {len(ims_files)} IMS files).")
 
@@ -230,19 +298,14 @@ def main():
             print(f"创建输出目录 (Created output directory): {output_dir}")
         except Exception as e:
             print(f"创建目录失败 (Error creating output directory): {e}")
-            return
+            return 1
 
     # 3. Input Channels
     available_channel_indices = []
     try:
-        with h5py.File(ims_files[0], "r") as f:
-             if "DataSet" in f and "ResolutionLevel 0" in f["DataSet"] and "TimePoint 0" in f["DataSet"]["ResolutionLevel 0"]:
-                 tp0 = f["DataSet"]["ResolutionLevel 0"]["TimePoint 0"]
-                 channels = [k for k in tp0.keys() if k.startswith("Channel")]
-                 channels.sort(key=lambda x: int(x.split(" ")[1]) if len(x.split(" ")) > 1 else 0)
-                 available_channel_indices = [int(k.split(" ")[1]) for k in channels if len(k.split(" ")) > 1]
-                 print(f"第一个文件中可用通道 (Available channels in first file): {available_channel_indices}")
-    except:
+        available_channel_indices = list_channel_indices(ims_files[0])
+        print(f"第一个文件中可用通道 (Available channels in first file): {available_channel_indices}")
+    except Exception:
         pass
 
     target_channel_indices = []
@@ -250,31 +313,44 @@ def main():
         channel_input = input("请输入想要输出的channel序号 (可输入 'all' 或多个序号如 '0,1,2'): ").strip().lower()
         if not channel_input:
             continue
-            
-        if channel_input == 'all':
-            if not available_channel_indices:
-                print("错误: 无法自动获取可用通道。请输入具体序号。")
-                continue
-            target_channel_indices = available_channel_indices
-            break
-        else:
-            try:
-                # Support comma or space separated numbers
-                parts = re.split(r'[,\s]+', channel_input)
-                target_channel_indices = [int(p) for p in parts if p.strip()]
-                if target_channel_indices:
-                    break
-            except ValueError:
-                print("无效的输入。请输入数字序号，如 '0' 或 '0,1,2'。")
 
-    # Process
+        try:
+            target_channel_indices = parse_channel_spec(channel_input, available_channel_indices)
+            break
+        except ValueError:
+            print("无效的输入。请输入数字序号，如 '0' 或 '0,1,2'，或 'all'。")
+
+    # Process one IMS file at a time, then one channel at a time
     print(f"\n开始转换通道 (Starting conversion for channels: {target_channel_indices})...")
     for ims_file in ims_files:
-        for channel_idx in target_channel_indices:
-            process_ims(ims_file, output_dir, channel_idx)
-        
+        if not convert_ims_file(ims_file, output_dir, target_channel_indices):
+            return 1
+
     print("\n所有转换完成! (All done!)")
-    # input("按回车键退出 (Press Enter to exit)...") # Commented out for automated run compatibility if needed
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Stream Imaris IMS from NAS/local path to TIFF slices. Does not copy the IMS file."
+    )
+    parser.add_argument("--input", "-i", help="IMS file or directory containing IMS files")
+    parser.add_argument("--output", "-o", help="Local output directory (writes ch0/, ch1/, ...)")
+    parser.add_argument("--channels", default="all", help="Channel spec: all or 0,1")
+    args = parser.parse_args(argv)
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    if args.input or args.output:
+        if not args.input or not args.output:
+            parser.error("--input and --output are both required in CLI mode")
+        return run_cli(args)
+    return run_interactive()
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

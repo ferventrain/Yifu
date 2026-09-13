@@ -55,6 +55,8 @@ class TestTubuleReconstructionCfg:
         assert cfg.save_skeleton is True
         assert cfg.save_swc is False
         assert cfg.downsample_factor == 4
+        assert cfg.method == "vessel_express"
+        assert cfg.downsample_method == "max_pool"
         assert cfg.process_existing_only is True
         assert cfg.output_dirname == "tubule_reconstruction"
         assert cfg.region_analysis.all_regions is True

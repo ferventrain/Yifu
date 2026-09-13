@@ -236,9 +236,25 @@ class TubuleReconstructionCfg(BaseModel):
         ge=1,
         description=(
             "Isotropic integer downsample factor applied to the binary mask before "
-            "skeletonization (max-pool). 1 = no downsample. Coordinates remain in um."
+            "skeletonization. 1 = no downsample. Coordinates remain in um."
         ),
     )
+    downsample_method: str = Field(
+        "max_pool",
+        description="Mask downsample: max_pool | occupancy | majority (vessel_express path)",
+    )
+    occupancy_threshold: Optional[float] = Field(
+        None,
+        description="Fill fraction for occupancy downsample; null uses 1/factor^2",
+    )
+    method: str = Field(
+        "vessel_express",
+        description="Skeletonizer: vessel_express (Lee + native EDT) or kimimaro (chunkwise TEASAR)",
+    )
+    through_angle_deg: float = Field(150.0, ge=0.0, description="Through-line angle for voxel-kink suppression")
+    kink_align_deg: float = Field(45.0, ge=0.0, description="Drop extra arm if aligned within this angle")
+    fill_holes: bool = Field(False, description="Fill enclosed cavities before vessel_express downsample")
+    max_hole_diameter_um: float = Field(25.0, ge=0.0, description="Max enclosed-hole diameter to fill (um)")
     keep_downsampled_mask: bool = Field(
         False,
         description="If true, keep the intermediate downsampled mask Zarr under the output directory",
@@ -274,6 +290,22 @@ class TubuleReconstructionCfg(BaseModel):
     @classmethod
     def _validate_halo_zyx(cls, value: Any) -> tuple[int, int, int]:
         return _coerce_int_triplet(value)
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def _validate_method(cls, value: Any) -> str:
+        method = str(value or "kimimaro").strip().lower()
+        if method not in {"kimimaro", "vessel_express"}:
+            raise ValueError("method must be kimimaro or vessel_express")
+        return method
+
+    @field_validator("downsample_method", mode="before")
+    @classmethod
+    def _validate_downsample_method(cls, value: Any) -> str:
+        method = str(value or "max_pool").strip().lower()
+        if method not in {"max_pool", "occupancy", "majority"}:
+            raise ValueError("downsample_method must be max_pool, occupancy, or majority")
+        return method
 
 
 def layout_for_sample(

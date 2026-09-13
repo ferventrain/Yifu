@@ -1,0 +1,38 @@
+{
+  "schema_version": "1",
+  "module": "harness",
+  "description": "Local Active-queue runner for main.py with progress.json, ETA from historical step timings, and SampleLayout result listing.",
+  "entrypoints": [
+    {
+      "id": "enqueue_job",
+      "function": "pipeline_modules.harness.queue.ActiveStore.add_job",
+      "cli": "python -m pipeline_modules.harness enqueue --sample-dir \"H:\\arivis-analysis\\<sample>\"",
+      "description": "Validate a sample directory under the analysis root and append it to the Active queue. A running operator UI will start it after the current job.",
+      "inputs": {
+        "sample_dir": { "type": "path", "required": true },
+        "config_path": { "type": "path|null", "default": null, "description": "Defaults to sample_dir/config.json" }
+      },
+      "outputs": {
+        "job": { "type": "object", "description": "Queued job record" }
+      }
+    },
+    {
+      "id": "list_jobs",
+      "function": "pipeline_modules.harness.queue.ActiveStore.list_job_views",
+      "cli": "python -m pipeline_modules.harness list",
+      "description": "List Active jobs with live progress and ETA.",
+      "outputs": {
+        "jobs": { "type": "array" }
+      }
+    },
+    {
+      "id": "serve_harness_ui",
+      "cli": "python -m apps.pipeline_harness --host 127.0.0.1 --port 8766",
+      "description": "Start the local operator UI for the Active queue.",
+      "inputs": {
+        "host": { "type": "string", "default": "127.0.0.1" },
+        "port": { "type": "int", "default": 8766 }
+      }
+    }
+  ]
+}

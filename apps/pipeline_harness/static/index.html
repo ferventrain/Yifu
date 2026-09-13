@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Yifu Pipeline Harness</title>
+  <link rel="stylesheet" href="/styles.css?v=4" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <h1>Yifu 运行监视</h1>
+      <p class="subtitle" id="header-paths">Loading…</p>
+    </div>
+    <div class="header-meta">
+      <span id="runner-status" class="header-status">队列空闲</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="mode-panel">
+      <div class="legend">
+        <span><i class="lamp queued"></i>等待</span>
+        <span><i class="lamp running"></i>运行中</span>
+        <span><i class="lamp failed"></i>报错停止</span>
+        <span><i class="lamp done"></i>完成</span>
+      </div>
+      <div class="toolbar">
+        <form id="add-form" class="add-form">
+          <label>
+            样本目录
+            <input id="sample-dir" type="text" required placeholder="H:\arivis-analysis\sample_name" />
+          </label>
+          <label>
+            config.json
+            <input id="config-path" type="text" placeholder="留空则使用 样本目录\config.json" />
+          </label>
+          <button type="submit" class="btn primary">加入队列</button>
+        </form>
+      </div>
+      <p class="hint">加入后会在当前任务结束后自动开始。报错可点「查看日志」。</p>
+      <p id="form-error" class="error-banner hidden"></p>
+      <div id="job-list" class="job-list"></div>
+    </section>
+  </main>
+
+  <dialog id="log-dialog" class="log-dialog">
+    <div class="log-head">
+      <strong id="log-title">日志</strong>
+      <button type="button" id="log-close" class="btn">关闭</button>
+    </div>
+    <pre id="log-body" class="log-body"></pre>
+  </dialog>
+
+  <script src="/app.js?v=4"></script>
+</body>
+</html>

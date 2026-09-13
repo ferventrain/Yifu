@@ -1,11 +1,13 @@
 {
   "schema_version": "2",
   "module": "tubule_reconstruction",
-  "description": "Vessel / tubule skeleton reconstruction from binary mask Zarr using kimimaro/TEASAR, with optional per-brain-region morphology (branch points, path lengths, tortuosity, volume).",
+  "description": "Vessel / tubule skeleton reconstruction from binary mask Zarr using VesselExpress-style Lee thinning (default) or optional kimimaro/TEASAR, with per-brain-region morphology.",
   "notes_for_agents": [
+    "Default skeletonizer is vessel_express (Lee + native EDT). Set method=kimimaro only if explicitly requested.",
     "save_skeleton=true is REQUIRED for multi-region morphology (branch points, tortuosity, path lengths). Outputs: skeleton_vertices.csv + skeleton_edges.csv.",
     "save_swc is OPTIONAL visualization only (kimimaro view / PyVista). It is NOT required for region stats.",
-    "Default accelerated path: chunkwise + chunk_workers≈8 + dust_threshold=100 + downsample_factor=4 (max-pool) + process_existing_only.",
+    "Default accelerated path: method=vessel_express + downsample_factor=4 (max-pool) + merge 15 um + prune 20 um + keep_downsampled_mask.",
+    "VesselExpress CLI: python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction. Use --estimate first.",
     "For main.py embedding: set tubule_reconstruction.enabled=true and region_analysis.all_regions=true to run segmentation once then export all Allen regions.",
     "Region volume uses the ORIGINAL full-resolution mask; skeleton topology uses the (possibly downsampled) mask. Coordinates stay in microns."
   ],
@@ -15,6 +17,7 @@
     "via_main": {
       "config_keys": {
         "tubule_reconstruction.enabled": true,
+        "tubule_reconstruction.method": "vessel_express",
         "tubule_reconstruction.save_skeleton": true,
         "tubule_reconstruction.save_swc": false,
         "tubule_reconstruction.dust_threshold": 100,
@@ -27,7 +30,7 @@
       "powershell": "micromamba run -n yifu python S:\\Yifu\\main.py --config S:\\Yifu\\config\\config_template.json --sample_dir \"S:\\path\\to\\sample\""
     },
     "standalone_powershell": [
-      "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --chunk_workers 8 --save_skeleton",
+      "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --downsample_method max_pool --workers 8 --keep_downsampled_mask --merge_branch_points_distance_um 15 --prune_spurs_max_length_um 20",
       "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
     ]
   },
@@ -157,6 +160,44 @@
         {
           "description": "Whole-brain all-region morphology after skeletonization",
           "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
+        }
+      ]
+    },
+    {
+      "id": "reconstruct_vessel_express",
+      "function": "pipeline_modules.tubule_reconstruction.vessel_express_reconstruction.reconstruct_vessel_express",
+      "cli": "python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction",
+      "description": "Occupancy-downsample a binary mask, Lee-skeletonize in memory (VesselExpress), and measure radius on the native mask via chunked EDT.",
+      "prerequisites": [
+        "Binary mask Zarr store must exist",
+        "Downsampled uint8 volume must fit in RAM (use --estimate)"
+      ],
+      "inputs": {
+        "mask_zarr_path": {"type": "path", "required": true},
+        "output_dir": {"type": "path", "required": true},
+        "dataset_name": {"type": "string", "default": "0"},
+        "resolution_xyz": {"type": "triplet_float_um", "default": [1.8, 1.8, 2.0]},
+        "downsample_factor": {"type": "int", "default": 4},
+        "downsample_method": {"type": "string", "default": "occupancy", "description": "occupancy | max_pool | majority"},
+        "occupancy_threshold": {"type": "float|null", "default": null, "description": "Fill fraction; null uses 1/factor^2"},
+        "dust_threshold": {"type": "int", "default": 100},
+        "keep_downsampled_mask": {"type": "bool", "default": true},
+        "max_in_memory_voxels": {"type": "int", "default": 8000000000}
+      },
+      "outputs": {
+        "vertex_csv_path": {"type": "path", "description": "skeleton_vertices.csv"},
+        "edge_csv_path": {"type": "path", "description": "skeleton_edges.csv"},
+        "branch_csv_path": {"type": "path", "description": "vessel_branch_metrics.csv"},
+        "summary_json_path": {"type": "path", "description": "vessel_network_summary.json"}
+      },
+      "common_commands": [
+        {
+          "description": "RAM estimate for 4x occupancy downsample",
+          "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction --estimate --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --downsample_factor 4"
+        },
+        {
+          "description": "VesselExpress Lee reconstruction with occupancy downsample and native radii",
+          "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\vessel_express\" --resolution_xyz \"1.8,1.8,2.0\" --downsample_factor 4 --downsample_method occupancy --dust_threshold 100"
         }
       ]
     }

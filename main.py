@@ -10,7 +10,8 @@ sys.path.append(str(project_root))
 PYTHON_EXE = sys.executable
 
 MAIN_PIPELINE_REGISTRATION_MODE = "atlas2image"
-PIPELINE_STEP_COUNT = 5
+PIPELINE_STEP_COUNT = 6
+_PROGRESS = None
 
 
 def print_pipeline_banner(sample_dir, config_path):
@@ -25,14 +26,21 @@ def print_step(step_num, title):
     print(f"\n{'-' * 60}")
     print(f"Step {step_num}/{PIPELINE_STEP_COUNT}: {title}")
     print("-" * 60)
+    if _PROGRESS is not None:
+        _PROGRESS.begin_step(step_num, title)
 
 
 def print_skip(reason):
     print(f"  SKIP: {reason}")
+    if _PROGRESS is not None:
+        _PROGRESS.note(f"SKIP: {reason}")
+        _PROGRESS.mark_current_skipped()
 
 
 def print_note(message):
     print(f"  NOTE: {message}")
+    if _PROGRESS is not None:
+        _PROGRESS.note(message)
 
 
 def run_command(cmd, desc, *, show_command=True):
@@ -550,7 +558,7 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
             f'--save_transforms '
             f'--config "{config_path}"'
         )
-        run_command(cmd, "2.1 ANTs registration (atlas → image)")
+        run_command(cmd, "2.1 ANTs registration (atlas -> image)")
 
     # Ensure label Zarr for downstream modules when requested. Older registration
     # runs may have produced only the TIFF stack.
@@ -633,6 +641,7 @@ def ensure_tubule_reconstruction(
     annotation_zarr_path=None,
     density_cfg_path=None,
     config_path=None,
+    skip_skeleton=False,
 ):
     """Run vessel skeletonization (+ optional whole-brain region morphology).
 
@@ -659,8 +668,38 @@ def ensure_tubule_reconstruction(
 
     halo = ",".join(str(v) for v in cfg.halo_zyx)
     res = ",".join(str(v) for v in resolution_xyz)
+    method = str(getattr(cfg, "method", "vessel_express") or "vessel_express").strip().lower()
 
-    if cfg.chunkwise:
+    if skip_skeleton:
+        print_skip("Skeleton reconstruction skipped (--only_region_analysis); using existing CSVs.")
+    elif method == "vessel_express":
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction '
+            f'--mask_zarr "{mask_zarr_path}" '
+            f'--output_dir "{output_dir}" '
+            f'--dataset_name "{cfg.mask_dataset_name}" '
+            f'--resolution_xyz "{res}" '
+            f'--foreground_label {cfg.foreground_label} '
+            f'--dust_threshold {cfg.dust_threshold} '
+            f'--downsample_factor {cfg.downsample_factor} '
+            f'--downsample_method {cfg.downsample_method} '
+            f'--workers {cfg.chunk_workers} '
+            f'--merge_branch_points_distance_um {cfg.merge_branch_points_distance_um} '
+            f'--prune_spurs_max_length_um {cfg.prune_spurs_max_length_um} '
+            f'--through_angle_deg {cfg.through_angle_deg} '
+            f'--kink_align_deg {cfg.kink_align_deg} '
+            f'--max_in_memory_voxels 8000000000'
+        )
+        if cfg.occupancy_threshold is not None:
+            cmd += f" --occupancy_threshold {cfg.occupancy_threshold}"
+        if cfg.keep_downsampled_mask:
+            cmd += " --keep_downsampled_mask"
+        else:
+            cmd += " --discard_downsampled_mask"
+        if cfg.fill_holes:
+            cmd += f" --fill_holes --max_hole_diameter_um {cfg.max_hole_diameter_um}"
+        run_command(cmd, "6.1 VesselExpress skeleton reconstruction")
+    elif cfg.chunkwise:
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction '
             f'--mask_zarr "{mask_zarr_path}" '
@@ -691,6 +730,7 @@ def ensure_tubule_reconstruction(
             cmd += " --no_stitch"
         if cfg.keep_downsampled_mask:
             cmd += " --keep_downsampled_mask"
+        run_command(cmd, "6.1 Vessel skeleton reconstruction")
     else:
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction '
@@ -716,8 +756,7 @@ def ensure_tubule_reconstruction(
             cmd += " --save_swc"
         if cfg.keep_downsampled_mask:
             cmd += " --keep_downsampled_mask"
-
-    run_command(cmd, "6.1 Vessel skeleton reconstruction")
+        run_command(cmd, "6.1 Vessel skeleton reconstruction")
 
     region_cfg = cfg.region_analysis
     if not region_cfg.enabled:
@@ -920,6 +959,21 @@ def main():
     parser.add_argument("--sample_dir", help="Root directory of the sample")
     parser.add_argument("--test", action="store_true", help="Run in test mode (quick checks only)")
     parser.add_argument("--skip_registration", action="store_true", help="Skip ANTs registration")
+    parser.add_argument(
+        "--only_tubule",
+        action="store_true",
+        help="Skip steps 1-5 and only run vessel reconstruction from existing mask/atlas Zarr",
+    )
+    parser.add_argument(
+        "--only_region_analysis",
+        action="store_true",
+        help="Skip steps 1-5 and skeletonization; run whole-brain region vessel morphology from existing CSVs",
+    )
+    parser.add_argument(
+        "--progress_file",
+        default=None,
+        help="Write structured progress JSON for the pipeline harness UI",
+    )
     args = parser.parse_args()
 
     if args.test:
@@ -945,6 +999,38 @@ def main():
     sample_dir = Path(args.sample_dir)
     print_pipeline_banner(sample_dir, config_path)
 
+    global _PROGRESS
+    if args.progress_file:
+        from pipeline_modules.harness.progress import ProgressWriter, planned_step_names
+
+        step_names = planned_step_names(cfg)
+        _PROGRESS = ProgressWriter(args.progress_file, step_total=len(step_names))
+        _PROGRESS.start_run(
+            sample_dir=str(sample_dir),
+            config_path=str(config_path),
+            step_total=len(step_names),
+        )
+
+    try:
+        _run_pipeline(args, cfg, config_path, sample_dir)
+        if _PROGRESS is not None:
+            from pipeline_modules.harness.results import collect_existing_results
+
+            _PROGRESS.finish(collect_existing_results(sample_dir, cfg))
+    except (KeyboardInterrupt, SystemExit) as exc:
+        failed = not isinstance(exc, SystemExit) or (exc.code not in (0, None))
+        if _PROGRESS is not None and failed:
+            _PROGRESS.fail(str(exc) or type(exc).__name__)
+        raise
+    except Exception as exc:
+        if _PROGRESS is not None:
+            _PROGRESS.fail(f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        _PROGRESS = None
+
+
+def _run_pipeline(args, cfg, config_path, sample_dir):
     signal_ch = cfg["input"]["channels"]["signal"]
     reg_ch = cfg["input"]["channels"]["registration"]
     preprocessing_cfg = cfg["preprocessing"]
@@ -954,6 +1040,47 @@ def main():
     analysis_cfg = cfg["analysis"]
     density_cfg_path = resolve_density_cfg_path(analysis_cfg)
     use_hemisphere_label = bool(analysis_cfg.get("use_hemisphere_label", False))
+
+    if getattr(args, "only_tubule", False) or getattr(args, "only_region_analysis", False):
+        skip_reason = (
+            "only_region_analysis: using existing skeleton CSVs."
+            if getattr(args, "only_region_analysis", False)
+            else "only_tubule: using existing intermediates."
+        )
+        for step_index, title in enumerate(
+            [
+                "Registration channel downsample",
+                "Atlas registration and label outputs",
+                "Signal preprocessing and Zarr conversion",
+                "Segmentation",
+                "Region density analysis",
+            ],
+            start=1,
+        ):
+            print_step(step_index, title)
+            print_skip(skip_reason)
+        mask_zarr_path = sample_dir / f"ch{signal_ch}_mask.zarr"
+        warped_label_zarr = sample_dir / "upsampled_atlas_label.zarr"
+        if not mask_zarr_path.exists():
+            print(f"Error: mask Zarr not found: {mask_zarr_path}")
+            sys.exit(1)
+        print_step(6, "Vessel network reconstruction and region morphology")
+        tubule_cfg = cfg.get("tubule_reconstruction", {})
+        if not tubule_cfg.get("enabled"):
+            print_skip("Tubule reconstruction disabled (tubule_reconstruction.enabled=false).")
+            return
+        ensure_tubule_reconstruction(
+            sample_dir=sample_dir,
+            signal_ch=f"ch{signal_ch}",
+            mask_zarr_path=mask_zarr_path,
+            tubule_cfg=tubule_cfg,
+            input_resolution_xyz=cfg["input"]["resolution_xyz"],
+            annotation_zarr_path=warped_label_zarr if warped_label_zarr.exists() else None,
+            density_cfg_path=density_cfg_path,
+            config_path=config_path,
+            skip_skeleton=bool(getattr(args, "only_region_analysis", False)),
+        )
+        return
 
     print_step(1, "Registration channel downsample")
     ensure_registration_downsample(

@@ -227,3 +227,27 @@ class TestAnalyzeRegionsFromSkeleton:
                 regions="RA",
                 output_dir=None,
             )
+
+
+def test_attach_branch_midpoints_from_endpoint_coords():
+    import pandas as pd
+
+    from pipeline_modules.tubule_reconstruction.region_vessel_analysis import _attach_branch_midpoints
+
+    branches = pd.DataFrame(
+        {
+            "skeleton_id": [0],
+            "source_z_um": [0.0],
+            "source_y_um": [0.0],
+            "source_x_um": [0.0],
+            "target_z_um": [10.0],
+            "target_y_um": [0.0],
+            "target_x_um": [0.0],
+            "length_um": [10.0],
+        }
+    )
+    vertices = pd.DataFrame(columns=["skeleton_id", "node_id", "z_um", "y_um", "x_um"])
+    out = _attach_branch_midpoints(branches, vertices)
+    assert float(out.loc[0, "mid_z_um"]) == 5.0
+    assert "branch_length_um" in out.columns
+    assert abs(float(out.loc[0, "tortuosity"]) - 1.0) < 1e-6
