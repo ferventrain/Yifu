@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 import time
 from scipy import ndimage
-import zarr
 
 from pipeline_modules.qc.grading import grade_qc_results
 from pipeline_modules.qc.image_qc import ImageQcConfig, compute_global_exposure_metrics, compute_image_qc, run_image_qc
@@ -20,6 +19,7 @@ from pipeline_modules.qc.metrics import (
     compute_focus_metrics,
     compute_stripe_metrics,
 )
+from pipeline_modules.utils.zarr_io import write_array
 
 
 def _make_uniform_image(value: float = 1000.0, shape: tuple[int, int] = (512, 512)) -> np.ndarray:
@@ -62,9 +62,7 @@ def _make_sharp_vs_blur_pair(shape: tuple[int, int] = (256, 256)) -> tuple[np.nd
 def _write_zarr(path: Path, array: np.ndarray, *, chunks=None) -> Path:
     if chunks is None:
         chunks = (1, min(array.shape[1], 128), min(array.shape[2], 128))
-    root = zarr.open_group(str(path), mode="w")
-    data = root.create_array("0", shape=array.shape, chunks=chunks, dtype=array.dtype)
-    data[:] = array
+    write_array(path, array, chunks=tuple(chunks))
     return path
 
 

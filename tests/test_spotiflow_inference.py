@@ -7,9 +7,9 @@ from types import ModuleType
 
 import numpy as np
 import pandas as pd
-import zarr
 
 from pipeline_modules.segmentation.spotiflow_inference import run_spotiflow_inference
+from pipeline_modules.utils.zarr_io import write_array
 
 
 class _FakeSpotiflow:
@@ -36,15 +36,13 @@ def test_run_spotiflow_inference_counts_regions(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "spotiflow.model", model_module)
 
     input_zarr = tmp_path / "signal.zarr"
-    root = zarr.group(store=zarr.DirectoryStore(str(input_zarr)), overwrite=True)
-    root.create_dataset("0", data=np.full((4, 4, 4), 101, dtype=np.uint16), chunks=(4, 4, 4))
+    write_array(input_zarr, np.full((4, 4, 4), 101, dtype=np.uint16), chunks=(4, 4, 4))
 
     label_zarr = tmp_path / "labels.zarr"
-    label_root = zarr.group(store=zarr.DirectoryStore(str(label_zarr)), overwrite=True)
     labels = np.zeros((4, 4, 4), dtype=np.uint16)
     labels[1, 1, 1] = 7
     labels[2, 2, 2] = 8
-    label_root.create_dataset("0", data=labels, chunks=(4, 4, 4))
+    write_array(label_zarr, labels, chunks=(4, 4, 4))
 
     cfg = tmp_path / "regions.csv"
     pd.DataFrame(
@@ -97,8 +95,7 @@ def test_run_spotiflow_inference_skips_tiles_below_default_threshold(tmp_path, m
     monkeypatch.setitem(sys.modules, "spotiflow.model", model_module)
 
     input_zarr = tmp_path / "signal.zarr"
-    root = zarr.group(store=zarr.DirectoryStore(str(input_zarr)), overwrite=True)
-    root.create_dataset("0", data=np.full((4, 4, 4), 99, dtype=np.uint16), chunks=(4, 4, 4))
+    write_array(input_zarr, np.full((4, 4, 4), 99, dtype=np.uint16), chunks=(4, 4, 4))
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()

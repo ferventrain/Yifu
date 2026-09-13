@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-import zarr
+
+from pipeline_modules.utils.zarr_io import create_output_zarr
 
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
@@ -27,8 +28,12 @@ def tiny_annotation_zarr(tmp_path):
 
     Labels: voxels in the lower half (z < 4) are 10, upper half are 20.
     """
-    store = zarr.open(str(tmp_path / "annotation.zarr"), mode="w")
-    arr = store.zeros("0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype="int32")
+    _, arr = create_output_zarr(
+        tmp_path / "annotation.zarr",
+        (8, 8, 8),
+        (8, 8, 8),
+        "int32",
+    )
     arr[:4, :, :] = 10
     arr[4:, :, :] = 20
     return tmp_path / "annotation.zarr"
@@ -37,8 +42,12 @@ def tiny_annotation_zarr(tmp_path):
 @pytest.fixture()
 def tiny_mask_zarr(tmp_path):
     """A small binary vessel mask Zarr matching tiny_annotation_zarr."""
-    store = zarr.open(str(tmp_path / "mask.zarr"), mode="w")
-    arr = store.zeros("0", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="uint8")
+    _, arr = create_output_zarr(
+        tmp_path / "mask.zarr",
+        (8, 8, 8),
+        (4, 4, 4),
+        "uint8",
+    )
     arr[1:3, 1:3, 1:3] = 1
     arr[5:7, 1:3, 1:3] = 1
     return tmp_path / "mask.zarr"

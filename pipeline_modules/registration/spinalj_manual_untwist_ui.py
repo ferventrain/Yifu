@@ -36,7 +36,9 @@ def run_formal_register_job(
     direction_y: float = 1.0,
     ants_out_name: str = "ants_out",
     landmarks_json: Path | None = None,
-    landmark_transform_type: str = "similarity",
+    landmark_transform_type: str = "zscale",
+    landmark_moving_z_flip: str = "auto",
+    reg_iterations: tuple[int, ...] | None = None,
 ) -> dict:
     """CLI/worker entry: atlas prep + ANTs registration (no GUI)."""
     import nibabel as nib
@@ -112,6 +114,8 @@ def run_formal_register_job(
         direction_y=direction_y,
         landmarks_json=landmarks_json,
         landmark_transform_type=landmark_transform_type,
+        landmark_moving_z_flip=landmark_moving_z_flip,
+        reg_iterations=reg_iterations,
     )
     payload = {
         "fixed": str(fixed_nii),
@@ -120,6 +124,8 @@ def run_formal_register_job(
         "direction_y": float(direction_y),
         "landmarks_json": str(landmarks_json) if landmarks_json else None,
         "landmark_transform_type": landmark_transform_type if landmarks_json else None,
+        "landmark_moving_z_flip": landmark_moving_z_flip if landmarks_json else None,
+        "reg_iterations": list(reg_iterations) if reg_iterations else None,
         "ants_out": str(ants_out),
         "elapsed_sec": float(time.time() - t0),
         "registration": summary,
@@ -859,9 +865,20 @@ def main() -> None:
     )
     p.add_argument(
         "--landmark_transform_type",
-        default="similarity",
-        choices=("rigid", "similarity", "affine"),
-        help="Linear transform fitted to landmark pairs before ANTs (default similarity)",
+        default="zscale",
+        choices=("zscale", "rigid", "similarity", "affine"),
+        help="Linear transform fitted to landmark pairs before ANTs (default zscale = independent Z scale)",
+    )
+    p.add_argument(
+        "--landmark_moving_z_flip",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="Flip atlas Z to match landmark order (default auto). Use off if rostrocaudal appears reversed.",
+    )
+    p.add_argument(
+        "--reg_iterations",
+        default="",
+        help="SyN iterations coarse,medium,fullres (ANTsPy default 40,20,0 skips full-res). Example: 40,20,20",
     )
     args = p.parse_args()
 
@@ -878,6 +895,12 @@ def main() -> None:
             ants_out_name=str(args.ants_out_name),
             landmarks_json=Path(args.landmarks_json) if args.landmarks_json else None,
             landmark_transform_type=str(args.landmark_transform_type),
+            landmark_moving_z_flip=str(args.landmark_moving_z_flip),
+            reg_iterations=(
+                tuple(int(x.strip()) for x in str(args.reg_iterations).split(","))
+                if str(args.reg_iterations).strip()
+                else None
+            ),
         )
         return
 

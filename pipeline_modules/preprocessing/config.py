@@ -129,6 +129,22 @@ class ClaheCfg(_ModelMixin):
 
 
 @dataclass(frozen=True)
+class SurfaceBrightnessHomogenizeCfg(_ModelMixin):
+    apply: bool = False
+    downsample: int = 8
+    field_sigma_px: float = 64.0
+    alpha: float = 1.0
+    interior_pct: float = 50.0
+    strength: float = 2.0
+    close_iter: int = 0
+    seed_pct: float = 90.0
+    grow_pct: float = 84.0
+    max_grow_px: float = 32.0
+    erode_px: float = 16.0
+    max_workers: int = 0
+
+
+@dataclass(frozen=True)
 class EdgeSignalRemovalCfg(_ModelMixin):
     apply: bool = False
     inward_px: int = 50
@@ -174,6 +190,7 @@ class PreprocessingCfg(_ModelMixin):
     median_filter: MedianFilterCfg = field(default_factory=MedianFilterCfg)
     scattering_removal: ScatteringRemovalCfg = field(default_factory=ScatteringRemovalCfg)
     clahe: ClaheCfg = field(default_factory=ClaheCfg)
+    surface_brightness_homogenize: SurfaceBrightnessHomogenizeCfg = field(default_factory=SurfaceBrightnessHomogenizeCfg)
     edge_signal_removal: EdgeSignalRemovalCfg = field(default_factory=EdgeSignalRemovalCfg)
     downsample: DownsampleCfg = field(default_factory=DownsampleCfg)
     zarr: ZarrCfg = field(default_factory=ZarrCfg)
@@ -186,6 +203,7 @@ class PreprocessingCfg(_ModelMixin):
         object.__setattr__(self, "median_filter", MedianFilterCfg.model_validate(self.median_filter))
         object.__setattr__(self, "scattering_removal", ScatteringRemovalCfg.model_validate(self.scattering_removal))
         object.__setattr__(self, "clahe", ClaheCfg.model_validate(self.clahe))
+        object.__setattr__(self, "surface_brightness_homogenize", SurfaceBrightnessHomogenizeCfg.model_validate(self.surface_brightness_homogenize))
         object.__setattr__(self, "edge_signal_removal", EdgeSignalRemovalCfg.model_validate(self.edge_signal_removal))
         object.__setattr__(self, "downsample", DownsampleCfg.model_validate(self.downsample))
         object.__setattr__(self, "zarr", ZarrCfg.model_validate(self.zarr))
@@ -203,6 +221,7 @@ class PreprocessingCfg(_ModelMixin):
                 "median_filter": {"type": "object"},
                 "scattering_removal": {"type": "object"},
                 "clahe": {"type": "object"},
+                "surface_brightness_homogenize": {"type": "object"},
                 "edge_signal_removal": {"type": "object"},
                 "downsample": {"type": "object"},
                 "zarr": {"type": "object"},

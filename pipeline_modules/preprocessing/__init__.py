@@ -9,6 +9,7 @@ from .config import (
     PreprocessingCfg,
     RollingBallCfg,
     ScatteringRemovalCfg,
+    SurfaceBrightnessHomogenizeCfg,
     TophatCfg,
     ZarrCfg,
     export_json_schema,
@@ -60,6 +61,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional runtime depend
     def remove_edge_signal(*args, **kwargs):  # type: ignore[no-redef]
         raise ModuleNotFoundError(f"edge signal removal support is unavailable: {_edge_import_error}")
 
+def homogenize_surface_brightness(*args, **kwargs):
+    """Lazy wrapper so ``python -m`` on the module is not shadowed by package import."""
+    try:
+        from .surface_brightness_homogenize import homogenize_surface_brightness as _homogenize
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional runtime dependency missing
+        raise ModuleNotFoundError(
+            f"surface brightness homogenize support is unavailable: {exc}"
+        ) from exc
+    return _homogenize(*args, **kwargs)
+
 __all__ = [
     "ChannelSubtractionCfg",
     "ClaheCfg",
@@ -71,6 +82,7 @@ __all__ = [
     "Preprocessor",
     "RollingBallCfg",
     "ScatteringRemovalCfg",
+    "SurfaceBrightnessHomogenizeCfg",
     "TophatCfg",
     "ZarrCfg",
     "apply_processing_steps",
@@ -80,6 +92,7 @@ __all__ = [
     "layout_for_sample",
     "load_capability_manifest",
     "normalize_channel_list",
+    "homogenize_surface_brightness",
     "remove_edge_signal",
     "run_preprocessing",
 ]

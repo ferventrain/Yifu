@@ -76,6 +76,57 @@
       }
     },
     {
+      "id": "homogenize_surface_brightness",
+      "function": "pipeline_modules.preprocessing.surface_brightness_homogenize.homogenize_surface_brightness",
+      "cli": "python -m pipeline_modules.preprocessing.surface_brightness_homogenize",
+      "description": "Equalize regional inner/outer tissue brightness with a log-domain shading field, keeping local highlight structure. Viewing-oriented; not wired into main.py.",
+      "prerequisites": [
+        "Signal TIFF directory must exist and contain TIFF slices"
+      ],
+      "inputs": {
+        "input_dir": { "type": "path", "required": true, "description": "Signal TIFF folder, commonly sample_dir/chX/" },
+        "output_zarr": { "type": "path", "required": false, "description": "Default: <input>_surface_homogenized.zarr beside the input" },
+        "downsample": { "type": "int", "default": 8 },
+        "field_sigma_px": { "type": "float", "default": 64.0 },
+        "strength": { "type": "float", "default": 2.0 },
+        "seed_pct": { "type": "float", "default": 90.0 },
+        "grow_pct": { "type": "float", "default": 84.0 },
+        "max_grow_px": { "type": "float", "default": 32.0 },
+        "erode_px": { "type": "float", "default": 16.0 },
+        "tissue_mask": { "type": "path", "required": false, "description": "Optional manual/SAM tissue mask Zarr or TIFF; skips automatic hysteresis when set" },
+        "target_scale": { "type": "float", "default": 1.0, "description": "Multiply shell I_ref; values below 1 press the surface darker" },
+        "ref_mix": { "type": "float", "default": 0.5, "description": "Shell I_ref mix in log space between observed surface and interior" },
+        "alpha": { "type": "float", "default": 1.0 },
+        "interior_pct": { "type": "float", "default": 50.0 },
+        "chunk_size": { "type": "triplet_int", "default": [32, 256, 256] },
+        "max_workers": { "type": "int", "default": 0 }
+      },
+      "outputs": {
+        "output_zarr": { "type": "dir", "description": "OME-Zarr group with dataset 0 plus 2x pyramid levels 1..N. Open with napari-ome-zarr for 3D." },
+        "qc_zarr": { "type": "dir", "description": "Sibling *_qc.zarr with a single dataset 0 of shape (3, z, y, x): input, tissue mask, normalized downsample" },
+        "manifest_path": { "type": "path", "description": "_run_manifest.json" }
+      }
+    },
+    {
+      "id": "add_resolution_pyramid",
+      "function": "pipeline_modules.preprocessing.zarr_pyramid.add_resolution_pyramid",
+      "cli": "python -m pipeline_modules.preprocessing.zarr_pyramid",
+      "description": "Add 2x OME-NGFF pyramid levels (1, 2, ...) to an existing 3D Zarr group that already has dataset 0. Needed for napari 3D viewing via napari-ome-zarr.",
+      "prerequisites": [
+        "Input must be a Zarr group containing a 3D array named 0"
+      ],
+      "inputs": {
+        "zarr_path": { "type": "path", "required": true },
+        "max_levels": { "type": "int", "default": 5 },
+        "min_size": { "type": "int", "default": 64 },
+        "method": { "type": "string", "default": "mean", "description": "mean for intensity; nearest for integer labels" },
+        "scale_zyx": { "type": "triplet_float", "default": [1.0, 1.0, 1.0], "description": "Full-res voxel size Z,Y,X written into NGFF scale" }
+      },
+      "outputs": {
+        "zarr_path": { "type": "dir", "description": "Same store, now with extra resolution arrays and NGFF multiscales metadata" }
+      }
+    },
+    {
       "id": "remove_edge_signal",
       "function": "pipeline_modules.preprocessing.edge_signal_removal.remove_edge_signal",
       "cli": "python pipeline_modules/preprocessing/edge_signal_removal.py",

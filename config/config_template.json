@@ -44,6 +44,20 @@
             "clip_limit": 2.0,
             "tile_grid_size": 8
         },
+        "surface_brightness_homogenize": {
+            "apply": false,
+            "downsample": 8,
+            "field_sigma_px": 64.0,
+            "alpha": 1.0,
+            "interior_pct": 50.0,
+            "strength": 2.0,
+            "close_iter": 0,
+            "seed_pct": 90.0,
+            "grow_pct": 84.0,
+            "max_grow_px": 32.0,
+            "erode_px": 16.0,
+            "max_workers": 0
+        },
         "edge_signal_removal": {
             "apply": false,
             "inward_px": 50,

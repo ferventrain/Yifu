@@ -136,17 +136,16 @@ def _save_mask(mask: np.ndarray, meta: dict[str, Any], output_path: Path, dtype:
         return str(output_path)
 
     if fmt == "zarr":
-        import zarr
-        from numcodecs import Blosc
+        from pipeline_modules.utils.zarr_io import create_output_zarr
 
-        root = zarr.group(store=zarr.DirectoryStore(str(output_path)), overwrite=True)
-        root.create_dataset(
-            "0",
+        chunks = mask.shape if all(v <= 256 for v in mask.shape) else (64, 128, 128)
+        create_output_zarr(
+            output_path,
+            mask.shape,
+            chunks,
+            mask.dtype,
             data=mask,
-            chunks=mask.shape if all(v <= 256 for v in mask.shape) else (64, 128, 128),
-            compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
         )
-        root.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}]}]
         return str(output_path)
 
     raise ValueError(f"Unsupported output format: {fmt}")

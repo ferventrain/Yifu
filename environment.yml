@@ -57,7 +57,7 @@ dependencies:
 
   # --- medical / volume IO ---
   - simpleitk
-  - zarr<3
+  - zarr>=3.1
   - numcodecs
   - nibabel
 
@@ -100,6 +100,7 @@ dependencies:
       - roifile
       - fill-voids
       - natsort
+      - napari-ome-zarr>=0.10
 
       # tubule reconstruction (kimimaro / TEASAR)
       - kimimaro

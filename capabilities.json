@@ -13,7 +13,9 @@
         "pipeline_modules/preprocessing/preprocessor.py",
         "pipeline_modules/preprocessing/tiff_to_zarr.py",
         "pipeline_modules/preprocessing/downsample.py",
-        "pipeline_modules/preprocessing/edge_signal_removal.py"
+        "pipeline_modules/preprocessing/edge_signal_removal.py",
+        "pipeline_modules/preprocessing/surface_brightness_homogenize.py",
+        "pipeline_modules/preprocessing/zarr_pyramid.py"
       ],
       "python_package": "pipeline_modules.preprocessing",
       "config_models": {

@@ -4,9 +4,9 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
-import zarr
 
 from pipeline_modules.segmentation.zarr_utils import export_zarr_to_tiff
+from pipeline_modules.utils.zarr_io import write_array
 
 
 class ExportZarrToTiffBatchTests(unittest.TestCase):
@@ -16,9 +16,8 @@ class ExportZarrToTiffBatchTests(unittest.TestCase):
             zarr_path = root / "mask.zarr"
             out_dir = root / "mask_tiff"
 
-            store = zarr.open(str(zarr_path), mode="w")
             data = np.arange(24, dtype=np.uint16).reshape(3, 2, 4)
-            store[:] = data
+            write_array(zarr_path, data)
 
             export_zarr_to_tiff(
                 zarr_path,

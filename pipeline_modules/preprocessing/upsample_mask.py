@@ -1,8 +1,9 @@
 import argparse
 import numpy as np
-import zarr
 from scipy import ndimage
 from tqdm import tqdm
+
+from pipeline_modules.utils.zarr_io import array_compressor, create_output_zarr, open_zarr_array
 
 
 def upsample_mask(input_mask_zarr, output_mask_zarr, full_res_zarr, chunk_size=(128, 256, 256)):
@@ -15,18 +16,10 @@ def upsample_mask(input_mask_zarr, output_mask_zarr, full_res_zarr, chunk_size=(
         chunk_size: Output chunk size
     """
     print(f"Loading downsampled mask: {input_mask_zarr}")
-    ds_mask_z = zarr.open(input_mask_zarr, mode='r')
-    if isinstance(ds_mask_z, zarr.Group) and '0' in ds_mask_z:
-        ds_mask = ds_mask_z['0']
-    else:
-        ds_mask = ds_mask_z
+    ds_mask = open_zarr_array(input_mask_zarr)
     
     print(f"Loading full resolution zarr: {full_res_zarr}")
-    full_z = zarr.open(full_res_zarr, mode='r')
-    if isinstance(full_z, zarr.Group) and '0' in full_z:
-        full_data = full_z['0']
-    else:
-        full_data = full_z
+    full_data = open_zarr_array(full_res_zarr)
     
     full_shape = full_data.shape
     ds_shape = ds_mask.shape
@@ -38,15 +31,12 @@ def upsample_mask(input_mask_zarr, output_mask_zarr, full_res_zarr, chunk_size=(
     print(f"Zoom factors: {zoom_factors}")
     
     print("Creating output zarr...")
-    store = zarr.DirectoryStore(str(output_mask_zarr))
-    root = zarr.group(store=store, overwrite=True)
-    
-    out = root.create_dataset(
-        '0',
-        shape=full_shape,
-        chunks=chunk_size,
-        dtype=ds_mask.dtype,
-        compressor=ds_mask.compressor
+    _, out = create_output_zarr(
+        output_mask_zarr,
+        full_shape,
+        chunk_size,
+        ds_mask.dtype,
+        compressor=array_compressor(ds_mask) or "default",
     )
     
     print("Upsampling by chunk...")

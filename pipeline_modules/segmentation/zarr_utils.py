@@ -13,6 +13,11 @@ from pipeline_modules.utils.tiff_stack_io import (
     run_bounded_batches,
     write_tiff_stack_batch,
 )
+from pipeline_modules.utils.zarr_io import (
+    create_output_zarr as _create_output_zarr,
+    list_existing_chunk_indices as _list_existing_chunk_indices,
+    open_zarr_array,
+)
 
 _DATASET_CACHE: dict[str, Any] = {}
 
@@ -31,68 +36,24 @@ def _require_zarr_stack():
 
 
 def open_zarr_dataset(path_like, dataset_name: str = "0"):
-    _, _, zarr, _ = _require_zarr_stack()
-    path = Path(path_like)
-    if not path.exists():
-        raise FileNotFoundError(f"Zarr path not found: {path}")
-
-    root = zarr.open(str(path), mode="r")
-    if isinstance(root, zarr.Array):
-        return root
-    if dataset_name in root and isinstance(root[dataset_name], zarr.Array):
-        return root[dataset_name]
-
-    array_keys = list(root.array_keys())
-    if len(array_keys) == 1:
-        return root[array_keys[0]]
-
-    raise ValueError(
-        f"Could not resolve a Zarr array from {path}. "
-        f"Available arrays: {array_keys}, requested dataset_name={dataset_name}"
-    )
+    _require_zarr_stack()
+    return open_zarr_array(path_like, dataset_name=dataset_name)
 
 
 def create_output_zarr(output_zarr, shape, chunks, dtype, *, dataset_name: str = "0", compressor="default"):
-    _, _, zarr, Blosc = _require_zarr_stack()
-    output_path = Path(output_zarr)
-    store_out = zarr.DirectoryStore(str(output_path))
-    root_out = zarr.group(store=store_out, overwrite=True)
-    if compressor == "default":
-        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
-    data_out = root_out.create_dataset(dataset_name, shape=shape, chunks=chunks, dtype=dtype, compressor=compressor)
-    root_out.attrs["multiscales"] = [{
-        "version": "0.4",
-        "datasets": [{"path": dataset_name}],
-    }]
-    return root_out, data_out
+    _require_zarr_stack()
+    return _create_output_zarr(
+        output_zarr,
+        shape,
+        chunks,
+        dtype,
+        dataset_name=dataset_name,
+        compressor=compressor,
+    )
 
 
 def list_existing_chunk_indices(data_in):
-    store = data_in.store
-    array_path = getattr(data_in, "path", "")
-    dim_sep = getattr(data_in, "_dimension_separator", ".")
-    ndim = len(data_in.shape)
-
-    prefix = f"{array_path}/" if array_path else ""
-    existing = set()
-    for raw_key in store.keys():
-        key = str(raw_key)
-        if prefix and not key.startswith(prefix):
-            continue
-        rel = key[len(prefix):] if prefix else key
-        if rel in {".zarray", ".zattrs", ".zgroup", "zarr.json"}:
-            continue
-        if rel.startswith("."):
-            continue
-        parts = rel.split(dim_sep)
-        if len(parts) != ndim:
-            continue
-        try:
-            idx = tuple(int(part) for part in parts)
-        except ValueError:
-            continue
-        existing.add(idx)
-    return sorted(existing)
+    return _list_existing_chunk_indices(data_in)
 
 
 def _get_cached_dataset(input_zarr: str, dataset_name: str):

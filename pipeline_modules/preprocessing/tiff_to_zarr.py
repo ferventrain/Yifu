@@ -118,27 +118,21 @@ def resolve_max_in_flight(
 
 
 def resolve_compressor(compressor: Any) -> Any | None:
-    if compressor is None or compressor == "none":
-        return None
-    if compressor == "default":
-        from numcodecs import Blosc
-
-        return Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
-    if compressor == "fast":
-        from numcodecs import Blosc
-
-        return Blosc(cname="lz4", clevel=1, shuffle=Blosc.SHUFFLE)
-    return compressor
+    try:
+        from pipeline_modules.utils.zarr_io import resolve_compressor as _resolve_compressor
+    except ImportError:  # pragma: no cover
+        from ..utils.zarr_io import resolve_compressor as _resolve_compressor
+    return _resolve_compressor(compressor)
 
 
 def _open_output_group(zarr_mod: Any, output_path: Path) -> Any:
-    """Create an empty Zarr group compatible with both zarr v2 and v3."""
-    if hasattr(zarr_mod, "DirectoryStore"):
-        store = zarr_mod.DirectoryStore(str(output_path))
-        return zarr_mod.group(store=store, overwrite=True)
-    # zarr>=3 removed DirectoryStore / create_dataset; keep format-2 on-disk layout
-    # so the rest of the pipeline can still open the result.
-    return zarr_mod.open_group(str(output_path), mode="w", zarr_format=2)
+    """Create an empty Zarr group, writing Zarr v2 on-disk layout."""
+    del zarr_mod
+    try:
+        from pipeline_modules.utils.zarr_io import open_output_group
+    except ImportError:  # pragma: no cover
+        from ..utils.zarr_io import open_output_group
+    return open_output_group(output_path, overwrite=True)
 
 
 def _create_array(
@@ -150,20 +144,17 @@ def _create_array(
     dtype: Any,
     compressor: Any,
 ) -> Any:
-    if hasattr(root, "create_dataset"):
-        return root.create_dataset(
-            dataset_name,
-            shape=shape,
-            chunks=chunks,
-            dtype=dtype,
-            compressor=compressor,
-        )
-    return root.create_array(
+    try:
+        from pipeline_modules.utils.zarr_io import create_array
+    except ImportError:  # pragma: no cover
+        from ..utils.zarr_io import create_array
+    return create_array(
+        root,
         dataset_name,
         shape=shape,
         chunks=chunks,
         dtype=dtype,
-        compressors=compressor,
+        compressor=compressor,
     )
 
 

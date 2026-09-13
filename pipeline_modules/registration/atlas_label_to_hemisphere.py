@@ -80,57 +80,45 @@ def _list_tiff_stack(input_dir: Path) -> list[Path]:
 
 def _open_zarr_dataset(path_like: Path, dataset_name: str):
     try:
-        import zarr
+        from pipeline_modules.utils.zarr_io import open_zarr_array
+    except ImportError:  # pragma: no cover
+        from ..utils.zarr_io import open_zarr_array
+    try:
+        return open_zarr_array(path_like, dataset_name=dataset_name)
     except ModuleNotFoundError as exc:
         raise PipelineError(
             ErrorCode.DEPENDENCY_MISSING,
             "zarr is required for hemisphere-label conversion",
             {"dependency": "zarr", "error": str(exc)},
         ) from exc
-
-    root = zarr.open(str(path_like), mode="r")
-    if isinstance(root, zarr.Array):
-        return root
-    if dataset_name in root:
-        dataset = root[dataset_name]
-        if isinstance(dataset, zarr.Array):
-            return dataset
-    array_keys = list(root.array_keys())
-    if len(array_keys) == 1:
-        return root[array_keys[0]]
-    raise PipelineError(
-        ErrorCode.ARGUMENT_INVALID,
-        "Could not resolve a Zarr array from input",
-        {"input": str(path_like), "dataset_name": dataset_name, "available_arrays": array_keys},
-    )
+    except (FileNotFoundError, ValueError) as exc:
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "Could not resolve a Zarr array from input",
+            {"input": str(path_like), "dataset_name": dataset_name, "error": str(exc)},
+        ) from exc
 
 
 def _create_output_dataset(output_path: Path, dataset_name: str, shape, chunk_size, compressor):
     try:
-        import zarr
-        from numcodecs import Blosc
+        from pipeline_modules.utils.zarr_io import create_output_zarr
+    except ImportError:  # pragma: no cover
+        from ..utils.zarr_io import create_output_zarr
+    try:
+        root, dataset = create_output_zarr(
+            output_path,
+            shape,
+            chunk_size,
+            np.uint8,
+            dataset_name=dataset_name,
+            compressor=compressor,
+        )
     except ModuleNotFoundError as exc:
         raise PipelineError(
             ErrorCode.DEPENDENCY_MISSING,
             "zarr and numcodecs are required for hemisphere-label conversion",
             {"dependency": "zarr/numcodecs", "error": str(exc)},
         ) from exc
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    store = zarr.DirectoryStore(str(output_path))
-    root = zarr.group(store=store, overwrite=True)
-    if compressor == "none":
-        compressor = None
-    elif compressor == "default":
-        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
-
-    dataset = root.create_dataset(
-        dataset_name,
-        shape=shape,
-        chunks=chunk_size,
-        dtype=np.uint8,
-        compressor=compressor,
-    )
     root.attrs["labels"] = {"0": "background", "1": "left", "2": "right"}
     return root, dataset
 

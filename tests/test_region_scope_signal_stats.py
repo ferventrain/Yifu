@@ -4,8 +4,8 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
-import zarr
 
+from pipeline_modules.utils.zarr_io import write_array
 from pipeline_modules.visualization.region_scope_signal_stats import compute_region_scope_signal_stats
 
 
@@ -17,9 +17,9 @@ class RegionScopeSignalStatsTests(unittest.TestCase):
             label_path = root / "label.zarr"
             signal_path = root / "signal.zarr"
 
-            mask = zarr.open(str(mask_path), mode="w", shape=(2, 4, 4), chunks=(1, 4, 4), dtype=np.uint8)
-            label = zarr.open(str(label_path), mode="w", shape=(2, 4, 4), chunks=(1, 4, 4), dtype=np.uint16)
-            signal = zarr.open(str(signal_path), mode="w", shape=(2, 4, 4), chunks=(1, 4, 4), dtype=np.uint16)
+            mask = write_array(mask_path, np.zeros((2, 4, 4), dtype=np.uint8), chunks=(1, 4, 4))
+            label = write_array(label_path, np.zeros((2, 4, 4), dtype=np.uint16), chunks=(1, 4, 4))
+            signal = write_array(signal_path, np.zeros((2, 4, 4), dtype=np.uint16), chunks=(1, 4, 4))
 
             mask[:] = 0
             label[:] = 0

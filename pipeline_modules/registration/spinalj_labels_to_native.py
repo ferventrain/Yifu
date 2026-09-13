@@ -521,6 +521,7 @@ def run_wizard_backproject(
     zarr_mode: str = "segments",
     full_native: bool = False,
     zarr_chunks: tuple[int, int, int] = (64, 256, 256),
+    ants_out_name: str = "ants_out",
 ) -> dict:
     import nibabel as nib
 
@@ -529,8 +530,9 @@ def run_wizard_backproject(
     wizard_dir = Path(wizard_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    ants_out = wizard_dir / ants_out_name
 
-    reg_summary = json.loads((wizard_dir / "ants_out" / "registration_summary.json").read_text(encoding="utf-8"))
+    reg_summary = json.loads((ants_out / "registration_summary.json").read_text(encoding="utf-8"))
     flip_meta = json.loads((wizard_dir / "straightened" / "flip_meta.json").read_text(encoding="utf-8"))
     straighten_meta = json.loads((wizard_dir / "straightened" / "straighten_meta.json").read_text(encoding="utf-8"))
     centerline = load_centerline_csv(wizard_dir / "centerline_zyx.csv")
@@ -548,6 +550,10 @@ def run_wizard_backproject(
     template_work = wizard_dir / "reg_work" / "Template_work.nii.gz"
     logger.info("Building segment volume from %s ...", segments_csv)
     seg_xyz, seg_aff = build_segment_volume_xyz(template_work, z_ids)
+    lm = reg_summary.get("landmarks") or {}
+    if bool(lm.get("moving_z_flipped")):
+        logger.info("Registration used Z-flipped atlas; flipping segment/annotation moving volumes along Z")
+        seg_xyz = np.ascontiguousarray(seg_xyz[:, :, ::-1])
     seg_moving_path = out_dir / "segments_atlas_work.nii.gz"
     nib.save(nib.Nifti1Image(seg_xyz, seg_aff), str(seg_moving_path))
 
@@ -608,7 +614,7 @@ def run_wizard_backproject(
     ann_sample = None
     sample_ann_path = None
     if zarr_mode in ("annotation", "both"):
-        warped_ann = wizard_dir / "ants_out" / "warped_annotation.nii.gz"
+        warped_ann = ants_out / "warped_annotation.nii.gz"
         if not warped_ann.exists():
             raise FileNotFoundError(f"Missing {warped_ann}")
         logger.info("Unstraighten annotation from %s ...", warped_ann)
@@ -764,6 +770,11 @@ def main() -> None:
     )
     p.add_argument("--zarr_chunks", default="64,256,256", help="Zarr chunks Z,Y,X")
     p.add_argument(
+        "--ants_out_name",
+        default="ants_out",
+        help="Registration output folder under wizard_dir (default ants_out; use ants_out_landmarks for the landmark trial)",
+    )
+    p.add_argument(
         "--reuse_sample_labels",
         action="store_true",
         help="Reuse existing segments/annotation NIfTI in out_dir (skip ANTs/unstraighten)",
@@ -804,6 +815,7 @@ def main() -> None:
         zarr_mode=args.zarr_mode,
         full_native=bool(args.full_native),
         zarr_chunks=chunks,
+        ants_out_name=str(args.ants_out_name),
     )
 
 
