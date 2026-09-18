@@ -165,24 +165,27 @@ def step3_registration_nii(
     log_path: Path,
     keep_coarse: bool,
 ) -> None:
-    if marker_path(reg_nii).exists():
-        log("Step 3 already complete (marker present), skipping")
-        return
-    res_xyz = [float(v) for v in config["input"]["resolution_xyz"]]
-    level2_xyz = [v * PYRAMID_LEVEL_STRIDE for v in res_xyz]
-    run_step(
-        [
-            PYTHON, "-m", "pipeline_modules.preprocessing.zarr_to_registration_nii",
-            "--input_zarr", coarse_zarr,
-            "--output_nii", reg_nii,
-            "--input_resolution_xyz", ",".join(f"{v:.4f}" for v in level2_xyz),
-            "--target_resolution_xyz", ",".join(
-                f"{float(v):.1f}" for v in config["preprocessing"]["downsample"]["target_resolution_xyz"]
-            ),
-        ],
-        "Zarr->NIfTI",
-        log_path,
-    )
+    if marker_path(reg_nii).exists() or reg_nii.exists():
+        # Marker missing but output present = the driver was killed between
+        # module completion and marker write; the module refuses to overwrite,
+        # so adopt the finished volume instead of rerunning.
+        log("Step 3 output already present, adopting")
+    else:
+        res_xyz = [float(v) for v in config["input"]["resolution_xyz"]]
+        level2_xyz = [v * PYRAMID_LEVEL_STRIDE for v in res_xyz]
+        run_step(
+            [
+                PYTHON, "-m", "pipeline_modules.preprocessing.zarr_to_registration_nii",
+                "--input_zarr", coarse_zarr,
+                "--output_nii", reg_nii,
+                "--input_resolution_xyz", ",".join(f"{v:.4f}" for v in level2_xyz),
+                "--target_resolution_xyz", ",".join(
+                    f"{float(v):.1f}" for v in config["preprocessing"]["downsample"]["target_resolution_xyz"]
+                ),
+            ],
+            "Zarr->NIfTI",
+            log_path,
+        )
     marker_path(reg_nii).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
     if not keep_coarse:
         shutil.rmtree(coarse_zarr, ignore_errors=True)
@@ -273,7 +276,13 @@ def main() -> int:
         print(__doc__)
         return 2
     sample = args[0]
-    sample_dir, ims_path = find_sample(sample)
+    try:
+        sample_dir, ims_path = find_sample(sample)
+    except Exception:
+        # No per-sample log yet (it lives in the sample dir); the traceback
+        # goes to the orchestrator's queue log instead of being lost.
+        traceback.print_exc()
+        return 1
     config_path = sample_dir / "config.json"
     status_path = sample_dir / "vessel_pipeline.status.txt"
     log_path = sample_dir / "vessel_pipeline.log"

@@ -20,6 +20,7 @@ from pathlib import Path
 
 REPO = Path(r"S:\Yifu")
 BATCH_DIR = Path(r"S:\Arivis_Analysis\_active\YF2025063002")
+NAS_ROOT = Path(r"//192.168.110.4/Yifu/YF2025063002")
 QUEUE_LOG = BATCH_DIR / "vessel_queue.log"
 DRIVER = REPO / "_run_YF2025063002_vessel.py"
 SAMPLES = ["MPTP_1", "MPTP_2", "SEBL_1", "SEBL_2", "PBS_1", "PBS_2"]
@@ -48,7 +49,10 @@ def wait_until_idle() -> None:
 
     store = ActiveStore()
     while True:
-        running = [job for job in store.list_jobs() if str(job.get("status")) == "running"]
+        running = [
+            job for job in store.list_job_views()  # job_view syncs external status
+            if str(job.get("status")) == "running"
+        ]
         if not running:
             return
         names = ", ".join(str(job.get("title") or job.get("id")) for job in running)
@@ -56,22 +60,49 @@ def wait_until_idle() -> None:
         time.sleep(60)
 
 
-def main() -> int:
-    log(f"=== YF2025063002 vessel queue start, samples={SAMPLES} ===")
+def wait_for_nas() -> None:
+    """Block until the NAS share answers again (a drop killed a whole pass once)."""
+    while True:
+        try:
+            if any(NAS_ROOT.glob("*_Destripe_DONE")):
+                return
+        except OSError:
+            pass
+        log("NAS unreachable; waiting 60 s")
+        time.sleep(60)
+
+
+def run_pass(samples: list[str]) -> dict[str, int]:
     results: dict[str, int] = {}
-    for index, sample in enumerate(SAMPLES, start=1):
+    for index, sample in enumerate(samples, start=1):
         wait_until_idle()
-        log(f"({index}/{len(SAMPLES)}) launching {sample}")
+        wait_for_nas()
+        log(f"({index}/{len(samples)}) launching {sample}")
         proc = subprocess.run(
             [sys.executable, str(DRIVER), sample],
             cwd=str(REPO),
         )
         results[sample] = proc.returncode
-        log(f"({index}/{len(SAMPLES)}) {sample} driver exited with code {proc.returncode}")
+        log(f"({index}/{len(samples)}) {sample} driver exited with code {proc.returncode}")
         time.sleep(15)
+    return results
+
+
+def main() -> int:
+    log(f"=== YF2025063002 vessel queue start, samples={SAMPLES} ===")
+    results: dict[str, int] = {}
+    pending = list(SAMPLES)
+    for round_number in range(1, 4):  # transient killer events: retry failed samples up to 3 passes
+        pass_results = run_pass(pending)
+        results.update(pass_results)
+        pending = [name for name, code in pass_results.items() if code != 0]
+        if not pending:
+            break
+        log(f"pass {round_number} finished with failures: {', '.join(pending)}; retrying in 5 min")
+        time.sleep(300)
 
     failed = [name for name, code in results.items() if code != 0]
-    log(f"=== queue finished: {len(results) - len(failed)}/{len(results)} ok"
+    log(f"=== queue finished: {len(SAMPLES) - len(failed)}/{len(SAMPLES)} ok"
         + (f", failed: {', '.join(failed)}" if failed else "") + " ===")
     return 1 if failed else 0
 
