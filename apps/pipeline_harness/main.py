@@ -1,4 +1,4 @@
-"""Local operator UI for the LSFM pipeline harness."""
+"""Pipeline Monitor (PM): local watch UI for the LSFM pipeline queue."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ class NoCacheStaticFiles(StarletteStaticFiles):
         return response
 
 
-app = FastAPI(title="Yifu Pipeline Harness", version="1.0")
+app = FastAPI(title="Yifu Pipeline Monitor (PM)", version="1.1")
 
 
 class AddJobBody(BaseModel):

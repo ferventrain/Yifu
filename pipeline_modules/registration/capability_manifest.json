@@ -1,16 +1,27 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "module": "registration",
-  "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
+  "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, hemisphere (Left/Right) label generation, and Zarr-native block-graph region signal analysis.",
+  "production_policy": {
+    "id": "no-tiff-imaris-direct",
+    "updated": "2026-09-18",
+    "rules": [
+      "Production samples are Imaris .ims sources: prepare inputs with pipeline_modules.preprocessing.ims_to_zarr and zarr_to_registration_nii instead of TIFF folders, then let main.py skip its TIFF-native steps (see preprocessing manifest production_policy).",
+      "sample_dir/original_shape.json (full-res z,y,x of the signal grid) must exist when no chX/ TIFF folder does: ANTs_registration uses it to upsample the warped label back to the signal grid.",
+      "save_upsampled_label=false and segmentation.export_mask_tiff=false by default in production configs; upsampled_atlas_label.zarr (+ atlas_label_hemisphere.zarr) is the label deliverable. The module still writes the label TIFF transiently and removes it after zarr conversion.",
+      "Preprocessing/enhancement stays OFF (preprocessing.*.apply=false) so intensity thresholds mean the same thing in every sample."
+    ]
+  },
   "entrypoints": [
     {
       "id": "run_full_pipeline",
       "function": "pipeline_modules.registration.ANTs_registration.BidirectionalRegistration.run_full_pipeline",
       "cli": "python pipeline_modules/registration/ANTs_registration.py",
-      "description": "Run ANTs registration (atlas2image or image2atlas), save warped labels, and optionally save transforms and registered image.",
+      "description": "Run ANTs registration (atlas2image or image2atlas), save warped labels, and optionally save transforms and registered image. Writes upsampled_atlas_label.zarr and (when configured) atlas_label_hemisphere.zarr natively; the label TIFF stack is a transient intermediate removed when registration.save_upsampled_label=false.",
       "prerequisites": [
-        "Downsampled registration-channel NIfTI must exist at SampleLayout.reg_downsample_nii",
-        "Allen atlas template + annotation NIfTI must be available"
+        "Downsampled registration-channel NIfTI must exist at SampleLayout.reg_downsample_nii (build it from an ims pyramid level via zarr_to_registration_nii; no TIFF folder required)",
+        "Allen atlas template + annotation NIfTI must be available",
+        "For label upsampling without TIFF folders: sample_dir/original_shape.json with the full-res signal (z,y,x) shape"
       ],
       "inputs": {
         "sample_dir":          {"type": "path", "required": true, "description": "Sample root directory"},
@@ -22,9 +33,9 @@
         "registration_type":   {"type": "string", "default": "SyN", "choices": ["Rigid", "Affine", "SyN", "SyNRA"]},
         "save_registered_image": {"type": "bool", "default": false},
         "save_transforms":     {"type": "bool", "default": false},
-        "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack"},
-        "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr"},
-        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr. Required when analysis.use_hemisphere_label=true in main.py config."},
+        "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack. Production default false: transient intermediate, removed after zarr conversion"},
+        "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr (the label deliverable)"},
+        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr (0=background, 1=left, 2=right). Required when analysis.use_hemisphere_label=true in main.py config for bilateral L/R statistics"},
         "config":              {"type": "path|null", "default": null, "description": "Path to main config.json for resolution info"},
         "density_cfg":         {"type": "path|null", "default": null}
       },
@@ -47,6 +58,10 @@
         "Mask Zarr, label Zarr, and signal Zarr must exist and share the same shape",
         "Allen region CSV must be available",
         "For left/right stats, provide --hemisphere_zarr or enable registration.save_upsampled_label_hemisphere_zarr plus analysis.use_hemisphere_label in config.json. Each connected signal object is assigned to the brain region and hemisphere where it has the most voxels (ties go to the smaller region id and to Left)."
+      ],
+      "semantics_notes": [
+        "Left/Right Signal Voxels and Left/Right Voxel Density are direct voxel-level counts (mask x region x hemisphere) and are valid for ANY mask, including whole-brain connected vascular networks.",
+        "Signal Count is connected-object based: meaningful for punctate/cell signals, meaningless for vessel networks that form one brain-spanning object. For vessels, report density columns only."
       ],
       "inputs": {
         "mask_zarr_path":       {"type": "path", "required": true},

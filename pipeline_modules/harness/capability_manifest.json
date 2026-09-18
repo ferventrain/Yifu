@@ -1,38 +1,86 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "module": "harness",
-  "description": "Local Active-queue runner for main.py with progress.json, ETA from historical step timings, and SampleLayout result listing.",
+  "product_name": "Pipeline Monitor (PM)",
+  "description": "Pipeline Monitor (PM, 简称 PM) is the local pipeline-watching GUI for the Yifu pipeline: a FastAPI app (default http://127.0.0.1:8766) over a file-backed serial job queue under YIFU_ANALYSIS_ROOT/_active. Agents enqueue or attach runs here; operators watch progress, ETA and logs in the browser.",
+  "production_policy": {
+    "id": "no-tiff-imaris-direct",
+    "updated": "2026-09-18",
+    "rules": [
+      "Whole-brain production runs must avoid TIFF intermediates: stream Imaris .ims directly with pipeline_modules.preprocessing.ims_to_zarr and pre-create the inputs main.py skips on (ch<signal>.zarr, ch<reg>_downsample/volume.nii.gz, sample_dir/original_shape.json). See pipeline_modules/preprocessing/capability_manifest.json.",
+      "Preprocessing/enhancement is OFF by default in production configs (every preprocessing.*.apply=false) so segmentation thresholds operate on raw stored intensities and stay comparable across samples and batches.",
+      "Custom multi-step flows that main.py cannot express (e.g. ims->zarr->segmentation->masked ims) are launched as driver scripts and attached to PM via ActiveStore.attach_external, never by hand-editing queue files.",
+      "One job runs at a time. To wait for the current run, poll ActiveStore.has_running() or GET /api/jobs; never launch heavy pipelines outside PM while a job is running."
+    ]
+  },
   "entrypoints": [
     {
       "id": "enqueue_job",
       "function": "pipeline_modules.harness.queue.ActiveStore.add_job",
-      "cli": "python -m pipeline_modules.harness enqueue --sample-dir \"H:\\arivis-analysis\\<sample>\"",
-      "description": "Validate a sample directory under the analysis root and append it to the Active queue. A running operator UI will start it after the current job.",
+      "cli": "python -m pipeline_modules.harness enqueue --sample-dir \"S:\\Arivis_Analysis\\_active\\<sample>\"",
+      "description": "Validate a sample directory under the analysis root (S:\\Arivis_Analysis) and append a kind=main job to the PM queue. config.json must exist in the sample dir (or pass config_path). The runner picks it up automatically: the GUI polls GET /api/jobs -> runner.maybe_start(), so a queued job starts as soon as nothing else is running and the browser/UI is open (or immediately after a POST /api/jobs).",
       "inputs": {
-        "sample_dir": { "type": "path", "required": true },
+        "sample_dir": { "type": "path", "required": true, "description": "Must be a subdirectory of the analysis root, not the _active/jobs|runs bookkeeping folders" },
         "config_path": { "type": "path|null", "default": null, "description": "Defaults to sample_dir/config.json" }
       },
       "outputs": {
-        "job": { "type": "object", "description": "Queued job record" }
+        "job": { "type": "object", "description": "Queued job record (id = <utcstamp>-<sample-slug>)" }
+      }
+    },
+    {
+      "id": "attach_external_job",
+      "function": "pipeline_modules.harness.queue.ActiveStore.attach_external",
+      "description": "Track an already-running custom driver as a PM job. Call this at driver start (see _run_YF2025063002_vessel.py for the reference implementation). PM derives status from the status file's FIRST line: RUNNING ... / ALL DONE / FAILED ... / CANCELLED, with 'Step <n>' parsed for the step display; write the ISO start time on line 2. Re-running attach_external on the same sample_dir updates the existing record instead of duplicating it.",
+      "inputs": {
+        "sample_dir": { "type": "path", "required": true },
+        "title": { "type": "string", "required": true },
+        "pid": { "type": "int|null", "default": null, "description": "Driver process id; PM marks the job failed if the pid dies while the status line still says RUNNING" },
+        "log_path": { "type": "path", "required": true, "description": "Driver log file shown in the PM log view" },
+        "status_path": { "type": "path", "required": true, "description": "Two-line status file: first line = <STATE> [Step n: description], second line = started_at ISO" },
+        "config_path": { "type": "path|null", "default": null },
+        "command": { "type": "string", "default": "", "description": "Short step chain description" },
+        "step_total": { "type": "int", "default": 7 }
+      },
+      "outputs": {
+        "job": { "type": "object", "description": "Synced external job record visible in PM" }
       }
     },
     {
       "id": "list_jobs",
       "function": "pipeline_modules.harness.queue.ActiveStore.list_job_views",
       "cli": "python -m pipeline_modules.harness list",
-      "description": "List Active jobs with live progress and ETA.",
+      "description": "List PM jobs with live progress, ETA (from historical step timings) and SampleLayout result listing. REST equivalent: GET http://127.0.0.1:8766/api/jobs (this call also triggers runner.maybe_start(), i.e. opening the PM page starts the next queued job).",
       "outputs": {
         "jobs": { "type": "array" }
       }
     },
     {
-      "id": "serve_harness_ui",
+      "id": "wait_for_idle",
+      "function": "pipeline_modules.harness.queue.ActiveStore.has_running",
+      "description": "True while any job (main or external) is running. Poll this every ~60 s before launching new work; a running EXTERNAL job blocks the serial runner exactly like a main job.",
+      "outputs": {
+        "busy": { "type": "bool" }
+      }
+    },
+    {
+      "id": "serve_pipeline_monitor",
+      "function": "apps.pipeline_harness.main.main",
       "cli": "python -m apps.pipeline_harness --host 127.0.0.1 --port 8766",
-      "description": "Start the local operator UI for the Active queue.",
+      "description": "Start Pipeline Monitor (PM). REST API: GET /api/meta, GET /api/jobs (auto-starts queued), POST /api/jobs {sample_dir, config_path}, DELETE /api/jobs/{id}, POST /api/queue/start, POST /api/queue/cancel, POST /api/jobs/{id}/cancel, GET /api/jobs/{id}/log?tail=N.",
       "inputs": {
         "host": { "type": "string", "default": "127.0.0.1" },
         "port": { "type": "int", "default": 8766 }
       }
     }
+  ],
+  "queue_semantics": {
+    "storage": "YIFU_ANALYSIS_ROOT/_active: queue.json (ordered ids), jobs/*.json (records), runs/<job_id>/ (progress.json + stdout log)",
+    "statuses": ["queued", "running", "done", "failed", "cancelled"],
+    "serial": "One running job at a time across kinds; next_queued() is only started when nothing is running",
+    "external_block": "Jobs with kind=external are never started by the runner itself; they only occupy the running slot while their pid is alive"
+  },
+  "reference_drivers": [
+    "_run_YF2025063002_vessel.py (ims -> zarr -> 25um registration nii -> main.py threshold + hemisphere -> L/R stats)",
+    "_run_YF2026070102_cfos.py (ims -> zarr -> cfos_unet -> masked ims)"
   ]
 }
