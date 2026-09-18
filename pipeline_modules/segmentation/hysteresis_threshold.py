@@ -37,15 +37,18 @@ logger = logging.getLogger(__name__)
 
 
 def _get_array(z) -> Any:
-    import zarr
-    if isinstance(z, zarr.Array):
+    try:
+        from pipeline_modules.utils.zarr_io import is_zarr_array, list_array_keys
+    except ImportError:  # pragma: no cover
+        from ..utils.zarr_io import is_zarr_array, list_array_keys
+    if is_zarr_array(z):
         return z
     if "0" in z:
         return z["0"]
-    arrays = list(z.arrays())
-    if len(arrays) == 1:
-        return arrays[0][1]
-    raise KeyError(f"Zarr group has {len(arrays)} arrays; cannot determine which to use")
+    keys = list_array_keys(z)
+    if len(keys) == 1:
+        return z[keys[0]]
+    raise KeyError(f"Zarr group has {len(keys)} arrays; cannot determine which to use")
 
 
 def hysteresis_threshold_3d(
@@ -143,16 +146,11 @@ def segment_hysteresis_zarr(
     use_full_volume = nbytes < 4 * 1024**3  # < 4 GB → load all at once
 
     chunks = (min(64, shape[0]), min(256, shape[1]), min(256, shape[2]))
-    store_out = zarr.DirectoryStore(str(output_path))
-    root_out = zarr.group(store=store_out, overwrite=True)
     try:
-        from numcodecs import Blosc
-        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
-    except (ImportError, ModuleNotFoundError):
-        compressor = None
-    out_arr = root_out.create_dataset("0", shape=shape, chunks=chunks, dtype=np.uint8,
-                                       compressor=compressor)
-    root_out.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}]}]
+        from pipeline_modules.utils.zarr_io import create_output_zarr
+    except ImportError:  # pragma: no cover
+        from ..utils.zarr_io import create_output_zarr
+    root_out, out_arr = create_output_zarr(output_path, shape, chunks, np.uint8)
 
     if use_full_volume:
         logger.info("Loading full volume (%d MB) for global hysteresis...",

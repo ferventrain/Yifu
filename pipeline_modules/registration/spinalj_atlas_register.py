@@ -541,8 +541,6 @@ def write_landmark_initial_transform(
     moving_pts = np.vstack(moving_pts)
     fixed_pts = np.vstack(fixed_pts)
     tx_type = str(transform_type).strip().lower()
-    if tx_type not in ("rigid", "similarity", "affine"):
-        raise ValueError("landmark transform_type must be rigid, similarity, or affine")
     logger.info(
         "Fitting landmark %s from %d pairs (sample Z %s→%s)",
         tx_type,
@@ -550,21 +548,61 @@ def write_landmark_initial_transform(
         src_z,
         dst_z,
     )
-    tx = ants.fit_transform_to_paired_points(
-        moving_pts,
-        fixed_pts,
-        transform_type=tx_type,
-    )
-    if isinstance(tx, (list, tuple)):
-        tx = tx[0]
-    # fit_transform_to_paired_points returns fixed→moving; ANTs -r wants moving→fixed.
-    tx = ants.invert_ants_transform(tx)
+    extra_fit: dict = {}
+    if tx_type == "zscale":
+        # Landmark XY on the atlas is nearly collinear (centroids sit on midline),
+        # so 3D similarity/affine is ill-conditioned and under-scales Z.
+        # Fit independent Z scale+shift and XY translation: T(moving) → fixed.
+        az = moving_pts[:, 2]
+        szp = fixed_pts[:, 2]
+        A = np.column_stack([az, np.ones_like(az)])
+        z_scale, z_shift = np.linalg.lstsq(A, szp, rcond=None)[0]
+        tx_xy = float(np.mean(fixed_pts[:, 0] - moving_pts[:, 0]))
+        ty_xy = float(np.mean(fixed_pts[:, 1] - moving_pts[:, 1]))
+        matrix = np.diag([1.0, 1.0, float(z_scale)])
+        translation = (tx_xy, ty_xy, float(z_shift))
+        tx = ants.create_ants_transform(
+            transform_type="AffineTransform",
+            dimension=3,
+            matrix=matrix,
+            translation=translation,
+        )
+        extra_fit = {
+            "z_scale": float(z_scale),
+            "z_shift_phys": float(z_shift),
+            "xy_translation_phys": [tx_xy, ty_xy],
+        }
+        logger.info(
+            "Landmark zscale: Z' = %.4f * Z + %.1f; XY translate=(%.1f, %.1f)",
+            z_scale,
+            z_shift,
+            tx_xy,
+            ty_xy,
+        )
+        # create_ants_transform above maps moving→fixed (good for points).
+        # ANTsPy apply_transforms / registration -r uses the matrix as
+        # fixed→moving resampling, so invert before writing.
+        tx_for_points = tx
+        tx = ants.invert_ants_transform(tx)
+    elif tx_type in ("rigid", "similarity", "affine"):
+        tx = ants.fit_transform_to_paired_points(
+            moving_pts,
+            fixed_pts,
+            transform_type=tx_type,
+        )
+        if isinstance(tx, (list, tuple)):
+            tx = tx[0]
+        # fit_transform_to_paired_points returns fixed→moving; ANTs -r wants moving→fixed.
+        tx = ants.invert_ants_transform(tx)
+    else:
+        raise ValueError("landmark transform_type must be zscale, rigid, similarity, or affine")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ants.write_transform(tx, str(out_path))
 
+    mapped_src = tx_for_points if tx_type == "zscale" else tx
     mapped = np.array(
-        [ants.apply_ants_transform_to_point(tx, list(p)) for p in moving_pts],
+        [ants.apply_ants_transform_to_point(mapped_src, list(p)) for p in moving_pts],
         dtype=np.float64,
     )
     err = mapped - fixed_pts
@@ -580,6 +618,7 @@ def write_landmark_initial_transform(
         "rmse_z_phys": rmse_z,
         "transform": str(out_path),
         "sample_z_scaled": src_z not in (None, dst_z),
+        **extra_fit,
     }
     logger.info(
         "Landmark init RMSE=%.3f (Z=%.3f) → %s",
@@ -652,6 +691,8 @@ def run_ants_registration(
     direction_y: float = 1.0,
     landmarks_json: Path | None = None,
     landmark_transform_type: str = "similarity",
+    landmark_moving_z_flip: str = "auto",
+    reg_iterations: tuple[int, ...] | None = None,
 ) -> dict:
     import ants
     import nibabel as nib
@@ -695,7 +736,15 @@ def run_ants_registration(
     if lm_path is not None:
         if not lm_path.exists():
             raise FileNotFoundError(f"landmarks_json not found: {lm_path}")
-        if _landmarks_need_moving_z_flip(lm_path):
+        do_flip = False
+        mode = str(landmark_moving_z_flip or "auto").strip().lower()
+        if mode in ("on", "true", "1", "yes"):
+            do_flip = True
+        elif mode in ("off", "false", "0", "no"):
+            do_flip = False
+        else:
+            do_flip = _landmarks_need_moving_z_flip(lm_path)
+        if do_flip:
             logger.info(
                 "Landmark Z mapping is reversed (sample high-Z ↔ atlas low-Z); "
                 "flipping moving atlas along Z before registration"
@@ -737,13 +786,15 @@ def run_ants_registration(
 
     fixed_matched = ants.histogram_match_image(fixed, moving)
     # SyNRA = Rigid + Affine + SyN: rigid stage can recover ~180° in-plane rotations.
+    syn_iters = tuple(int(v) for v in reg_iterations) if reg_iterations else None
     logger.info(
         "Running ANTs registration type=%s (atlas -> image, metric=mattes MI, "
-        "aff_do_reflection=%s, direction_y=%s, landmark_init=%s)",
+        "aff_do_reflection=%s, direction_y=%s, landmark_init=%s, reg_iterations=%s)",
         transform,
         allow_reflection,
         direction_y,
         initial_transform,
+        syn_iters if syn_iters is not None else "ANTsPy default (40, 20, 0)",
     )
     reg_kwargs = dict(
         fixed=fixed_matched,
@@ -752,6 +803,8 @@ def run_ants_registration(
         aff_do_reflection=bool(allow_reflection),
         moving_mask=moving_mask,
     )
+    if syn_iters is not None:
+        reg_kwargs["reg_iterations"] = syn_iters
     if initial_transform is not None:
         reg_kwargs["initial_transform"] = initial_transform
     if fixed_mask is not None:
@@ -810,6 +863,7 @@ def run_ants_registration(
         "fixed_shape": list(fixed.shape),
         "moving_shape": list(moving.shape),
         "landmarks": landmark_meta,
+        "reg_iterations": list(syn_iters) if syn_iters is not None else [40, 20, 0],
     }
     (out_dir / "registration_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     logger.info("Registration finished. QC slices in %s", qc_dir)

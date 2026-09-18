@@ -94,6 +94,95 @@ def _list_tiff_names(tiff_dir: Path) -> list[str]:
     return [p.name for p in files]
 
 
+def filter_mask_volume(
+    mask: np.ndarray,
+    *,
+    max_aspect_ratio: float = 3.0,
+    max_voxels: int = 200,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Apply the same CC filters used at apply-mask time to one 3D annotation."""
+    fg_value = 255 if int(np.max(mask)) > 1 else 1
+    filtered, n_labels, n_removed_aspect, n_removed_volume = filter_elongated_components_chunk(
+        mask,
+        max_aspect_ratio=max_aspect_ratio,
+        max_voxels=max_voxels,
+    )
+    out = np.where(filtered > 0, fg_value, 0).astype(np.uint8)
+    return out, {
+        "components_total": n_labels,
+        "components_removed_aspect": n_removed_aspect,
+        "components_removed_volume": n_removed_volume,
+        "components_kept": n_labels - n_removed_aspect - n_removed_volume,
+        "voxels_before": int((np.asarray(mask) > 0).sum()),
+        "voxels_after": int((out > 0).sum()),
+    }
+
+
+def filter_mask_tiff_directory(
+    input_mask_dir: Path,
+    output_mask_dir: Path,
+    *,
+    max_aspect_ratio: float = 3.0,
+    max_voxels: int = 200,
+) -> dict[str, str | int | float]:
+    """Rewrite a folder of 3D mask TIFFs with apply-mask CC filters."""
+    import tifffile
+
+    files = sorted(input_mask_dir.glob("*.tif")) + sorted(input_mask_dir.glob("*.tiff"))
+    files = sorted({p.name: p for p in files}.values(), key=lambda p: p.name)
+    if not files:
+        raise FileNotFoundError(f"No TIFF files found in {input_mask_dir}")
+
+    output_mask_dir.mkdir(parents=True, exist_ok=True)
+    totals = {
+        "files": 0,
+        "components_total": 0,
+        "components_removed_aspect": 0,
+        "components_removed_volume": 0,
+        "components_kept": 0,
+        "voxels_before": 0,
+        "voxels_after": 0,
+    }
+    skipped: list[str] = []
+    for path in tqdm(files, desc="Filter masks", unit="file"):
+        try:
+            mask = tifffile.imread(str(path))
+        except Exception as exc:
+            skipped.append(f"{path.name}: {exc}")
+            continue
+        if mask.ndim != 3:
+            skipped.append(f"{path.name}: expected 3D mask, got shape {tuple(mask.shape)}")
+            continue
+        filtered, stats = filter_mask_volume(
+            mask,
+            max_aspect_ratio=max_aspect_ratio,
+            max_voxels=max_voxels,
+        )
+        tifffile.imwrite(str(output_mask_dir / path.name), filtered, compression="zlib")
+        totals["files"] += 1
+        for key in (
+            "components_total",
+            "components_removed_aspect",
+            "components_removed_volume",
+            "components_kept",
+            "voxels_before",
+            "voxels_after",
+        ):
+            totals[key] += int(stats[key])
+
+    result = {
+        "input_mask_dir": str(input_mask_dir),
+        "output_mask_dir": str(output_mask_dir),
+        "max_aspect_ratio": float(max_aspect_ratio),
+        "max_voxels": int(max_voxels),
+        "files_skipped": int(len(skipped)),
+        **totals,
+    }
+    if skipped:
+        result["skipped"] = "; ".join(skipped[:20])
+    return result
+
+
 def apply_mask_to_signal(
     *,
     signal_zarr: Path,
@@ -197,11 +286,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Apply mask to signal; within each Zarr chunk, drop 3D connected "
-            "components whose bbox aspect ratio exceeds the threshold."
+            "components whose bbox aspect ratio exceeds the threshold. "
+            "Or rewrite a TIFF mask folder with the same CC filters."
         ),
     )
-    parser.add_argument("--signal_zarr", type=Path, required=True)
-    parser.add_argument("--mask_zarr", type=Path, required=True)
+    parser.add_argument(
+        "--input_mask_tiff_dir",
+        type=Path,
+        default=None,
+        help="If set with --output_mask_tiff_dir, filter 3D mask TIFFs and exit.",
+    )
+    parser.add_argument("--output_mask_tiff_dir", type=Path, default=None)
+    parser.add_argument("--signal_zarr", type=Path, default=None)
+    parser.add_argument("--mask_zarr", type=Path, default=None)
     parser.add_argument("--output_mask_zarr", type=Path, default=None)
     parser.add_argument("--masked_signal_zarr", type=Path, default=None)
     parser.add_argument("--masked_tiff_dir", type=Path, default=None)
@@ -230,6 +327,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.input_mask_tiff_dir is not None or args.output_mask_tiff_dir is not None:
+        if args.input_mask_tiff_dir is None or args.output_mask_tiff_dir is None:
+            raise ValueError("TIFF filter mode requires both --input_mask_tiff_dir and --output_mask_tiff_dir")
+        result = filter_mask_tiff_directory(
+            args.input_mask_tiff_dir,
+            args.output_mask_tiff_dir,
+            max_aspect_ratio=args.max_aspect_ratio,
+            max_voxels=args.max_voxels,
+        )
+        for key, value in result.items():
+            print(f"{key}: {value}")
+        return 0
+    if args.signal_zarr is None or args.mask_zarr is None:
+        raise ValueError("Zarr mode requires --signal_zarr and --mask_zarr")
     result = apply_mask_to_signal(
         signal_zarr=args.signal_zarr,
         mask_zarr=args.mask_zarr,

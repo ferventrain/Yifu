@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import zarr
 from scipy import ndimage
 from tqdm import tqdm
 
@@ -225,25 +224,11 @@ DEFAULT_TEASAR_PARAMS = {
 
 
 def open_zarr_dataset(path_like, dataset_name="0"):
-    path = Path(path_like)
-    if not path.exists():
-        raise FileNotFoundError(f"Zarr path not found: {path}")
-
-    root = zarr.open(str(path), mode="r")
-    if isinstance(root, zarr.Array):
-        return root
-
-    if dataset_name in root and isinstance(root[dataset_name], zarr.Array):
-        return root[dataset_name]
-
-    array_keys = list(root.array_keys())
-    if len(array_keys) == 1:
-        return root[array_keys[0]]
-
-    raise ValueError(
-        f"Could not resolve a Zarr array from {path}. "
-        f"Available arrays: {array_keys}, requested dataset_name={dataset_name}"
-    )
+    try:
+        from pipeline_modules.utils.zarr_io import open_zarr_array
+    except ImportError:  # running the file directly without project root on sys.path
+        from ..utils.zarr_io import open_zarr_array
+    return open_zarr_array(path_like, dataset_name=dataset_name)
 
 
 def parse_resolution_xyz(resolution_text):
@@ -296,37 +281,11 @@ def parse_roi(roi_text):
 
 def list_existing_chunk_indices(mask_zarr):
     """List chunk indices that physically exist in the Zarr store."""
-    store = mask_zarr.store
-    array_path = getattr(mask_zarr, "path", "")
-    dim_sep = getattr(mask_zarr, "_dimension_separator", ".")
-    ndim = len(mask_zarr.shape)
-
-    prefix = f"{array_path}/" if array_path else ""
-    existing = set()
-
-    for raw_key in store.keys():
-        key = str(raw_key)
-        if prefix and not key.startswith(prefix):
-            continue
-
-        rel = key[len(prefix):] if prefix else key
-        if rel in {".zarray", ".zattrs", ".zgroup", "zarr.json"}:
-            continue
-        if rel.startswith("."):
-            continue
-
-        parts = rel.split(dim_sep)
-        if len(parts) != ndim:
-            continue
-
-        try:
-            idx = tuple(int(p) for p in parts)
-        except ValueError:
-            continue
-
-        existing.add(idx)
-
-    return sorted(existing)
+    try:
+        from pipeline_modules.utils.zarr_io import list_existing_chunk_indices as _list_chunks
+    except ImportError:
+        from ..utils.zarr_io import list_existing_chunk_indices as _list_chunks
+    return _list_chunks(mask_zarr)
 
 
 def chunk_index_to_slices(chunk_index, chunks, shape):
@@ -1923,18 +1882,13 @@ def downsample_binary_mask_zarr(
     out_chunks = tuple(min(out_chunks[i], out_shape[i]) for i in range(3))
 
     output_path = Path(output_zarr_path)
-    if output_path.exists():
-        shutil.rmtree(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    root = zarr.open_group(str(output_path), mode="w")
-    out = root.create_dataset(
-        "0",
-        shape=out_shape,
-        chunks=out_chunks,
-        dtype=np.uint8,
-        overwrite=True,
-    )
+    try:
+        from pipeline_modules.utils.zarr_io import create_output_zarr
+    except ImportError:
+        from ..utils.zarr_io import create_output_zarr
+    root, out = create_output_zarr(output_path, out_shape, out_chunks, np.uint8)
 
     # Iterate output chunks; read the corresponding source block and max-pool.
     for out_index in tqdm(list(iter_all_chunk_indices(out_shape, out_chunks)), desc="Downsample mask"):

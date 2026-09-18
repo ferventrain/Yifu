@@ -4,7 +4,6 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
-import zarr
 
 from pipeline_modules.segmentation.cfos_unet_qc import (
     _records_from_sample_dirs,
@@ -14,14 +13,11 @@ from pipeline_modules.segmentation.cfos_unet_qc import (
     compute_sample_qc_metrics,
     export_block_previews,
 )
+from pipeline_modules.utils.zarr_io import write_array
 
 
 def _write_zarr(path: Path, array: np.ndarray, *, chunks=None) -> Path:
-    root = zarr.open(str(path), mode="w")
-    if chunks is None:
-        chunks = array.shape
-    data = root.zeros("0", shape=array.shape, chunks=chunks, dtype=array.dtype)
-    data[:] = array
+    write_array(path, array, chunks=tuple(chunks) if chunks is not None else None)
     return path
 
 

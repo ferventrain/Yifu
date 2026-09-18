@@ -120,27 +120,11 @@ def parse_resolution_xyz(resolution_text):
 
 
 def open_zarr_dataset(path_like, dataset_name):
-    path = Path(path_like)
-    if not path.exists():
-        raise FileNotFoundError(f"Zarr path not found: {path}")
-
-    root = zarr.open(str(path), mode="r")
-    if isinstance(root, zarr.Array):
-        return root
-
-    if dataset_name in root:
-        dataset = root[dataset_name]
-        if isinstance(dataset, zarr.Array):
-            return dataset
-
-    array_keys = list(root.array_keys())
-    if len(array_keys) == 1:
-        return root[array_keys[0]]
-
-    raise ValueError(
-        f"Could not resolve a Zarr array from {path}. "
-        f"Available arrays: {array_keys}, requested dataset_name={dataset_name}"
-    )
+    try:
+        from pipeline_modules.utils.zarr_io import open_zarr_array
+    except ImportError:
+        from ..utils.zarr_io import open_zarr_array
+    return open_zarr_array(path_like, dataset_name=dataset_name)
 
 
 def validate_zarr_inputs(mask_zarr, label_zarr, signal_zarr):
