@@ -651,56 +651,6 @@
       }
     },
     {
-      "id": "plot_vessel_diameter_histogram",
-      "function": "pipeline_modules.visualization.vessel_diameter_histogram.main",
-      "cli": "python pipeline_modules/visualization/vessel_diameter_histogram.py",
-      "description": "Generate a publication-ready vessel diameter histogram from kimimaro vessel_branch_metrics.csv (diameter_um = mean_radius_um * 2).",
-      "prerequisites": [
-        "Input CSV must contain mean_radius_um, typically from kimimaro_reconstruction.py region/branch metrics export"
-      ],
-      "inputs": {
-        "branch_csv": { "type": "path", "required": true, "description": "vessel_branch_metrics.csv path" },
-        "output": { "type": "path|null", "default": null, "description": "Defaults to vessel_diameter_histogram.png next to the CSV" },
-        "bins": { "type": "int", "default": 24 },
-        "dpi": { "type": "int", "default": 300 },
-        "title": { "type": "string", "default": "Vessel Diameter Distribution" },
-        "xlabel": { "type": "string", "default": "Vessel diameter (um)" },
-        "ylabel": { "type": "string", "default": "Section count" },
-        "figsize": { "type": "width,height", "default": "8.4,5.6" },
-        "xlim": { "type": "min,max|null", "default": null }
-      },
-      "outputs": {
-        "histogram_png": { "type": "path", "description": "vessel_diameter_histogram.png or explicit --output path" }
-      },
-      "common_commands": [
-        {
-          "description": "Default histogram next to branch metrics CSV",
-          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\vessel_diameter_histogram.py --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\""
-        },
-        {
-          "description": "Explicit output path and figure options",
-          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\vessel_diameter_histogram.py --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --output \"S:\\sample\\tubule_reconstruction\\vessel_diameter_histogram.png\" --bins 28 --dpi 300 --figsize 8.4,5.6"
-        }
-      ],
-      "guide": {
-        "summary": "Generate a publication-ready vessel diameter histogram from kimimaro branch metrics CSV.",
-        "input": {
-          "file": "vessel_branch_metrics.csv",
-          "required_column": "mean_radius_um",
-          "diameter_formula": "diameter_um = mean_radius_um * 2",
-          "filtering": "NaN, inf, and <= 0 values are dropped automatically"
-        },
-        "default_output": "vessel_diameter_histogram.png next to the input CSV",
-        "figure_contents": [
-          "White-background publication layout with restrained bio-journal palette",
-          "Histogram of branch mean vessel diameter",
-          "Thin count outline on top of bars",
-          "Mean and median reference lines",
-          "Summary box with n, mean, median, std, min, max"
-        ]
-      }
-    },
-    {
       "id": "export_region_mip",
       "function": "pipeline_modules.visualization.region_mip_export.export_region_mip_tiffs",
       "cli": "python pipeline_modules/visualization/region_mip_export.py",
