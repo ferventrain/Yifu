@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import time
 from pathlib import Path
 from typing import Any
 
 from pipeline_modules.harness.jsonio import read_json, utc_now_iso, write_json_atomic
 
+logger = logging.getLogger(__name__)
+_LAST_CHILD_REPORT_AT = 0.0
+_CHILD_REPORT_INTERVAL_S = 2.0
+
 PROGRESS_SCHEMA_VERSION = "1"
 
-CANONICAL_STEPS = [
+PIPELINE_MODE_BRAIN = "brain"
+PIPELINE_MODE_SPINAL_CORD = "spinal_cord"
+
+BRAIN_STEPS = [
     "Registration channel downsample",
     "Atlas registration and label outputs",
     "Signal preprocessing and Zarr conversion",
@@ -18,11 +28,33 @@ CANONICAL_STEPS = [
     "Vessel network reconstruction and region morphology",
 ]
 
+SPINAL_CORD_STEPS = [
+    "Signal preprocessing and Zarr conversion",
+    "Segmentation",
+    "Spinal cord per-vertebra signal analysis",
+]
+
+CANONICAL_STEPS = BRAIN_STEPS
+
 SPOTIFLOW_STEP_5 = "Spotiflow signal count summary"
 
 
+def pipeline_mode(config: dict[str, Any] | None = None) -> str:
+    """Return the configured pipeline mode: ``brain`` (default) or ``spinal_cord``."""
+    if isinstance(config, dict):
+        mode = str(config.get("mode") or "").strip().lower()
+        if mode in (PIPELINE_MODE_BRAIN, PIPELINE_MODE_SPINAL_CORD):
+            return mode
+        legacy = bool((config.get("spinal_cord") or {}).get("enabled"))
+        if legacy:
+            return PIPELINE_MODE_SPINAL_CORD
+    return PIPELINE_MODE_BRAIN
+
+
 def planned_step_names(config: dict[str, Any] | None = None) -> list[str]:
-    names = list(CANONICAL_STEPS)
+    if pipeline_mode(config) == PIPELINE_MODE_SPINAL_CORD:
+        return list(SPINAL_CORD_STEPS)
+    names = list(BRAIN_STEPS)
     method = ""
     if isinstance(config, dict):
         method = str((config.get("segmentation") or {}).get("method") or "").strip().lower()
@@ -31,7 +63,7 @@ def planned_step_names(config: dict[str, Any] | None = None) -> list[str]:
     return names
 
 
-def empty_progress(*, step_total: int = 6) -> dict[str, Any]:
+def empty_progress(*, step_total: int = len(CANONICAL_STEPS)) -> dict[str, Any]:
     return {
         "schema_version": PROGRESS_SCHEMA_VERSION,
         "status": "pending",
@@ -61,7 +93,7 @@ def read_progress(path: Path) -> dict[str, Any]:
 class ProgressWriter:
     """Append-only-ish writer used by the main orchestrator."""
 
-    def __init__(self, path: str | Path, *, step_total: int = 6) -> None:
+    def __init__(self, path: str | Path, *, step_total: int = len(CANONICAL_STEPS)) -> None:
         self.path = Path(path)
         self.state = empty_progress(step_total=step_total)
 
@@ -159,6 +191,46 @@ class ProgressWriter:
         self.state["run_ended_at"] = utc_now_iso()
         self.state["error"] = str(error)
         self._flush()
+
+
+def report_child_units(
+    unit_done: int,
+    unit_total: int,
+    *,
+    phase: str = "",
+    phase_started_at: str | None = None,
+    force: bool = False,
+) -> None:
+    """Mirror tqdm-style unit progress into ``YIFU_PROGRESS_FILE`` for the harness UI.
+
+    Subprocess CLIs invoked by ``main.py`` only print to stdout. The monitor never
+    parses those bars; it reads this JSON file. Call from long inner loops.
+    """
+    progress_file = os.environ.get("YIFU_PROGRESS_FILE", "").strip()
+    if not progress_file:
+        return
+    global _LAST_CHILD_REPORT_AT
+    now = time.monotonic()
+    done = int(unit_done or 0)
+    total = int(unit_total or 0)
+    finished = total > 0 and done >= total
+    if not force and not finished and (now - _LAST_CHILD_REPORT_AT) < _CHILD_REPORT_INTERVAL_S:
+        return
+    _LAST_CHILD_REPORT_AT = now
+    try:
+        path = Path(progress_file)
+        writer = ProgressWriter(path)
+        writer.state = read_progress(path)
+        if str(writer.state.get("status") or "") not in {"running", "pending"}:
+            return
+        started = phase_started_at
+        if not started and phase and writer.state.get("unit_phase") == phase:
+            started = writer.state.get("phase_started_at")
+        if not started:
+            started = writer.state.get("phase_started_at") or writer.state.get("step_started_at") or utc_now_iso()
+        writer.set_units(done, total, phase=phase, phase_started_at=started)
+    except Exception:
+        logger.debug("Could not update harness progress file", exc_info=True)
 
 
 def _parse_iso(value: str | None):

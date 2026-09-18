@@ -74,6 +74,17 @@ def parse_args():
         help="Mask interpretation",
     )
     parser.add_argument("--min_voxels", type=int, default=10, help="Minimum merged component size")
+    parser.add_argument(
+        "--max_voxels",
+        type=int,
+        default=0,
+        help="Maximum merged component size in voxels; 0 disables the upper bound",
+    )
+    parser.add_argument(
+        "--report_physical_volume",
+        action="store_true",
+        help="Add um3/mm3 volume and count-density columns derived from --resolution_xyz",
+    )
     parser.add_argument("--flush_every", type=int, default=25, help="Rewrite Excel after every N rows")
     parser.add_argument("--resolution_xyz", default="1,1,1", help="Voxel size in microns as x,y,z")
     parser.add_argument("--tmp_dir", default="", help="Temporary folder for block artifacts")
@@ -252,7 +263,7 @@ def build_display_name(node):
     return node.get("name") or ""
 
 
-def build_region_row(node, aggregated_stats):
+def build_region_row(node, aggregated_stats, voxel_volume_um3=0.0):
     hemispheres = aggregated_stats.get("hemispheres")
     # Whole-brain Total columns always come from region-pair object collapse,
     # not from summing left/right hemisphere columns.
@@ -260,6 +271,7 @@ def build_region_row(node, aggregated_stats):
 
     total_voxels = int(row_stats["total_voxels"])
     signal_voxels = int(row_stats["signal_voxels"])
+    signal_count = int(row_stats["signal_count"])
     voxel_density = float(signal_voxels / total_voxels) if total_voxels > 0 else 0.0
 
     row = {
@@ -268,9 +280,22 @@ def build_region_row(node, aggregated_stats):
         "Total Voxels": total_voxels,
         "Signal Voxels": signal_voxels,
         "Voxel Density": voxel_density,
-        "Signal Count": int(row_stats["signal_count"]),
+        "Signal Count": signal_count,
         "Sum Intensity": float(row_stats["sum_intensity"]),
     }
+    voxel_volume_um3 = float(voxel_volume_um3 or 0.0)
+    if voxel_volume_um3 > 0.0:
+        signal_volume_um3 = signal_voxels * voxel_volume_um3
+        region_volume_mm3 = total_voxels * voxel_volume_um3 / 1e9
+        row["Signal Volume (um3)"] = float(signal_volume_um3)
+        row["Signal Volume (mm3)"] = float(signal_volume_um3 / 1e9)
+        row["Region Volume (mm3)"] = float(region_volume_mm3)
+        row["Count Density (count/mm3)"] = (
+            float(signal_count / region_volume_mm3) if region_volume_mm3 > 0 else 0.0
+        )
+        row["Mean Object Volume (um3)"] = (
+            float(signal_volume_um3 / signal_count) if signal_count > 0 else 0.0
+        )
     if hemispheres:
         for hemisphere_id, hemisphere_name in HEMISPHERE_NAMES.items():
             hemisphere_stats = hemispheres.get(
@@ -311,7 +336,7 @@ def empty_hemisphere_stats():
     }
 
 
-def flatten_region_rows(region_tree, direct_stats):
+def flatten_region_rows(region_tree, direct_stats, voxel_volume_um3=0.0):
     rows = []
     hemisphere_enabled = "total_region_voxels_by_hemisphere" in direct_stats
 
@@ -361,7 +386,7 @@ def flatten_region_rows(region_tree, direct_stats):
                     aggregated["hemispheres"][hemisphere_id]["sum_intensity"] += child_aggregated["hemispheres"][hemisphere_id]["sum_intensity"]
 
         if label_id is not None and label_id > 0 and aggregated["total_voxels"] > 0:
-            rows.append(build_region_row(node, aggregated))
+            rows.append(build_region_row(node, aggregated, voxel_volume_um3=voxel_volume_um3))
 
         return aggregated
 
@@ -394,6 +419,14 @@ def flush_rows_to_excel(rows, output_path):
                 "Signal Count",
                 "Sum Intensity",
             ]
+            if "Signal Volume (um3)" in level_frame.columns:
+                export_columns += [
+                    "Signal Volume (um3)",
+                    "Signal Volume (mm3)",
+                    "Region Volume (mm3)",
+                    "Count Density (count/mm3)",
+                    "Mean Object Volume (um3)",
+                ]
             if "Left Total Voxels" in level_frame.columns:
                 export_columns += [
                     "Left Total Voxels",
@@ -1563,9 +1596,12 @@ def collapse_root_region_hemisphere_arrays_by_majority(roots, regions, hemispher
     return base_result
 
 
-def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels):
+def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels, max_voxels=0):
     logger.info("Pass 3/3b: collapsing merged objects into per-region statistics...")
     kept_root_mask = root_sizes >= int(min_voxels)
+    max_voxels = int(max_voxels or 0)
+    if max_voxels > 0:
+        kept_root_mask &= root_sizes <= max_voxels
     kept_root_mask[0] = False
 
     root_chunks = []
@@ -1667,9 +1703,12 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
 
     kept_components = int(np.count_nonzero((parent == np.arange(parent.shape[0], dtype=np.int64)) & kept_root_mask))
     kept_voxels = int(root_sizes[kept_root_mask].sum(dtype=np.int64))
+    size_window = (
+        f"{min_voxels}..{max_voxels} voxels" if max_voxels > 0 else f">= {min_voxels} voxels"
+    )
     logger.info(
-        "Kept %d connected components with >= %d voxels, covering %d voxels",
-        kept_components, min_voxels, kept_voxels,
+        "Kept %d connected components with %s, covering %d voxels",
+        kept_components, size_window, kept_voxels,
     )
 
     total_region_voxels = {
@@ -1698,9 +1737,9 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
     }
 
 
-def export_region_excel(region_tree, direct_stats, output_path, flush_every):
+def export_region_excel(region_tree, direct_stats, output_path, flush_every, voxel_volume_um3=0.0):
     rows = []
-    all_rows = flatten_region_rows(region_tree, direct_stats)
+    all_rows = flatten_region_rows(region_tree, direct_stats, voxel_volume_um3=voxel_volume_um3)
     for index, row in enumerate(all_rows, start=1):
         rows.append(row)
         if flush_every > 0 and index % flush_every == 0:
@@ -1728,8 +1767,13 @@ def analyze_zarr_graph(
     keep_tmp,
     pass1_workers,
     hemisphere_zarr_path="",
+    max_voxels=0,
+    report_physical_volume=False,
 ):
-    _ = resolution_xyz
+    voxel_volume_um3 = 0.0
+    if report_physical_volume:
+        voxel_volume_um3 = float(resolution_xyz[0] * resolution_xyz[1] * resolution_xyz[2])
+        logger.info("Physical volume reporting enabled: voxel volume = %.6g um3", voxel_volume_um3)
     mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name)
     label_zarr = open_zarr_dataset(label_zarr_path, dataset_name)
     signal_zarr = open_zarr_dataset(signal_zarr_path, dataset_name)
@@ -1789,11 +1833,18 @@ def analyze_zarr_graph(
             parent=parent,
             root_sizes=root_sizes,
             min_voxels=min_voxels,
+            max_voxels=max_voxels,
         )
         logger.info("Timing | Pass 3b region collapse: %.2fs", time.perf_counter() - pass3b_start_time)
 
         export_start_time = time.perf_counter()
-        export_region_excel(region_tree, direct_stats, output_path, flush_every)
+        export_region_excel(
+            region_tree,
+            direct_stats,
+            output_path,
+            flush_every,
+            voxel_volume_um3=voxel_volume_um3,
+        )
         logger.info("Timing | Excel export: %.2fs", time.perf_counter() - export_start_time)
     finally:
         logger.info("Timing | Total analysis: %.2fs", time.perf_counter() - total_start_time)
@@ -1844,6 +1895,8 @@ def main():
             keep_tmp=args.keep_tmp,
             pass1_workers=args.pass1_workers,
             hemisphere_zarr_path=args.hemisphere_zarr,
+            max_voxels=args.max_voxels,
+            report_physical_volume=args.report_physical_volume,
         )
 
         if write_run_manifest is not None:
@@ -1862,6 +1915,8 @@ def main():
                     "foreground_mode": args.foreground_mode,
                     "foreground_label": args.foreground_label,
                     "min_voxels": args.min_voxels,
+                    "max_voxels": args.max_voxels,
+                    "report_physical_volume": args.report_physical_volume,
                     "resolution_xyz": args.resolution_xyz,
                     "hemisphere_zarr_path": args.hemisphere_zarr,
                 },

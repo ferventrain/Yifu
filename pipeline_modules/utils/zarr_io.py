@@ -133,6 +133,30 @@ def open_output_group(path: str | Path, *, overwrite: bool = True) -> Any:
         return zarr.open_group(str(output), mode=mode)
 
 
+_UNSIGNED_DTYPES = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}
+_SIGNED_DTYPES = {1: np.int8, 2: np.int16, 4: np.int32, 8: np.int64}
+_FLOAT_DTYPES = {2: np.float16, 4: np.float32, 8: np.float64}
+
+
+def normalize_zarr_dtype(dtype: Any) -> Any:
+    """Map TIFF/numpy2 dtype objects to a class zarr 3 can register.
+
+    ``tifffile`` on numpy 2 can yield ``numpy.dtypes.UIntDType`` whose
+    ``.type`` is ``numpy.uintc``. zarr 3.1 matches ``numpy.uint32`` but not
+    ``uintc`` / the raw TIFF dtype object.
+    """
+    dt = np.dtype(dtype)
+    if dt.kind == "u":
+        return _UNSIGNED_DTYPES[dt.itemsize]
+    if dt.kind == "i":
+        return _SIGNED_DTYPES[dt.itemsize]
+    if dt.kind == "f":
+        return _FLOAT_DTYPES[dt.itemsize]
+    if dt.kind == "b":
+        return np.bool_
+    return dt.type
+
+
 def create_array(
     root: Any,
     dataset_name: str,
@@ -143,6 +167,7 @@ def create_array(
     compressor: Any = "default",
     data: np.ndarray | None = None,
 ) -> Any:
+    dtype = normalize_zarr_dtype(dtype)
     if isinstance(compressor, str) or compressor is None:
         resolved = resolve_compressor("none" if compressor is None else compressor)
     else:

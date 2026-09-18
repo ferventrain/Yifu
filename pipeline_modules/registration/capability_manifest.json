@@ -137,6 +137,33 @@
         "summary_csv":   {"type": "path", "description": "Per-target region voxel counts CSV"},
         "manifest_path": {"type": "path", "optional": true, "description": "_run_manifest.json (when output_dir set)"}
       }
+    },
+    {
+      "id": "run_spinal_segment_analysis",
+      "function": "pipeline_modules.registration.spinal_segment_signal_stats.run_spinal_segment_analysis",
+      "cli": "python -m pipeline_modules.registration.spinal_segment_signal_stats",
+      "description": "Per-vertebra spinal cord signal statistics: threshold mask + vertebral segment labels (SpinalJ wizard output, auto-upsampled to the signal grid) -> per-segment signal count / volume / density Excel + CSV, filtering merged objects by [min_voxels, max_voxels].",
+      "prerequisites": [
+        "Signal Zarr and threshold segmentation mask Zarr must exist (pipeline steps 3-4)",
+        "Vertebral segment label Zarr under sample_dir (spinalj_segments.zarr or *_native.zarr from spinalj_labels_to_native.py --write_zarr)",
+        "Segment legend CSV (segment_id_legend.csv) reachable via label Zarr attrs or sample_dir"
+      ],
+      "inputs": {
+        "sample_dir":       {"type": "path", "required": true, "description": "Sample root directory"},
+        "signal_ch":        {"type": "string", "required": true, "description": "Signal channel label (e.g. '0')"},
+        "signal_zarr_path": {"type": "path", "required": true, "description": "Signal Zarr (dataset '0')"},
+        "mask_zarr_path":   {"type": "path", "required": true, "description": "Binary threshold mask Zarr (foreground=1)"},
+        "segments_zarr":    {"type": "path", "default": "spinalj_segments", "description": "Vertebral segment label Zarr under sample_dir"},
+        "legend_csv":       {"type": "path|null", "default": null, "description": "Segment legend CSV; defaults to zarr attrs / segment_id_legend.csv"},
+        "min_voxels":       {"type": "int", "default": 300, "description": "Minimum merged object size in voxels"},
+        "max_voxels":       {"type": "int", "default": 5000, "description": "Maximum merged object size in voxels; 0 disables"},
+        "resolution_xyz":   {"type": "string", "default": "1,1,1", "description": "Voxel size in microns as x,y,z (config input.resolution_xyz)"}
+      },
+      "outputs": {
+        "excel":      {"type": "path", "description": "results/<sample>_ch<ch>_spinal_segment_stats.xlsx (Level_0 summary + Level_1 per vertebra)"},
+        "csv":        {"type": "path", "description": "Flat CSV copy of the Excel"},
+        "region_csv": {"type": "path", "description": "results/<sample>_spinal_segment_regions.csv legend-derived region CSV"}
+      }
     }
   ],
   "configuration_models": {

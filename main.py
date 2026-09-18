@@ -12,6 +12,7 @@ PYTHON_EXE = sys.executable
 MAIN_PIPELINE_REGISTRATION_MODE = "atlas2image"
 PIPELINE_STEP_COUNT = 6
 _PROGRESS = None
+_STEP_TOTAL = PIPELINE_STEP_COUNT
 
 
 def print_pipeline_banner(sample_dir, config_path):
@@ -24,7 +25,7 @@ def print_pipeline_banner(sample_dir, config_path):
 
 def print_step(step_num, title):
     print(f"\n{'-' * 60}")
-    print(f"Step {step_num}/{PIPELINE_STEP_COUNT}: {title}")
+    print(f"Step {step_num}/{_STEP_TOTAL}: {title}")
     print("-" * 60)
     if _PROGRESS is not None:
         _PROGRESS.begin_step(step_num, title)
@@ -816,6 +817,56 @@ def ensure_tubule_reconstruction(
     return output_dir
 
 
+def ensure_spinal_cord_outputs(
+    sample_dir,
+    signal_ch,
+    zarr_path,
+    mask_zarr_path,
+    spinal_cfg,
+    resolution_xyz,
+):
+    from pipeline_modules.utils.deliverable_paths import spinal_segment_stats_xlsx
+
+    if not Path(zarr_path).exists():
+        print(f"Error: Signal Zarr not found: {zarr_path}")
+        sys.exit(1)
+    if not Path(mask_zarr_path).exists():
+        print(f"Error: Mask Zarr not found: {mask_zarr_path} (run the segmentation step first).")
+        sys.exit(1)
+
+    analysis_cfg = spinal_cfg.get("analysis", {})
+    min_voxels = int(analysis_cfg.get("min_voxels", 300))
+    max_voxels = int(analysis_cfg.get("max_voxels", 5000))
+    pass1_workers = int(analysis_cfg.get("pass1_workers", 4))
+
+    output_excel = spinal_segment_stats_xlsx(sample_dir, f"ch{signal_ch}")
+    if output_excel.exists() and not bool(spinal_cfg.get("rerun", False)):
+        print_skip(f"Output already exists: {output_excel}")
+        return
+    output_excel.parent.mkdir(parents=True, exist_ok=True)
+
+    resolution_xyz_str = format_csv(resolution_xyz)
+    segments_zarr = spinal_cfg.get("segments_zarr", "spinalj_segments")
+    legend_csv = str(spinal_cfg.get("segments_legend_csv", "") or "").strip()
+    cmd = (
+        f'"{PYTHON_EXE}" -m pipeline_modules.registration.spinal_segment_signal_stats '
+        f'--sample_dir "{sample_dir}" '
+        f'--signal_ch {signal_ch} '
+        f'--signal_zarr "{zarr_path}" '
+        f'--mask_zarr "{mask_zarr_path}" '
+        f'--segments_zarr "{segments_zarr}" '
+        f'--min_voxels {min_voxels} '
+        f'--max_voxels {max_voxels} '
+        f'--resolution_xyz "{resolution_xyz_str}" '
+        f'--pass1_workers {pass1_workers}'
+    )
+    if legend_csv:
+        cmd += f' --legend_csv "{legend_csv}"'
+    run_command(cmd, "3.1 Spinal cord per-vertebra signal statistics")
+    print_note(f"Per-vertebra stats Excel: {output_excel}")
+    print_note(f"Per-vertebra stats CSV: {output_excel.with_suffix('.csv')}")
+
+
 def run_density_analysis(
     sample_dir,
     signal_ch,
@@ -999,16 +1050,18 @@ def main():
     sample_dir = Path(args.sample_dir)
     print_pipeline_banner(sample_dir, config_path)
 
-    global _PROGRESS
-    if args.progress_file:
-        from pipeline_modules.harness.progress import ProgressWriter, planned_step_names
+    global _PROGRESS, _STEP_TOTAL
+    from pipeline_modules.harness.progress import planned_step_names
 
-        step_names = planned_step_names(cfg)
-        _PROGRESS = ProgressWriter(args.progress_file, step_total=len(step_names))
+    _STEP_TOTAL = len(planned_step_names(cfg))
+    if args.progress_file:
+        from pipeline_modules.harness.progress import ProgressWriter
+
+        _PROGRESS = ProgressWriter(args.progress_file, step_total=_STEP_TOTAL)
         _PROGRESS.start_run(
             sample_dir=str(sample_dir),
             config_path=str(config_path),
-            step_total=len(step_names),
+            step_total=_STEP_TOTAL,
         )
 
     try:
@@ -1031,6 +1084,12 @@ def main():
 
 
 def _run_pipeline(args, cfg, config_path, sample_dir):
+    from pipeline_modules.harness.progress import PIPELINE_MODE_SPINAL_CORD, pipeline_mode
+
+    if pipeline_mode(cfg) == PIPELINE_MODE_SPINAL_CORD:
+        run_spinal_cord_pipeline(args, cfg, config_path, sample_dir)
+        return
+
     signal_ch = cfg["input"]["channels"]["signal"]
     reg_ch = cfg["input"]["channels"]["registration"]
     preprocessing_cfg = cfg["preprocessing"]
@@ -1223,9 +1282,9 @@ def _run_pipeline(args, cfg, config_path, sample_dir):
             print_step(5, "Region density analysis")
             print_skip("Density analysis skipped (atlas label Zarr unavailable).")
 
+        print_step(6, "Vessel network reconstruction and region morphology")
         tubule_cfg = cfg.get("tubule_reconstruction", {})
         if tubule_cfg.get("enabled"):
-            print_step(6, "Vessel network reconstruction and region morphology")
             ensure_tubule_reconstruction(
                 sample_dir=sample_dir,
                 signal_ch=f"ch{signal_ch}",
@@ -1237,8 +1296,44 @@ def _run_pipeline(args, cfg, config_path, sample_dir):
                 config_path=config_path,
             )
         else:
-            print_step(6, "Vessel network reconstruction and region morphology")
             print_skip("Tubule reconstruction disabled (tubule_reconstruction.enabled=false).")
+
+    print("\n" + "=" * 60)
+    print("Pipeline completed successfully.")
+    print("=" * 60)
+
+
+def run_spinal_cord_pipeline(args, cfg, config_path, sample_dir):
+    """Spinal-cord mode: preprocessing -> segmentation -> per-vertebra analysis.
+
+    The vertebral-segment labels come from the SpinalJ wizard (run manually per
+    sample); brain-specific steps (ANTs atlas registration, brain region
+    density, vessel morphology) do not apply in this mode.
+    """
+    signal_ch = cfg["input"]["channels"]["signal"]
+    preprocessing_cfg = cfg["preprocessing"]
+    zarr_cfg = preprocessing_cfg["zarr"]
+    seg_cfg = cfg["segmentation"]
+    if seg_cfg.get("method") == "spotiflow":
+        print("Error: mode=spinal_cord requires a mask-based segmentation method (threshold or cfos_unet).")
+        sys.exit(1)
+
+    print_step(1, "Signal preprocessing and Zarr conversion")
+    signal_tiff_dir = ensure_signal_tiff_dir(sample_dir, signal_ch, preprocessing_cfg)
+    zarr_path = ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg)
+
+    print_step(2, "Segmentation")
+    mask_zarr_path, _ = ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg)
+
+    print_step(3, "Spinal cord per-vertebra signal analysis")
+    ensure_spinal_cord_outputs(
+        sample_dir=sample_dir,
+        signal_ch=signal_ch,
+        zarr_path=zarr_path,
+        mask_zarr_path=mask_zarr_path,
+        spinal_cfg=cfg.get("spinal_cord", {}),
+        resolution_xyz=cfg["input"]["resolution_xyz"],
+    )
 
     print("\n" + "=" * 60)
     print("Pipeline completed successfully.")

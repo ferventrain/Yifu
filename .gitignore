@@ -29,3 +29,10 @@ SOTA_test/spotiflow_results/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410.csv
 results/spotiflow_results/output_mask.tiff
 SOTA_test/spotiflow_results/output_mask.tiff
 smoke_test_outputs/*
+# Generated / local-only
+blur_analysis/
+mlruns/
+node_modules/
+package.json
+package-lock.json
+.zcode/
