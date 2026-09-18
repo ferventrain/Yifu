@@ -200,6 +200,69 @@
           "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\vessel_express\" --resolution_xyz \"1.8,1.8,2.0\" --downsample_factor 4 --downsample_method occupancy --dust_threshold 100"
         }
       ]
+    },
+    {
+      "id": "analyze_vessel_diameter_global",
+      "function": "pipeline_modules.tubule_reconstruction.vessel_diameter_analysis.main",
+      "cli": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis global",
+      "description": "Publication-ready whole-sample vessel diameter histogram (PNG) from kimimaro vessel_branch_metrics.csv (diameter_um = mean_radius_um * 2). Same script also offers the region mode for per-atlas-region diameter bin tables.",
+      "prerequisites": [
+        "Input CSV must contain mean_radius_um, typically from kimimaro_reconstruction.py or vessel_express_reconstruction.py branch metrics export"
+      ],
+      "inputs": {
+        "branch_csv": {"type": "path", "default": "vessel_branch_metrics.csv"},
+        "output": {"type": "path|null", "default": null, "description": "Defaults to vessel_diameter_histogram.png next to the CSV"},
+        "bins": {"type": "int", "default": 24},
+        "dpi": {"type": "int", "default": 300},
+        "title": {"type": "string", "default": "Vessel Diameter Distribution"},
+        "xlabel": {"type": "string", "default": "Vessel diameter (um)"},
+        "ylabel": {"type": "string", "default": "Section count"},
+        "figsize": {"type": "width,height", "default": "8.4,5.6"},
+        "xlim": {"type": "min,max|null", "default": null}
+      },
+      "outputs": {
+        "histogram_png": {"type": "path", "description": "vessel_diameter_histogram.png or explicit --output path"}
+      },
+      "common_commands": [
+        {
+          "description": "Default histogram next to branch metrics CSV",
+          "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis global --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\""
+        },
+        {
+          "description": "Explicit output path and figure options",
+          "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis global --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --output \"S:\\sample\\tubule_reconstruction\\vessel_diameter_histogram.png\" --bins 28 --dpi 300 --figsize 8.4,5.6"
+        }
+      ]
+    },
+    {
+      "id": "analyze_vessel_diameter_region",
+      "function": "pipeline_modules.tubule_reconstruction.vessel_diameter_analysis.main",
+      "cli": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis region",
+      "description": "Export per-atlas-region vessel branch diameter bin table (CSV); branches assigned by atlas label at endpoint midpoint, same rule as region_vessel_analysis.",
+      "prerequisites": [
+        "skeleton_vertices.csv and vessel_branch_metrics.csv from a reconstruction run",
+        "Registered atlas label Zarr and Allen-style region CSV"
+      ],
+      "inputs": {
+        "vertex_csv": {"type": "path", "required": true},
+        "branch_csv": {"type": "path", "required": true},
+        "annotation_zarr": {"type": "path", "required": true, "description": "Registered atlas label Zarr"},
+        "annotation_dataset_name": {"type": "string", "default": "0"},
+        "annotation_resolution_xyz": {"type": "triplet_float_um", "required": true},
+        "cfg": {"type": "path", "required": true, "description": "Allen-style region CSV"},
+        "regions": {"type": "string", "required": true, "description": "Comma/semicolon separated region queries"},
+        "bin_edges_um": {"type": "string", "default": "0,2,4,6,8,10,12,15,20,30"},
+        "output": {"type": "path", "required": true}
+      },
+      "outputs": {
+        "region_diameter_bins_csv": {"type": "path", "description": "Per-region rows: diameter_bin_um, branch_count, branch_percent, total_branch_length_um, length_percent, total_valid_branch_count"}
+      },
+      "common_commands": [
+        {
+          "description": "Diameter bins for isocortex and HPF",
+          "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis region --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --annotation_resolution_xyz 1.8,1.8,2.0 --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --regions \"Isocortex,HPF\" --output \"S:\\sample\\tubule_reconstruction\\region_diameter_bins.csv\""
+        }
+      ]
     }
   ],
   "configuration_models": {

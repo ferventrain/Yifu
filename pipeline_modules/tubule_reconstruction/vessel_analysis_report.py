@@ -111,18 +111,27 @@ def stream_edges(edge_csv):
 
 
 def stream_vertices(vertex_csv):
+    columns = set(csv_columns(vertex_csv))
+    if "degree" not in columns:
+        return None
     degree_hist = {}
     num_vertices = 0
     num_endpoints = 0
     num_endpoints_non_boundary = 0
     num_branch_points = 0
     branch_degree_hist = {}
-    usecols = ["degree", "in_core", "touches_core_boundary"]
+    usecols = ["degree"]
+    if "in_core" in columns:
+        usecols.append("in_core")
+    has_boundary = "touches_core_boundary" in columns
+    if has_boundary:
+        usecols.append("touches_core_boundary")
     for chunk in pd.read_csv(vertex_csv, usecols=usecols, chunksize=VERTEX_CHUNK, low_memory=False):
-        in_core = chunk["in_core"].fillna(False).astype(bool).to_numpy()
-        if not in_core.any():
-            continue
-        chunk = chunk.loc[in_core]
+        if "in_core" in chunk.columns:
+            in_core = chunk["in_core"].fillna(False).astype(bool).to_numpy()
+            if not in_core.any():
+                continue
+            chunk = chunk.loc[in_core]
         degree = pd.to_numeric(chunk["degree"], errors="coerce").to_numpy(dtype=np.float64)
         valid = ~np.isnan(degree)
         degree = degree[valid]
@@ -139,8 +148,9 @@ def stream_vertices(vertex_csv):
             branch_degree_hist[int(k)] = branch_degree_hist.get(int(k), 0) + int(sub.sum())
         endpoint_mask = degree_int == 1
         num_endpoints += int(endpoint_mask.sum())
-        boundary = chunk["touches_core_boundary"].fillna(False).astype(bool).to_numpy()[valid]
-        num_endpoints_non_boundary += int((endpoint_mask & ~boundary).sum())
+        if has_boundary:
+            boundary = chunk["touches_core_boundary"].fillna(False).astype(bool).to_numpy()[valid]
+            num_endpoints_non_boundary += int((endpoint_mask & ~boundary).sum())
     return {
         "num_vertices": num_vertices,
         "num_endpoints": num_endpoints,
@@ -149,6 +159,114 @@ def stream_vertices(vertex_csv):
         "degree_histogram": degree_hist,
         "branch_point_degree_histogram": branch_degree_hist,
     }
+
+
+NODE_KEY_STRIDE = 1 << 40
+
+
+def stream_vertex_stats_from_edges(edge_csv):
+    """Vertex degree statistics derived from edge endpoint lists.
+
+    Fallback for skeleton outputs whose vertices CSV has no kimimaro ``degree``
+    column (e.g. vessel_express_reconstruction). Node identity is the
+    (skeleton_id, node_id) pair packed into one int64 key.
+    """
+    cols = set(csv_columns(edge_csv))
+    usecols = ["skeleton_id", "source_node", "target_node"]
+    missing = sorted(set(usecols).difference(cols))
+    if missing:
+        raise ValueError(f"Edge CSV is missing required columns: {missing}")
+    key_parts = []
+    count_parts = []
+    for chunk in pd.read_csv(edge_csv, usecols=usecols, chunksize=EDGE_CHUNK, low_memory=False):
+        skeleton_id = pd.to_numeric(chunk["skeleton_id"], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+        source = pd.to_numeric(chunk["source_node"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+        target = pd.to_numeric(chunk["target_node"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+        keys = np.concatenate([skeleton_id * NODE_KEY_STRIDE + source, skeleton_id * NODE_KEY_STRIDE + target])
+        unique, counts = np.unique(keys, return_counts=True)
+        key_parts.append(unique)
+        count_parts.append(counts)
+    if not key_parts:
+        return {
+            "num_vertices": 0,
+            "num_endpoints": 0,
+            "num_endpoints_non_boundary": None,
+            "num_branch_points": 0,
+            "degree_histogram": {},
+            "branch_point_degree_histogram": {},
+        }
+    all_keys = np.concatenate(key_parts)
+    all_counts = np.concatenate(count_parts)
+    _, inverse = np.unique(all_keys, return_inverse=True)
+    degrees = np.bincount(inverse, weights=all_counts.astype(np.float64)).astype(np.int64)
+    hist = np.bincount(np.clip(degrees, 0, None), minlength=0)
+    degree_hist = {int(k): int(c) for k, c in enumerate(hist) if c}
+    endpoint_mask = degrees == 1
+    branch_mask = degrees >= 3
+    if branch_mask.any():
+        values, counts = np.unique(degrees[branch_mask], return_counts=True)
+        branch_degree_hist = {int(k): int(c) for k, c in zip(values, counts)}
+    else:
+        branch_degree_hist = {}
+    return {
+        "num_vertices": int(degrees.size),
+        "num_endpoints": int(endpoint_mask.sum()),
+        "num_endpoints_non_boundary": None,
+        "num_branch_points": int(branch_mask.sum()),
+        "degree_histogram": degree_hist,
+        "branch_point_degree_histogram": branch_degree_hist,
+    }
+
+
+EUCLIDEAN_MIN_UM = 1e-6
+
+
+def is_express_branch_metrics(branch_csv):
+    """True for vessel_express vessel_branch_metrics.csv (per-branch polylines)."""
+    cols = set(csv_columns(branch_csv))
+    return "length_um" in cols and "mean_radius_um" in cols and "branch_length_um" not in cols
+
+
+def load_express_branch_table(branch_csv):
+    """Kimimaro-like branch table from a vessel_express vessel_branch_metrics.csv.
+
+    Rows are branch-point-to-branch-point polylines with path length in
+    ``length_um``; tortuosity is path length over endpoint euclidean distance.
+    Loops (both ends at the same location) get degenerate tortuosity values, so
+    they are flagged ``is_loop`` and excluded from tortuosity statistics.
+    """
+    table = pd.read_csv(branch_csv, low_memory=False)
+    required = {"length_um", "mean_radius_um", "source_z_um", "source_y_um", "source_x_um", "target_z_um", "target_y_um", "target_x_um"}
+    missing = sorted(required.difference(table.columns))
+    if missing:
+        raise ValueError(f"Branch CSV is missing required columns: {missing}")
+    source = table[["source_z_um", "source_y_um", "source_x_um"]].to_numpy(dtype=np.float64)
+    target = table[["target_z_um", "target_y_um", "target_x_um"]].to_numpy(dtype=np.float64)
+    euclidean = np.linalg.norm(target - source, axis=1)
+    length = pd.to_numeric(table["length_um"], errors="coerce").to_numpy(dtype=np.float64)
+    tortuosity = np.divide(length, euclidean, out=np.full_like(length, np.nan), where=euclidean > EUCLIDEAN_MIN_UM)
+    if {"start_degree", "end_degree"}.issubset(table.columns):
+        start_degree = pd.to_numeric(table["start_degree"], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+        end_degree = pd.to_numeric(table["end_degree"], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+        is_branch_to_branch = (start_degree >= 3) & (end_degree >= 3)
+        is_terminal_branch = (start_degree == 1) | (end_degree == 1)
+    else:
+        is_branch_to_branch = np.ones(len(table), dtype=bool)
+        is_terminal_branch = np.zeros(len(table), dtype=bool)
+    if {"start_node", "end_node"}.issubset(table.columns):
+        start_node = pd.to_numeric(table["start_node"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+        end_node = pd.to_numeric(table["end_node"], errors="coerce").fillna(-2).to_numpy(dtype=np.int64)
+        is_loop = (start_node == end_node) & (start_node >= 0)
+    else:
+        is_loop = euclidean <= EUCLIDEAN_MIN_UM
+    table = table.assign(
+        branch_length_um=length,
+        tortuosity=tortuosity,
+        is_branch_to_branch=is_branch_to_branch,
+        is_terminal_branch=is_terminal_branch,
+        is_loop=is_loop,
+    )
+    return table
 
 
 def stream_edt_branches(edge_csv):
@@ -304,6 +422,7 @@ def build_diameter_rows(branch_table):
     length = pd.to_numeric(branch_table["branch_length_um"], errors="coerce").to_numpy(dtype=np.float64)
     tortuosity = pd.to_numeric(branch_table["tortuosity"], errors="coerce").to_numpy(dtype=np.float64)
     valid_dia = np.isfinite(diameter) & (diameter > 0)
+    total_valid_count = int(valid_dia.sum())
     length = np.where(np.isfinite(length), length, 0.0)
     rows = []
     for index, lower in enumerate(DEFAULT_DIAM_BIN_EDGES):
@@ -324,7 +443,7 @@ def build_diameter_rows(branch_table):
                 "lower_um": lower,
                 "upper_um": upper if np.isfinite(upper) else np.nan,
                 "branch_count": branch_count,
-                "branch_percent": float(branch_count / max(int(mask.sum()), 1) * 100.0),
+                "branch_percent": float(branch_count / max(total_valid_count, 1) * 100.0),
                 "length_um": length_sum,
                 "length_percent": float(length_sum / max(float(length[valid_dia].sum()), 1e-12) * 100.0),
                 "tortuosity_min": tort_min,
@@ -494,7 +613,10 @@ def main() -> int:
     summary = {}
     summary["sample_id"] = args.sample_id
     summary["resolution_xyz_um"] = list(resolution)
-    summary["skeleton_source"] = "edt_polyline" if edt_mode else "kimimaro"
+    express_mode = (not edt_mode) and is_express_branch_metrics(branch_csv)
+    summary["skeleton_source"] = (
+        "edt_polyline" if edt_mode else ("vessel_express" if express_mode else "kimimaro")
+    )
 
     if edt_mode:
         print("EDT polyline edges detected; streaming branches ...")
@@ -506,10 +628,17 @@ def main() -> int:
     else:
         print("Streaming edges ...")
         summary.update(stream_edges(edge_csv))
+        if express_mode:
+            print("vessel_express branch metrics detected; building branch table ...")
+            branch_table = load_express_branch_table(branch_csv)
+        else:
+            print("Loading branch table ...")
+            branch_table = pd.read_csv(branch_csv, low_memory=False)
         print("Streaming vertices ...")
         vertex_stats = stream_vertices(vertex_csv)
-        print("Loading branch table ...")
-        branch_table = pd.read_csv(branch_csv, low_memory=False)
+        if vertex_stats is None:
+            print("Vertices CSV has no degree column; deriving degree stats from edges ...")
+            vertex_stats = stream_vertex_stats_from_edges(edge_csv)
 
     summary.update(
         {

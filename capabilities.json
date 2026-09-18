@@ -76,7 +76,8 @@
         "pipeline_modules/tubule_reconstruction/kimimaro_reconstruction.py",
         "pipeline_modules/tubule_reconstruction/region_vessel_analysis.py",
         "pipeline_modules/tubule_reconstruction/vessel_express_reconstruction.py",
-        "pipeline_modules/tubule_reconstruction/mask_downsample.py"
+        "pipeline_modules/tubule_reconstruction/mask_downsample.py",
+        "pipeline_modules/tubule_reconstruction/vessel_diameter_analysis.py"
       ],
       "python_package": "pipeline_modules.tubule_reconstruction",
       "config_models": {
@@ -100,8 +101,7 @@
         "pipeline_modules/visualization/warp_mask_zarr_to_atlas_points.py",
         "pipeline_modules/visualization/render_points_brainrender.py",
         "pipeline_modules/visualization/heatmap.py",
-        "pipeline_modules/visualization/render_vessels_pyvista.py",
-        "pipeline_modules/visualization/vessel_diameter_histogram.py"
+        "pipeline_modules/visualization/render_vessels_pyvista.py"
       ],
       "python_package": "pipeline_modules.visualization",
       "inputs_from": ["density_results_xlsx", "mask_zarr", "atlas_label_zarr"],
