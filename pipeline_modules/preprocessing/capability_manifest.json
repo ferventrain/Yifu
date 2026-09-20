@@ -1,13 +1,70 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "module": "preprocessing",
-  "description": "Config-driven TIFF preprocessing, registration-channel downsampling, TIFF-to-Zarr conversion, edge-signal removal, and mask upsampling.",
+  "description": "Imaris-direct and TIFF-based volume preparation: stream .ims channels to Zarr, build the registration NIfTI from an ims pyramid level (no TIFF layer), plus legacy TIFF preprocessing/downsample tools.",
+  "production_policy": {
+    "id": "no-tiff-imaris-direct",
+    "updated": "2026-09-18",
+    "rules": [
+      "Whole-brain production runs must avoid TIFF intermediates. Source data is Imaris .ims (hundreds of GB per file): stream it with ims_to_zarr instead of exporting TIFF folders.",
+      "Preprocessing/enhancement (channel_subtraction, median_filter, clahe, tophat, rolling_ball, scattering_removal, surface_brightness_homogenize, edge_signal_removal) is DISABLED by default in production configs: every preprocessing.*.apply=false. Thresholds then operate on raw stored intensities and stay comparable across samples and batches. Only enable a step for a diagnosed, sample-specific artifact.",
+      "main.py is TIFF-folder-native but skips steps whose outputs already exist: pre-create ch<signal>.zarr (ims_to_zarr), ch<reg>_downsample/volume.nii.gz (zarr_to_registration_nii) and sample_dir/original_shape.json (full-res z,y,x of the signal grid) to run it with zero TIFF folders.",
+      "For the registration channel only a coarse pyramid level is needed: read it with ims_to_zarr --resolution_level N (level N is 2^N x downsampled, level 2 ~ 8x) and rescale to 25 um with zarr_to_registration_nii; delete the coarse zarr afterwards.",
+      "Deliverables are Zarr/Excel/PNG: keep segmentation.export_mask_tiff=false and registration.save_upsampled_label=false (the label TIFF is written only as a transient intermediate and removed after zarr conversion).",
+      "Entry points marked \"legacy_tiff\": true below are kept for old samples that only exist as TIFF folders; do not use them for new Imaris-based production runs."
+    ]
+  },
   "entrypoints": [
     {
+      "id": "convert_ims_to_zarr",
+      "function": "pipeline_modules.preprocessing.ims_to_zarr.convert_ims_to_zarr",
+      "cli": "python -m pipeline_modules.preprocessing.ims_to_zarr --input <sample.ims> --output <chX.zarr> --channels 1 --chunk_size 32,256,256 --gzip_level 1",
+      "description": "PRIMARY entry point: stream selected channels of an Imaris .ims directly into Zarr (per-channel gzip zarr, dataset '0'). Select coarse pyramid levels with --resolution_level N (Imaris levels are 2^N per axis) when full resolution is not needed. Resumable; the reference driver _run_YF2025063002_vessel.py step 1 shows usage.",
+      "prerequisites": [
+        "Imaris .ims file must exist and be readable (DataSet/ResolutionLevel N/TimePoint 0/Channel M/Data)",
+        "Output .zarr must not exist (or resume an incomplete one)"
+      ],
+      "inputs": {
+        "input": { "type": "path", "required": true, "description": "Imaris .ims file" },
+        "output": { "type": "path", "required": true, "description": "Output .zarr path (single channel) or directory root (multi channel)" },
+        "channels": { "type": "string", "default": "0", "description": "Channel spec: all, 0, or 0,1" },
+        "resolution_level": { "type": "int", "default": 0, "description": "Imaris ResolutionLevel to read; 0 = full resolution" },
+        "chunk_size": { "type": "triplet_int", "default": [32, 256, 256], "description": "z,y,x; z sets the streaming read slab" },
+        "gzip_level": { "type": "int", "default": 1 },
+        "hdf_cache_mb": { "type": "int", "default": 256 },
+        "json_logs": { "type": "bool", "default": false }
+      },
+      "outputs": {
+        "output_zarr": { "type": "dir", "description": "Zarr volume with dataset '0' (single-channel mode)" }
+      }
+    },
+    {
+      "id": "zarr_to_registration_nii",
+      "function": "pipeline_modules.preprocessing.zarr_to_registration_nii.convert_zarr_to_registration_nii",
+      "cli": "python -m pipeline_modules.preprocessing.zarr_to_registration_nii --input_zarr <chX_L2.zarr> --output_nii <sample>/ch0_downsample/volume.nii.gz --input_resolution_xyz 14.384,14.384,16 --target_resolution_xyz 25,25,25",
+      "description": "Rescale a (coarse pyramid level) Zarr to the registration spacing and write volume.nii.gz with the same NIfTI convention as preprocessing.downsample (xyz transpose + diagonal affine), so ANTs_registration consumes it in place of the TIFF-folder downsample. Also writes original_shape.json (full-res z,y,x + spacing) beside the output; copy it to sample_dir/original_shape.json for ANTs label upsampling. Tested in tests/test_zarr_to_registration_nii.py.",
+      "prerequisites": [
+        "Input Zarr with dataset '0' (commonly an ims pyramid level written by convert_ims_to_zarr)"
+      ],
+      "inputs": {
+        "input_zarr": { "type": "path", "required": true },
+        "output_nii": { "type": "path", "required": true },
+        "input_resolution_xyz": { "type": "triplet_float_um", "required": true, "description": "x,y,z um of the input zarr (native ims resolution x 2^level)" },
+        "target_resolution_xyz": { "type": "triplet_float_um", "default": [25.0, 25.0, 25.0] },
+        "dataset_name": { "type": "string", "default": "0" }
+      },
+      "outputs": {
+        "output_nii": { "type": "path", "description": "Registration NIfTI (volume.nii.gz)" },
+        "original_shape_json": { "type": "path", "description": "original_shape.json beside the NIfTI" },
+        "manifest_path": { "type": "path", "description": "_run_manifest.json beside the NIfTI" }
+      }
+    },
+    {
       "id": "run_preprocessing",
+      "legacy_tiff": true,
       "function": "pipeline_modules.preprocessing.preprocessor.run_preprocessing",
       "cli": "python -m pipeline_modules.preprocessing.preprocessor",
-      "description": "Apply optional channel subtraction plus ordered enhancement steps to one or more TIFF channels and emit per-channel manifests.",
+      "description": "Apply optional channel subtraction plus ordered enhancement steps to one or more TIFF channels and emit per-channel manifests. Legacy TIFF path; production configs keep every step disabled (see production_policy).",
       "prerequisites": [
         "Sample directory must exist",
         "Requested channel TIFF directories must exist and contain TIFF slices"
@@ -30,9 +87,10 @@
     },
     {
       "id": "convert_tiff_to_zarr",
+      "legacy_tiff": true,
       "function": "pipeline_modules.preprocessing.tiff_to_zarr.convert_tiff_to_zarr",
       "cli": "python pipeline_modules/preprocessing/tiff_to_zarr.py",
-      "description": "Convert a TIFF stack directory into a directory-store Zarr volume with basic multiscales metadata.",
+      "description": "Convert a TIFF stack directory into a directory-store Zarr volume with basic multiscales metadata. Legacy TIFF path; prefer convert_ims_to_zarr for Imaris sources. Used internally by registration for the atlas label zarr.",
       "prerequisites": [
         "Input TIFF directory must exist and contain TIFF slices"
       ],
@@ -55,9 +113,10 @@
     },
     {
       "id": "downsample_folder",
+      "legacy_tiff": true,
       "function": "pipeline_modules.preprocessing.downsample.downsample_folder",
       "cli": "python pipeline_modules/preprocessing/downsample.py",
-      "description": "Downsample a 3D TIFF stack into a new TIFF stack plus NIfTI volume, using nearest-neighbour interpolation.",
+      "description": "Downsample a 3D TIFF stack into a new TIFF stack plus NIfTI volume, using nearest-neighbour interpolation. Legacy TIFF path; prefer zarr_to_registration_nii on an ims pyramid level.",
       "prerequisites": [
         "Input TIFF directory must exist and contain TIFF slices or a single OME-TIFF"
       ],

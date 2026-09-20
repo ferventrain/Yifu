@@ -1,16 +1,27 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "module": "registration",
-  "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
+  "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, hemisphere (Left/Right) label generation, and Zarr-native block-graph region signal analysis.",
+  "production_policy": {
+    "id": "no-tiff-imaris-direct",
+    "updated": "2026-09-18",
+    "rules": [
+      "Production samples are Imaris .ims sources: prepare inputs with pipeline_modules.preprocessing.ims_to_zarr and zarr_to_registration_nii instead of TIFF folders, then let main.py skip its TIFF-native steps (see preprocessing manifest production_policy).",
+      "sample_dir/original_shape.json (full-res z,y,x of the signal grid) must exist when no chX/ TIFF folder does: ANTs_registration uses it to upsample the warped label back to the signal grid.",
+      "save_upsampled_label=false and segmentation.export_mask_tiff=false by default in production configs; upsampled_atlas_label.zarr (+ atlas_label_hemisphere.zarr) is the label deliverable. The module still writes the label TIFF transiently and removes it after zarr conversion.",
+      "Preprocessing/enhancement stays OFF (preprocessing.*.apply=false) so intensity thresholds mean the same thing in every sample."
+    ]
+  },
   "entrypoints": [
     {
       "id": "run_full_pipeline",
       "function": "pipeline_modules.registration.ANTs_registration.BidirectionalRegistration.run_full_pipeline",
       "cli": "python pipeline_modules/registration/ANTs_registration.py",
-      "description": "Run ANTs registration (atlas2image or image2atlas), save warped labels, and optionally save transforms and registered image.",
+      "description": "Run ANTs registration (atlas2image or image2atlas), save warped labels, and optionally save transforms and registered image. Writes upsampled_atlas_label.zarr and (when configured) atlas_label_hemisphere.zarr natively; the label TIFF stack is a transient intermediate removed when registration.save_upsampled_label=false.",
       "prerequisites": [
-        "Downsampled registration-channel NIfTI must exist at SampleLayout.reg_downsample_nii",
-        "Allen atlas template + annotation NIfTI must be available"
+        "Downsampled registration-channel NIfTI must exist at SampleLayout.reg_downsample_nii (build it from an ims pyramid level via zarr_to_registration_nii; no TIFF folder required)",
+        "Allen atlas template + annotation NIfTI must be available",
+        "For label upsampling without TIFF folders: sample_dir/original_shape.json with the full-res signal (z,y,x) shape"
       ],
       "inputs": {
         "sample_dir":          {"type": "path", "required": true, "description": "Sample root directory"},
@@ -22,9 +33,9 @@
         "registration_type":   {"type": "string", "default": "SyN", "choices": ["Rigid", "Affine", "SyN", "SyNRA"]},
         "save_registered_image": {"type": "bool", "default": false},
         "save_transforms":     {"type": "bool", "default": false},
-        "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack"},
-        "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr"},
-        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr. Required when analysis.use_hemisphere_label=true in main.py config."},
+        "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack. Production default false: transient intermediate, removed after zarr conversion"},
+        "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr (the label deliverable)"},
+        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr (0=background, 1=left, 2=right). Required when analysis.use_hemisphere_label=true in main.py config for bilateral L/R statistics"},
         "config":              {"type": "path|null", "default": null, "description": "Path to main config.json for resolution info"},
         "density_cfg":         {"type": "path|null", "default": null}
       },
@@ -47,6 +58,10 @@
         "Mask Zarr, label Zarr, and signal Zarr must exist and share the same shape",
         "Allen region CSV must be available",
         "For left/right stats, provide --hemisphere_zarr or enable registration.save_upsampled_label_hemisphere_zarr plus analysis.use_hemisphere_label in config.json. Each connected signal object is assigned to the brain region and hemisphere where it has the most voxels (ties go to the smaller region id and to Left)."
+      ],
+      "semantics_notes": [
+        "Left/Right Signal Voxels and Left/Right Voxel Density are direct voxel-level counts (mask x region x hemisphere) and are valid for ANY mask, including whole-brain connected vascular networks.",
+        "Signal Count is connected-object based: meaningful for punctate/cell signals, meaningless for vessel networks that form one brain-spanning object. For vessels, report density columns only."
       ],
       "inputs": {
         "mask_zarr_path":       {"type": "path", "required": true},
@@ -136,6 +151,33 @@
         "output_volume": {"type": "path", "description": "Remapped label volume"},
         "summary_csv":   {"type": "path", "description": "Per-target region voxel counts CSV"},
         "manifest_path": {"type": "path", "optional": true, "description": "_run_manifest.json (when output_dir set)"}
+      }
+    },
+    {
+      "id": "run_spinal_segment_analysis",
+      "function": "pipeline_modules.registration.spinal_segment_signal_stats.run_spinal_segment_analysis",
+      "cli": "python -m pipeline_modules.registration.spinal_segment_signal_stats",
+      "description": "Per-vertebra spinal cord signal statistics: threshold mask + vertebral segment labels (SpinalJ wizard output, auto-upsampled to the signal grid) -> per-segment signal count / volume / density Excel + CSV, filtering merged objects by [min_voxels, max_voxels].",
+      "prerequisites": [
+        "Signal Zarr and threshold segmentation mask Zarr must exist (pipeline steps 3-4)",
+        "Vertebral segment label Zarr under sample_dir (spinalj_segments.zarr or *_native.zarr from spinalj_labels_to_native.py --write_zarr)",
+        "Segment legend CSV (segment_id_legend.csv) reachable via label Zarr attrs or sample_dir"
+      ],
+      "inputs": {
+        "sample_dir":       {"type": "path", "required": true, "description": "Sample root directory"},
+        "signal_ch":        {"type": "string", "required": true, "description": "Signal channel label (e.g. '0')"},
+        "signal_zarr_path": {"type": "path", "required": true, "description": "Signal Zarr (dataset '0')"},
+        "mask_zarr_path":   {"type": "path", "required": true, "description": "Binary threshold mask Zarr (foreground=1)"},
+        "segments_zarr":    {"type": "path", "default": "spinalj_segments", "description": "Vertebral segment label Zarr under sample_dir"},
+        "legend_csv":       {"type": "path|null", "default": null, "description": "Segment legend CSV; defaults to zarr attrs / segment_id_legend.csv"},
+        "min_voxels":       {"type": "int", "default": 300, "description": "Minimum merged object size in voxels"},
+        "max_voxels":       {"type": "int", "default": 5000, "description": "Maximum merged object size in voxels; 0 disables"},
+        "resolution_xyz":   {"type": "string", "default": "1,1,1", "description": "Voxel size in microns as x,y,z (config input.resolution_xyz)"}
+      },
+      "outputs": {
+        "excel":      {"type": "path", "description": "results/<sample>_ch<ch>_spinal_segment_stats.xlsx (Level_0 summary + Level_1 per vertebra)"},
+        "csv":        {"type": "path", "description": "Flat CSV copy of the Excel"},
+        "region_csv": {"type": "path", "description": "results/<sample>_spinal_segment_regions.csv legend-derived region CSV"}
       }
     }
   ],

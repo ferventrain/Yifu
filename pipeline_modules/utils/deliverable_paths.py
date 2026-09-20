@@ -51,6 +51,20 @@ def brain_distribution_stats_xlsx(sample_dir: str | Path, channel: str) -> Path:
     return results_dir(sample_dir) / f"{slug}_{channel_token}_brain_distribution_stats.xlsx"
 
 
+def spinal_segment_stats_xlsx(sample_dir: str | Path, channel: str) -> Path:
+    channel_token = normalize_channel(channel)
+    slug = sample_slug(sample_dir)
+    return results_dir(sample_dir) / f"{slug}_{channel_token}_spinal_segment_stats.xlsx"
+
+
+def spinal_segment_stats_csv(sample_dir: str | Path, channel: str) -> Path:
+    return spinal_segment_stats_xlsx(sample_dir, channel).with_suffix(".csv")
+
+
+def spinal_segment_region_csv(sample_dir: str | Path) -> Path:
+    return results_dir(sample_dir) / f"{sample_slug(sample_dir)}_spinal_segment_regions.csv"
+
+
 def heatmap_2d_dir(sample_dir: str | Path, channel: str) -> Path:
     channel_token = normalize_channel(channel)
     slug = sample_slug(sample_dir)

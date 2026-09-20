@@ -24,6 +24,7 @@ from pipeline_modules.utils.deliverable_paths import (
     heatmap_2d_dir as deliverable_heatmap_2d_dir,
     heatmap_3d_png as deliverable_heatmap_3d_png,
     results_dir as deliverable_results_dir,
+    spinal_segment_stats_xlsx as deliverable_spinal_segment_stats_xlsx,
     visualization_dir as deliverable_visualization_dir,
 )
 
@@ -155,6 +156,16 @@ class SampleLayout(BaseModel):
         return self.brain_distribution_stats_xlsx
 
     @property
+    def spinal_segment_stats_xlsx(self) -> Path:
+        """Per-vertebra spinal cord signal statistics Excel workbook."""
+        return deliverable_spinal_segment_stats_xlsx(self.sample_dir, self.signal_ch)
+
+    @property
+    def spinal_segment_stats_csv(self) -> Path:
+        """Flat CSV copy of :attr:`spinal_segment_stats_xlsx`."""
+        return self.spinal_segment_stats_xlsx.with_suffix(".csv")
+
+    @property
     def heatmap_2d_dir(self) -> Path:
         """2D heatmap slice output directory."""
         return deliverable_heatmap_2d_dir(self.sample_dir, self.signal_ch)
@@ -214,6 +225,7 @@ class SampleLayout(BaseModel):
             "reg_downsample_dir", "reg_downsample_nii", "atlas_label_tiff_dir",
             "mask_tiff_dir", "results_dir", "visualization_dir",
             "brain_distribution_stats_xlsx", "density_results_xlsx",
+            "spinal_segment_stats_xlsx", "spinal_segment_stats_csv",
             "heatmap_2d_dir", "heatmap_3d_png",
             "tubule_reconstruction_dir", "tubule_branch_csv", "tubule_summary_json",
             "tubule_vertex_csv", "tubule_edge_csv",

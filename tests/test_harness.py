@@ -87,6 +87,26 @@ def test_progress_writer_and_eta(analysis_home: Path):
     assert eta["current_step_remaining_s"] is not None
 
 
+def test_report_child_units_writes_progress_file(analysis_home: Path, monkeypatch):
+    sample = _write_sample(analysis_home)
+    store = ActiveStore()
+    job = store.add_job(sample)
+    progress_file = Path(store.job_view(job)["progress_path"])
+    writer = ProgressWriter(progress_file, step_total=6)
+    writer.start_run(sample_dir=str(sample), config_path=str(sample / "config.json"))
+    writer.begin_step(4, "Segmentation")
+    monkeypatch.setenv("YIFU_PROGRESS_FILE", str(progress_file))
+    from pipeline_modules.harness import progress as progress_mod
+
+    progress_mod._LAST_CHILD_REPORT_AT = 0.0
+    progress_mod.report_child_units(1161, 2160, phase="Threshold segmentation", force=True)
+    payload = json.loads(progress_file.read_text(encoding="utf-8"))
+    assert payload["unit_done"] == 1161
+    assert payload["unit_total"] == 2160
+    assert payload["unit_phase"] == "Threshold segmentation"
+    assert payload["step_name"] == "Segmentation"
+
+
 def test_record_step_timings_skips_tiny_and_skipped(analysis_home: Path):
     sample = _write_sample(analysis_home)
     store = ActiveStore()
@@ -146,6 +166,27 @@ def test_collect_existing_results(tmp_path: Path):
 def test_spotiflow_planned_steps():
     names = planned_step_names({"segmentation": {"method": "spotiflow"}})
     assert names[4] == "Spotiflow signal count summary"
+
+
+def test_spinal_mode_planned_steps():
+    names = planned_step_names({"mode": "spinal_cord"})
+    assert names == [
+        "Signal preprocessing and Zarr conversion",
+        "Segmentation",
+        "Spinal cord per-vertebra signal analysis",
+    ]
+
+
+def test_pipeline_mode_defaults_and_legacy_flag():
+    from pipeline_modules.harness.progress import pipeline_mode
+
+    assert pipeline_mode(None) == "brain"
+    assert pipeline_mode(MINIMAL_CONFIG) == "brain"
+    assert pipeline_mode({"mode": "brain"}) == "brain"
+    assert pipeline_mode({"mode": "spinal_cord"}) == "spinal_cord"
+    # Configs written before mode existed used spinal_cord.enabled.
+    assert pipeline_mode({"spinal_cord": {"enabled": True}}) == "spinal_cord"
+    assert pipeline_mode({"mode": "bogus"}) == "brain"
 
 
 def test_sample_nested_under_active_is_allowed(analysis_home: Path):

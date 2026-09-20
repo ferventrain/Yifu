@@ -11,6 +11,8 @@ from pipeline_modules.utils.sample_layout import SampleLayout
 RESULT_KEYS = [
     "brain_distribution_stats_xlsx",
     "density_results_xlsx",
+    "spinal_segment_stats_xlsx",
+    "spinal_segment_stats_csv",
     "mask_zarr",
     "signal_zarr",
     "atlas_label_zarr",

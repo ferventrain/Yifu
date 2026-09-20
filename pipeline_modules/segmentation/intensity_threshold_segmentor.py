@@ -11,6 +11,15 @@ from typing import Any
 from tqdm import tqdm
 
 try:
+    from pipeline_modules.harness.progress import report_child_units, utc_now_iso
+except ImportError:  # pragma: no cover
+    def report_child_units(*_args, **_kwargs):
+        return
+
+    def utc_now_iso():
+        return ""
+
+try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
     from pipeline_modules.utils.run_manifest import write_run_manifest
     from pipeline_modules.segmentation.zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
@@ -20,6 +29,27 @@ except ImportError:  # pragma: no cover
     from .zarr_utils import create_output_zarr, list_existing_chunk_indices, open_zarr_dataset
 
 logger = logging.getLogger(__name__)
+
+
+def _tqdm_with_harness(total: int, desc: str, unit: str):
+    started = utc_now_iso()
+    pbar = tqdm(total=total, desc=desc, unit=unit)
+    orig_update = pbar.update
+
+    def update(n=1):
+        result = orig_update(n)
+        report_child_units(
+            int(pbar.n),
+            int(pbar.total or 0),
+            phase=desc,
+            phase_started_at=started,
+            force=bool(pbar.total and pbar.n >= pbar.total),
+        )
+        return result
+
+    pbar.update = update  # type: ignore[method-assign]
+    report_child_units(0, int(total), phase=desc, phase_started_at=started, force=True)
+    return pbar
 
 
 def _require_threshold_stack():
@@ -169,7 +199,7 @@ def run_threshold_segmentation(
         z_chunk_size = chunks[0]
         n_y = (shape[1] + tile_size - 1) // tile_size
         n_x = (shape[2] + tile_size - 1) // tile_size
-        pbar = tqdm(total=len(incomplete_z_indices) * n_y * n_x, desc="Resume threshold segmentation", unit="tile")
+        pbar = _tqdm_with_harness(len(incomplete_z_indices) * n_y * n_x, "Resume threshold segmentation", "tile")
         for z_idx in incomplete_z_indices:
             z = z_idx * z_chunk_size
             z_end = min(z + z_chunk_size, shape[0])
@@ -198,7 +228,7 @@ def run_threshold_segmentation(
                     "No physical chunks found in input store",
                     {"input_zarr": str(input_path)},
                 )
-            pbar = tqdm(total=len(existing_indices), desc="Threshold segmentation (test mode)", unit="chunk")
+            pbar = _tqdm_with_harness(len(existing_indices), "Threshold segmentation (test mode)", "chunk")
             for idx in existing_indices:
                 slices = []
                 for axis, chunk_idx in enumerate(idx):
@@ -221,7 +251,7 @@ def run_threshold_segmentation(
             n_z = (shape[0] + z_chunk_size - 1) // z_chunk_size
             n_y = (shape[1] + tile_size - 1) // tile_size
             n_x = (shape[2] + tile_size - 1) // tile_size
-            pbar = tqdm(total=n_z * n_y * n_x, desc="Threshold segmentation", unit="tile")
+            pbar = _tqdm_with_harness(n_z * n_y * n_x, "Threshold segmentation", "tile")
             for z in range(0, shape[0], z_chunk_size):
                 z_end = min(z + z_chunk_size, shape[0])
                 for y in range(0, shape[1], tile_size):

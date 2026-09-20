@@ -8,10 +8,31 @@ from pipeline_modules.utils.zarr_io import (
     create_output_zarr,
     list_array_keys,
     list_existing_chunk_indices,
+    normalize_zarr_dtype,
     open_group,
     open_zarr_array,
     write_array,
 )
+
+
+def test_create_array_accepts_tifffile_uint32_dtype(tmp_path: Path):
+    import tifffile
+
+    tiff_path = tmp_path / "label.tif"
+    tifffile.imwrite(tiff_path, np.array([[70000]], dtype=np.uint32))
+    sample_dtype = tifffile.imread(tiff_path).dtype
+    assert normalize_zarr_dtype(sample_dtype) is np.uint32
+
+    root, dataset = create_output_zarr(
+        tmp_path / "labels.zarr",
+        (2, 4, 4),
+        (1, 4, 4),
+        sample_dtype,
+    )
+    dataset[0] = 70000
+    opened = open_zarr_array(tmp_path / "labels.zarr")
+    assert opened.dtype == np.uint32
+    assert int(opened[0, 0, 0]) == 70000
 
 
 def test_write_array_keeps_zarr_v2_layout(tmp_path: Path):
