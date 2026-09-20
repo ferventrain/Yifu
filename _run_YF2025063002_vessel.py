@@ -289,6 +289,12 @@ def main() -> int:
 
     sample_dir.mkdir(parents=True, exist_ok=True)
     log_file = open(log_path, "a", encoding="utf-8")
+    # Under the scheduled task the inherited stdout/stderr handles are invalid;
+    # python.exe then exits with code 120 (stdout flush failure at shutdown)
+    # even after a fully successful run. Point fd 1/2 at the log so this
+    # process and every child it spawns carry valid handles.
+    os.dup2(log_file.fileno(), 1)
+    os.dup2(log_file.fileno(), 2)
     sys.stdout = Tee(sys.__stdout__, log_file)
     sys.stderr = Tee(sys.__stderr__, log_file)
 

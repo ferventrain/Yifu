@@ -72,6 +72,16 @@ def wait_for_nas() -> None:
         time.sleep(60)
 
 
+def sample_finished(sample: str) -> bool:
+    """The status file, not the exit code, is the verdict on a run."""
+    status = BATCH_DIR / f"YF2025063002_{sample}" / "vessel_pipeline.status.txt"
+    try:
+        first = status.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return False
+    return first.startswith("ALL DONE")
+
+
 def run_pass(samples: list[str]) -> dict[str, int]:
     results: dict[str, int] = {}
     for index, sample in enumerate(samples, start=1):
@@ -82,8 +92,13 @@ def run_pass(samples: list[str]) -> dict[str, int]:
             [sys.executable, str(DRIVER), sample],
             cwd=str(REPO),
         )
-        results[sample] = proc.returncode
-        log(f"({index}/{len(samples)}) {sample} driver exited with code {proc.returncode}")
+        if sample_finished(sample):
+            results[sample] = 0
+            code_note = f"(exit {proc.returncode}, status file says ALL DONE -> ok)"
+        else:
+            results[sample] = proc.returncode or 1
+            code_note = f"(exit {proc.returncode}, status file NOT done)"
+        log(f"({index}/{len(samples)}) {sample} driver finished {code_note}")
         time.sleep(15)
     return results
 
