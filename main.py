@@ -259,6 +259,39 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
         print_skip(f"Registration downsample already exists: {reg_nifti_path}")
         return
 
+    target_str = ",".join(f"{float(value):.4f}" for value in target_res)
+    reg_tiff_dir = sample_dir / f"ch{reg_ch}"
+    reg_zarr_path = sample_dir / f"ch{reg_ch}.zarr"
+    reg_downsampled_zarr = sample_dir / f"ch{reg_ch}_downsampled.zarr"
+
+    if not reg_tiff_dir.exists() and reg_downsampled_zarr.exists():
+        from pipeline_modules.preprocessing.zarr_to_registration_nii import resolve_input_resolution_xyz
+
+        coarse_res, res_source = resolve_input_resolution_xyz(reg_downsampled_zarr, input_res)
+        print_note(f"Coarse registration Zarr resolution {coarse_res} um (x,y,z) via {res_source}")
+        input_str = ",".join(f"{value:.4f}" for value in coarse_res)
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.zarr_to_registration_nii '
+            f'--input_zarr "{reg_downsampled_zarr}" '
+            f'--output_nii "{reg_nifti_path}" '
+            f'--input_resolution_xyz "{input_str}" '
+            f'--target_resolution_xyz "{target_str}"'
+        )
+        run_command(cmd, "1.1 Downsample registration channel (from coarse Zarr)")
+        return
+
+    if not reg_tiff_dir.exists() and reg_zarr_path.exists():
+        input_str = ",".join(f"{float(value):.4f}" for value in input_res)
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.zarr_to_registration_nii '
+            f'--input_zarr "{reg_zarr_path}" '
+            f'--output_nii "{reg_nifti_path}" '
+            f'--input_resolution_xyz "{input_str}" '
+            f'--target_resolution_xyz "{target_str}"'
+        )
+        run_command(cmd, "1.1 Downsample registration channel (from Zarr)")
+        return
+
     try:
         factor_str = calculate_downsample_factor_str(input_res, target_res)
         print_note(f"Downsample factors (z,y,x): {factor_str}")
@@ -268,7 +301,7 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
 
     cmd = (
         f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.downsample '
-        f'--input_folder "{sample_dir / f"ch{reg_ch}"}" '
+        f'--input_folder "{reg_tiff_dir}" '
         f'--factor "{factor_str}"'
     )
     run_command(cmd, "1.1 Downsample registration channel")

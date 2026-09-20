@@ -37,6 +37,38 @@ def parse_resolution_xyz(resolution_text: str) -> tuple[float, float, float]:
     return values
 
 
+def resolve_input_resolution_xyz(
+    input_zarr: str | Path,
+    native_resolution_xyz: tuple[float, float, float],
+) -> tuple[tuple[float, float, float], str]:
+    """Resolution of a registration-input Zarr, coarse-level aware.
+
+    ``ims_to_zarr --reg_channel`` records ``ims_stride_xyz`` (exact per-axis
+    stride vs IMS level 0) and ``ims_resolution_level`` on the output zarr;
+    prefer them, fall back to ``2**level``, else assume native resolution.
+    Returns ``(resolution_xyz, source_note)``.
+    """
+    import zarr
+
+    native = tuple(float(v) for v in native_resolution_xyz)
+    try:
+        attrs = zarr.open_group(str(input_zarr), mode="r").attrs
+        stride = attrs.get("ims_stride_xyz")
+        if stride and len(stride) == 3 and all(float(v) > 0 for v in stride):
+            res = tuple(native[i] * float(stride[i]) for i in range(3))
+            return res, f"ims_stride_xyz={tuple(round(float(v), 2) for v in stride)}"
+        level = attrs.get("ims_resolution_level")
+        if level is not None:
+            factor = 2 ** int(level)
+            return (
+                tuple(v * factor for v in native),
+                f"ims_resolution_level={int(level)} (2^level fallback)",
+            )
+    except Exception:  # noqa: BLE001 - metadata lookup is best-effort
+        pass
+    return native, "native (no ims attrs)"
+
+
 def _zoom_to_shape(volume: np.ndarray, target_shape: tuple[int, int, int]) -> np.ndarray:
     from scipy import ndimage
 

@@ -17,6 +17,12 @@ CLI::
 Single ``--channels`` values write the Zarr store to ``--output`` directly;
 multi-channel specs write ``<output>/ch{N}.zarr`` per channel (a trailing
 ``.zarr`` suffix on ``--output`` is dropped for the directory form).
+
+Registration fast path: ``--reg_channel 0`` additionally streams channel 0
+from a coarse IMS pyramid level (``--reg_resolution_level``, default 2) into
+``ch0_downsampled.zarr`` with ``ims_resolution_level``/``ims_stride_xyz``
+attrs, which ``main.py`` downsamples to the registration NIfTI directly.
+Interactive runs without the flag are asked whether to extract it.
 """
 
 from __future__ import annotations
@@ -172,6 +178,70 @@ def resolve_output_paths(output: str | Path, channels: list[int]) -> list[Path]:
         return [out]
     root = out.with_suffix("") if out.suffix == ".zarr" else out
     return [root / f"ch{channel}.zarr" for channel in channels]
+
+
+def ims_level_stride_xyz(ims_path: str | Path, resolution_level: int) -> list[float]:
+    """Per-axis stride of an IMS pyramid level relative to level 0.
+
+    Reads dataset *shapes* only (no voxel data), so the exact stride is
+    computed from the file itself instead of assuming a power-of-two rule.
+    """
+    h5py = _require_h5py()
+    level = int(resolution_level)
+    path = Path(ims_path)
+
+    def _shape_for_level(handle, target_level: int) -> tuple[int, int, int]:
+        try:
+            timepoint_group = handle["DataSet"][f"ResolutionLevel {target_level}"]["TimePoint 0"]
+        except KeyError:
+            raise PipelineError(
+                ErrorCode.INPUT_FORMAT_INVALID,
+                "Invalid IMS file: missing ResolutionLevel/TimePoint",
+                {"input_ims": str(path), "resolution_level": target_level},
+            ) from None
+        for key in timepoint_group.keys():
+            if not str(key).startswith("Channel"):
+                continue
+            data = timepoint_group[key].get("Data")
+            if data is None:
+                continue
+            return tuple(int(v) for v in data.shape)
+        raise PipelineError(
+            ErrorCode.INPUT_FORMAT_INVALID,
+            "Invalid IMS file: no channel data at resolution level",
+            {"input_ims": str(path), "resolution_level": target_level},
+        )
+
+    with h5py.File(str(path), "r") as handle:
+        shape_coarse = _shape_for_level(handle, level)
+        if level == 0:
+            return [1.0, 1.0, 1.0]
+        shape_full = _shape_for_level(handle, 0)
+    return [shape_full[i] / max(shape_coarse[i], 1) for i in range(3)]
+
+
+def _write_ims_coarse_attrs(
+    output_zarr: str | Path,
+    *,
+    channel: int,
+    resolution_level: int,
+    stride_xyz: list[float],
+) -> None:
+    """Record level/stride metadata so downstream can recover the voxel size."""
+    import zarr
+
+    group = zarr.open_group(str(output_zarr), mode="r+")
+    group.attrs["ims_channel"] = int(channel)
+    group.attrs["ims_resolution_level"] = int(resolution_level)
+    group.attrs["ims_stride_xyz"] = [float(v) for v in stride_xyz]
+
+
+def _coarse_reg_output_path(output: str | Path, channels: list[int], reg_channel: int) -> Path:
+    out = Path(output)
+    if len(channels) == 1:
+        return out.parent / f"ch{reg_channel}_downsampled.zarr"
+    root = out.with_suffix("") if out.suffix == ".zarr" else out
+    return root / f"ch{reg_channel}_downsampled.zarr"
 
 
 def _open_existing_writable(output_path: Path) -> Any:
@@ -359,8 +429,17 @@ def convert_ims_to_zarr(
     timepoint: int = DEFAULT_TIMEPOINT,
     gzip_level: int = 1,
     hdf_cache_mb: int = DEFAULT_IMS_HDF_CACHE_MB,
+    reg_channel: int | None = None,
+    reg_resolution_level: int = 2,
 ) -> dict[str, Any]:
-    """Convert selected IMS channels to Zarr. Fails only if no channel converts."""
+    """Convert selected IMS channels to Zarr. Fails only if no channel converts.
+
+    When ``reg_channel`` is set, that channel is additionally streamed from a
+    coarse IMS pyramid level (``reg_resolution_level``) into
+    ``ch{N}_downsampled.zarr`` next to the main outputs, for fast registration
+    downsampling. Its zarr attrs record ``ims_resolution_level`` and the exact
+    per-axis ``ims_stride_xyz`` relative to level 0.
+    """
     available = list_ims_channel_indices(input_ims, resolution_level=resolution_level)
     selected = parse_channel_spec(channels, available)
     output_paths = resolve_output_paths(output, selected)
@@ -383,6 +462,31 @@ def convert_ims_to_zarr(
             failed[str(channel)] = str(exc.message)
         except Exception as exc:  # pragma: no cover - defensive batch boundary
             failed[str(channel)] = str(exc)
+
+    if reg_channel is not None:
+        try:
+            reg_path = _coarse_reg_output_path(output, selected, int(reg_channel))
+            converted[f"{int(reg_channel)}_downsampled"] = convert_ims_channel_to_zarr(
+                input_ims,
+                reg_path,
+                channel=int(reg_channel),
+                resolution_level=int(reg_resolution_level),
+                timepoint=timepoint,
+                chunk_size=chunk_size,
+                gzip_level=gzip_level,
+                hdf_cache_mb=hdf_cache_mb,
+            )
+            stride_xyz = ims_level_stride_xyz(input_ims, int(reg_resolution_level))
+            _write_ims_coarse_attrs(
+                reg_path,
+                channel=int(reg_channel),
+                resolution_level=int(reg_resolution_level),
+                stride_xyz=stride_xyz,
+            )
+        except PipelineError as exc:
+            failed[f"{int(reg_channel)}_downsampled"] = str(exc.message)
+        except Exception as exc:  # pragma: no cover - defensive batch boundary
+            failed[f"{int(reg_channel)}_downsampled"] = str(exc)
 
     if not converted:
         raise PipelineError(
@@ -410,6 +514,19 @@ def parse_args() -> argparse.Namespace:
         help="Zarr chunk size z,y,x (default: 32,256,256). z sets the streaming read slab.",
     )
     parser.add_argument("--resolution_level", type=int, default=DEFAULT_RESOLUTION_LEVEL, help="IMS ResolutionLevel to read")
+    parser.add_argument(
+        "--reg_channel",
+        default="",
+        help="Also stream this channel from a coarse pyramid level for registration "
+        "(e.g. 0 writes ch0_downsampled.zarr). Empty: ask interactively on a TTY; "
+        "'none' disables.",
+    )
+    parser.add_argument(
+        "--reg_resolution_level",
+        type=int,
+        default=2,
+        help="IMS ResolutionLevel for --reg_channel (default: 2)",
+    )
     parser.add_argument("--timepoint", type=int, default=DEFAULT_TIMEPOINT, help="IMS TimePoint to read")
     parser.add_argument("--gzip_level", type=int, default=1, help="Zarr gzip compression level (default: 1)")
     parser.add_argument("--hdf_cache_mb", type=int, default=DEFAULT_IMS_HDF_CACHE_MB, help="HDF5 chunk cache size in MB")
@@ -417,11 +534,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_reg_channel(spec: str, *, reg_resolution_level: int, tty: bool | None = None) -> int | None:
+    """Resolve --reg_channel into a channel index (None = skip).
+
+    Empty spec asks interactively (TTY only, default No); 'none' always skips.
+    """
+    text = str(spec).strip().lower()
+    if text in ("none", "no", "false", "off"):
+        return None
+    if text:
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise PipelineError(
+                ErrorCode.ARGUMENT_INVALID,
+                "--reg_channel must be an integer channel index or 'none'",
+                {"reg_channel": spec},
+            ) from exc
+    is_tty = sys.stdin.isatty() if tty is None else tty
+    if not is_tty:
+        logger.info(
+            "Non-interactive run: skipping coarse registration-channel extraction "
+            "(pass --reg_channel 0 to extract ch0_downsampled.zarr)."
+        )
+        return None
+    try:
+        answer = input(
+            f"是否同时提取配准通道 ch0 的降采样 IMS 层 (ResolutionLevel {reg_resolution_level}) "
+            f"到 ch0_downsampled.zarr 用于快速配准? [y/N]: "
+        )
+    except (EOFError, OSError):
+        return None
+    if answer.strip().lower() not in ("y", "yes"):
+        return None
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     _configure_logging(args.json_logs)
 
     try:
+        reg_channel = resolve_reg_channel(args.reg_channel, reg_resolution_level=int(args.reg_resolution_level))
         result = convert_ims_to_zarr(
             args.input,
             args.output,
@@ -431,6 +585,8 @@ def main() -> int:
             timepoint=int(args.timepoint),
             gzip_level=int(args.gzip_level),
             hdf_cache_mb=int(args.hdf_cache_mb),
+            reg_channel=reg_channel,
+            reg_resolution_level=int(args.reg_resolution_level),
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0

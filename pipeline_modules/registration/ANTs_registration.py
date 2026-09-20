@@ -277,7 +277,23 @@ class BidirectionalRegistration:
                         return shape
                     except Exception as e:
                         logger.error("Error reading %s: %s", folder, e)
-        
+
+        # No-TIFF production: fall back to the channel Zarr stores (Z, Y, X).
+        possible_zarrs = [
+            self.sample_dir / f"ch{self.signal_channel}.zarr",
+            self.sample_dir / f"ch{self.register_channel}.zarr",
+        ]
+        for zarr_path in possible_zarrs:
+            if zarr_path.exists():
+                try:
+                    from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
+
+                    shape = tuple(int(v) for v in open_zarr_dataset(zarr_path).shape)
+                    logger.info("Found raw data in %s. Inferred shape: %s", zarr_path, shape)
+                    return shape
+                except Exception as e:
+                    logger.error("Error reading %s: %s", zarr_path, e)
+
         return None
     
     def _load_tiff_stack(self, folder_path: Path) -> np.ndarray:
