@@ -17,9 +17,9 @@ Thumbs.db
 .pytest_cache/
 *.docx
 
-# Local agent state
-.claude/settings.local.json
-.claude/projects/
+# Local agent / IDE state (kept out of the public repo)
+.claude/
+.cursor/
 
 # Project specific
 *.log
