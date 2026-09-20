@@ -28,14 +28,25 @@ from datetime import datetime
 from pathlib import Path
 
 REPO = Path(r"S:\Yifu")
-BATCH_DIR = Path(r"S:\Arivis_Analysis\_active\YF2025063002")
-NAS_ROOT = Path(r"//192.168.110.4/Yifu/YF2025063002")
 ANALYSIS_ROOT = Path(r"S:\Arivis_Analysis")
 os.environ["YIFU_DATA_DIR"] = r"S:\Yifu_data"
 os.environ["YIFU_ANALYSIS_ROOT"] = str(ANALYSIS_ROOT)
 os.environ["PYTHONUNBUFFERED"] = "1"
 sys.path.insert(0, str(REPO))
 os.environ["PYTHONPATH"] = str(REPO) + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+# dataset id -> (analysis batch dir under the analysis root, NAS root of the raw ims folders)
+DATASETS = {
+    "YF2025063002": {
+        "batch_dir": Path(r"S:\Arivis_Analysis\_active\YF2025063002"),
+        "nas_root": Path(r"//192.168.110.4/Yifu/YF2025063002"),
+    },
+    "YF2026051202": {
+        "batch_dir": Path(r"S:\Arivis_Analysis\_active\YF2026051202"),
+        "nas_root": Path(r"//192.168.110.17/MegaSpim/YF2026051202"),
+    },
+}
+DEFAULT_DATASET = "YF2025063002"
 
 PYTHON = sys.executable
 MAX_ATTEMPTS = 4
@@ -92,15 +103,23 @@ def run_step(cmd: list[str], desc: str, log_path: Path) -> None:
     raise RuntimeError(f"{desc} failed after {MAX_ATTEMPTS} attempts")
 
 
-def find_sample(sample: str) -> tuple[Path, Path]:
-    sample_dir = BATCH_DIR / f"YF2025063002_{sample}"
+def find_sample(spec: str) -> tuple[Path, Path]:
+    """Resolve 'YF<id>_<sample>' (or bare '<sample>' = default dataset) to sample dir + ims."""
+    match = re.match(r"(YF\d+)_(.+)$", spec)
+    if match:
+        dataset, sample = match.group(1), match.group(2)
+    else:
+        dataset, sample = DEFAULT_DATASET, spec
+    dataset_cfg = DATASETS.get(dataset)
+    if dataset_cfg is None:
+        raise KeyError(f"unknown dataset {dataset}; known: {sorted(DATASETS)}")
+    sample_dir = dataset_cfg["batch_dir"] / f"{dataset}_{sample}"
     if not sample_dir.is_dir():
         raise FileNotFoundError(f"sample dir not found: {sample_dir}")
-    candidates = []
-    for root in glob.glob(str(NAS_ROOT / "*_Destripe_DONE")):
-        match = re.search(r"(PBS|SEBL|MPTP)_(\d+)(?=_Destripe_DONE$)", root)
-        if match and f"{match.group(1)}_{match.group(2)}" == sample:
-            candidates.append(root)
+    candidates = [
+        root for root in glob.glob(str(dataset_cfg["nas_root"] / "*_Destripe_DONE"))
+        if re.search(rf"_{re.escape(sample)}(?=_Destripe_DONE$)", root)
+    ]
     if len(candidates) != 1:
         raise FileNotFoundError(f"expected 1 NAS folder for {sample}, found {candidates}")
     ims_files = glob.glob(candidates[0] + "/*.ims")
@@ -109,7 +128,7 @@ def find_sample(sample: str) -> tuple[Path, Path]:
     return sample_dir, Path(ims_files[0])
 
 
-def step1_signal_zarr(ims_path: Path, signal_zarr: Path, log_path: Path) -> None:
+def step1_signal_zarr(ims_path: Path, signal_zarr: Path, signal_ch: str, log_path: Path) -> None:
     if marker_path(signal_zarr).exists():
         log("Step 1 already complete (marker present), skipping")
         return
@@ -118,11 +137,11 @@ def step1_signal_zarr(ims_path: Path, signal_zarr: Path, log_path: Path) -> None
             PYTHON, "-m", "pipeline_modules.preprocessing.ims_to_zarr",
             "--input", ims_path,
             "--output", signal_zarr,
-            "--channels", "1",
+            "--channels", signal_ch,
             "--chunk_size", "32,256,256",
             "--gzip_level", "1",
         ],
-        "IMS->Zarr ch1",
+        "IMS->Zarr signal",
         log_path,
     )
     marker_path(signal_zarr).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
@@ -138,7 +157,7 @@ def write_original_shape_json(sample_dir: Path, signal_zarr: Path) -> None:
     log(f"original_shape.json: {shape}")
 
 
-def step2_coarse_reg_zarr(ims_path: Path, coarse_zarr: Path, log_path: Path) -> None:
+def step2_coarse_reg_zarr(ims_path: Path, coarse_zarr: Path, reg_ch: str, log_path: Path) -> None:
     if marker_path(coarse_zarr).exists():
         log("Step 2 already complete (marker present), skipping")
         return
@@ -147,11 +166,11 @@ def step2_coarse_reg_zarr(ims_path: Path, coarse_zarr: Path, log_path: Path) -> 
             PYTHON, "-m", "pipeline_modules.preprocessing.ims_to_zarr",
             "--input", ims_path,
             "--output", coarse_zarr,
-            "--channels", "0",
+            "--channels", reg_ch,
             "--resolution_level", "2",
             "--chunk_size", "32,256,256",
         ],
-        "IMS->Zarr ch0 L2",
+        "IMS->Zarr registration L2",
         log_path,
     )
     marker_path(coarse_zarr).write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
@@ -249,14 +268,14 @@ def step5_verify(sample_dir: Path, config: dict) -> None:
     log("VERIFY OK: " + json.dumps(report, ensure_ascii=False))
 
 
-def attach_to_harness(sample_dir: Path, config_path: Path, log_path: Path, status_path: Path) -> None:
+def attach_to_harness(sample_dir: Path, dataset: str, config_path: Path, log_path: Path, status_path: Path) -> None:
     try:
         from pipeline_modules.harness.queue import ActiveStore
 
         store = ActiveStore()
         record = store.attach_external(
             sample_dir,
-            title=f"YF2025063002 vessel bilateral: {sample_dir.name.replace('YF2025063002_', '')}",
+            title=f"{dataset} vessel bilateral: {sample_dir.name.replace(dataset + '_', '')}",
             pid=os.getpid(),
             log_path=log_path,
             status_path=status_path,
@@ -276,6 +295,8 @@ def main() -> int:
         print(__doc__)
         return 2
     sample = args[0]
+    dataset_match = re.match(r"(YF\d{8})_", sample)
+    dataset = dataset_match.group(1) if dataset_match else DEFAULT_DATASET
     try:
         sample_dir, ims_path = find_sample(sample)
     except Exception:
@@ -302,11 +323,14 @@ def main() -> int:
         status_path.write_text(f"{first_line}\n{datetime.now().isoformat(timespec='seconds')}\n", encoding="utf-8")
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    signal_zarr = sample_dir / "ch1.zarr"
-    coarse_zarr = sample_dir / "ch0_L2.zarr"
-    reg_nii = sample_dir / "ch0_downsample" / "volume.nii.gz"
+    channels = config["input"]["channels"]
+    signal_ch = str(channels["signal"])
+    reg_ch = str(channels["registration"])
+    signal_zarr = sample_dir / f"ch{signal_ch}.zarr"
+    coarse_zarr = sample_dir / f"ch{reg_ch}_L2.zarr"
+    reg_nii = sample_dir / f"ch{reg_ch}_downsample" / "volume.nii.gz"
 
-    log(f"=== YF2025063002 {sample} vessel bilateral start pid={os.getpid()} ===")
+    log(f"=== {dataset} {sample} vessel bilateral start pid={os.getpid()} ===")
     log(f"Python={PYTHON} IMS={ims_path}")
     free_gb = shutil.disk_usage(sample_dir).free / 1024**3
     log(f"free on S: {free_gb:.0f} GB")
@@ -316,16 +340,17 @@ def main() -> int:
             raise FileNotFoundError(config_path)
         if not ims_path.exists():
             raise FileNotFoundError(ims_path)
-        attach_to_harness(sample_dir, config_path, log_path, status_path)
+        attach_to_harness(sample_dir, dataset, config_path, log_path, status_path)
 
+        signal_step_title = f"IMS ch{signal_ch} (vessel) -> Zarr"
         for step_number, title, _tag in STEPS[:-1]:
             write_status(f"RUNNING Step {step_number}: {title}")
             if step_number == 1:
-                step1_signal_zarr(ims_path, signal_zarr, log_path)
-                write_status("RUNNING Step 1: IMS ch1 (vessel) -> Zarr (writing original_shape.json)")
+                step1_signal_zarr(ims_path, signal_zarr, signal_ch, log_path)
+                write_status(f"RUNNING Step 1: {signal_step_title} (writing original_shape.json)")
                 write_original_shape_json(sample_dir, signal_zarr)
             elif step_number == 2:
-                step2_coarse_reg_zarr(ims_path, coarse_zarr, log_path)
+                step2_coarse_reg_zarr(ims_path, coarse_zarr, reg_ch, log_path)
             elif step_number == 3:
                 step3_registration_nii(sample_dir, config, coarse_zarr, reg_nii, log_path, keep_coarse)
             elif step_number == 4:
