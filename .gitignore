@@ -15,6 +15,7 @@ Thumbs.db
 # Build artifacts / caches
 *.egg-info/
 .pytest_cache/
+*.docx
 
 # Local agent state
 .claude/settings.local.json
