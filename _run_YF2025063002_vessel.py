@@ -63,7 +63,7 @@ STEPS = [
 
 class Tee:
     def __init__(self, *streams):
-        self.streams = streams
+        self.streams = [stream for stream in streams if stream is not None]
 
     def write(self, data):
         for stream in self.streams:
@@ -140,6 +140,10 @@ def step1_signal_zarr(ims_path: Path, signal_zarr: Path, signal_ch: str, log_pat
             "--channels", signal_ch,
             "--chunk_size", "32,256,256",
             "--gzip_level", "1",
+            # Never allow the interactive ch0-downsample prompt: under a
+            # scheduled task stdin is an invisible console, input() blocks
+            # forever, and the whole run stalls at this step.
+            "--reg_channel", "none",
         ],
         "IMS->Zarr signal",
         log_path,
@@ -169,6 +173,7 @@ def step2_coarse_reg_zarr(ims_path: Path, coarse_zarr: Path, reg_ch: str, log_pa
             "--channels", reg_ch,
             "--resolution_level", "2",
             "--chunk_size", "32,256,256",
+            "--reg_channel", "none",
         ],
         "IMS->Zarr registration L2",
         log_path,
@@ -310,14 +315,14 @@ def main() -> int:
 
     sample_dir.mkdir(parents=True, exist_ok=True)
     log_file = open(log_path, "a", encoding="utf-8")
-    # Under the scheduled task the inherited stdout/stderr handles are invalid;
-    # python.exe then exits with code 120 (stdout flush failure at shutdown)
-    # even after a fully successful run. Point fd 1/2 at the log so this
-    # process and every child it spawns carry valid handles.
-    os.dup2(log_file.fileno(), 1)
-    os.dup2(log_file.fileno(), 2)
-    sys.stdout = Tee(sys.__stdout__, log_file)
-    sys.stderr = Tee(sys.__stderr__, log_file)
+    # Under the scheduled task the process has NO valid std handles: writing
+    # to them raises OSError(9) and killing the interpreter at shutdown (exit
+    # 120/1, "lost sys.stderr") even after success, and os.dup2 onto the
+    # missing fds fails the same way. So route this process's output through
+    # the log file only; child processes get the valid log handle explicitly
+    # in run_step (stdout=log_file), which works regardless of lineage.
+    sys.stdout = Tee(log_file)
+    sys.stderr = Tee(log_file)
 
     def write_status(first_line: str) -> None:
         status_path.write_text(f"{first_line}\n{datetime.now().isoformat(timespec='seconds')}\n", encoding="utf-8")

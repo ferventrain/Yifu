@@ -21,7 +21,7 @@ from pipeline_modules.harness.paths import (
     stdout_log_path,
 )
 from pipeline_modules.harness.progress import empty_progress, estimate_eta, estimate_unit_eta, planned_step_names, read_progress
-from pipeline_modules.harness.proc import pid_is_alive
+from pipeline_modules.harness.proc import pid_created_at, pid_is_alive, pid_matches
 from pipeline_modules.harness.results import load_config
 from pipeline_modules.harness.timing import load_timing_history
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
@@ -210,6 +210,9 @@ class ActiveStore:
                 "config_path": config_file or record.get("config_path") or "",
                 "project_name": project_name or record.get("project_name"),
                 "pid": int(pid) if pid else record.get("pid"),
+                # Creation time of the attached process, so sync_external_job
+                # can tell a dead job's reused pid from the real one.
+                "pid_created_at": pid_created_at(pid) if pid else record.get("pid_created_at"),
                 "log_path": str(Path(log_path)) if log_path else record.get("log_path"),
                 "status_path": str(Path(status_path)) if status_path else record.get("status_path"),
                 "module_progress_path": (
@@ -247,7 +250,7 @@ class ActiveStore:
 
     def sync_external_job(self, job: dict[str, Any]) -> dict[str, Any]:
         parsed = _parse_status_file(job.get("status_path"))
-        alive = pid_is_alive(job.get("pid"))
+        alive = pid_matches(job.get("pid"), job.get("pid_created_at"))
         first = parsed.get("first_line") or ""
         previous = str(job.get("status") or "running")
         if first.startswith("ALL DONE"):

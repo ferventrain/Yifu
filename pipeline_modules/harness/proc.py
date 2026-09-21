@@ -28,6 +28,33 @@ def pid_is_alive(pid: int | None) -> bool:
     return True
 
 
+def pid_created_at(pid: int | None) -> float | None:
+    """Process creation time (seconds since epoch), or None when unknown."""
+    if pid is None:
+        return None
+    try:
+        import psutil
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
+
+
+def pid_matches(pid: int | None, created_at: float | None) -> bool:
+    """True when ``pid`` is alive and (when a creation time was recorded at
+    attach time) still is the same process instance. Guards against Windows
+    PID reuse, where a dead job's pid gets handed to an unrelated process and
+    plain liveness checks report the job as running forever."""
+    if not pid_is_alive(pid):
+        return False
+    if created_at is None:
+        return True
+    actual = pid_created_at(pid)
+    if actual is None:
+        return True
+    return abs(actual - float(created_at)) <= 5.0
+
+
 def _pid_is_alive_windows(pid: int) -> bool:
     import ctypes
     from ctypes import wintypes
