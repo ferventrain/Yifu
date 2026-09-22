@@ -50,7 +50,11 @@ DEFAULT_DATASET = "YF2025063002"
 
 PYTHON = sys.executable
 MAX_ATTEMPTS = 4
-PYRAMID_LEVEL_STRIDE = 8  # Imaris pyramid levels are powers of two
+IMS_REG_LEVEL = 2  # Imaris pyramid level for the registration channel
+# Imaris level N is 2**N per axis (level 2 = 4x) — NOT 2^level *of the level
+# index order*; an earlier 8x assumption produced 12.5 um voxels in the 25 um
+# registration NIfTI and a 2x-per-axis oversampled grid.
+PYRAMID_LEVEL_STRIDE = 2**IMS_REG_LEVEL
 
 STEPS = [
     (1, "IMS ch1 (vessel) -> Zarr", "ims_to_zarr"),

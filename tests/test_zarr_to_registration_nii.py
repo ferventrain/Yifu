@@ -52,12 +52,12 @@ def test_convert_rescales_and_matches_nifti_convention(tmp_path):
     assert result["output_shape_zyx"] == [8, 32, 24]
 
     image = nib.load(str(output_nii))
-    # Convention matches preprocessing.downsample: (z, y, x) transposed to
-    # (x, y, z) with a diagonal spacing affine.
+    # Convention matches the proven dbdb36 registration: (z, y, x) transposed
+    # to (x, y, z) with a UNIT affine — physical spacing must NOT be baked
+    # into the header (the atlas side is read at unit spacing).
     assert image.shape == (24, 32, 8)
     assert image.get_data_dtype() == np.uint16
-    affine = image.affine
-    assert affine[0, 0] == 24.0 and affine[1, 1] == 24.0 and affine[2, 2] == 32.0
+    assert np.allclose(image.affine, np.eye(4))
 
     data = np.asanyarray(image.dataobj)
     assert data.min() >= 0 and data.max() <= 65535

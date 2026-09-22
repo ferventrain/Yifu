@@ -167,6 +167,44 @@ def _iter_3d_blocks(shape: tuple[int, int, int], block_shape: tuple[int, int, in
                 yield z0, z1, y0, y1, x0, x1
 
 
+def _label_x_extent_zarr(label_zarr, shape, read_block_shape) -> tuple[int, int] | None:
+    """Stream the label volume and return the (min, max) x of nonzero voxels.
+
+    The midline must bisect the registered brain, not the sample volume: the
+    brain sits wherever mounting put it, so a volume-midplane split assigns
+    near-100%% of voxels to one hemisphere whenever the brain is off-center.
+    """
+    xmin, xmax = None, None
+    for z0, z1, y0, y1, x0, x1 in _iter_3d_blocks(shape, read_block_shape):
+        block = np.asarray(label_zarr[z0:z1, y0:y1, x0:x1])
+        if not np.any(block > 0):
+            continue
+        x_present = np.any(block > 0, axis=(0, 1))
+        present = np.nonzero(x_present)[0]
+        block_xmin, block_xmax = x0 + int(present[0]), x0 + int(present[-1])
+        xmin = block_xmin if xmin is None else min(xmin, block_xmin)
+        xmax = block_xmax if xmax is None else max(xmax, block_xmax)
+    if xmin is None:
+        return None
+    return xmin, xmax
+
+
+def _label_x_extent_tiff(tiff_files) -> tuple[int, int] | None:
+    xmin, xmax = None, None
+    for tiff_path in tiff_files:
+        label_slice = tifffile.imread(str(tiff_path))
+        if not np.any(label_slice > 0):
+            continue
+        x_present = np.any(label_slice > 0, axis=0)
+        present = np.nonzero(x_present)[0]
+        slice_xmin, slice_xmax = int(present[0]), int(present[-1])
+        xmin = slice_xmin if xmin is None else min(xmin, slice_xmin)
+        xmax = slice_xmax if xmax is None else max(xmax, slice_xmax)
+    if xmin is None:
+        return None
+    return xmin, xmax
+
+
 def convert_atlas_label_to_hemisphere(
     input_dir: str | Path,
     output_zarr: str | Path,
@@ -196,15 +234,25 @@ def convert_atlas_label_to_hemisphere(
                 {"shape": list(label_zarr.shape)},
             )
         shape = tuple(int(value) for value in label_zarr.shape)
-        split_x = int(np.ceil(shape[2] / 2.0))
-        root, dataset = _create_output_dataset(output_path, dataset_name, shape, chunk_size, compressor)
-
         input_chunks = getattr(label_zarr, "chunks", None)
         read_block_shape = (
             tuple(int(value) for value in input_chunks[:3])
             if input_chunks is not None
             else tuple(int(value) for value in chunk_size)
         )
+        extent = _label_x_extent_zarr(label_zarr, shape, read_block_shape)
+        if extent is None:
+            split_x = int(np.ceil(shape[2] / 2.0))
+        else:
+            split_x = extent[0] + (extent[1] - extent[0] + 1) // 2
+        logger.info(
+            "Hemisphere midline: label x extent=%s, split_x=%d (volume midplane=%d)",
+            extent,
+            split_x,
+            int(np.ceil(shape[2] / 2.0)),
+        )
+        root, dataset = _create_output_dataset(output_path, dataset_name, shape, chunk_size, compressor)
+
         block_specs = list(_iter_3d_blocks(shape, read_block_shape))
         for z0, z1, y0, y1, x0, x1 in tqdm(block_specs, desc="Hemisphere Zarr blocks", unit="block"):
             label_block = np.asarray(label_zarr[z0:z1, y0:y1, x0:x1])
@@ -232,7 +280,17 @@ def convert_atlas_label_to_hemisphere(
                 {"first_slice_shape": list(first_slice.shape)},
             )
         shape = (len(tiff_files), int(first_slice.shape[0]), int(first_slice.shape[1]))
-        split_x = int(np.ceil(shape[2] / 2.0))
+        extent = _label_x_extent_tiff(tiff_files)
+        if extent is None:
+            split_x = int(np.ceil(shape[2] / 2.0))
+        else:
+            split_x = extent[0] + (extent[1] - extent[0] + 1) // 2
+        logger.info(
+            "Hemisphere midline: label x extent=%s, split_x=%d (volume midplane=%d)",
+            extent,
+            split_x,
+            int(np.ceil(shape[2] / 2.0)),
+        )
         root, dataset = _create_output_dataset(output_path, dataset_name, shape, chunk_size, compressor)
 
         for z_index, tiff_path in tqdm(
@@ -256,6 +314,8 @@ def convert_atlas_label_to_hemisphere(
 
     root.attrs["source"] = str(input_path)
     root.attrs["input_kind"] = input_kind
+    root.attrs["split_x"] = int(split_x)
+    root.attrs["label_x_extent"] = list(extent) if extent is not None else None
 
     result = {
         "success": True,
@@ -266,6 +326,8 @@ def convert_atlas_label_to_hemisphere(
         "shape": list(shape),
         "dtype": "uint8",
         "chunk_size": list(chunk_size),
+        "label_x_extent": list(extent) if extent is not None else None,
+        "split_x": int(split_x),
     }
     if write_run_manifest is not None:
         manifest_path = write_run_manifest(

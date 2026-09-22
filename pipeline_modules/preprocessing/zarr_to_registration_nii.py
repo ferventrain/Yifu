@@ -2,9 +2,10 @@
 
 Streams the input Zarr (typically an Imaris pyramid level written by
 ims_to_zarr) slab by slab, rescales xy per slab and z once on the assembled
-stack, and writes ``volume.nii.gz`` with the same NIfTI convention as
-preprocessing.downsample (xyz transpose + diagonal affine), so
-ANTs_registration can consume it in place of the TIFF-folder downsample.
+stack, and writes ``volume.nii.gz`` with the production registration NIfTI
+convention (xyz transpose + UNIT affine — see the comment in
+``convert_zarr_to_registration_nii``), so ANTs_registration can consume it in
+place of the TIFF-folder downsample.
 """
 from __future__ import annotations
 
@@ -132,13 +133,15 @@ def convert_zarr_to_registration_nii(
     volume_u16 = np.clip(np.rint(volume), 0, 65535).astype(np.uint16)
     del volume
 
-    # Same NIfTI convention as preprocessing.downsample: (z, y, x) -> (x, y, z)
-    # with a diagonal spacing affine.
+    # NIfTI convention of the proven dbdb36 production registration: (z, y, x)
+    # transposed to (x, y, z) with a UNIT diagonal affine. The reference atlas
+    # TIFF carries no spacing metadata and the registration loads it at unit
+    # spacing, so registration runs voxel-isometrically. Writing a true
+    # physical affine (e.g. 25 um) makes the atlas' physical extent land
+    # outside the sample volume and ANTs warps it into an empty volume. The
+    # true voxel size is recorded in original_shape.json instead.
     volume_xyz = np.transpose(volume_u16, (2, 1, 0))
     affine = np.eye(4)
-    affine[0, 0] = tgt_x
-    affine[1, 1] = tgt_y
-    affine[2, 2] = tgt_z
     output_path.parent.mkdir(parents=True, exist_ok=True)
     nib.save(nib.Nifti1Image(volume_xyz, affine), str(output_path))
 
