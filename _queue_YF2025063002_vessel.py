@@ -108,6 +108,12 @@ def sample_finished(sample: str) -> bool:
 def run_pass(samples: list[str]) -> dict[str, int]:
     results: dict[str, int] = {}
     for index, sample in enumerate(samples, start=1):
+        if sample_finished(sample):
+            # Status file already says ALL DONE: the verdict is in; do not even
+            # launch a driver (a re-verify would redo the ~1.5 h region scan).
+            results[sample] = 0
+            log(f"({index}/{len(samples)}) {sample} already ALL DONE, skipping")
+            continue
         wait_until_idle()
         wait_for_nas(DATASETS[dataset_of(sample)]["nas_root"])
         log(f"({index}/{len(samples)}) launching {sample}")
