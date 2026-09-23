@@ -12,6 +12,15 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Build artifacts / caches
+*.egg-info/
+.pytest_cache/
+*.docx
+
+# Local agent / IDE state (kept out of the public repo)
+.claude/
+.cursor/
+
 # Project specific
 *.log
 *.tmp

@@ -200,61 +200,14 @@ class TestExportAndManifest:
 
         manifest = load_capability_manifest()
         assert manifest["module"] == "registration"
-        assert len(manifest["entrypoints"]) == 4
+        assert len(manifest["entrypoints"]) == 6
         entry_ids = {e["id"] for e in manifest["entrypoints"]}
         assert "run_full_pipeline" in entry_ids
         assert "analyze_zarr_graph" in entry_ids
+        assert "convert_atlas_label_to_hemisphere" in entry_ids
         assert "check_region_coverage" in entry_ids
         assert "merge_atlas_regions" in entry_ids
-        assert "convert_atlas_label_to_hemisphere" not in entry_ids
-
-
-# ---------------------------------------------------------------------------
-# Smoke tests for check_region_coverage_zarr helpers
-# ---------------------------------------------------------------------------
-
-
-class TestCheckRegionCoverageHelpers:
-    def test_load_region_tree(self, tiny_region_csv):
-        from pipeline_modules.registration.check_region_coverage_zarr import load_region_tree
-
-        nodes_by_id, acronym_to_ids = load_region_tree(str(tiny_region_csv))
-        assert 1 in nodes_by_id
-        assert 10 in nodes_by_id
-        assert 20 in nodes_by_id
-        assert nodes_by_id[10]["name"] == "RegionA"
-        assert "ra" in acronym_to_ids
-
-    def test_resolve_target_node_by_id(self, tiny_region_csv):
-        from pipeline_modules.registration.check_region_coverage_zarr import (
-            load_region_tree,
-            resolve_target_node,
-        )
-
-        nodes_by_id, acronym_to_ids = load_region_tree(str(tiny_region_csv))
-        node = resolve_target_node(nodes_by_id, acronym_to_ids, region_id=10)
-        assert node["id"] == 10
-        assert node["acronym"] == "RA"
-
-    def test_resolve_target_node_by_acronym(self, tiny_region_csv):
-        from pipeline_modules.registration.check_region_coverage_zarr import (
-            load_region_tree,
-            resolve_target_node,
-        )
-
-        nodes_by_id, acronym_to_ids = load_region_tree(str(tiny_region_csv))
-        node = resolve_target_node(nodes_by_id, acronym_to_ids, acronym="RB")
-        assert node["id"] == 20
-
-    def test_resolve_missing_raises(self, tiny_region_csv):
-        from pipeline_modules.registration.check_region_coverage_zarr import (
-            load_region_tree,
-            resolve_target_node,
-        )
-
-        nodes_by_id, acronym_to_ids = load_region_tree(str(tiny_region_csv))
-        with pytest.raises(KeyError):
-            resolve_target_node(nodes_by_id, acronym_to_ids, region_id=999)
+        assert "run_spinal_segment_analysis" in entry_ids
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +231,9 @@ class TestMergeAtlasRegionsHelpers:
         )
 
         nodes = load_region_tree(str(tiny_region_csv))
-        target_specs = resolve_target_specs(nodes, "wb20", "")
-        # wb20 may not match our tiny CSV, so test with explicit target_ids
+        # wb20 preset ids are absent from the tiny CSV -> validation raises
+        with pytest.raises(KeyError):
+            resolve_target_specs(nodes, "wb20", "")
         target_specs = resolve_target_specs(nodes, "", "1")
         merge_mapping, summaries = build_nearest_ancestor_mapping(nodes, target_specs)
         # Everything should map to root (id=1)

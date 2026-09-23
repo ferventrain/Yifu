@@ -93,11 +93,11 @@ def tiny_skeleton_csvs(tmp_path):
 
 @pytest.fixture()
 def tiny_region_csv(tmp_path):
-    """A minimal Allen-style region CSV with two leaf nodes."""
+    """A minimal region CSV in the Region_Csv_Rev1 dialect (Python-literal columns)."""
     rows = [
-        {"id": 1,  "name": "root",      "acronym": "root", "structure_id_path": "/1/"},
-        {"id": 10, "name": "RegionA",   "acronym": "RA",   "structure_id_path": "/1/10/"},
-        {"id": 20, "name": "RegionB",   "acronym": "RB",   "structure_id_path": "/1/20/"},
+        {"id": 1,  "name": "root",    "acronym": "['root']", "structure_id_path": "[1]"},
+        {"id": 10, "name": "RegionA", "acronym": "['RA']",   "structure_id_path": "[1, 10]"},
+        {"id": 20, "name": "RegionB", "acronym": "['RB']",   "structure_id_path": "[1, 20]"},
     ]
     csv_path = tmp_path / "regions.csv"
     pd.DataFrame(rows).to_csv(csv_path, index=False)

@@ -1,4 +1,0 @@
-magicgui
-napari
-numpy
-tifffile
