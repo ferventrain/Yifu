@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from tqdm import tqdm
 
 try:
@@ -87,6 +88,53 @@ def _iter_chunk_slices(shape: tuple[int, int, int], chunks: tuple[int, int, int]
             for x in range(0, shape[2], chunks[2]):
                 x_end = min(x + chunks[2], shape[2])
                 yield (slice(z, z_end), slice(y, y_end), slice(x, x_end))
+
+
+def _percentile_bounds_from_histogram(
+    counts: np.ndarray,
+    low_pct: float,
+    high_pct: float,
+) -> tuple[float, float]:
+    total = int(counts.sum())
+    if total <= 0:
+        return 0.0, 1.0
+    cumulative = np.cumsum(counts.astype(np.int64))
+    low_index = int(np.searchsorted(cumulative, total * float(low_pct) / 100.0))
+    high_index = int(np.searchsorted(cumulative, total * float(high_pct) / 100.0))
+    max_index = int(counts.size - 1)
+    return float(min(low_index, max_index)), float(min(high_index, max_index))
+
+
+def _global_normalize_bounds(
+    data_in,
+    chunk_slices: list[tuple[slice, slice, slice]],
+    low_pct: float,
+    high_pct: float,
+) -> tuple[float, float, str]:
+    """Whole-volume normalization bounds computed before chunked inference.
+
+    Unsigned integer volumes (the pipeline standard, uint16) use an exact
+    value histogram; other dtypes fall back to a uniform voxel subsample of
+    roughly 4M values.
+    """
+    dtype = np.dtype(data_in.dtype)
+    if np.issubdtype(dtype, np.unsignedinteger) and int(np.iinfo(dtype).max) <= 65535:
+        counts = np.zeros(int(np.iinfo(dtype).max) + 1, dtype=np.int64)
+        for slices in chunk_slices:
+            block = np.asarray(data_in[slices])
+            counts += np.bincount(block.ravel(), minlength=counts.size)[: counts.size]
+        low, high = _percentile_bounds_from_histogram(counts, low_pct, high_pct)
+        return low, high, "exact histogram over full volume"
+
+    total_voxels = int(np.prod([int(v) for v in data_in.shape]))
+    step = max(1, total_voxels // (1 << 22))
+    samples: list[np.ndarray] = []
+    for slices in chunk_slices:
+        block = np.asarray(data_in[slices])
+        samples.append(block.ravel()[::step].astype(np.float32, copy=False))
+    pooled = np.concatenate(samples) if samples else np.zeros(1, dtype=np.float32)
+    low, high = (float(v) for v in np.percentile(pooled, (float(low_pct), float(high_pct))))
+    return low, high, f"subsample of {int(pooled.size)} voxels"
 
 
 def _infer_volume(
@@ -176,6 +224,7 @@ def run_cfos_unet_inference(
     probability_dtype: str = "float16",
     chunk_size: tuple[int, int, int] | None = None,
     normalize_percentiles: tuple[float, float] = (1.0, 99.5),
+    normalize_scope: str = "global",
 ) -> dict[str, Any]:
     import numpy as np
 
@@ -246,6 +295,24 @@ def run_cfos_unet_inference(
     else:
         chunk_slices_iter = list(_iter_chunk_slices(tuple(int(v) for v in data_in.shape), inferred_chunk_size))
 
+    normalize_bounds: tuple[float, float] | None = None
+    normalize_bounds_source = "per chunk"
+    if str(normalize_scope).lower() == "global":
+        logger.info(
+            "Computing whole-volume normalize bounds (percentiles %s) before chunked inference...",
+            tuple(float(p) for p in normalize_percentiles),
+        )
+        global_low, global_high, normalize_bounds_source = _global_normalize_bounds(
+            data_in,
+            chunk_slices_iter,
+            float(normalize_percentiles[0]),
+            float(normalize_percentiles[1]),
+        )
+        normalize_bounds = (global_low, global_high)
+        logger.info(
+            "Global normalize bounds: low=%g high=%g (%s)", global_low, global_high, normalize_bounds_source
+        )
+
     with torch_mod.inference_mode():
         for slices in tqdm(chunk_slices_iter, total=len(chunk_slices_iter), desc="cFos inference", unit="chunk"):
             volume_np = np.asarray(data_in[slices])
@@ -256,6 +323,8 @@ def run_cfos_unet_inference(
                 volume_np,
                 low_pct=float(normalize_percentiles[0]),
                 high_pct=float(normalize_percentiles[1]),
+                low=None if normalize_bounds is None else normalize_bounds[0],
+                high=None if normalize_bounds is None else normalize_bounds[1],
             )
             logits = _infer_volume(
                 volume_np,
@@ -296,6 +365,9 @@ def run_cfos_unet_inference(
         "output_mode": output_mode,
         "output_dtype": output_dtype,
         "probability_dtype": probability_dtype,
+        "normalize_scope": str(normalize_scope).lower(),
+        "normalize_bounds": list(normalize_bounds) if normalize_bounds else None,
+        "normalize_bounds_source": normalize_bounds_source,
     }
     manifest_path = write_run_manifest(
         output_zarr,
@@ -354,6 +426,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probability_dtype", default="float16", help="numpy dtype for optional probability output")
     parser.add_argument("--chunk_size", default="", help="Override output chunk size as z,y,x")
     parser.add_argument("--normalize_percentiles", default="1.0,99.5", help="Percentile pair low,high for normalization")
+    parser.add_argument(
+        "--normalize_scope",
+        choices=["global", "chunk"],
+        default="global",
+        help="global (default): compute percentiles over the whole volume first, then "
+        "normalize every chunk with the same bounds; chunk: per-chunk percentiles (legacy)",
+    )
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()
 
@@ -405,6 +484,7 @@ def main() -> int:
             probability_dtype=args.probability_dtype,
             chunk_size=_parse_triplet(args.chunk_size),
             normalize_percentiles=_parse_percentiles(args.normalize_percentiles),
+            normalize_scope=args.normalize_scope,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0

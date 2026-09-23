@@ -104,40 +104,120 @@ def select_keep_labels_3d(
     min_voxels: int,
     max_extent_ratio: float,
     downsample_factor: int,
-) -> tuple[set[int], int, int]:
+    max_single_slice_voxels: int = 0,
+    max_slice_counts_ds: np.ndarray | None = None,
+    shell_hits: np.ndarray | None = None,
+) -> tuple[set[int], int, int, int, int]:
+    """Decide which 3D components survive the standard filters.
+
+    Volumes/areas are given at full resolution and converted to the
+    downsampled grid. A filter value <= 0 disables that filter:
+
+    - ``min_voxels`` / ``max_voxels``: 3D object volume bounds
+    - ``max_extent_ratio``: bounding-box max/min axis ratio
+    - ``max_single_slice_voxels``: drop objects whose largest single-slice
+      footprint (vessels, surface sheets) exceeds this many voxels
+    - ``shell_hits``: per-label voxel counts inside the excluded near-boundary
+      shell; any hit removes the object
+    """
     keep_labels: set[int] = set()
     removed_volume = 0
     removed_extent = 0
+    removed_single_slice = 0
+    removed_edge = 0
 
     scale_volume = downsample_factor ** 3
-    max_voxels_ds = max(int(max_voxels // scale_volume), 1)
-    min_voxels_ds = max(int(min_voxels // scale_volume), 1)
+    min_voxels_ds = max(int(min_voxels) // scale_volume, 1) if min_voxels > 0 else 0
+    max_voxels_ds = max(int(max_voxels) // scale_volume, 1) if max_voxels > 0 else 0
+    single_slice_threshold_ds = (
+        float(max_single_slice_voxels) / float(downsample_factor ** 2) if max_single_slice_voxels > 0 else 0.0
+    )
 
     voxel_counts = stats["voxel_counts"]
     bounding_boxes = stats["bounding_boxes"]
 
     for label_idx in range(1, len(voxel_counts)):
         count_ds = int(voxel_counts[label_idx])
-        if count_ds < min_voxels_ds:
+        if min_voxels_ds and count_ds < min_voxels_ds:
             removed_volume += 1
             continue
-        if count_ds > max_voxels_ds:
+        if max_voxels_ds and count_ds > max_voxels_ds:
             removed_volume += 1
             continue
-
-        ratio = _extent_ratio(bounding_boxes[label_idx])
-        if ratio > max_extent_ratio:
-            removed_extent += 1
+        if (
+            single_slice_threshold_ds > 0
+            and max_slice_counts_ds is not None
+            and int(max_slice_counts_ds[label_idx]) >= single_slice_threshold_ds
+        ):
+            removed_single_slice += 1
+            continue
+        if max_extent_ratio > 0:
+            ratio = _extent_ratio(bounding_boxes[label_idx])
+            if ratio > max_extent_ratio:
+                removed_extent += 1
+                continue
+        if shell_hits is not None and int(shell_hits[label_idx]) > 0:
+            removed_edge += 1
             continue
 
         keep_labels.add(label_idx)
 
-    return keep_labels, removed_volume, removed_extent
+    return keep_labels, removed_volume, removed_extent, removed_single_slice, removed_edge
 
 
 def upsample_keep_slice(ds_keep: np.ndarray, factor: int, height: int, width: int) -> np.ndarray:
     upsampled = np.repeat(np.repeat(ds_keep, factor, axis=0), factor, axis=1)
     return upsampled[:height, :width]
+
+
+def _downsample_foreground(label_arr, factor: int, ds_shape: tuple[int, int, int]) -> np.ndarray:
+    """Max-pool (label > 0) onto the downsampled grid, streaming z slabs."""
+    ds = np.zeros(ds_shape, dtype=np.uint8)
+    for z0 in range(0, int(label_arr.shape[0]), factor):
+        z1 = min(z0 + factor, int(label_arr.shape[0]))
+        slab = (np.asarray(label_arr[z0:z1]) > 0).astype(np.uint8)
+        ds[z0 // factor] = block_reduce(slab, block_size=(factor, factor, factor), func=np.max)[0]
+    return ds
+
+
+def _per_component_max_slice_counts(labels: np.ndarray, n_labels: int) -> np.ndarray:
+    """Largest single downsampled-slice footprint per component label."""
+    max_counts = np.zeros(n_labels, dtype=np.int64)
+    for z in range(labels.shape[0]):
+        counts = np.bincount(labels[z].astype(np.int64).ravel(), minlength=n_labels)
+        np.maximum(max_counts, counts[:n_labels], out=max_counts)
+    return max_counts
+
+
+def _boundary_shell_hits(
+    label_in,
+    *,
+    factor: int,
+    ds_shape: tuple[int, int, int],
+    labels: np.ndarray,
+    n_labels: int,
+    exclude_edge_px: int,
+) -> tuple[np.ndarray, int]:
+    """Per-label voxel counts inside the near-brain-surface exclusion shell.
+
+    The brain surface comes from the registered atlas label (label > 0); it is
+    downsampled, eroded by ceil(exclude_edge_px / factor) voxels, and the
+    shell between the surface and the eroded core defines the exclusion zone.
+    """
+    from scipy import ndimage as ndi
+
+    ds_brain = _downsample_foreground(label_in, factor, ds_shape)
+    iterations = max(1, -(-int(exclude_edge_px) // int(factor)))
+    core = ndi.binary_erosion(
+        ds_brain.astype(bool),
+        structure=ndi.generate_binary_structure(3, 1),
+        iterations=iterations,
+    )
+    shell = (ds_brain > 0) & ~core
+    if not np.any(shell):
+        return np.zeros(n_labels, dtype=np.int64), iterations
+    shell_hits = np.bincount(labels[shell].astype(np.int64).ravel(), minlength=n_labels)
+    return shell_hits[:n_labels], iterations
 
 
 def postprocess_cfos_mask_3d(
@@ -151,6 +231,8 @@ def postprocess_cfos_mask_3d(
     min_voxels: int,
     max_extent_ratio: float,
     downsample_factor: int,
+    exclude_edge_px: int = 0,
+    max_single_slice_voxels: int = 0,
     label_zarr: Path | None = None,
     region_query: str | None = None,
     region_cfg: Path | None = None,
@@ -167,20 +249,21 @@ def postprocess_cfos_mask_3d(
     region_id_array = None
     region_name = None
     region_ids: set[int] = set()
-    if region_query:
+    if region_query or exclude_edge_px > 0:
         if label_zarr is None:
-            raise ValueError("--region requires --label_zarr")
+            raise ValueError("--region and --exclude_edge_px require --label_zarr")
         label_in = open_zarr_dataset(label_zarr, dataset_name=dataset_name)
         if label_in.shape != mask_in.shape:
             raise ValueError(f"Shape mismatch: mask={mask_in.shape}, label={label_in.shape}")
-        region_cfg = region_cfg or DEFAULT_REGION_CFG
-        region_ids, region_name = resolve_region_subtree_ids(region_query, cfg_path=region_cfg)
-        region_id_array = np.asarray(sorted(region_ids))
+        if region_query:
+            region_cfg = region_cfg or DEFAULT_REGION_CFG
+            region_ids, region_name = resolve_region_subtree_ids(region_query, cfg_path=region_cfg)
+            region_id_array = np.asarray(sorted(region_ids))
 
     ds_mask, ds_region, active_z_indices = downsample_mask_zarr(
         mask_in,
         factor=downsample_factor,
-        label_in=label_in,
+        label_in=label_in if region_id_array is not None else None,
         region_id_array=region_id_array,
     )
     if ds_region is not None:
@@ -188,15 +271,34 @@ def postprocess_cfos_mask_3d(
         ds_mask = ds_mask.astype(np.uint8)
     labels = cc3d.connected_components(ds_mask, connectivity=26)
     stats = cc3d.statistics(labels)
-    print(f"3D connected components: {len(stats['voxel_counts']) - 1} objects in filter scope", flush=True)
+    n_labels = int(len(stats["voxel_counts"]))
+    print(f"3D connected components: {n_labels - 1} objects in filter scope", flush=True)
 
-    keep_labels, removed_volume, removed_extent = select_keep_labels_3d(
+    shell_hits = None
+    erosion_iterations = 0
+    if exclude_edge_px > 0:
+        shell_hits, erosion_iterations = _boundary_shell_hits(
+            label_in,
+            factor=downsample_factor,
+            ds_shape=tuple(int(v) for v in ds_mask.shape),
+            labels=labels,
+            n_labels=n_labels,
+            exclude_edge_px=exclude_edge_px,
+        )
+    max_slice_counts_ds = None
+    if max_single_slice_voxels > 0:
+        max_slice_counts_ds = _per_component_max_slice_counts(labels, n_labels)
+
+    keep_labels, removed_volume, removed_extent, removed_single_slice, removed_edge = select_keep_labels_3d(
         labels,
         stats,
         max_voxels=max_voxels,
         min_voxels=min_voxels,
         max_extent_ratio=max_extent_ratio,
         downsample_factor=downsample_factor,
+        max_single_slice_voxels=max_single_slice_voxels,
+        max_slice_counts_ds=max_slice_counts_ds,
+        shell_hits=shell_hits,
     )
     ds_keep = np.isin(labels, list(keep_labels)).astype(np.uint8)
 
@@ -273,10 +375,15 @@ def postprocess_cfos_mask_3d(
         "max_voxels_full": int(max_voxels),
         "max_voxels_downsampled": int(max(max_voxels // (downsample_factor**3), 1)),
         "max_extent_ratio": float(max_extent_ratio),
-        "labels_total_3d": int(len(stats["voxel_counts"]) - 1),
+        "exclude_edge_px": int(exclude_edge_px),
+        "edge_shell_erosion_iterations": int(erosion_iterations),
+        "max_single_slice_voxels": int(max_single_slice_voxels),
+        "labels_total_3d": int(n_labels - 1),
         "labels_kept_3d": int(len(keep_labels)),
         "labels_removed_volume_3d": int(removed_volume),
         "labels_removed_extent_3d": int(removed_extent),
+        "labels_removed_single_slice_3d": int(removed_single_slice),
+        "labels_removed_edge_3d": int(removed_edge),
         "region_query": region_query or "",
         "region_name": region_name or "",
         "region_ids_count": int(len(region_ids)),
@@ -310,7 +417,21 @@ def parse_args() -> argparse.Namespace:
         "--max_extent_ratio",
         type=float,
         default=3.0,
-        help="Maximum allowed max-axis/min-axis ratio from 3D bounding box.",
+        help="Maximum allowed max-axis/min-axis ratio from 3D bounding box (0 disables).",
+    )
+    parser.add_argument(
+        "--exclude_edge_px",
+        type=int,
+        default=0,
+        help="Drop objects with any voxel within this many pixels inside the brain "
+        "surface (atlas label boundary); requires --label_zarr (0 disables).",
+    )
+    parser.add_argument(
+        "--max_single_slice_voxels",
+        type=int,
+        default=0,
+        help="Drop objects whose largest single-slice footprint exceeds this many "
+        "full-resolution voxels (0 disables).",
     )
     parser.add_argument(
         "--downsample_factor",
@@ -322,7 +443,8 @@ def parse_args() -> argparse.Namespace:
         "--label_zarr",
         type=Path,
         default=None,
-        help="Registered atlas label Zarr in sample space (required with --region).",
+        help="Registered atlas label Zarr in sample space (required with --region "
+        "or --exclude_edge_px).",
     )
     parser.add_argument(
         "--region",
@@ -357,6 +479,8 @@ def main() -> int:
         max_voxels=args.max_voxels,
         min_voxels=args.min_voxels,
         max_extent_ratio=args.max_extent_ratio,
+        exclude_edge_px=args.exclude_edge_px,
+        max_single_slice_voxels=args.max_single_slice_voxels,
         downsample_factor=args.downsample_factor,
         label_zarr=args.label_zarr,
         region_query=args.region,

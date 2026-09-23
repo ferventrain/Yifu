@@ -354,6 +354,7 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
         )
         if probability_zarr_path:
             cmd += f' --probability_zarr "{probability_zarr_path}"'
+        cmd += f' --normalize_scope "{model_cfg.get("normalize_scope", "global")}"'
         if model_cfg.get("patch_size"):
             cmd += f' --patch_size "{format_csv(model_cfg["patch_size"])}"'
         if model_cfg.get("chunk_size"):
@@ -506,6 +507,10 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     export_mask_tiff = bool(seg_cfg.get("export_mask_tiff", False))
     probability_zarr_path = None
     force_rerun = False
+    post_cfg = seg_cfg.get("postprocess") or {} if seg_cfg["method"] == "cfos_unet" else {}
+    post_enabled = bool(post_cfg.get("enabled", False))
+    raw_mask_path = sample_dir / f"ch{signal_ch}_mask_raw.zarr" if post_enabled else None
+    seg_target_mask = raw_mask_path or mask_zarr_path
     if seg_cfg["method"] == "cfos_unet":
         model_cfg = seg_cfg["cfos_unet"]
         configured_probability_zarr = model_cfg.get("probability_zarr", "")
@@ -534,10 +539,32 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
         return mask_zarr_path, mask_tiff_dir
 
     segmentation_ran = False
-    if force_rerun or not mask_zarr_path.exists() or not probability_ready:
-        seg_cmd = build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_zarr_path)
+    if force_rerun or not seg_target_mask.exists() or not probability_ready:
+        seg_cmd = build_segmentation_command(seg_cfg, zarr_path, seg_target_mask, probability_zarr_path)
         run_command(seg_cmd, f'4.1 Segmentation ({seg_cfg["method"]})')
         segmentation_ran = True
+
+    if post_enabled and (segmentation_ran or not mask_zarr_path.exists()):
+        exclude_edge_px = int(post_cfg.get("exclude_edge_px", 40))
+        label_zarr_path = sample_dir / "upsampled_atlas_label.zarr"
+        if exclude_edge_px > 0 and not label_zarr_path.exists():
+            print(f"Error: segmentation.postprocess.exclude_edge_px requires {label_zarr_path} (run registration first).")
+            sys.exit(1)
+        post_cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.cfos_mask_postprocess '
+            f'--signal_zarr "{zarr_path}" '
+            f'--mask_zarr "{seg_target_mask}" '
+            f'--output_mask_zarr "{mask_zarr_path}" '
+            f'--exclude_edge_px {exclude_edge_px} '
+            f'--max_single_slice_voxels {int(post_cfg.get("max_single_slice_voxels", 200))} '
+            f'--max_voxels {int(post_cfg.get("max_voxels", 0))} '
+            f'--min_voxels {int(post_cfg.get("min_voxels", 0))} '
+            f'--max_extent_ratio {float(post_cfg.get("max_extent_ratio", 0.0))} '
+            f'--downsample_factor {int(post_cfg.get("downsample_factor", 4))}'
+        )
+        if label_zarr_path.exists():
+            post_cmd += f' --label_zarr "{label_zarr_path}"'
+        run_command(post_cmd, "4.2 Standard mask postprocess (edge/single-slice filters)")
 
     if force_rerun and segmentation_ran and directory_has_files(mask_tiff_dir):
         remove_path(mask_tiff_dir)

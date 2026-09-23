@@ -130,7 +130,18 @@
             "output_mode": "binary",
             "output_dtype": "uint8",
             "probability_dtype": "float16",
-            "normalize_percentiles": [1.0, 99.5]
+            "normalize_percentiles": [1.0, 99.5],
+            "normalize_scope": "global"
+        },
+
+        "postprocess": {
+            "enabled": true,
+            "exclude_edge_px": 40,
+            "max_single_slice_voxels": 200,
+            "max_voxels": 0,
+            "min_voxels": 0,
+            "max_extent_ratio": 0.0,
+            "downsample_factor": 4
         },
 
         "spotiflow": {

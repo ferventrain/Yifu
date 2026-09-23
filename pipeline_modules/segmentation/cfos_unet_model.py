@@ -4,11 +4,18 @@ from pathlib import Path
 from typing import Any
 
 
-def normalize_volume(volume, low_pct: float = 1.0, high_pct: float = 99.5):
+def normalize_volume(volume, low_pct: float = 1.0, high_pct: float = 99.5, *, low=None, high=None):
+    """Clip-stretch normalize to [0, 1].
+
+    Percentile bounds are computed from the volume unless ``low``/``high`` are
+    passed explicitly (whole-brain normalization reuses globally computed
+    bounds so every chunk is scaled identically).
+    """
     import numpy as np
 
     volume = volume.astype(np.float32, copy=False)
-    low, high = np.percentile(volume, (float(low_pct), float(high_pct)))
+    if low is None or high is None:
+        low, high = np.percentile(volume, (float(low_pct), float(high_pct)))
     if high <= low:
         volume = volume - volume.min()
         denom = volume.max()
