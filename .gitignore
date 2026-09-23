@@ -45,3 +45,6 @@ node_modules/
 package.json
 package-lock.json
 .zcode/
+
+# Local one-off helper/run scripts never belong in the repo
+_*.py
