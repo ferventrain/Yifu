@@ -9,7 +9,7 @@
     "rules": [
       "Whole-brain production runs must avoid TIFF intermediates: stream Imaris .ims directly with pipeline_modules.preprocessing.ims_to_zarr and pre-create the inputs main.py skips on (ch<signal>.zarr, ch<reg>_downsample/volume.nii.gz, sample_dir/original_shape.json). See pipeline_modules/preprocessing/capability_manifest.json.",
       "Preprocessing/enhancement is OFF by default in production configs (every preprocessing.*.apply=false) so segmentation thresholds operate on raw stored intensities and stay comparable across samples and batches.",
-      "Custom multi-step flows that main.py cannot express (e.g. ims->zarr->segmentation->masked ims) are launched as driver scripts and attached to PM via ActiveStore.attach_external, never by hand-editing queue files.",
+      "Custom multi-step flows that main.py cannot express (e.g. ims->zarr->segmentation->masked ims) are launched as driver scripts and attached to PM via ActiveStore.attach_external, never by hand-editing queue files. Launch method and driver requirements are governed by launch_stability_policy in THIS manifest.",
       "One job runs at a time. To wait for the current run, poll ActiveStore.has_running() or GET /api/jobs; never launch heavy pipelines outside PM while a job is running."
     ]
   },
@@ -73,6 +73,49 @@
       }
     }
   ],
+  "launch_stability_policy": {
+    "id": "unattended-run-stability",
+    "updated": "2026-09-23",
+    "origin": "Incidents 2026-09-18..23 (YF2025063002 vessel batch): whole process trees died to invisible-console input() prompts, invalid std handles (exit 120 fake failures), PID reuse faking 'running', NAS drops, and unidentified external kill waves. Rules below are the distilled fix set.",
+    "launch_methods_ranked": [
+      {
+        "rank": 1,
+        "method": "Operator's own terminal window",
+        "why": "The most process-lineage-stable place on Windows: the human sees a death immediately and re-runs. For interactive batches hand the operator ONE paste-able command (the queue orchestrator already accepts a sample list); PM stays a read-only progress viewer."
+      },
+      {
+        "rank": 2,
+        "method": "Windows scheduled task (schtasks /Run)",
+        "why": "For unattended serial batches. Parent is the Task Scheduler service, so the tree survives console/session cleanup that kills cmd-started children. See _schedule_vessel_queue.py; pair with the watchdog below."
+      },
+      {
+        "rank": 3,
+        "method": "PM queue (add_job, kind=main)",
+        "why": "Only for flows main.py natively expresses. Custom multi-step flows are forbidden here; use a driver attached via attach_external."
+      }
+    ],
+    "forbidden": [
+      "cmd /c start /b or detached-shell spawns from agent tooling: their lineage dies with the tool's cleanup AND adds failure modes at every layer; kill waves on this machine target exactly such chains.",
+      "Interactive input() anywhere in an unattended chain: a scheduled task provides an invisible console where isatty() is TRUE and input() blocks forever (cost: one full day once). Pass explicit flags instead, e.g. ims_to_zarr --reg_channel none.",
+      "Relying on process exit codes as the verdict: with no valid std handles python exits 120/1 AFTER completing all work, and killed drivers exit with misleading codes. The two-line status file (RUNNING/ALL DONE/FAILED + started_at) is the ONLY verdict.",
+      "Writing to inherited sys.__stdout__/__stderr__ or os.dup2 onto missing fds (raises OSError 9, 'lost sys.stderr'): route driver output through an explicitly opened log file; pass that same handle to child processes via subprocess stdout=<log_file>.",
+      "Ad-hoc psutil/taskkill sweeps matching by command substring: they kill unrelated trees (self-inflicted once). Kill by exact PID, or by PID + create-time.",
+      "Re-running finished samples to 'verify': region analysis has no output-exists skip, so a re-verify costs ~1.5 h/sample. Skip on status file == ALL DONE."
+    ],
+    "driver_contract": [
+      "Two-line status file (first line 'RUNNING Step N: ...' / 'ALL DONE' / 'FAILED ...', second line started_at ISO) written at every step transition; PM parses line 1 and the Step N counter.",
+      "Marker file after each completed step (output.done), and ADOPT orphaned outputs: if the artifact exists but the marker is missing, the driver was killed between module completion and marker write — modules refuse to overwrite, so adopt and move on instead of failing.",
+      "attach_external to PM at start with pid AND pid_created_at (PID reuse fakes liveness otherwise; sync_external_job validates via pid_matches).",
+      "Retry loop (up to 4 attempts per step, backoff) + a pass-level retry (3 passes, 5 min apart) around the whole sample list.",
+      "wait_for_nas() before each launch: a NAS drop killed a whole pass once.",
+      "register a watchdog: scheduled task every 15 min that relaunches the queue when samples remain unfinished and no orchestrator process is alive (_vessel_queue_watchdog.py, task YifuVesselWatchdog). Any kill, whatever its source, is then absorbed within one period at marker-level cost — this is what makes 'never crashes' practically true."
+    ],
+    "reference_implementations": [
+      "_run_YF2025063002_vessel.py (driver honoring the full contract)",
+      "_queue_YF2025063002_vessel.py (serial orchestrator: status-file verdict, ALL DONE skip, NAS preflight, 3-pass retry)",
+      "_vessel_queue_watchdog.py + _schedule_vessel_queue.py (self-heal + schtasks launcher)"
+    ]
+  },
   "queue_semantics": {
     "storage": "YIFU_ANALYSIS_ROOT/_active: queue.json (ordered ids), jobs/*.json (records), runs/<job_id>/ (progress.json + stdout log)",
     "statuses": ["queued", "running", "done", "failed", "cancelled"],
@@ -81,6 +124,7 @@
   },
   "reference_drivers": [
     "_run_YF2025063002_vessel.py (ims -> zarr -> 25um registration nii -> main.py threshold + hemisphere -> L/R stats)",
-    "_run_YF2026070102_cfos.py (ims -> zarr -> cfos_unet -> masked ims)"
+    "_run_YF2026070102_cfos.py (ims -> zarr -> cfos_unet -> masked ims)",
+    "_vessel_queue_watchdog.py (15-min self-heal for any unattended queue)"
   ]
 }
