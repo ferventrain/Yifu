@@ -154,6 +154,60 @@ def _match_plane(presence: np.ndarray, plane: np.ndarray) -> np.ndarray:
     return out
 
 
+def _resample_plane(volume_plane: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    """Nearest-neighbour resample a full-res label/hemisphere plane onto the
+    exact NIfTI grid. Integer-stride slicing ([::14]) drifts progressively
+    against the true 13.68-voxel NIfTI spacing (several pixels at the frame
+    edge), which reads as registration error in the overlay."""
+    from scipy import ndimage
+
+    if volume_plane.shape == target_shape:
+        return volume_plane
+    factors = (target_shape[0] / volume_plane.shape[0], target_shape[1] / volume_plane.shape[1])
+    return ndimage.zoom(volume_plane.astype(np.uint8), factors, order=0).astype(bool)
+
+
+def measure_boundary_alignment(nii_path: Path, label_zarr_path: Path) -> dict:
+    """Axial-plane IoU between the label extent and tissue (autofluorescence),
+    and the best small translation. Separates overlay/rendering offsets
+    (zero-shift IoU already high) from genuine registration misalignment
+    (large optimal shift)."""
+    import nibabel as nib
+    from scipy import ndimage
+
+    if not nii_path.exists() or not label_zarr_path.exists():
+        return {"status": "WARN", "reason": "missing inputs"}
+    nii_xyz = np.asanyarray(nib.load(str(nii_path)).dataobj)  # x,y,z
+    nx, ny, nz = nii_xyz.shape
+    label = open_zarr_array(label_zarr_path)
+    lz, ly, lx = (int(v) for v in label.shape)
+
+    tissue = np.transpose(nii_xyz[:, :, nz // 2]) > np.percentile(nii_xyz[:, :, nz // 2], 55)
+    tissue = ndimage.binary_closing(tissue, iterations=3)
+    label_plane = _resample_plane(np.asarray(label[lz // 2]) > 0, tissue.shape)
+
+    def iou(shift_y, shift_x):
+        moved = np.roll(label_plane, (shift_y, shift_x), axis=(0, 1))
+        inter = int((moved & tissue).sum())
+        union = int((moved | tissue).sum())
+        return inter / union if union else 0.0
+
+    base = iou(0, 0)
+    best, best_shift = base, (0, 0)
+    for dy in range(-8, 9):
+        for dx in range(-8, 9):
+            value = iou(dy, dx)
+            if value > best:
+                best, best_shift = value, (dy, dx)
+    return {
+        "status": "INFO",
+        "iou_zero_shift": round(base, 3),
+        "iou_best_shift": round(best, 3),
+        "best_shift_px_zyx": [best_shift[0], best_shift[1]],
+        "note": "<=2 px residual is expected at 25 um SyN granularity; large optimal shift indicates true misregistration",
+    }
+
+
 def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_path: Path, out_png: Path) -> None:
     import nibabel as nib
     from PIL import Image, ImageDraw
@@ -163,8 +217,7 @@ def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_p
     label = open_zarr_array(label_zarr_path) if label_zarr_path.exists() else None  # z,y,x
     hemi = open_zarr_array(hemi_zarr_path) if hemi_zarr_path.exists() else None
     lz, ly, lx = (int(v) for v in label.shape) if label is not None else (0, 0, 0)
-    fx, fy, fz = lx / max(nx, 1), ly / max(ny, 1), lz / max(nz, 1)
-    sx = [max(int(round(v)), 1) for v in (fz, fy, fx)]  # strides on label z,y,x
+    fx = lx / max(nx, 1)
 
     # Display convention: rows = first listed axis, cols = second.
     # axial (rows=y, cols=x), coronal (rows=z, cols=x), sagittal (rows=z, cols=y).
@@ -176,11 +229,15 @@ def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_p
     label_planes: dict[str, np.ndarray | None] = {"axial": None, "coronal": None, "sagittal": None}
     hemi_plane: np.ndarray | None = None
     if label is not None:
-        label_planes["axial"] = np.asarray(label[lz // 2])[:: sx[1], :: sx[2]] > 0          # (y, x)
-        label_planes["coronal"] = np.asarray(label[:, ly // 2, :])[:: sx[0], :: sx[2]] > 0  # (z, x)
-        label_planes["sagittal"] = np.asarray(label[:, :, lx // 2])[:: sx[0], :: sx[1]] > 0  # (z, y)
+        # Resample onto the exact NIfTI grid per plane (see _resample_plane).
+        axial_target = planes["axial"].shape          # (y, x)
+        coronal_target = planes["coronal"].shape      # (z, x)
+        sagittal_target = planes["sagittal"].shape    # (z, y)
+        label_planes["axial"] = _resample_plane(np.asarray(label[lz // 2]) > 0, axial_target)
+        label_planes["coronal"] = _resample_plane(np.asarray(label[:, ly // 2, :]) > 0, coronal_target)
+        label_planes["sagittal"] = _resample_plane(np.asarray(label[:, :, lx // 2]) > 0, sagittal_target)
     if hemi is not None:
-        hemi_plane = np.asarray(hemi[lz // 2])[:: sx[1], :: sx[2]]  # (y, x): 0 bg, 1 left, 2 right
+        hemi_plane = _resample_plane(np.asarray(hemi[lz // 2]), planes["axial"].shape)
 
     import zarr as _zarr
 
@@ -298,6 +355,10 @@ def run_qc(
         [float(v) for v in config["preprocessing"]["downsample"]["target_resolution_xyz"]],
     )
     checks["registration_correlation"] = check_registration_correlation(nii_path, warped_dir)
+    try:
+        checks["boundary_alignment"] = measure_boundary_alignment(nii_path, label_zarr_path)
+    except Exception:
+        logger.exception("boundary alignment measurement failed")
 
     try:
         render_registration_views(nii_path, label_zarr_path, hemi_zarr_path, output_dir / "registration_views.png")
