@@ -130,9 +130,10 @@
     {
       "id": "harness",
       "path": "pipeline_modules/harness",
-      "description": "Local Active-queue runner for main.py with a simple operator UI, progress.json, historical step ETAs, and SampleLayout result listing.",
+      "description": "Pipeline Monitor (PM): local serial job queue + operator UI (http://127.0.0.1:8766), progress.json, historical step ETAs, SampleLayout result listing. MANDATORY for production runs: enqueue main.py flows via `python -m pipeline_modules.harness enqueue` and attach custom multi-step drivers via ActiveStore.attach_external; never launch heavy pipelines outside PM while any job is running (poll ActiveStore.has_running()). Read the capability manifest first: it carries the two-line status-file verdict, launch_stability_policy and driver_contract.",
       "agent_native": true,
       "capability_manifest": "pipeline_modules/harness/capability_manifest.json",
+      "usage_doc": "README.md section 4.0",
       "primary_scripts": [
         "pipeline_modules/harness/queue.py",
         "pipeline_modules/harness/runner.py",

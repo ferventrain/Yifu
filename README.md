@@ -221,13 +221,48 @@ copy config_template.json config.json
 
 ## 4. 运行主流程
 
+### 4.0 生产运行必须经过 Pipeline Monitor（PM）
+
+**约定：任何全脑/生产级运行都必须挂在 PM 上**，不允许在 PM 之外裸启动重型流程。PM 是本地串行任务队列 + 进度看板（FastAPI，默认 <http://127.0.0.1:8766>），保证同一时间只跑一个任务，并向人和 agent 暴露进度 / ETA / 日志。完整契约见
+`pipeline_modules/harness/capability_manifest.json`（含 launch_stability_policy 与 driver_contract），agent 应先读它再启动任务。
+
+两种挂靠方式：
+
+1. **main.py 能原生表达的流程** → 入队（runner 自动串行执行）：
+
+   ```bash
+   python -m pipeline_modules.harness enqueue --sample-dir "S:\Arivis_Analysis\_active\<sample>"
+   ```
+
+   样本目录下需有 `config.json`。GUI 打开或 `GET /api/jobs` 时即触发下一个排队任务。
+
+2. **自定义多步流程（main.py 表达不了的 ims→zarr→分割→导出等）** → 写成 driver 脚本，启动时把 driver 挂到 PM：
+
+   ```bash
+   python -m pipeline_modules.harness attach --sample-dir "S:\Arivis_Analysis\_active\<sample>" \
+       --title "<任务名>" --pid <driver_pid> --log <driver日志> --status <status文件>
+   ```
+
+   （程序化等价：`pipeline_modules.harness.queue.ActiveStore.attach_external(...)`；同一 sample_dir 重复调用是刷新而非重复入队。）
+
+   driver 必须遵守两行 status 文件约定（第 1 行 `RUNNING Step n: ...` / `ALL DONE` / `FAILED ...`，第 2 行 ISO 启动时间）——**这是任务成败的唯一判据**，进程退出码不可信。完整 driver 契约见 manifest 的 `launch_stability_policy.driver_contract`。
+
+启动新任务前先确认队列空闲（每 ~60 s 轮询）：
+
+```python
+from pipeline_modules.harness.queue import ActiveStore
+ActiveStore().has_running()   # True 时禁止启动任何重型流程
+```
+
+### 4.1 标准命令
+
 标准命令：
 
 ```bash
 python main.py --config config.json --sample_dir "S:\path\to\sample_dir"
 ```
 
-这是最常用的启动方式。`--sample_dir` 当前基本是必填项。
+这是最常用的启动方式。`--sample_dir` 当前基本是必填项。生产运行请改走 4.0 的 PM 入队。
 
 ### 常见变体
 
