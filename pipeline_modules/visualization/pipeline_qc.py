@@ -144,40 +144,78 @@ def check_registration_correlation(nii_path: Path, warped_dir: Path) -> dict:
     return {"status": status, "pearson_r": round(corr, 4), "warped_nonzero": int(mask.sum())}
 
 
-def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_attrs: dict, out_png: Path) -> None:
+def _match_plane(presence: np.ndarray, plane: np.ndarray) -> np.ndarray:
+    """Crop/pad a label-derived plane to the display plane shape."""
+    if presence.shape == plane.shape:
+        return presence
+    out = np.zeros(plane.shape, dtype=bool)
+    h, w = min(presence.shape[0], plane.shape[0]), min(presence.shape[1], plane.shape[1])
+    out[:h, :w] = presence[:h, :w]
+    return out
+
+
+def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_path: Path, out_png: Path) -> None:
     import nibabel as nib
     from PIL import Image, ImageDraw
 
     nii_xyz = np.asanyarray(nib.load(str(nii_path)).dataobj)  # x,y,z
     nx, ny, nz = nii_xyz.shape
-    label = open_zarr_array(label_zarr_path) if label_zarr_path.exists() else None
+    label = open_zarr_array(label_zarr_path) if label_zarr_path.exists() else None  # z,y,x
+    hemi = open_zarr_array(hemi_zarr_path) if hemi_zarr_path.exists() else None
     lz, ly, lx = (int(v) for v in label.shape) if label is not None else (0, 0, 0)
+    fx, fy, fz = lx / max(nx, 1), ly / max(ny, 1), lz / max(nz, 1)
+    sx = [max(int(round(v)), 1) for v in (fz, fy, fx)]  # strides on label z,y,x
 
-    panels = []  # (u8 plane, contour bool at same shape, view name, x_axis_len or None)
-    axial = _norm_u8(nii_xyz[:, :, nz // 2])  # (y, x)
-    coronal = _norm_u8(nii_xyz[:, ny // 2, :])  # (z, x)
-    sagittal = _norm_u8(nii_xyz[nx // 2, :])  # (z, y)
-    label_planes = {}
+    # Display convention: rows = first listed axis, cols = second.
+    # axial (rows=y, cols=x), coronal (rows=z, cols=x), sagittal (rows=z, cols=y).
+    planes = {
+        "axial": _norm_u8(np.transpose(nii_xyz[:, :, nz // 2])),          # -> (y, x)
+        "coronal": _norm_u8(np.transpose(nii_xyz[:, ny // 2, :])),        # -> (z, x)
+        "sagittal": _norm_u8(np.transpose(nii_xyz[nx // 2, :, :])),       # -> (z, y)
+    }
+    label_planes: dict[str, np.ndarray | None] = {"axial": None, "coronal": None, "sagittal": None}
+    hemi_plane: np.ndarray | None = None
     if label is not None:
-        fx, fy, fz = lx / max(nx, 1), ly / max(ny, 1), lz / max(nz, 1)
-        label_planes["axial"] = np.asarray(label[lz // 2])[:: max(int(round(fy)), 1), :: max(int(round(fx)), 1)] > 0
-        label_planes["coronal"] = np.asarray(label[:, ly // 2, :])[:: max(int(round(fz)), 1), :: max(int(round(fx)), 1)] > 0
-        label_planes["sagittal"] = np.asarray(label[:, :, lx // 2])[:: max(int(round(fz)), 1), :: max(int(round(fy)), 1)] > 0
+        label_planes["axial"] = np.asarray(label[lz // 2])[:: sx[1], :: sx[2]] > 0          # (y, x)
+        label_planes["coronal"] = np.asarray(label[:, ly // 2, :])[:: sx[0], :: sx[2]] > 0  # (z, x)
+        label_planes["sagittal"] = np.asarray(label[:, :, lx // 2])[:: sx[0], :: sx[1]] > 0  # (z, y)
+    if hemi is not None:
+        hemi_plane = np.asarray(hemi[lz // 2])[:: sx[1], :: sx[2]]  # (y, x): 0 bg, 1 left, 2 right
 
-    split_x = hemi_attrs.get("split_x")
+    import zarr as _zarr
+
+    try:
+        split_x = dict(_zarr.open(str(hemi_zarr_path), mode="r").attrs).get("split_x")
+    except Exception:
+        split_x = None
+
     images = []
-    for name, plane in (("axial", axial), ("coronal", coronal), ("sagittal", sagittal)):
+    for name, plane in planes.items():
         rgb = np.repeat(plane[..., None], 3, axis=2)
         presence = label_planes.get(name)
-        if presence is not None and presence.shape == plane.shape:
-            rgb[_label_contour(presence)] = (255, 60, 60)
+        if presence is not None:
+            rgb[_label_contour(_match_plane(presence, plane))] = (255, 60, 60)
         img = Image.fromarray(rgb)
         draw = ImageDraw.Draw(img)
         if name in ("axial", "coronal") and split_x:
-            fx = lx / max(nx, 1)
+            # cols are the x axis on both views; scale full-res split into nii x.
             draw.line([(int(split_x / fx), 0), (int(split_x / fx), img.height)], fill=(255, 220, 0), width=2)
         draw.text((6, 4), name, fill=(255, 255, 255))
         images.append(img)
+
+    # Hemisphere-verification panel: axial plane tinted left=red / right=blue
+    # on the autofluorescence background — shows whether the split plane
+    # actually separates the two lobes.
+    if hemi_plane is not None:
+        rgb = np.repeat(planes["axial"][..., None], 3, axis=2)
+        matched = _match_plane(hemi_plane, planes["axial"])
+        rgb[matched == 1] = (255, 90, 90)
+        rgb[matched == 2] = (90, 120, 255)
+        img = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(img)
+        draw.text((6, 4), "axial L/R check", fill=(255, 255, 255))
+        images.append(img)
+
     height = max(img.height for img in images)
     sheet = Image.new("RGB", (sum(img.width for img in images) + 16 * (len(images) - 1), height), (20, 20, 20))
     offset = 0
@@ -261,15 +299,8 @@ def run_qc(
     )
     checks["registration_correlation"] = check_registration_correlation(nii_path, warped_dir)
 
-    hemi_attrs: dict = {}
     try:
-        import zarr
-
-        hemi_attrs = dict(zarr.open(str(hemi_zarr_path), mode="r").attrs)
-    except Exception:
-        logger.warning("hemisphere zarr attrs unreadable: %s", hemi_zarr_path)
-    try:
-        render_registration_views(nii_path, label_zarr_path, hemi_attrs, output_dir / "registration_views.png")
+        render_registration_views(nii_path, label_zarr_path, hemi_zarr_path, output_dir / "registration_views.png")
     except Exception:
         logger.exception("registration views failed")
 
@@ -279,13 +310,21 @@ def run_qc(
     except Exception:
         logger.exception("segmentation blocks failed")
 
+    split_x_attr = None
+    try:
+        import zarr
+
+        split_x_attr = dict(zarr.open(str(hemi_zarr_path), mode="r").attrs).get("split_x")
+    except Exception:
+        logger.warning("hemisphere zarr attrs unreadable: %s", hemi_zarr_path)
+
     statuses = [str(check.get("status")) for check in checks.values()]
     overall = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
     verdict = {
         "sample": sample_dir.name,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "checks": checks,
-        "hemisphere_split_x": hemi_attrs.get("split_x"),
+        "hemisphere_split_x": split_x_attr,
         "overall": overall,
     }
     (output_dir / "verdict.json").write_text(json.dumps(verdict, indent=1, ensure_ascii=False), encoding="utf-8")
