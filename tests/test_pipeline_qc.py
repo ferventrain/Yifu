@@ -93,10 +93,15 @@ def test_qc_passes_on_good_sample(tmp_path):
     assert (sample / "qc" / "registration_views.png").exists()
     blocks = sorted((sample / "qc" / "seg_blocks").glob("block_*.zarr"))
     assert 1 <= len(blocks) <= 5
+    import json as _json
     block = zarr.open(str(blocks[0]), mode="r")
-    assert "0" in block and "1" in block
-    assert block["0"].dtype == np.uint16 and block["1"].dtype == np.uint8
-    assert "block_offset_zyx" in dict(block.attrs)
+    assert "0" in block and "1" not in block
+    assert block["0"].shape[0] == 2  # channel axis: signal + mask
+    assert block["0"].dtype == np.uint16
+    attrs = dict(block.attrs)
+    assert "block_offset_zyx" in attrs
+    assert attrs["multiscales"][0]["axes"][0] == {"name": "c", "type": "channel"}
+    assert [c["label"] for c in attrs["omero"]["channels"]] == ["signal", "mask"]
 
 
 def test_qc_fails_on_bad_hemisphere_balance(tmp_path):

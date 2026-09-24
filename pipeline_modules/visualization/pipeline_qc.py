@@ -283,14 +283,15 @@ def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_p
 
 
 def save_segmentation_blocks(signal_zarr_path: Path, mask_zarr_path: Path, label_zarr_path: Path,
-                             out_dir: Path, sample_name: str) -> list[Path]:
+                             out_dir: Path, sample_name: str, resolution_xyz=(1.8, 1.8, 2.0)) -> list[Path]:
+    from pipeline_modules.utils.zarr_io import ome_ngff_multiscales
+
     signal = open_zarr_array(signal_zarr_path)
     mask = open_zarr_array(mask_zarr_path)
     label = open_zarr_array(label_zarr_path)
     nz, ny, nx = (int(v) for v in signal.shape)
     bz, by, bx = (min(b, n) for b, n in zip(BLOCK_ZYX, (nz, ny, nx)))
     rng = random.Random(RANDOM_SEED)
-    label_center = (label is not None)
     written = []
     attempts = 0
     while len(written) < N_SEG_BLOCKS and attempts < 40:
@@ -298,18 +299,31 @@ def save_segmentation_blocks(signal_zarr_path: Path, mask_zarr_path: Path, label
         z0 = rng.randrange(0, nz - bz + 1)
         y0 = rng.randrange(0, ny - by + 1)
         x0 = rng.randrange(0, nx - bx + 1)
-        if label_center and not np.any(np.asarray(label[z0:z0 + bz, y0:y0 + by, x0:x0 + bx]) > 0):
+        if not np.any(np.asarray(label[z0:z0 + bz, y0:y0 + by, x0:x0 + bx]) > 0):
             continue
         mask_block = np.asarray(mask[z0:z0 + bz, y0:y0 + by, x0:x0 + bx])
         if not np.any(mask_block > 0):
             continue
         signal_block = np.asarray(signal[z0:z0 + bz, y0:y0 + by, x0:x0 + bx])
+        # One OME-Zarr store per block, single (c, z, y, x) array with channel
+        # 0 = raw signal, channel 1 = mask (0/1). NGFF multiscales + omero
+        # metadata make napari (napari-ome-zarr) open it directly via
+        # drag-and-drop and split the two channels into named layers.
         block_path = out_dir / f"block_{len(written):02d}.zarr"
+        stacked = np.stack([signal_block, mask_block.astype(signal_block.dtype)])
         group = open_output_group(block_path, overwrite=True)
-        create_array(group, "0", shape=signal_block.shape, chunks=(min(32, bz), by, bx),
-                     dtype=signal_block.dtype, data=signal_block)
-        create_array(group, "1", shape=mask_block.shape, chunks=(min(32, bz), by, bx),
-                     dtype=mask_block.dtype, data=mask_block)
+        create_array(group, "0", shape=stacked.shape, chunks=(2, min(32, bz), by, bx),
+                     dtype=stacked.dtype, data=stacked)
+        group.attrs["multiscales"] = ome_ngff_multiscales(
+            ["0"], ndim=4, base_scale=(1.0, resolution_xyz[2], resolution_xyz[1], resolution_xyz[0]),
+            name=f"{sample_name} QC block",
+        )
+        group.attrs["omero"] = {
+            "channels": [
+                {"label": "signal", "color": "FFFF00", "window": {"start": 0, "end": 65535}, "active": True},
+                {"label": "mask", "color": "FF0000", "window": {"start": 0, "end": 1}, "active": True},
+            ],
+        }
         group.attrs["block_offset_zyx"] = [z0, y0, x0]
         group.attrs["block_shape_zyx"] = [bz, by, bx]
         group.attrs["sample"] = sample_name
@@ -367,7 +381,8 @@ def run_qc(
 
     try:
         save_segmentation_blocks(signal_zarr_path, mask_zarr_path, label_zarr_path,
-                                 output_dir / "seg_blocks", sample_dir.name)
+                                 output_dir / "seg_blocks", sample_dir.name,
+                                 resolution_xyz=tuple(float(v) for v in config["input"]["resolution_xyz"]))
     except Exception:
         logger.exception("segmentation blocks failed")
 
