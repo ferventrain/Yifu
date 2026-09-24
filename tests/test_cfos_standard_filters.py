@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from pipeline_modules.segmentation.cfos_mask_postprocess import (
     postprocess_cfos_mask_3d,
@@ -36,12 +37,13 @@ def test_normalize_volume_with_global_bounds_matches_global_percentiles():
     # brightness difference; global bounds preserve it.
     per_chunk_a = normalize_volume(volume_a, 1.0, 99.5)
     per_chunk_b = normalize_volume(volume_b, 1.0, 99.5)
-    assert per_chunk_a[1, 1] == per_chunk_b[1, 1] == 1.0
+    assert per_chunk_a[1, 1] == pytest.approx(1.0, abs=1e-6)
+    assert per_chunk_b[1, 1] == pytest.approx(1.0, abs=1e-6)
     global_a = normalize_volume(volume_a, low=0.0, high=500.0)
     global_b = normalize_volume(volume_b, low=0.0, high=500.0)
-    assert global_a[1, 1] == 0.03  # 15/500
-    assert global_b[0, 0] == 0.2  # 100/500
-    assert global_b[1, 1] == 1.0  # 1000 clips at the global high
+    assert global_a[1, 1] == pytest.approx(0.03, abs=1e-6)  # 15/500
+    assert global_b[0, 0] == pytest.approx(0.2, abs=1e-6)  # 100/500
+    assert global_b[1, 1] == pytest.approx(1.0, abs=1e-6)  # 1000 clips at the global high
 
 
 def test_select_keep_labels_filters_single_slice_and_edge():
