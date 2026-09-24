@@ -95,6 +95,11 @@ def parse_args():
         help="Optional hemisphere label Zarr. When provided, left/right stats are enabled.",
     )
     parser.add_argument(
+        "--hemisphere_only",
+        action="store_true",
+        help="With --hemisphere_zarr: export Left/Right columns only and suppress whole-brain columns.",
+    )
+    parser.add_argument(
         "--pass1_workers",
         type=int,
         default=1,
@@ -263,39 +268,44 @@ def build_display_name(node):
     return node.get("name") or ""
 
 
-def build_region_row(node, aggregated_stats, voxel_volume_um3=0.0):
+def build_region_row(node, aggregated_stats, voxel_volume_um3=0.0, hemisphere_only=False):
     hemispheres = aggregated_stats.get("hemispheres")
-    # Whole-brain Total columns always come from region-pair object collapse,
-    # not from summing left/right hemisphere columns.
-    row_stats = aggregated_stats
-
-    total_voxels = int(row_stats["total_voxels"])
-    signal_voxels = int(row_stats["signal_voxels"])
-    signal_count = int(row_stats["signal_count"])
-    voxel_density = float(signal_voxels / total_voxels) if total_voxels > 0 else 0.0
 
     row = {
         "Name": build_display_name(node),
         "st_level": node.get("st_level"),
-        "Total Voxels": total_voxels,
-        "Signal Voxels": signal_voxels,
-        "Voxel Density": voxel_density,
-        "Signal Count": signal_count,
-        "Sum Intensity": float(row_stats["sum_intensity"]),
     }
-    voxel_volume_um3 = float(voxel_volume_um3 or 0.0)
-    if voxel_volume_um3 > 0.0:
-        signal_volume_um3 = signal_voxels * voxel_volume_um3
-        region_volume_mm3 = total_voxels * voxel_volume_um3 / 1e9
-        row["Signal Volume (um3)"] = float(signal_volume_um3)
-        row["Signal Volume (mm3)"] = float(signal_volume_um3 / 1e9)
-        row["Region Volume (mm3)"] = float(region_volume_mm3)
-        row["Count Density (count/mm3)"] = (
-            float(signal_count / region_volume_mm3) if region_volume_mm3 > 0 else 0.0
+    include_whole_brain = not (hemisphere_only and hemispheres)
+    if include_whole_brain:
+        # Whole-brain Total columns always come from region-pair object collapse,
+        # not from summing left/right hemisphere columns.
+        row_stats = aggregated_stats
+        total_voxels = int(row_stats["total_voxels"])
+        signal_voxels = int(row_stats["signal_voxels"])
+        signal_count = int(row_stats["signal_count"])
+        voxel_density = float(signal_voxels / total_voxels) if total_voxels > 0 else 0.0
+        row.update(
+            {
+                "Total Voxels": total_voxels,
+                "Signal Voxels": signal_voxels,
+                "Voxel Density": voxel_density,
+                "Signal Count": signal_count,
+                "Sum Intensity": float(row_stats["sum_intensity"]),
+            }
         )
-        row["Mean Object Volume (um3)"] = (
-            float(signal_volume_um3 / signal_count) if signal_count > 0 else 0.0
-        )
+        voxel_volume_um3 = float(voxel_volume_um3 or 0.0)
+        if voxel_volume_um3 > 0.0:
+            signal_volume_um3 = signal_voxels * voxel_volume_um3
+            region_volume_mm3 = total_voxels * voxel_volume_um3 / 1e9
+            row["Signal Volume (um3)"] = float(signal_volume_um3)
+            row["Signal Volume (mm3)"] = float(signal_volume_um3 / 1e9)
+            row["Region Volume (mm3)"] = float(region_volume_mm3)
+            row["Count Density (count/mm3)"] = (
+                float(signal_count / region_volume_mm3) if region_volume_mm3 > 0 else 0.0
+            )
+            row["Mean Object Volume (um3)"] = (
+                float(signal_volume_um3 / signal_count) if signal_count > 0 else 0.0
+            )
     if hemispheres:
         for hemisphere_id, hemisphere_name in HEMISPHERE_NAMES.items():
             hemisphere_stats = hemispheres.get(
@@ -336,7 +346,7 @@ def empty_hemisphere_stats():
     }
 
 
-def flatten_region_rows(region_tree, direct_stats, voxel_volume_um3=0.0):
+def flatten_region_rows(region_tree, direct_stats, voxel_volume_um3=0.0, hemisphere_only=False):
     rows = []
     hemisphere_enabled = "total_region_voxels_by_hemisphere" in direct_stats
 
@@ -386,7 +396,9 @@ def flatten_region_rows(region_tree, direct_stats, voxel_volume_um3=0.0):
                     aggregated["hemispheres"][hemisphere_id]["sum_intensity"] += child_aggregated["hemispheres"][hemisphere_id]["sum_intensity"]
 
         if label_id is not None and label_id > 0 and aggregated["total_voxels"] > 0:
-            rows.append(build_region_row(node, aggregated, voxel_volume_um3=voxel_volume_um3))
+            rows.append(
+                build_region_row(node, aggregated, voxel_volume_um3=voxel_volume_um3, hemisphere_only=hemisphere_only)
+            )
 
         return aggregated
 
@@ -394,7 +406,7 @@ def flatten_region_rows(region_tree, direct_stats, voxel_volume_um3=0.0):
     return rows
 
 
-def flush_rows_to_excel(rows, output_path):
+def flush_rows_to_excel(rows, output_path, hemisphere_only=False):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dataframe = pd.DataFrame(rows)
@@ -411,22 +423,26 @@ def flush_rows_to_excel(rows, output_path):
 
         for level in unique_levels:
             level_frame = dataframe[dataframe["st_level"] == level].copy().reset_index(drop=True)
-            export_columns = [
-                "Name",
-                "Total Voxels",
-                "Signal Voxels",
-                "Voxel Density",
-                "Signal Count",
-                "Sum Intensity",
-            ]
-            if "Signal Volume (um3)" in level_frame.columns:
-                export_columns += [
-                    "Signal Volume (um3)",
-                    "Signal Volume (mm3)",
-                    "Region Volume (mm3)",
-                    "Count Density (count/mm3)",
-                    "Mean Object Volume (um3)",
+            if hemisphere_only and "Left Total Voxels" in level_frame.columns:
+                # Bilateral-only statistics: suppress whole-brain columns.
+                export_columns = ["Name"]
+            else:
+                export_columns = [
+                    "Name",
+                    "Total Voxels",
+                    "Signal Voxels",
+                    "Voxel Density",
+                    "Signal Count",
+                    "Sum Intensity",
                 ]
+                if "Signal Volume (um3)" in level_frame.columns:
+                    export_columns += [
+                        "Signal Volume (um3)",
+                        "Signal Volume (mm3)",
+                        "Region Volume (mm3)",
+                        "Count Density (count/mm3)",
+                        "Mean Object Volume (um3)",
+                    ]
             if "Left Total Voxels" in level_frame.columns:
                 export_columns += [
                     "Left Total Voxels",
@@ -1737,17 +1753,19 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
     }
 
 
-def export_region_excel(region_tree, direct_stats, output_path, flush_every, voxel_volume_um3=0.0):
+def export_region_excel(region_tree, direct_stats, output_path, flush_every, voxel_volume_um3=0.0, hemisphere_only=False):
     rows = []
-    all_rows = flatten_region_rows(region_tree, direct_stats, voxel_volume_um3=voxel_volume_um3)
+    all_rows = flatten_region_rows(
+        region_tree, direct_stats, voxel_volume_um3=voxel_volume_um3, hemisphere_only=hemisphere_only
+    )
     for index, row in enumerate(all_rows, start=1):
         rows.append(row)
         if flush_every > 0 and index % flush_every == 0:
             logger.info("Flushing %d rows to %s", len(rows), output_path)
-            flush_rows_to_excel(rows, output_path)
+            flush_rows_to_excel(rows, output_path, hemisphere_only=hemisphere_only)
 
     logger.info("Final flush with %d rows to %s", len(rows), output_path)
-    flush_rows_to_excel(rows, output_path)
+    flush_rows_to_excel(rows, output_path, hemisphere_only=hemisphere_only)
 
 
 def analyze_zarr_graph(
@@ -1769,6 +1787,7 @@ def analyze_zarr_graph(
     hemisphere_zarr_path="",
     max_voxels=0,
     report_physical_volume=False,
+    hemisphere_only=False,
 ):
     voxel_volume_um3 = 0.0
     if report_physical_volume:
@@ -1844,6 +1863,7 @@ def analyze_zarr_graph(
             output_path,
             flush_every,
             voxel_volume_um3=voxel_volume_um3,
+            hemisphere_only=hemisphere_only,
         )
         logger.info("Timing | Excel export: %.2fs", time.perf_counter() - export_start_time)
     finally:
@@ -1897,6 +1917,7 @@ def main():
             hemisphere_zarr_path=args.hemisphere_zarr,
             max_voxels=args.max_voxels,
             report_physical_volume=args.report_physical_volume,
+            hemisphere_only=args.hemisphere_only,
         )
 
         if write_run_manifest is not None:

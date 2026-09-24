@@ -108,7 +108,8 @@
       "attach_external to PM at start with pid AND pid_created_at (PID reuse fakes liveness otherwise; sync_external_job validates via pid_matches).",
       "Retry loop (up to 4 attempts per step, backoff) + a pass-level retry (3 passes, 5 min apart) around the whole sample list.",
       "wait_for_nas() before each launch: a NAS drop killed a whole pass once.",
-      "register a watchdog: scheduled task every 15 min that relaunches the queue when samples remain unfinished and no orchestrator process is alive (_vessel_queue_watchdog.py, task YifuVesselWatchdog). Any kill, whatever its source, is then absorbed within one period at marker-level cost — this is what makes 'never crashes' practically true."
+      "register a watchdog: scheduled task every 15 min that relaunches the queue when samples remain unfinished and no orchestrator process is alive (_vessel_queue_watchdog.py, task YifuVesselWatchdog). Any kill, whatever its source, is then absorbed within one period at marker-level cost — this is what makes 'never crashes' practically true.",
+      "run post-run QC (pipeline_modules.visualization.pipeline_qc) as part of the verify step: 4 hard checks (label magnitude, hemisphere balance, 25um grid, registration correlation) plus human views (normalized registration tri-plane with label contour + hemisphere split line; 5 random raw+mask blocks as 2-channel zarr). verdict overall=FAIL must fail the driver so the queue stops carrying a bad run; outputs land in <sample>/qc/."
     ],
     "reference_implementations": [
       "_run_YF2025063002_vessel.py (driver honoring the full contract)",

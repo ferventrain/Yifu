@@ -9,7 +9,8 @@
       "Production samples are Imaris .ims sources: prepare inputs with pipeline_modules.preprocessing.ims_to_zarr and zarr_to_registration_nii instead of TIFF folders, then let main.py skip its TIFF-native steps (see preprocessing manifest production_policy).",
       "sample_dir/original_shape.json (full-res z,y,x of the signal grid) must exist when no chX/ TIFF folder does: ANTs_registration uses it to upsample the warped label back to the signal grid.",
       "save_upsampled_label=false and segmentation.export_mask_tiff=false by default in production configs; upsampled_atlas_label.zarr (+ atlas_label_hemisphere.zarr) is the label deliverable. The module still writes the label TIFF transiently and removes it after zarr conversion.",
-      "Preprocessing/enhancement stays OFF (preprocessing.*.apply=false) so intensity thresholds mean the same thing in every sample."
+      "Preprocessing/enhancement stays OFF (preprocessing.*.apply=false) so intensity thresholds mean the same thing in every sample.",
+      "Bilateral statistics are the deliverable: set analysis.use_hemisphere_label=true plus analysis.hemisphere_only=true so the Excel exports Left/Right columns only (whole-brain columns suppressed). Post-run QC (pipeline_modules.visualization.pipeline_qc) then validates label magnitude, hemisphere balance, grid shape and registration correlation, and renders human-check views."
     ]
   },
   "entrypoints": [
@@ -79,7 +80,8 @@
         "tmp_dir":              {"type": "path|null", "default": null},
         "keep_tmp":             {"type": "bool", "default": false},
         "pass1_workers":        {"type": "int", "default": 1},
-        "hemisphere_zarr_path":  {"type": "path|null", "default": null, "description": "Optional hemisphere Zarr for left/right stats"}
+        "hemisphere_zarr_path":  {"type": "path|null", "default": null, "description": "Optional hemisphere Zarr for left/right stats"},
+        "hemisphere_only":       {"type": "bool", "default": false, "description": "With hemisphere stats: export Left/Right columns only, suppress whole-brain columns (production default for bilateral studies)"}
       },
       "outputs": {
         "excel_path":    {"type": "path", "description": "Per-region signal statistics Excel workbook; may include Left/Right Total Voxels, Left/Right Signal Voxels, Left/Right Voxel Density, Left/Right Signal Count, Left/Right Sum Intensity when hemisphere_zarr is used"},
