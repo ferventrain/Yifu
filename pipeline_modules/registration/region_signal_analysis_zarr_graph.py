@@ -1741,6 +1741,27 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
         region_signal_counts_by_hemisphere = {}
         region_sum_intensity_by_hemisphere = {}
 
+    # Hemisphere signal voxels/intensity MUST be the voxelwise pass-1 counts,
+    # not the object collapse: a brain-spanning vessel network is ONE connected
+    # object, so the collapse assigns all of its voxels to a single majority
+    # hemisphere (observed: 98-100% of signal on one side). Object counts
+    # (region_signal_counts_by_hemisphere) stay collapse-based by nature.
+    def _voxelwise_pair_dict(manifest_key):
+        pair_dict = {}
+        for key, value in manifest_payload.get(manifest_key, {}).items():
+            region_id, hemisphere_id = str(key).split(":", 1)
+            pair_dict[(int(region_id), int(hemisphere_id))] = int(value)
+        return pair_dict
+
+    voxelwise_signal_by_hemisphere = _voxelwise_pair_dict("region_signal_voxels_by_hemisphere")
+    if voxelwise_signal_by_hemisphere:
+        region_signal_voxels_by_hemisphere = voxelwise_signal_by_hemisphere
+    voxelwise_intensity_by_hemisphere = _voxelwise_pair_dict("region_sum_intensity_by_hemisphere")
+    if voxelwise_intensity_by_hemisphere:
+        region_sum_intensity_by_hemisphere = {
+            key: float(value) for key, value in voxelwise_intensity_by_hemisphere.items()
+        }
+
     return {
         "total_region_voxels": total_region_voxels,
         "region_signal_voxels": region_signal_voxels,

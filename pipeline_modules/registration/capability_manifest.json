@@ -61,7 +61,7 @@
         "For left/right stats, provide --hemisphere_zarr or enable registration.save_upsampled_label_hemisphere_zarr plus analysis.use_hemisphere_label in config.json. Each connected signal object is assigned to the brain region and hemisphere where it has the most voxels (ties go to the smaller region id and to Left)."
       ],
       "semantics_notes": [
-        "Left/Right Signal Voxels and Left/Right Voxel Density are direct voxel-level counts (mask x region x hemisphere) and are valid for ANY mask, including whole-brain connected vascular networks.",
+        "Left/Right Signal Voxels, Sum Intensity and Voxel Density are direct voxel-level counts (mask x region x hemisphere) and are valid for ANY mask, including whole-brain connected vascular networks. Regression-tested in tests/test_hemisphere_signal_voxelwise.py: the pass-3 object collapse must never override these (a brain-spanning vessel is one object and would land 100% on its majority hemisphere).",
         "Signal Count is connected-object based: meaningful for punctate/cell signals, meaningless for vessel networks that form one brain-spanning object. For vessels, report density columns only."
       ],
       "inputs": {
