@@ -100,6 +100,14 @@ def parse_args():
         help="With --hemisphere_zarr: export Left/Right columns only and suppress whole-brain columns.",
     )
     parser.add_argument(
+        "--hemisphere_signal_mode",
+        choices=("object", "voxelwise"),
+        default="object",
+        help="Attribution of signal voxels to hemispheres: 'object' assigns each connected "
+        "object wholly to its majority hemisphere (cFos punctate signals); 'voxelwise' counts "
+        "per voxel (required for network signals such as vessels).",
+    )
+    parser.add_argument(
         "--pass1_workers",
         type=int,
         default=1,
@@ -1612,7 +1620,14 @@ def collapse_root_region_hemisphere_arrays_by_majority(roots, regions, hemispher
     return base_result
 
 
-def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels, max_voxels=0):
+def aggregate_final_region_stats(
+    manifest_payload,
+    parent,
+    root_sizes,
+    min_voxels,
+    max_voxels=0,
+    hemisphere_signal_mode="object",
+):
     logger.info("Pass 3/3b: collapsing merged objects into per-region statistics...")
     kept_root_mask = root_sizes >= int(min_voxels)
     max_voxels = int(max_voxels or 0)
@@ -1741,11 +1756,17 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
         region_signal_counts_by_hemisphere = {}
         region_sum_intensity_by_hemisphere = {}
 
-    # Hemisphere signal voxels/intensity MUST be the voxelwise pass-1 counts,
-    # not the object collapse: a brain-spanning vessel network is ONE connected
-    # object, so the collapse assigns all of its voxels to a single majority
-    # hemisphere (observed: 98-100% of signal on one side). Object counts
-    # (region_signal_counts_by_hemisphere) stay collapse-based by nature.
+    # Hemisphere signal voxels/intensity: choose the attribution model by
+    # signal morphology (analysis.hemisphere_signal_mode).
+    #   "voxelwise" - count mask x region x hemisphere per voxel. Required for
+    #                 network signals (vessels): a brain-spanning stain is ONE
+    #                 connected object and object attribution would hand 100%
+    #                 of it to its majority hemisphere.
+    #   "object"    - each connected object goes wholly to its majority
+    #                 (region, hemisphere). Correct for punctate signals
+    #                 (cFos cells): a cell belongs to one place, and this
+    #                 matches historical cFos analyses.
+    # Signal Count stays object-based under both modes (it is an object count).
     def _voxelwise_pair_dict(manifest_key):
         pair_dict = {}
         for key, value in manifest_payload.get(manifest_key, {}).items():
@@ -1753,14 +1774,15 @@ def aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxel
             pair_dict[(int(region_id), int(hemisphere_id))] = int(value)
         return pair_dict
 
-    voxelwise_signal_by_hemisphere = _voxelwise_pair_dict("region_signal_voxels_by_hemisphere")
-    if voxelwise_signal_by_hemisphere:
-        region_signal_voxels_by_hemisphere = voxelwise_signal_by_hemisphere
-    voxelwise_intensity_by_hemisphere = _voxelwise_pair_dict("region_sum_intensity_by_hemisphere")
-    if voxelwise_intensity_by_hemisphere:
-        region_sum_intensity_by_hemisphere = {
-            key: float(value) for key, value in voxelwise_intensity_by_hemisphere.items()
-        }
+    if str(hemisphere_signal_mode).lower() == "voxelwise":
+        voxelwise_signal_by_hemisphere = _voxelwise_pair_dict("region_signal_voxels_by_hemisphere")
+        if voxelwise_signal_by_hemisphere:
+            region_signal_voxels_by_hemisphere = voxelwise_signal_by_hemisphere
+        voxelwise_intensity_by_hemisphere = _voxelwise_pair_dict("region_sum_intensity_by_hemisphere")
+        if voxelwise_intensity_by_hemisphere:
+            region_sum_intensity_by_hemisphere = {
+                key: float(value) for key, value in voxelwise_intensity_by_hemisphere.items()
+            }
 
     return {
         "total_region_voxels": total_region_voxels,
@@ -1809,6 +1831,7 @@ def analyze_zarr_graph(
     max_voxels=0,
     report_physical_volume=False,
     hemisphere_only=False,
+    hemisphere_signal_mode="object",
 ):
     voxel_volume_um3 = 0.0
     if report_physical_volume:
@@ -1874,6 +1897,7 @@ def analyze_zarr_graph(
             root_sizes=root_sizes,
             min_voxels=min_voxels,
             max_voxels=max_voxels,
+            hemisphere_signal_mode=hemisphere_signal_mode,
         )
         logger.info("Timing | Pass 3b region collapse: %.2fs", time.perf_counter() - pass3b_start_time)
 
@@ -1939,6 +1963,7 @@ def main():
             max_voxels=args.max_voxels,
             report_physical_volume=args.report_physical_volume,
             hemisphere_only=args.hemisphere_only,
+            hemisphere_signal_mode=args.hemisphere_signal_mode,
         )
 
         if write_run_manifest is not None:

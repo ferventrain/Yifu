@@ -938,6 +938,7 @@ def run_density_analysis(
     density_cfg_path,
     resolution_xyz,
     hemisphere_only=False,
+    hemisphere_signal_mode="object",
 ):
     if not warped_label_zarr_path.exists():
         print(f"Error: Label Zarr not found at {warped_label_zarr_path}.")
@@ -970,6 +971,8 @@ def run_density_analysis(
         cmd += f' --hemisphere_zarr "{hemisphere_zarr_path}"'
         if hemisphere_only:
             cmd += " --hemisphere_only"
+        if hemisphere_signal_mode and hemisphere_signal_mode != "object":
+            cmd += f' --hemisphere_signal_mode {hemisphere_signal_mode}'
     run_command(cmd, "5.2 Region density analysis")
 
 
@@ -1341,6 +1344,7 @@ def _run_pipeline(args, cfg, config_path, sample_dir):
                 density_cfg_path,
                 cfg["input"]["resolution_xyz"],
                 hemisphere_only=bool(analysis_cfg.get("hemisphere_only", False)),
+                hemisphere_signal_mode=str(analysis_cfg.get("hemisphere_signal_mode", "object")),
             )
         else:
             print_step(5, "Region density analysis")

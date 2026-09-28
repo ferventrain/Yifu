@@ -46,7 +46,9 @@ def _synthetic_inputs():
 
 def test_hemisphere_signal_voxels_are_voxelwise_not_object_assigned():
     manifest_payload, parent, root_sizes, collapsed = _synthetic_inputs()
-    stats = aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels=10)
+    stats = aggregate_final_region_stats(
+        manifest_payload, parent, root_sizes, min_voxels=10, hemisphere_signal_mode="voxelwise"
+    )
 
     # Region 101 exists only in the voxelwise totals (it has no kept object):
     # its per-hemisphere signal must still be reported, split 60/60.
@@ -62,6 +64,29 @@ def test_hemisphere_signal_voxels_are_voxelwise_not_object_assigned():
     # Whole-brain columns come from the (block-artifact) collapse; with no
     # blocks in this synthetic manifest they are empty by construction.
     assert stats["region_signal_voxels"] == {}
+
+
+def test_hemisphere_signal_object_mode_keeps_collapse():
+    """Object mode (cFos punctate signals): voxelwise data is NOT injected.
+
+    The collapse attribution itself is produced from block artifacts; with an
+    empty synthetic manifest it yields nothing, so the hemisphere signal keys
+    must stay absent (i.e. the function must not fall back to the voxelwise
+    manifest counts). Production semantics of object mode are covered by the
+    historical cFos outputs."""
+    manifest_payload, parent, root_sizes, collapsed = _synthetic_inputs()
+    stats = aggregate_final_region_stats(
+        manifest_payload, parent, root_sizes, min_voxels=10, hemisphere_signal_mode="object"
+    )
+    assert "region_signal_voxels_by_hemisphere" not in stats
+    assert "region_sum_intensity_by_hemisphere" not in stats
+
+
+def test_hemisphere_signal_default_mode_is_object():
+    """No mode given -> legacy object behaviour (historical cFos comparability)."""
+    manifest_payload, parent, root_sizes, collapsed = _synthetic_inputs()
+    stats = aggregate_final_region_stats(manifest_payload, parent, root_sizes, min_voxels=10)
+    assert "region_signal_voxels_by_hemisphere" not in stats
 
 
 def test_hemisphere_columns_absent_without_hemisphere_data():
