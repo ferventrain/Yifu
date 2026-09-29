@@ -13,6 +13,7 @@ from pipeline_modules.harness.jsonio import read_json, utc_now_iso, write_json_a
 from pipeline_modules.harness.paths import (
     active_dir,
     analysis_root,
+    artifacts_path,
     job_file,
     jobs_dir,
     progress_path,
@@ -24,9 +25,12 @@ from pipeline_modules.harness.progress import empty_progress, estimate_eta, esti
 from pipeline_modules.harness.proc import pid_created_at, pid_is_alive, pid_matches
 from pipeline_modules.harness.results import load_config
 from pipeline_modules.harness.timing import load_timing_history
+from pipeline_modules.harness.verify import normalize_error
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
-JOB_STATUSES = ("queued", "running", "done", "failed", "cancelled")
+JOB_STATUSES = ("queued", "running", "verifying", "succeeded", "failed", "cancelled", "stalled")
+#: Statuses that mean "this sample already has an active run" for dedupe.
+ACTIVE_STATUSES = ("queued", "running", "verifying")
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _STEP_RE = re.compile(r"Step\s+(\d+)", re.IGNORECASE)
 RESERVED_ACTIVE_NAMES = {"jobs", "runs"}
@@ -147,12 +151,15 @@ class ActiveStore:
             "sample_dir": str(sample),
             "sample_name": sample.name,
             "config_path": str(config_file),
+            "pipeline": str(cfg.get("mode") or "brain"),
             "status": "queued",
             "created_at": utc_now_iso(),
             "started_at": None,
             "ended_at": None,
+            "duration_s": None,
             "pid": None,
             "error": None,
+            "cancel_requested": False,
             "project_name": cfg.get("project_name"),
             "extra_args": [str(item) for item in (extra_args or [])],
         }
@@ -235,6 +242,22 @@ class ActiveStore:
         target = str(_norm(sample_dir)).replace("/", "\\").lower()
         for job in self.list_jobs():
             if str(job.get("kind") or "") != "external":
+                continue
+            if str(job.get("sample_dir") or "").replace("/", "\\").lower() == target:
+                return job
+        return None
+
+    def find_active_for_sample(self, sample_dir: str | Path) -> dict[str, Any] | None:
+        """A queued/running/verifying main job for this sample, if any.
+
+        The run command dedupes on this: one active run per sample, so a
+        double submit returns the existing run_id instead of queuing twice.
+        """
+        target = str(_norm(Path(sample_dir))).replace("/", "\\").lower()
+        for job in self.list_jobs():
+            if str(job.get("kind") or "main") != "main":
+                continue
+            if str(job.get("status") or "") not in ACTIVE_STATUSES:
                 continue
             if str(job.get("sample_dir") or "").replace("/", "\\").lower() == target:
                 return job
@@ -329,7 +352,16 @@ class ActiveStore:
 
         def sort_key(job: dict[str, Any]) -> tuple[int, int, str]:
             status = str(job.get("status") or "")
-            rank = {"running": 0, "queued": 1, "failed": 2, "cancelled": 3, "done": 4}.get(status, 5)
+            rank = {
+                "running": 0,
+                "verifying": 1,
+                "queued": 2,
+                "stalled": 3,
+                "failed": 4,
+                "cancelled": 5,
+                "done": 6,
+                "succeeded": 6,
+            }.get(status, 7)
             queued_index = order.get(str(job.get("id")), 10_000)
             return (rank, queued_index, str(job.get("created_at") or ""))
 
@@ -435,9 +467,14 @@ class ActiveStore:
         view = dict(job)
         view["progress"] = progress
         view["eta"] = eta
+        view["error"] = normalize_error(job.get("error"))
         view["log_path"] = str(log_file)
         view["progress_path"] = str(progress_path(job_id, self.active))
-        if progress.get("results"):
+        manifest = read_json(artifacts_path(job_id, self.active), default=None)
+        if isinstance(manifest, dict):
+            view["verification"] = manifest.get("verification")
+            view["results"] = manifest.get("artifacts") or []
+        elif progress.get("results"):
             view["results"] = progress["results"]
         return view
 

@@ -221,48 +221,31 @@ copy config_template.json config.json
 
 ## 4. 运行主流程
 
-### 4.0 生产运行必须经过 Pipeline Monitor（PM）
+**推荐入口（一条命令，跑完可以关终端）**：
 
-**约定：任何全脑/生产级运行都必须挂在 PM 上**，不允许在 PM 之外裸启动重型流程。PM 是本地串行任务队列 + 进度看板（FastAPI，默认 <http://127.0.0.1:8766>），保证同一时间只跑一个任务，并向人和 agent 暴露进度 / ETA / 日志。完整契约见
-`pipeline_modules/harness/capability_manifest.json`（含 launch_stability_policy 与 driver_contract），agent 应先读它再启动任务。
-
-两种挂靠方式：
-
-1. **main.py 能原生表达的流程** → 入队（runner 自动串行执行）：
-
-   ```bash
-   python -m pipeline_modules.harness enqueue --sample-dir "S:\Arivis_Analysis\_active\<sample>"
-   ```
-
-   样本目录下需有 `config.json`。GUI 打开或 `GET /api/jobs` 时即触发下一个排队任务。
-
-2. **自定义多步流程（main.py 表达不了的 ims→zarr→分割→导出等）** → 写成 driver 脚本，启动时把 driver 挂到 PM：
-
-   ```bash
-   python -m pipeline_modules.harness attach --sample-dir "S:\Arivis_Analysis\_active\<sample>" \
-       --title "<任务名>" --pid <driver_pid> --log <driver日志> --status <status文件>
-   ```
-
-   （程序化等价：`pipeline_modules.harness.queue.ActiveStore.attach_external(...)`；同一 sample_dir 重复调用是刷新而非重复入队。）
-
-   driver 必须遵守两行 status 文件约定（第 1 行 `RUNNING Step n: ...` / `ALL DONE` / `FAILED ...`，第 2 行 ISO 启动时间）——**这是任务成败的唯一判据**，进程退出码不可信。完整 driver 契约见 manifest 的 `launch_stability_policy.driver_contract`。
-
-启动新任务前先确认队列空闲（每 ~60 s 轮询）：
-
-```python
-from pipeline_modules.harness.queue import ActiveStore
-ActiveStore().has_running()   # True 时禁止启动任何重型流程
+```bash
+python -m pipeline_modules.harness run \
+  --sample-dir "S:/Arivis_Analysis/<sample>" \
+  --config "S:/Arivis_Analysis/<sample>/config.json"
 ```
 
-### 4.1 标准命令
+它会校验输入、创建任务、启动唯一 worker 并立即返回 `run_id`；之后在
+Pipeline Monitor（http://127.0.0.1:8766，只读）里看当前步骤、运行时间、心跳和结果。
+任务结束时只有"进程正常结束 + 结果文件存在且可读 + artifact manifest 写入"才会标记
+`succeeded`，失败会给出结构化错误（哪一步 / 什么类别 / 能否重试 / 建议动作）。
+提交前可先 `python -m pipeline_modules.harness preflight --sample-dir ...` 做一次只读校验；
+取消用 `python -m pipeline_modules.harness cancel <run_id>`。
 
-标准命令：
+生产/全脑运行不要绕过队列裸跑：同一时间只跑一个任务，Monitor 显示有任务运行中时不要另启
+重型流程；main.py 表达不了的定制多步流程仍用 attach 挂到 PM（见 harness capability manifest）。
+
+直接启动（不经队列，前台阻塞，适合调试单个步骤）：
 
 ```bash
 python main.py --config config.json --sample_dir "S:\path\to\sample_dir"
 ```
 
-这是最常用的启动方式。`--sample_dir` 当前基本是必填项。生产运行请改走 4.0 的 PM 入队。
+这是原来的启动方式，仍然可用。`--sample_dir` 当前基本是必填项。
 
 ### 常见变体
 

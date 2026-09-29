@@ -105,9 +105,19 @@ main {
   box-shadow: 0 0 0 3px rgba(43, 154, 74, 0.28);
   animation: pulse 1.4s ease-in-out infinite;
 }
+.lamp.verifying {
+  background: #2b6cb0;
+  box-shadow: 0 0 0 3px rgba(43, 108, 176, 0.28);
+  animation: pulse 1.4s ease-in-out infinite;
+}
 .lamp.failed { background: var(--danger); box-shadow: 0 0 0 2px rgba(184, 50, 50, 0.28); }
-.lamp.done { background: #1f7a43; box-shadow: 0 0 0 2px rgba(31, 122, 67, 0.25); }
+.lamp.done, .lamp.succeeded { background: #1f7a43; box-shadow: 0 0 0 2px rgba(31, 122, 67, 0.25); }
 .lamp.cancelled { background: #8a8f98; }
+.lamp.stalled {
+  background: #d97706;
+  box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.3);
+  animation: pulse 2.2s ease-in-out infinite;
+}
 
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
@@ -254,9 +264,31 @@ main {
 
 .status-label.queued { color: #8a7018; }
 .status-label.running { color: #1f7a43; }
+.status-label.verifying { color: var(--accent-strong); }
 .status-label.failed { color: var(--danger); }
-.status-label.done { color: #1f7a43; }
+.status-label.done, .status-label.succeeded { color: #1f7a43; }
 .status-label.cancelled { color: var(--muted); }
+.status-label.stalled { color: #b45309; }
+
+.error-detail {
+  margin-top: 0.55rem;
+  padding: 0.5rem 0.65rem;
+  border-left: 3px solid var(--danger);
+  background: rgba(184, 50, 50, 0.07);
+  border-radius: 4px;
+  font-size: 0.83rem;
+}
+
+.error-detail p { margin: 0.15rem 0; }
+
+.error-detail .error-code {
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.error-detail .error-suggestion {
+  color: var(--text);
+}
 
 .hint {
   margin: 0.55rem 0 0;
@@ -337,10 +369,13 @@ main {
   height: 100%;
   width: 0;
   background: var(--accent);
+  transition: width 0.4s ease;
 }
 
-.progress-fill.done { background: var(--success); }
+.progress-fill.done, .progress-fill.succeeded { background: var(--success); }
 .progress-fill.failed { background: var(--danger); }
+.progress-fill.stalled { background: #d97706; }
+.progress-fill.verifying { background: var(--accent-strong); }
 
 .results {
   margin-top: 0.65rem;

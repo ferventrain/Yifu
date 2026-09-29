@@ -1,4 +1,16 @@
-"""Pipeline Monitor (PM): local watch UI for the LSFM pipeline queue."""
+"""Pipeline Monitor (PM): READ-ONLY local watch UI for the LSFM pipeline queue.
+
+Opening this page, refreshing it, or polling GET /api/jobs NEVER starts a
+task. Jobs are only ever started by:
+
+* submitting a task (``python -m pipeline_modules.harness run`` or POST /api/jobs),
+* explicitly starting the worker (POST /api/queue/start),
+* the worker itself advancing the queue,
+* cancelling a task (POST /api/jobs/{id}/cancel).
+
+Everything the page shows comes from job records, progress.json, stdout.log
+and artifacts.json. No log parsing, no fabricated percentages.
+"""
 
 from __future__ import annotations
 
@@ -20,11 +32,16 @@ from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from pipeline_modules.harness.paths import open_path_in_file_manager, stdout_log_path
 from pipeline_modules.harness.queue import ActiveStore, is_under
-from pipeline_modules.harness.runner import QueueRunner
+from pipeline_modules.harness.worker import (
+    decorate_views,
+    ensure_worker_running,
+    request_cancel,
+    worker_snapshot,
+)
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
 STATIC_DIR = APP_DIR / "static"
-ASSET_VERSION = "4"
+ASSET_VERSION = "5"
 
 def _resolve_pipeline_python() -> str | None:
     for key in ("YIFU_PYTHON", "YIFU_PYTHON_EXE"):
@@ -35,7 +52,6 @@ def _resolve_pipeline_python() -> str | None:
 
 
 store = ActiveStore()
-runner = QueueRunner(store, python_exe=_resolve_pipeline_python())
 
 
 class NoCacheStaticFiles(StarletteStaticFiles):
@@ -46,7 +62,7 @@ class NoCacheStaticFiles(StarletteStaticFiles):
         return response
 
 
-app = FastAPI(title="Yifu Pipeline Monitor (PM)", version="1.1")
+app = FastAPI(title="Yifu Pipeline Monitor (PM)", version="2.0")
 
 
 class AddJobBody(BaseModel):
@@ -64,33 +80,37 @@ async def pipeline_error_handler(_request, exc: PipelineError):
     return JSONResponse(status_code=status, content=exc.to_dict())
 
 
+def _jobs_payload() -> dict[str, Any]:
+    """Assemble the job view. Read-only: never spawns, never mutates."""
+    return {
+        "jobs": decorate_views(store.list_job_views(), store.active),
+        "worker": worker_snapshot(store.active),
+        "analysis_root": str(store.root),
+        "active_dir": str(store.active),
+    }
+
+
 @app.get("/api/meta")
 def api_meta() -> dict[str, Any]:
     store.ensure_layout()
     return {
         "analysis_root": str(store.root),
         "active_dir": str(store.active),
-        "runner": runner.snapshot(),
+        "worker": worker_snapshot(store.active),
         "asset_version": ASSET_VERSION,
     }
 
 
 @app.get("/api/jobs")
 def api_jobs() -> dict[str, Any]:
-    runner.maybe_start()
-    return {
-        "jobs": store.list_job_views(),
-        "runner": runner.snapshot(),
-        "analysis_root": str(store.root),
-        "active_dir": str(store.active),
-    }
+    return _jobs_payload()
 
 
 @app.post("/api/jobs")
 def api_add_job(body: AddJobBody) -> dict[str, Any]:
     record = store.add_job(body.sample_dir, body.config_path or None)
-    runner.maybe_start()
-    return {"job": store.job_view(record), "runner": runner.snapshot()}
+    worker = ensure_worker_running(store, python_exe=_resolve_pipeline_python())
+    return {"job": decorate_views([store.job_view(record)], store.active)[0], "worker": worker["worker"]}
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -101,19 +121,24 @@ def api_remove_job(job_id: str) -> dict[str, str]:
 
 @app.post("/api/queue/start")
 def api_start_queue() -> dict[str, Any]:
-    return {"runner": runner.maybe_start(), "jobs": store.list_job_views()}
+    """Explicit worker start (an allowed state change, unlike GET polling)."""
+    ensure_worker_running(store, python_exe=_resolve_pipeline_python())
+    return _jobs_payload()
 
 
 @app.post("/api/queue/cancel")
 def api_cancel_current() -> dict[str, Any]:
-    snapshot = runner.cancel_current()
-    return {"runner": snapshot, "jobs": store.list_job_views()}
+    running = store.running_job()
+    if running is None:
+        return {**_jobs_payload(), "cancelled": None}
+    request_cancel(store, str(running["id"]))
+    return {**_jobs_payload(), "cancelled": running["id"]}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
 def api_cancel_job(job_id: str) -> dict[str, Any]:
-    snapshot = runner.cancel_job(job_id)
-    return {"runner": snapshot, "jobs": store.list_job_views()}
+    request_cancel(store, job_id)
+    return _jobs_payload()
 
 
 @app.get("/api/jobs/{job_id}/log")
@@ -127,6 +152,24 @@ def api_job_log(job_id: str, tail: int = Query(200, ge=1, le=2000)) -> dict[str,
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"job_id": job_id, "text": "\n".join(lines[-tail:]), "path": str(path)}
+
+
+@app.get("/api/jobs/{job_id}/artifacts")
+def api_job_artifacts(job_id: str) -> dict[str, Any]:
+    """Artifact manifest written by the worker's verifier (read-only)."""
+    from pipeline_modules.harness.paths import artifacts_path
+
+    job = store.load_job(job_id)
+    path = artifacts_path(job_id, store.active)
+    if not path.exists():
+        return {"job_id": job_id, "artifacts": None, "path": str(path)}
+    try:
+        payload = path.read_text(encoding="utf-8")
+        import json as _json
+
+        return {"job_id": job_id, **_json.loads(payload)}
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/open")

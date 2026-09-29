@@ -42,6 +42,26 @@ def timing_history_path(active: Path | None = None) -> Path:
     return (active or active_dir()) / "timing_history.json"
 
 
+def worker_state_path(active: Path | None = None) -> Path:
+    return (active or active_dir()) / "worker.json"
+
+
+def worker_lock_path(active: Path | None = None) -> Path:
+    return (active or active_dir()) / "worker.lock"
+
+
+def worker_log_path(active: Path | None = None) -> Path:
+    return (active or active_dir()) / "logs" / "worker.log"
+
+
+def artifacts_path(job_id: str, active: Path | None = None) -> Path:
+    return run_dir(job_id, active) / "artifacts.json"
+
+
+def cancel_flag_path(job_id: str, active: Path | None = None) -> Path:
+    return run_dir(job_id, active) / "cancel.flag"
+
+
 def job_file(job_id: str, active: Path | None = None) -> Path:
     return jobs_dir(active) / f"{job_id}.json"
 

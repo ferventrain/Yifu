@@ -2,9 +2,12 @@ const POLL_MS = 1500;
 const STATUS_LABELS = {
   queued: "等待",
   running: "运行中",
-  failed: "报错停止",
+  verifying: "验证输出",
+  succeeded: "完成",
   done: "完成",
+  failed: "失败",
   cancelled: "已取消",
+  stalled: "失联",
 };
 
 const els = {
@@ -32,30 +35,42 @@ function showError(message, holdMs = 0, kind = "error") {
   errorHoldUntil = message && holdMs ? Date.now() + holdMs : 0;
 }
 
-function formatSeconds(value) {
-  if (value == null || Number.isNaN(Number(value))) return null;
-  const seconds = Math.max(0, Number(value));
-  if (seconds < 90) return `约 ${Math.round(seconds)} 秒`;
-  const minutes = seconds / 60;
-  if (minutes < 90) return `约 ${minutes < 10 ? minutes.toFixed(1) : Math.round(minutes)} 分钟`;
-  return `约 ${(minutes / 60).toFixed(1)} 小时`;
+function formatDuration(seconds) {
+  if (seconds == null || Number.isNaN(Number(seconds))) return null;
+  const total = Math.max(0, Math.round(Number(seconds)));
+  if (total < 60) return `${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes} 分`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 时 ${minutes % 60} 分`;
 }
 
+function formatEta(seconds) {
+  if (seconds == null || Number.isNaN(Number(seconds))) return null;
+  const total = Math.max(0, Math.round(Number(seconds)));
+  if (total < 90) return `约 ${total} 秒`;
+  if (total < 5400) return `约 ${(total / 60).toFixed(total < 600 ? 1 : 0)} 分`;
+  return `约 ${(total / 3600).toFixed(1)} 时`;
+}
+
+// Honest progress: completed steps + real unit fraction only. Steps without
+// unit data contribute nothing beyond their boundary — never a guessed %.
 function progressPercent(job) {
-  if (job.status === "done") return 100;
+  const status = job.display_status || job.status;
+  if (status === "succeeded" || status === "done") return 100;
   const progress = job.progress || {};
   const unitTotal = Number(progress.unit_total || 0);
   const unitDone = Number(progress.unit_done || 0);
-  const total = Number(progress.step_total || 6);
+  const total = Number(progress.step_total || 0);
   const index = Number(progress.step_index || 0);
-  if (total <= 0 || index <= 0) return job.status === "running" ? 8 : 0;
+  if (total <= 0 || index <= 0) return status === "running" ? 0 : 0;
   const base = ((index - 1) / total) * 100;
   const stepSpan = 100 / total;
   if (unitTotal > 0) {
     const frac = Math.max(0, Math.min(1, unitDone / unitTotal));
     return Math.min(99, Math.round(base + stepSpan * frac));
   }
-  return Math.min(99, Math.round(base + stepSpan * 0.45));
+  return Math.min(99, Math.round(base));
 }
 
 function apiError(payload) {
@@ -77,16 +92,14 @@ async function api(path, options) {
 function renderJobs(data) {
   const jobs = data.jobs || [];
   els.paths.textContent = `样本根目录 ${data.analysis_root}  ·  Active ${data.active_dir}`;
-  const running = jobs.filter((job) => job.status === "running");
+  const worker = data.worker || {};
+  const running = jobs.filter((job) => (job.display_status || job.status) === "running");
   const queued = jobs.filter((job) => job.status === "queued");
-  if (running.length) {
-    els.runner.textContent = `运行中 ${running.length} 个` + (queued.length ? `，排队 ${queued.length} 个` : "");
-    els.runner.classList.add("busy");
-  } else if (queued.length) {
-    els.runner.textContent = `等待自动开始（${queued.length}）`;
-    els.runner.classList.remove("busy");
+  if (worker.alive) {
+    els.runner.textContent = `Worker pid ${worker.pid} 在线` + (running.length ? `，运行中 ${running.length}` : "") + (queued.length ? `，排队 ${queued.length}` : "");
+    els.runner.classList.toggle("busy", running.length > 0);
   } else {
-    els.runner.textContent = "队列空闲";
+    els.runner.textContent = running.length ? "有任务标记运行中但 Worker 不在线（失联）" : "Worker 离线（下次提交任务时自动启动）";
     els.runner.classList.remove("busy");
   }
 
@@ -94,7 +107,7 @@ function renderJobs(data) {
   if (!jobs.length) {
     const empty = document.createElement("p");
     empty.className = "empty";
-    empty.textContent = "还没有任务。加入样本后会在当前任务结束后自动开始。";
+    empty.textContent = "还没有任务。用标准命令提交：python -m pipeline_modules.harness run --sample-dir <样本目录>";
     els.jobList.appendChild(empty);
     return;
   }
@@ -102,9 +115,10 @@ function renderJobs(data) {
 }
 
 function renderCard(job) {
-  const status = job.status || "queued";
+  const rawStatus = job.status || "queued";
+  const status = job.display_status || rawStatus;
   const card = document.createElement("article");
-  card.className = "job-card";
+  card.className = `job-card status-${status}`;
 
   const head = document.createElement("div");
   head.className = "job-head";
@@ -116,7 +130,6 @@ function renderCard(job) {
   idLine.className = "job-id";
   idLine.textContent = job.pid ? `${job.id}  ·  pid ${job.pid}` : job.id;
   titleWrap.append(title, idLine);
-
   const cluster = document.createElement("div");
   cluster.className = "status-cluster";
   const lamp = document.createElement("i");
@@ -130,45 +143,56 @@ function renderCard(job) {
   const meta = document.createElement("p");
   meta.className = "job-meta";
   meta.textContent = job.config_path ? `${job.sample_dir}  ·  ${job.config_path}` : job.sample_dir;
+  card.append(head, meta);
 
+  // --- step / progress line (unknown stays unknown) ---
   const progress = job.progress || {};
   const step = document.createElement("p");
   step.className = "job-step";
-  if (progress.step_name) {
+  const unitTotal = Number(progress.unit_total || 0);
+  const unitDone = Number(progress.unit_done || 0);
+  if (status === "queued") {
+    step.textContent = "等待 Worker 执行";
+  } else if (progress.step_name) {
     const total = progress.step_total || 0;
     const index = progress.step_index || 0;
-    step.textContent = index && total ? `步骤 ${index}/${total}  ${progress.step_name}` : progress.step_name;
-  } else if (status === "queued") {
-    step.textContent = "等待当前任务结束后自动开始";
-  } else {
-    step.textContent = progress.error || job.error || "";
+    const stepLabel = index && total ? `步骤 ${index}/${total}  ${progress.step_name}` : progress.step_name;
+    if (unitTotal > 0) {
+      step.textContent = `${stepLabel}  ·  ${unitDone} / ${unitTotal}`;
+    } else if (status === "running" || status === "verifying") {
+      step.textContent = `${stepLabel}  ·  进度未知`;
+    } else {
+      step.textContent = stepLabel;
+    }
+  } else if (status === "verifying") {
+    step.textContent = "正在验证输出文件";
   }
 
-  const eta = job.eta || {};
+  // --- timing / heartbeat line ---
   const etaLine = document.createElement("p");
   etaLine.className = "eta-line";
-  if (status === "running") {
-    const current = formatSeconds(eta.current_step_remaining_s);
-    const total = formatSeconds(eta.total_remaining_s);
-    const unitTotal = Number(eta.unit_total || progress.unit_total || 0);
-    const unitDone = Number(eta.unit_done || progress.unit_done || 0);
-    if (eta.collecting && !current && !total) {
-      etaLine.textContent = unitTotal
-        ? `正在收集耗时  ·  ${unitDone}/${unitTotal}`
-        : "正在收集耗时";
+  const parts = [];
+  if (status === "running" || status === "verifying" || status === "stalled") {
+    const totalDur = formatDuration(job.duration_s);
+    const stepDur = formatDuration(job.current_step_duration_s);
+    if (totalDur) parts.push(`总耗时 ${totalDur}`);
+    if (stepDur) parts.push(`当前步骤 ${stepDur}`);
+    if (job.heartbeat_age_s != null) parts.push(`最后心跳 ${formatDuration(job.heartbeat_age_s)}前`);
+    else parts.push("最后心跳 无");
+    const eta = job.eta || {};
+    if (eta.collecting || (eta.total_remaining_s == null && eta.current_step_remaining_s == null)) {
+      parts.push("预计剩余：数据收集中");
     } else {
-      const parts = [];
-      if (unitTotal) parts.push(`${unitDone}/${unitTotal}`);
+      const current = formatEta(eta.current_step_remaining_s);
+      const total = formatEta(eta.total_remaining_s);
       if (current) parts.push(`本步剩余 ${current}`);
       if (total && total !== current) parts.push(`全部剩余 ${total}`);
-      else if (total && !current) parts.push(`全部剩余 ${total}`);
-      etaLine.textContent = parts.join("  ·  ") || "正在收集耗时";
     }
-  } else if (status === "done") {
-    etaLine.textContent = "分析完成";
-  } else if (job.error) {
-    etaLine.textContent = job.error;
+  } else if (status === "succeeded" || status === "done") {
+    parts.push(job.duration_s != null ? `耗时 ${formatDuration(job.duration_s)}` : "分析完成");
   }
+  etaLine.textContent = parts.join("  ·  ");
+  card.append(step, etaLine);
 
   const track = document.createElement("div");
   track.className = "progress-track";
@@ -176,10 +200,38 @@ function renderCard(job) {
   fill.className = `progress-fill ${status}`;
   fill.style.width = `${progressPercent(job)}%`;
   track.appendChild(fill);
-  card.append(head, meta, step, etaLine, track);
+  card.appendChild(track);
 
+  // --- structured error panel ---
+  const error = job.error;
+  if (error && typeof error === "object" && error.message) {
+    const box = document.createElement("div");
+    box.className = "error-detail";
+    const codeLine = document.createElement("p");
+    codeLine.className = "error-code";
+    codeLine.textContent = `[${error.code}]${error.step_id != null ? ` 步骤 ${error.step_id}` : ""}${error.retryable ? " · 可重试" : " · 不可自动重试"}`;
+    const msgLine = document.createElement("p");
+    msgLine.textContent = error.message;
+    box.append(codeLine, msgLine);
+    if (error.suggestion) {
+      const sug = document.createElement("p");
+      sug.className = "error-suggestion";
+      sug.textContent = `建议：${error.suggestion}`;
+      box.appendChild(sug);
+    }
+    card.appendChild(box);
+  } else if (typeof error === "string" && error) {
+    const box = document.createElement("div");
+    box.className = "error-detail";
+    const msgLine = document.createElement("p");
+    msgLine.textContent = error;
+    box.appendChild(msgLine);
+    card.appendChild(box);
+  }
+
+  // --- artifact / result paths ---
   const results = job.results || progress.results || [];
-  if (status === "done" && results.length) {
+  if ((status === "succeeded" || status === "done") && results.length) {
     const box = document.createElement("details");
     box.className = "results";
     box.open = expandedResultJobs.has(job.id);
@@ -227,11 +279,11 @@ function renderCard(job) {
   actions.className = "card-actions";
   const logBtn = document.createElement("button");
   logBtn.type = "button";
-  logBtn.className = status === "failed" ? "btn danger" : "btn";
+  logBtn.className = status === "failed" || status === "stalled" ? "btn danger" : "btn";
   logBtn.textContent = "查看日志";
   logBtn.addEventListener("click", () => openLog(job));
   actions.appendChild(logBtn);
-  if (status === "running") {
+  if (status === "running" || status === "verifying" || status === "stalled" || status === "queued") {
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn danger";

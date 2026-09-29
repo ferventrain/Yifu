@@ -1,72 +1,100 @@
 {
-  "schema_version": "2",
+  "schema_version": "3",
   "module": "harness",
   "product_name": "Pipeline Monitor (PM)",
-  "description": "Pipeline Monitor (PM, 简称 PM) is the local pipeline-watching GUI for the Yifu pipeline: a FastAPI app (default http://127.0.0.1:8766) over a file-backed serial job queue under YIFU_ANALYSIS_ROOT/_active. Agents enqueue or attach runs here; operators watch progress, ETA and logs in the browser.",
+  "description": "Yifu 本地任务运行器 + 只读监视 UI。一条标准命令 (python -m pipeline_modules.harness run) 完成校验、建任务、启动唯一 worker 并返回 run_id；worker 串行执行 main.py、写 progress.json 心跳、结束后做输出验证并生成 artifact manifest。Pipeline Monitor (FastAPI, http://127.0.0.1:8766) 完全只读：刷新页面不会启动任何任务。",
+  "recommended_entrypoint": {
+    "id": "run_sample",
+    "cli": "python -m pipeline_modules.harness run --sample-dir \"S:/Arivis_Analysis/<sample>\" --config \"S:/Arivis_Analysis/<sample>/config.json\"",
+    "preflight_cli": "python -m pipeline_modules.harness preflight --sample-dir \"S:/Arivis_Analysis/<sample>\"",
+    "function": "pipeline_modules.harness.__main__.cmd_run",
+    "description": "推荐且唯一推荐的提交方式。校验 sample_dir（须在 analysis root 下）与 config.json，按样本去重（同一样本已有 queued/running 任务时返回原 run_id），创建任务记录，启动或复用唯一 detached worker，立即打印 {run_id, log_path, progress_path, monitor} 后退出。关闭终端不影响运行。",
+    "outputs": {
+      "run_id": { "type": "string", "description": "<utcstamp>-<sample-slug>，用于 cancel/list 与 Monitor 查看" }
+    }
+  },
+  "agent_rules": "宗旨：少命令（只用标准入口，不写 run.py）、不猜（只认状态和结构化错误，不解析日志）、少改（普通失败不引发改代码）。需要新代码时先与用户确认放置位置：现有仓库，还是项目文件夹下用完即删。完整规则见仓库根 AGENTS.md。",
   "production_policy": {
     "id": "no-tiff-imaris-direct",
-    "updated": "2026-09-18",
+    "updated": "2026-09-28",
     "rules": [
       "Whole-brain production runs must avoid TIFF intermediates: stream Imaris .ims directly with pipeline_modules.preprocessing.ims_to_zarr and pre-create the inputs main.py skips on (ch<signal>.zarr, ch<reg>_downsample/volume.nii.gz, sample_dir/original_shape.json). See pipeline_modules/preprocessing/capability_manifest.json.",
       "Preprocessing/enhancement is OFF by default in production configs (every preprocessing.*.apply=false) so segmentation thresholds operate on raw stored intensities and stay comparable across samples and batches.",
-      "Custom multi-step flows that main.py cannot express (e.g. ims->zarr->segmentation->masked ims) are launched as driver scripts and attached to PM via ActiveStore.attach_external, never by hand-editing queue files. Launch method and driver requirements are governed by launch_stability_policy in THIS manifest.",
-      "One job runs at a time. To wait for the current run, poll ActiveStore.has_running() or GET /api/jobs; never launch heavy pipelines outside PM while a job is running."
+      "标准流程一律用 run_sample 入口提交。main.py 表达不了的定制多步流程（如 ims->zarr->segmentation->masked ims）才用 attach_external 挂载外部 driver；不允许手工编辑 queue 文件。",
+      "One job runs at a time (single worker, exclusive lock). To wait for the current run, poll python -m pipeline_modules.harness list or GET /api/jobs; never launch heavy pipelines outside the worker while a job is running."
     ]
   },
   "entrypoints": [
     {
-      "id": "enqueue_job",
-      "function": "pipeline_modules.harness.queue.ActiveStore.add_job",
-      "cli": "python -m pipeline_modules.harness enqueue --sample-dir \"S:\\Arivis_Analysis\\_active\\<sample>\"",
-      "description": "Validate a sample directory under the analysis root (S:\\Arivis_Analysis) and append a kind=main job to the PM queue. config.json must exist in the sample dir (or pass config_path). The runner picks it up automatically: the GUI polls GET /api/jobs -> runner.maybe_start(), so a queued job starts as soon as nothing else is running and the browser/UI is open (or immediately after a POST /api/jobs).",
+      "id": "run_sample",
+      "cli": "python -m pipeline_modules.harness run --sample-dir <sample> [--config <config.json>] [--extra-arg --only_tubule]",
+      "function": "pipeline_modules.harness.__main__.cmd_run",
+      "description": "标准提交入口（同 recommended_entrypoint）。--extra-arg 只接受白名单 flag：--skip_registration / --only_tubule / --only_region_analysis；不接受任意 shell 命令。",
       "inputs": {
         "sample_dir": { "type": "path", "required": true, "description": "Must be a subdirectory of the analysis root, not the _active/jobs|runs bookkeeping folders" },
         "config_path": { "type": "path|null", "default": null, "description": "Defaults to sample_dir/config.json" }
       },
       "outputs": {
-        "job": { "type": "object", "description": "Queued job record (id = <utcstamp>-<sample-slug>)" }
+        "job": { "type": "object", "description": "Queued job record; run_id printed as JSON on stdout" }
       }
+    },
+    {
+      "id": "preflight",
+      "cli": "python -m pipeline_modules.harness preflight --sample-dir <sample>",
+      "function": "pipeline_modules.harness.__main__.cmd_preflight",
+      "description": "Submit 前的一次只读校验：sample_dir、config.json、pipeline mode、required outputs 与当前 worker 状态。不创建任务。",
+      "outputs": { "status": { "type": "object", "description": "{status: ok, pipeline, required_outputs, active_run, worker}" } }
+    },
+    {
+      "id": "cancel_job",
+      "cli": "python -m pipeline_modules.harness cancel <run_id>",
+      "function": "pipeline_modules.harness.worker.request_cancel",
+      "description": "协作式取消：写 cancel flag，worker 终止 pipeline 进程树并把任务标记 cancelled。queued 任务直接取消。",
+      "outputs": { "result": { "type": "object", "description": "{job_id, status: cancelled|cancel_requested}" } }
+    },
+    {
+      "id": "list_jobs",
+      "cli": "python -m pipeline_modules.harness list",
+      "function": "pipeline_modules.harness.__main__.cmd_list",
+      "description": "只读列出任务（含 display_status、heartbeat_age_s、duration_s、结构化 error）。REST 等价：GET http://127.0.0.1:8766/api/jobs —— GET 不会启动任何任务。",
+      "outputs": { "jobs": { "type": "array" } }
+    },
+    {
+      "id": "run_worker",
+      "cli": "python -m pipeline_modules.harness worker",
+      "function": "pipeline_modules.harness.worker.HarnessWorker.run_forever",
+      "description": "内部入口：detached 串行 worker。由 run/POST 自动启动，一般不需要手动调用。持有 _active/worker.lock 独占锁；空闲 30 分钟自动退出；崩溃重启后会收养仍存活的 pipeline 子进程，或把失去心跳的 running 任务标记 stalled。",
+      "outputs": { "exit": { "type": "int", "description": "0 on idle timeout or clean stop" } }
     },
     {
       "id": "attach_external_job",
       "function": "pipeline_modules.harness.queue.ActiveStore.attach_external",
-      "description": "Track an already-running custom driver as a PM job. Call this at driver start (see _run_YF2025063002_vessel.py for the reference implementation). PM derives status from the status file's FIRST line: RUNNING ... / ALL DONE / FAILED ... / CANCELLED, with 'Step <n>' parsed for the step display; write the ISO start time on line 2. Re-running attach_external on the same sample_dir updates the existing record instead of duplicating it.",
+      "cli": "python -m pipeline_modules.harness attach --sample-dir <s> --title <t> --pid <p> --log <l> --status <f>",
+      "description": "LEGACY/定制流程：把 main.py 表达不了的自定义 driver 挂到 PM。状态文件首行 RUNNING/ALL DONE/FAILED/CANCELLED，第二行 started_at ISO。同一样本重复 attach 会更新而不是复制记录。标准流程不要用这个，用 run。",
       "inputs": {
         "sample_dir": { "type": "path", "required": true },
         "title": { "type": "string", "required": true },
-        "pid": { "type": "int|null", "default": null, "description": "Driver process id; PM marks the job failed if the pid dies while the status line still says RUNNING" },
-        "log_path": { "type": "path", "required": true, "description": "Driver log file shown in the PM log view" },
-        "status_path": { "type": "path", "required": true, "description": "Two-line status file: first line = <STATE> [Step n: description], second line = started_at ISO" },
+        "pid": { "type": "int|null", "default": null },
+        "log_path": { "type": "path", "required": true },
+        "status_path": { "type": "path", "required": true },
         "config_path": { "type": "path|null", "default": null },
-        "command": { "type": "string", "default": "", "description": "Short step chain description" },
+        "command": { "type": "string", "default": "" },
         "step_total": { "type": "int", "default": 7 }
       },
-      "outputs": {
-        "job": { "type": "object", "description": "Synced external job record visible in PM" }
-      }
+      "outputs": { "job": { "type": "object" } }
     },
     {
-      "id": "list_jobs",
-      "function": "pipeline_modules.harness.queue.ActiveStore.list_job_views",
-      "cli": "python -m pipeline_modules.harness list",
-      "description": "List PM jobs with live progress, ETA (from historical step timings) and SampleLayout result listing. REST equivalent: GET http://127.0.0.1:8766/api/jobs (this call also triggers runner.maybe_start(), i.e. opening the PM page starts the next queued job).",
-      "outputs": {
-        "jobs": { "type": "array" }
-      }
-    },
-    {
-      "id": "wait_for_idle",
-      "function": "pipeline_modules.harness.queue.ActiveStore.has_running",
-      "description": "True while any job (main or external) is running. Poll this every ~60 s before launching new work; a running EXTERNAL job blocks the serial runner exactly like a main job.",
-      "outputs": {
-        "busy": { "type": "bool" }
-      }
+      "id": "enqueue_job",
+      "function": "pipeline_modules.harness.queue.ActiveStore.add_job",
+      "cli": "python -m pipeline_modules.harness enqueue --sample-dir <sample>",
+      "description": "LEGACY：只入队不启动 worker（与旧脚本兼容）。推荐改用 run_sample。",
+      "outputs": { "job": { "type": "object" } }
     },
     {
       "id": "serve_pipeline_monitor",
       "function": "apps.pipeline_harness.main.main",
       "cli": "python -m apps.pipeline_harness --host 127.0.0.1 --port 8766",
-      "description": "Start Pipeline Monitor (PM). REST API: GET /api/meta, GET /api/jobs (auto-starts queued), POST /api/jobs {sample_dir, config_path}, DELETE /api/jobs/{id}, POST /api/queue/start, POST /api/queue/cancel, POST /api/jobs/{id}/cancel, GET /api/jobs/{id}/log?tail=N.",
+      "description": "启动 Pipeline Monitor（只读 UI）。REST：GET /api/meta, GET /api/jobs（只读）, GET /api/jobs/{id}/log, GET /api/jobs/{id}/artifacts, POST /api/jobs（提交+启动 worker）, POST /api/queue/start（显式启动 worker）, POST /api/jobs/{id}/cancel, POST /api/queue/cancel, DELETE /api/jobs/{id}, POST /api/open。GET 请求永远不会启动任务。",
       "inputs": {
         "host": { "type": "string", "default": "127.0.0.1" },
         "port": { "type": "int", "default": 8766 }
@@ -75,58 +103,40 @@
   ],
   "launch_stability_policy": {
     "id": "unattended-run-stability",
-    "updated": "2026-09-23",
-    "origin": "Incidents 2026-09-18..23 (YF2025063002 vessel batch): whole process trees died to invisible-console input() prompts, invalid std handles (exit 120 fake failures), PID reuse faking 'running', NAS drops, and unidentified external kill waves. Rules below are the distilled fix set.",
-    "launch_methods_ranked": [
-      {
-        "rank": 1,
-        "method": "Operator's own terminal window",
-        "why": "The most process-lineage-stable place on Windows: the human sees a death immediately and re-runs. For interactive batches hand the operator ONE paste-able command (the queue orchestrator already accepts a sample list); PM stays a read-only progress viewer."
-      },
-      {
-        "rank": 2,
-        "method": "Windows scheduled task (schtasks /Run)",
-        "why": "For unattended serial batches. Parent is the Task Scheduler service, so the tree survives console/session cleanup that kills cmd-started children. See _schedule_vessel_queue.py; pair with the watchdog below."
-      },
-      {
-        "rank": 3,
-        "method": "PM queue (add_job, kind=main)",
-        "why": "Only for flows main.py natively expresses. Custom multi-step flows are forbidden here; use a driver attached via attach_external."
-      }
+    "updated": "2026-09-28",
+    "origin": "Incidents 2026-09-18..23 (YF2025063002 vessel batch) distilled into the harness itself: the detached worker replaces cmd/schtasks driver chains, and success is decided by output verification instead of status-file text.",
+    "rules": [
+      "The worker is spawned DETACHED (own log file, no inherited console handles); closing the submitting terminal or the Monitor never kills a run.",
+      "No interactive input() anywhere in the chain; all flags are explicit.",
+      "Process exit codes and log text are NEVER the verdict: succeeded requires exit 0 AND required outputs exist AND readable AND artifact manifest written (pipeline_modules/harness/verify.py).",
+      "Worker crash recovery: on restart, still-alive pipeline pids are adopted; dead ones become stalled with a structured STALLED error (retryable), never succeeded.",
+      "Heartbeats: worker stamps progress.json heartbeat_at every 15 s; older than 120 s (or dead worker) displays as stalled.",
+      "Kill by exact PID (taskkill /T /F via the cooperative cancel flag), never by command-substring sweeps."
     ],
-    "forbidden": [
-      "cmd /c start /b or detached-shell spawns from agent tooling: their lineage dies with the tool's cleanup AND adds failure modes at every layer; kill waves on this machine target exactly such chains.",
-      "Interactive input() anywhere in an unattended chain: a scheduled task provides an invisible console where isatty() is TRUE and input() blocks forever (cost: one full day once). Pass explicit flags instead, e.g. ims_to_zarr --reg_channel none.",
-      "Relying on process exit codes as the verdict: with no valid std handles python exits 120/1 AFTER completing all work, and killed drivers exit with misleading codes. The two-line status file (RUNNING/ALL DONE/FAILED + started_at) is the ONLY verdict.",
-      "Writing to inherited sys.__stdout__/__stderr__ or os.dup2 onto missing fds (raises OSError 9, 'lost sys.stderr'): route driver output through an explicitly opened log file; pass that same handle to child processes via subprocess stdout=<log_file>.",
-      "Ad-hoc psutil/taskkill sweeps matching by command substring: they kill unrelated trees (self-inflicted once). Kill by exact PID, or by PID + create-time.",
-      "Re-running finished samples to 'verify': region analysis has no output-exists skip, so a re-verify costs ~1.5 h/sample. Skip on status file == ALL DONE."
-    ],
-    "driver_contract": [
-      "Two-line status file (first line 'RUNNING Step N: ...' / 'ALL DONE' / 'FAILED ...', second line started_at ISO) written at every step transition; PM parses line 1 and the Step N counter.",
-      "Marker file after each completed step (output.done), and ADOPT orphaned outputs: if the artifact exists but the marker is missing, the driver was killed between module completion and marker write — modules refuse to overwrite, so adopt and move on instead of failing.",
-      "attach_external to PM at start with pid AND pid_created_at (PID reuse fakes liveness otherwise; sync_external_job validates via pid_matches).",
-      "Retry loop (up to 4 attempts per step, backoff) + a pass-level retry (3 passes, 5 min apart) around the whole sample list.",
-      "wait_for_nas() before each launch: a NAS drop killed a whole pass once.",
-      "register a watchdog: scheduled task every 15 min that relaunches the queue when samples remain unfinished and no orchestrator process is alive (_vessel_queue_watchdog.py, task YifuVesselWatchdog). Any kill, whatever its source, is then absorbed within one period at marker-level cost — this is what makes 'never crashes' practically true.",
-      "run post-run QC (pipeline_modules.visualization.pipeline_qc) as part of the verify step: 4 hard checks (label magnitude, hemisphere balance, 25um grid, registration correlation) plus human views (normalized registration tri-plane with label contour + hemisphere split line; 5 random raw+mask blocks as 2-channel zarr). verdict overall=FAIL must fail the driver so the queue stops carrying a bad run; outputs land in <sample>/qc/."
-    ],
-    "reference_implementations_note": "The scripts below were one-off run scripts and are removed from the working tree as of 2026-09-24 (repo runs via main.py + config only). Recover them from git history if needed (git log --diff-filter=D --name-only).",
-    "reference_implementations": [
-      "_run_YF2025063002_vessel.py (driver honoring the full contract)",
-      "_queue_YF2025063002_vessel.py (serial orchestrator: status-file verdict, ALL DONE skip, NAS preflight, 3-pass retry)",
-      "_vessel_queue_watchdog.py + _schedule_vessel_queue.py (self-heal + schtasks launcher)"
+    "historical_reference": [
+      "旧 driver 契约（两行 status 文件、marker、watchdog）仍适用于 attach_external 的自定义流程；标准流程已由 worker + verifier 取代。"
     ]
   },
   "queue_semantics": {
-    "storage": "YIFU_ANALYSIS_ROOT/_active: queue.json (ordered ids), jobs/*.json (records), runs/<job_id>/ (progress.json + stdout log)",
-    "statuses": ["queued", "running", "done", "failed", "cancelled"],
-    "serial": "One running job at a time across kinds; next_queued() is only started when nothing is running",
-    "external_block": "Jobs with kind=external are never started by the runner itself; they only occupy the running slot while their pid is alive"
+    "storage": "YIFU_ANALYSIS_ROOT/_active: queue.json (ordered ids), jobs/*.json (records), runs/<job_id>/ (progress.json + stdout.log + artifacts.json + cancel.flag), worker.json (worker liveness), worker.lock (exclusive), logs/worker.log",
+    "statuses": ["queued", "running", "verifying", "succeeded", "failed", "cancelled", "stalled"],
+    "status_meanings": {
+      "queued": "已提交等待执行",
+      "running": "runner 进程和 heartbeat 正常",
+      "verifying": "内部状态：程序已结束，正在验证输出",
+      "succeeded": "正常结束 AND required outputs 存在 AND 可读取 AND artifact manifest 写入",
+      "failed": "异常退出或输出验证失败（带结构化 error）",
+      "cancelled": "用户主动取消",
+      "stalled": "worker/心跳消失，无法确认是否仍在执行（retryable）"
+    },
+    "serial": "Single detached worker holds an exclusive lock; one running job at a time across kinds",
+    "dedupe": "run 命令对同一样本的 queued/running/verifying 任务去重，返回原 run_id",
+    "readonly_monitor": "GET /api/jobs 与页面刷新不做任何状态变更；只有 提交/显式启动 worker/取消/worker 推进队列 会改变状态"
   },
-  "reference_drivers": [
-    "_run_YF2025063002_vessel.py (ims -> zarr -> 25um registration nii -> main.py threshold + hemisphere -> L/R stats)",
-    "_run_YF2026070102_cfos.py (ims -> zarr -> cfos_unet -> masked ims)",
-    "_vessel_queue_watchdog.py (15-min self-heal for any unattended queue)"
-  ]
+  "progress_protocol": {
+    "file": "runs/<job_id>/progress.json (atomic writes)",
+    "fields": ["run_id", "status", "step_index", "step_total", "step_name", "unit_done", "unit_total", "message", "started_at", "step_started_at", "heartbeat_at"],
+    "unknown_units": "unit_total 为 null 表示进度未知；UI 显示『进度未知』，禁止伪造百分比或 ETA",
+    "module_api": "pipeline_modules.harness.runcontext.RunContext (start_step/progress/heartbeat/log/register_output/check_cancelled/finish_step)；旧模块可继续用 report_child_units"
+  }
 }

@@ -67,15 +67,22 @@ def empty_progress(*, step_total: int = len(CANONICAL_STEPS)) -> dict[str, Any]:
     return {
         "schema_version": PROGRESS_SCHEMA_VERSION,
         "status": "pending",
+        "run_id": None,
         "step_index": 0,
         "step_total": int(step_total),
         "step_name": "",
         "step_started_at": None,
         "run_started_at": None,
         "run_ended_at": None,
+        "heartbeat_at": None,
         "message": "",
         "error": None,
         "skipped": False,
+        # unit_done/unit_total stay None until a step reports real units;
+        # None means "progress unknown" and must never be guessed.
+        "unit_done": None,
+        "unit_total": None,
+        "unit_phase": None,
         "steps": [],
         "results": None,
         "sample_dir": None,
@@ -96,6 +103,12 @@ class ProgressWriter:
     def __init__(self, path: str | Path, *, step_total: int = len(CANONICAL_STEPS)) -> None:
         self.path = Path(path)
         self.state = empty_progress(step_total=step_total)
+        # Adopt whatever is already on disk (heartbeat from the worker,
+        # child-reported units) so our next flush does not erase it.
+        existing = read_progress(self.path)
+        if existing.get("status") not in (None, "pending") or existing.get("heartbeat_at"):
+            self.state.update(existing)
+            self.state["step_total"] = int(step_total)
 
     def _flush(self) -> None:
         write_json_atomic(self.path, self.state)
@@ -111,8 +124,15 @@ class ProgressWriter:
             self.state["step_total"] = int(step_total)
         self.state["status"] = "running"
         self.state["run_started_at"] = utc_now_iso()
+        self.state["heartbeat_at"] = utc_now_iso()
+        if not self.state.get("run_id"):
+            self.state["run_id"] = self.path.parent.name
         self.state["sample_dir"] = sample_dir
         self.state["config_path"] = config_path
+        self._flush()
+
+    def heartbeat(self) -> None:
+        self.state["heartbeat_at"] = utc_now_iso()
         self._flush()
 
     def _close_current_step(self) -> None:
@@ -136,6 +156,13 @@ class ProgressWriter:
         self.state["step_started_at"] = now
         self.state["skipped"] = False
         self.state["message"] = ""
+        self.state["heartbeat_at"] = now
+        # A new step has no units until it reports some; stale numbers from
+        # the previous step would fabricate progress.
+        self.state["unit_done"] = None
+        self.state["unit_total"] = None
+        self.state["unit_phase"] = None
+        self.state["phase_started_at"] = None
         self.state["steps"].append(
             {
                 "index": int(step_index),
@@ -180,6 +207,7 @@ class ProgressWriter:
         self._close_current_step()
         self.state["status"] = "done"
         self.state["run_ended_at"] = utc_now_iso()
+        self.state["heartbeat_at"] = self.state["run_ended_at"]
         self.state["error"] = None
         self.state["results"] = results or []
         self.state["unit_done"] = int(self.state.get("unit_total") or 0) or self.state.get("unit_done")
@@ -189,6 +217,7 @@ class ProgressWriter:
         self._close_current_step()
         self.state["status"] = "failed"
         self.state["run_ended_at"] = utc_now_iso()
+        self.state["heartbeat_at"] = self.state["run_ended_at"]
         self.state["error"] = str(error)
         self._flush()
 
@@ -231,6 +260,24 @@ def report_child_units(
         writer.set_units(done, total, phase=phase, phase_started_at=started)
     except Exception:
         logger.debug("Could not update harness progress file", exc_info=True)
+
+
+def touch_heartbeat(path: Path) -> str | None:
+    """Worker-side heartbeat: read-modify-write ONLY ``heartbeat_at``.
+
+    The pipeline subprocess owns the rest of the file; the worker stamps
+    liveness so the monitor can distinguish "running" from "stalled" without
+    parsing logs. Atomic write keeps half-finished states impossible.
+    """
+    state = read_progress(path)
+    now = utc_now_iso()
+    state["heartbeat_at"] = now
+    try:
+        write_json_atomic(path, state)
+    except OSError:
+        logger.debug("Could not stamp heartbeat", exc_info=True)
+        return None
+    return now
 
 
 def _parse_iso(value: str | None):

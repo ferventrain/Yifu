@@ -36,6 +36,7 @@ class ErrorCode(str, Enum):
     CUDA_OOM = "CUDA_OOM"
     CONVERGENCE_FAILED = "CONVERGENCE_FAILED"
     EMPTY_RESULT = "EMPTY_RESULT"
+    OUTPUT_INVALID = "OUTPUT_INVALID"
 
     # --- Internal / unexpected (exit code 5) ---
     INTERNAL_ERROR = "INTERNAL_ERROR"
@@ -50,6 +51,7 @@ _EXIT_CODES: dict[ErrorCode, int] = {
     ErrorCode.CUDA_OOM: 4,
     ErrorCode.CONVERGENCE_FAILED: 4,
     ErrorCode.EMPTY_RESULT: 4,
+    ErrorCode.OUTPUT_INVALID: 4,
     ErrorCode.INTERNAL_ERROR: 5,
 }
 
