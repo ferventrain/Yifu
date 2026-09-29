@@ -4,6 +4,36 @@
   "description": "Plotting and export utilities for density tables, atlas-region summaries, mask point clouds, brainrender inputs, and vessel renderings.",
   "entrypoints": [
     {
+      "id": "annotate_tissue_roi",
+      "term": "组织选区 (tissue ROI)",
+      "cli": "python -m pipeline_modules.visualization.annotate_tissue_sam_napari --sample-dir <sample_dir>",
+      "function": "pipeline_modules.visualization.annotate_tissue_sam_napari.main",
+      "description": "一句话打开样本做组织选区标注：自动定位 <sample>/*_surface_homogenized_qc.zarr，napari micro-SAM 画框 + Segment All Slices（可选 napari-label-interpolator 插值），Save tissue mask 固定写到 <sample>/tissue_roi.zarr（zarr attrs 记 downsample/source/tissue_fraction）。QC 卷不存在时返回结构化错误并给出 homogenize --qc_only 生成命令。消费方式：surface_brightness_homogenize --tissue_mask <sample>/tissue_roi.zarr（同 QC downsample）。",
+      "inputs": {
+        "sample_dir": {
+          "type": "path",
+          "required": true,
+          "description": "样本目录；须恰好含一个 *_surface_homogenized_qc.zarr，多个时改用 --input"
+        },
+        "input": {
+          "type": "path|null",
+          "default": null,
+          "description": "显式指定 QC 卷（兼容旧用法）"
+        },
+        "output": {
+          "type": "path|null",
+          "default": null,
+          "description": "默认 <sample>/tissue_roi.zarr，不要改"
+        }
+      },
+      "outputs": {
+        "tissue_roi_zarr": {
+          "type": "path",
+          "description": "<sample>/tissue_roi.zarr + 同级 tissue_roi_embeddings/ 缓存"
+        }
+      }
+    },
+    {
       "id": "plot_coarse_region_metric",
       "function": "pipeline_modules.visualization.coarse_region_metric_plot.generate_coarse_region_outputs",
       "cli": "python pipeline_modules/visualization/coarse_region_metric_plot.py",
@@ -177,7 +207,11 @@
         "metric": {
           "type": "string",
           "default": "Signal Count",
-          "examples": ["Signal Count", "Signal Voxels", "Sum Intensity"]
+          "examples": [
+            "Signal Count",
+            "Signal Voxels",
+            "Sum Intensity"
+          ]
         },
         "level": {
           "type": "int",
@@ -200,7 +234,11 @@
         "rank_by": {
           "type": "string",
           "default": "weighted_log_ratio",
-          "choices": ["weighted_log_ratio", "abs_log_ratio", "abs_count_diff"],
+          "choices": [
+            "weighted_log_ratio",
+            "abs_log_ratio",
+            "abs_count_diff"
+          ],
           "description": "Ranking score for selecting top regions; weighted_log_ratio uses abs(log_ratio) * log1p(countA + countB)"
         },
         "output_prefix": {
@@ -260,7 +298,12 @@
         "mode": {
           "type": "string",
           "default": "sample-stack",
-          "examples": ["sample-stack", "stack", "atlas-slice", "batch-cell-density-slices"]
+          "examples": [
+            "sample-stack",
+            "stack",
+            "atlas-slice",
+            "batch-cell-density-slices"
+          ]
         },
         "input": {
           "type": "path|null",
@@ -340,25 +383,91 @@
         "Run in the yifu/registration environment (ANTsPy required)"
       ],
       "inputs": {
-        "sample_dir": { "type": "dir", "required": false, "description": "Sample root; resolves mask_zarr and transforms when explicit paths are omitted" },
-        "signal_ch": { "type": "string", "default": "ch0" },
-        "register_ch": { "type": "string", "default": "ch0" },
-        "mask_zarr": { "type": "path|null", "default": null },
-        "atlas_image": { "type": "path", "required": true },
-        "atlas_name": { "type": "string", "default": "allen_mouse_25um" },
-        "resolution_xyz": { "type": "triplet_float_um", "required": true, "description": "Input mask voxel size in microns as x,y,z" },
-        "target_resolution_xyz": { "type": "triplet_float_um", "default": [25.0, 25.0, 25.0] },
-        "foreground_mode": { "type": "string", "default": "nonzero", "choices": ["nonzero", "equal"] },
-        "foreground_label": { "type": "int", "default": 1 },
-        "max_points": { "type": "int", "default": 150000, "description": "Random cap on exported atlas points; 0 disables cap" },
-        "output": { "type": "path|null", "default": null, "description": "Atlas-space CSV; defaults to sample_dir/visualization/points.csv" },
-        "output_volume": { "type": "path|null", "default": null, "description": "Optional atlas-space binary mask TIFF" },
-        "skip_points": { "type": "bool", "default": false }
+        "sample_dir": {
+          "type": "dir",
+          "required": false,
+          "description": "Sample root; resolves mask_zarr and transforms when explicit paths are omitted"
+        },
+        "signal_ch": {
+          "type": "string",
+          "default": "ch0"
+        },
+        "register_ch": {
+          "type": "string",
+          "default": "ch0"
+        },
+        "mask_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "atlas_image": {
+          "type": "path",
+          "required": true
+        },
+        "atlas_name": {
+          "type": "string",
+          "default": "allen_mouse_25um"
+        },
+        "resolution_xyz": {
+          "type": "triplet_float_um",
+          "required": true,
+          "description": "Input mask voxel size in microns as x,y,z"
+        },
+        "target_resolution_xyz": {
+          "type": "triplet_float_um",
+          "default": [
+            25.0,
+            25.0,
+            25.0
+          ]
+        },
+        "foreground_mode": {
+          "type": "string",
+          "default": "nonzero",
+          "choices": [
+            "nonzero",
+            "equal"
+          ]
+        },
+        "foreground_label": {
+          "type": "int",
+          "default": 1
+        },
+        "max_points": {
+          "type": "int",
+          "default": 150000,
+          "description": "Random cap on exported atlas points; 0 disables cap"
+        },
+        "output": {
+          "type": "path|null",
+          "default": null,
+          "description": "Atlas-space CSV; defaults to sample_dir/visualization/points.csv"
+        },
+        "output_volume": {
+          "type": "path|null",
+          "default": null,
+          "description": "Optional atlas-space binary mask TIFF"
+        },
+        "skip_points": {
+          "type": "bool",
+          "default": false
+        }
       },
       "outputs": {
-        "atlas_points_csv": { "type": "path", "description": "sample_dir/visualization/points.csv" },
-        "atlas_volume_tiff": { "type": "path", "optional": true, "description": "Optional atlas-space mask TIFF when --output_volume is set" },
-        "summary_json": { "type": "path", "optional": true, "description": "Metadata JSON written next to atlas volume export" }
+        "atlas_points_csv": {
+          "type": "path",
+          "description": "sample_dir/visualization/points.csv"
+        },
+        "atlas_volume_tiff": {
+          "type": "path",
+          "optional": true,
+          "description": "Optional atlas-space mask TIFF when --output_volume is set"
+        },
+        "summary_json": {
+          "type": "path",
+          "optional": true,
+          "description": "Metadata JSON written next to atlas volume export"
+        }
       },
       "sample_layout": {
         "mask_zarr": "sample_dir/<signal_ch>_mask.zarr",
@@ -387,39 +496,152 @@
         "Default region groups: config/region_groups.json"
       ],
       "inputs": {
-        "sample_dir": { "type": "dir", "required": false, "description": "Sample root; auto-resolves points.csv and default output paths under sample_dir/visualization/" },
-        "points_csv": { "type": "path|null", "default": null, "description": "Atlas-space point CSV; defaults to sample_dir/visualization/points.csv when --sample_dir is set" },
-        "signal_ch": { "type": "string", "default": "ch1" },
-        "register_ch": { "type": "string", "default": "ch0" },
-        "force_warp": { "type": "bool", "default": false, "description": "Regenerate atlas-space points even if CSV exists" },
-        "atlas_name": { "type": "string", "default": "allen_mouse_25um" },
-        "region_groups": { "type": "path", "default": "config/region_groups.json", "description": "Named atlas region groups with acronyms and colors" },
-        "group_names": { "type": "csv_string|null", "default": null, "examples": ["PFC,HIP,AMY,ACC,NAc,LHb"] },
-        "group_colors": { "type": "csv_string|null", "default": null },
-        "color_points_by_group": { "type": "bool", "default": false },
-        "filter_points_by_group": { "type": "bool", "default": false },
-        "drop_unassigned_group_points": { "type": "bool", "default": false },
-        "screenshot_per_group": { "type": "bool", "default": false, "description": "Save one PNG per selected group using the same camera" },
-        "output_dir": { "type": "path|null", "default": null, "description": "Output directory for --screenshot_per_group; defaults to sample_dir/visualization/brainrender" },
-        "camera_view": { "type": "path|null", "default": null, "description": "Load camera JSON; omit path to use sample_dir/visualization/{sample}_brainrender_view.json" },
-        "export_camera_view": { "type": "path|null", "default": null, "description": "Interactive camera export mode; press V in viewer to save JSON" },
-        "point_radius": { "type": "float", "default": 40.0 },
-        "point_color": { "type": "string", "default": "#ff4d6d" },
-        "point_alpha": { "type": "float", "default": 0.95 },
-        "root_alpha": { "type": "float", "default": 0.12 },
-        "hemisphere": { "type": "string", "default": "both", "choices": ["both", "left", "right"] },
-        "camera": { "type": "string", "default": "three_quarters" },
-        "output": { "type": "path|null", "default": null, "description": "Single PNG output; omit to open interactive viewer" },
-        "screenshot_scale": { "type": "int", "default": 2 },
-        "title": { "type": "string|null", "default": null },
-        "background": { "type": "string", "default": "white" },
-        "show_axes": { "type": "bool", "default": false }
+        "sample_dir": {
+          "type": "dir",
+          "required": false,
+          "description": "Sample root; auto-resolves points.csv and default output paths under sample_dir/visualization/"
+        },
+        "points_csv": {
+          "type": "path|null",
+          "default": null,
+          "description": "Atlas-space point CSV; defaults to sample_dir/visualization/points.csv when --sample_dir is set"
+        },
+        "signal_ch": {
+          "type": "string",
+          "default": "ch1"
+        },
+        "register_ch": {
+          "type": "string",
+          "default": "ch0"
+        },
+        "force_warp": {
+          "type": "bool",
+          "default": false,
+          "description": "Regenerate atlas-space points even if CSV exists"
+        },
+        "atlas_name": {
+          "type": "string",
+          "default": "allen_mouse_25um"
+        },
+        "region_groups": {
+          "type": "path",
+          "default": "config/region_groups.json",
+          "description": "Named atlas region groups with acronyms and colors"
+        },
+        "group_names": {
+          "type": "csv_string|null",
+          "default": null,
+          "examples": [
+            "PFC,HIP,AMY,ACC,NAc,LHb"
+          ]
+        },
+        "group_colors": {
+          "type": "csv_string|null",
+          "default": null
+        },
+        "color_points_by_group": {
+          "type": "bool",
+          "default": false
+        },
+        "filter_points_by_group": {
+          "type": "bool",
+          "default": false
+        },
+        "drop_unassigned_group_points": {
+          "type": "bool",
+          "default": false
+        },
+        "screenshot_per_group": {
+          "type": "bool",
+          "default": false,
+          "description": "Save one PNG per selected group using the same camera"
+        },
+        "output_dir": {
+          "type": "path|null",
+          "default": null,
+          "description": "Output directory for --screenshot_per_group; defaults to sample_dir/visualization/brainrender"
+        },
+        "camera_view": {
+          "type": "path|null",
+          "default": null,
+          "description": "Load camera JSON; omit path to use sample_dir/visualization/{sample}_brainrender_view.json"
+        },
+        "export_camera_view": {
+          "type": "path|null",
+          "default": null,
+          "description": "Interactive camera export mode; press V in viewer to save JSON"
+        },
+        "point_radius": {
+          "type": "float",
+          "default": 40.0
+        },
+        "point_color": {
+          "type": "string",
+          "default": "#ff4d6d"
+        },
+        "point_alpha": {
+          "type": "float",
+          "default": 0.95
+        },
+        "root_alpha": {
+          "type": "float",
+          "default": 0.12
+        },
+        "hemisphere": {
+          "type": "string",
+          "default": "both",
+          "choices": [
+            "both",
+            "left",
+            "right"
+          ]
+        },
+        "camera": {
+          "type": "string",
+          "default": "three_quarters"
+        },
+        "output": {
+          "type": "path|null",
+          "default": null,
+          "description": "Single PNG output; omit to open interactive viewer"
+        },
+        "screenshot_scale": {
+          "type": "int",
+          "default": 2
+        },
+        "title": {
+          "type": "string|null",
+          "default": null
+        },
+        "background": {
+          "type": "string",
+          "default": "white"
+        },
+        "show_axes": {
+          "type": "bool",
+          "default": false
+        }
       },
       "outputs": {
-        "points_csv": { "type": "path", "description": "sample_dir/visualization/points.csv" },
-        "camera_view_json": { "type": "path", "optional": true, "description": "sample_dir/visualization/{sample}_brainrender_view.json" },
-        "group_png": { "type": "path", "optional": true, "description": "sample_dir/visualization/brainrender/{GROUP}_brainrender.png when --screenshot_per_group is used" },
-        "single_png": { "type": "path", "optional": true, "description": "Explicit --output PNG path" }
+        "points_csv": {
+          "type": "path",
+          "description": "sample_dir/visualization/points.csv"
+        },
+        "camera_view_json": {
+          "type": "path",
+          "optional": true,
+          "description": "sample_dir/visualization/{sample}_brainrender_view.json"
+        },
+        "group_png": {
+          "type": "path",
+          "optional": true,
+          "description": "sample_dir/visualization/brainrender/{GROUP}_brainrender.png when --screenshot_per_group is used"
+        },
+        "single_png": {
+          "type": "path",
+          "optional": true,
+          "description": "Explicit --output PNG path"
+        }
       },
       "common_commands": [
         {
@@ -489,20 +711,98 @@
             "Short: {\"PFC\": [\"FRP\", \"ACA\", \"PL\", \"ILA\", \"ORB\", \"DP\"]}"
           ],
           "default_groups": [
-            {"name": "PFC", "acronyms": ["FRP", "ACA", "PL", "ILA", "ORB", "DP"], "note": "含 ACA，与 ACC 组故意重叠"},
-            {"name": "dlPFC", "acronyms": ["PL", "ACAd", "ORBl"], "note": "背外侧 PFC 小鼠同源近似"},
-            {"name": "vmPFC", "acronyms": ["ILA", "ACAv", "ORBm", "FRP"], "note": "腹内侧 PFC 小鼠同源近似"},
-            {"name": "HIP", "acronyms": ["HIP"]},
-            {"name": "AMY", "acronyms": ["BLA", "BMA", "LA", "PA", "CEA", "MEA", "AAA", "IA", "COA", "PAA"]},
-            {"name": "ACC", "acronyms": ["ACA"], "note": "与 PFC 重叠 intentional"},
-            {"name": "NAc", "acronyms": ["ACB"]},
-            {"name": "LHb", "acronyms": ["LH"]}
+            {
+              "name": "PFC",
+              "acronyms": [
+                "FRP",
+                "ACA",
+                "PL",
+                "ILA",
+                "ORB",
+                "DP"
+              ],
+              "note": "含 ACA，与 ACC 组故意重叠"
+            },
+            {
+              "name": "dlPFC",
+              "acronyms": [
+                "PL",
+                "ACAd",
+                "ORBl"
+              ],
+              "note": "背外侧 PFC 小鼠同源近似"
+            },
+            {
+              "name": "vmPFC",
+              "acronyms": [
+                "ILA",
+                "ACAv",
+                "ORBm",
+                "FRP"
+              ],
+              "note": "腹内侧 PFC 小鼠同源近似"
+            },
+            {
+              "name": "HIP",
+              "acronyms": [
+                "HIP"
+              ]
+            },
+            {
+              "name": "AMY",
+              "acronyms": [
+                "BLA",
+                "BMA",
+                "LA",
+                "PA",
+                "CEA",
+                "MEA",
+                "AAA",
+                "IA",
+                "COA",
+                "PAA"
+              ]
+            },
+            {
+              "name": "ACC",
+              "acronyms": [
+                "ACA"
+              ],
+              "note": "与 PFC 重叠 intentional"
+            },
+            {
+              "name": "NAc",
+              "acronyms": [
+                "ACB"
+              ]
+            },
+            {
+              "name": "LHb",
+              "acronyms": [
+                "LH"
+              ]
+            }
           ]
         },
         "workflow": [
-          {"step": 1, "action": "交互预览 + 按组着色", "flags": "--color_points_by_group --filter_points_by_group", "note": "不加 --color_points_by_group 时所有点为默认红色 #ff4d6d"},
-          {"step": 2, "action": "交互保存固定视角", "flags": "--export_camera_view", "note": "按 V 保存 JSON；此步骤不生成按组 PNG"},
-          {"step": 3, "action": "同视角按组批量截图", "flags": "--screenshot_per_group --camera_view", "note": "第一组 mesh 加载可能较慢（1-3 分钟正常）"}
+          {
+            "step": 1,
+            "action": "交互预览 + 按组着色",
+            "flags": "--color_points_by_group --filter_points_by_group",
+            "note": "不加 --color_points_by_group 时所有点为默认红色 #ff4d6d"
+          },
+          {
+            "step": 2,
+            "action": "交互保存固定视角",
+            "flags": "--export_camera_view",
+            "note": "按 V 保存 JSON；此步骤不生成按组 PNG"
+          },
+          {
+            "step": 3,
+            "action": "同视角按组批量截图",
+            "flags": "--screenshot_per_group --camera_view",
+            "note": "第一组 mesh 加载可能较慢（1-3 分钟正常）"
+          }
         ],
         "keyboard_shortcuts": {
           "V": "保存视角到 sample_dir/visualization/{sample}_brainrender_view.json",
@@ -511,13 +811,32 @@
           "Q_or_Esc": "关闭窗口"
         },
         "camera_view_json_format": {
-          "required_fields": ["pos", "viewup", "clipping_range"],
+          "required_fields": [
+            "pos",
+            "viewup",
+            "clipping_range"
+          ],
           "example": {
-            "pos": [-29176, 70303, 15030],
-            "focal_point": [7830, 4296, -5694],
-            "viewup": [-1, 0, 0],
+            "pos": [
+              -29176,
+              70303,
+              15030
+            ],
+            "focal_point": [
+              7830,
+              4296,
+              -5694
+            ],
+            "viewup": [
+              -1,
+              0,
+              0
+            ],
             "distance": 78459,
-            "clipping_range": [61887, 99152],
+            "clipping_range": [
+              61887,
+              99152
+            ],
             "name": "nao_1_brainrender_view"
           }
         },
@@ -529,13 +848,34 @@
           "--group_names 必须加引号，否则逗号会拆成多个参数，例如 --group_names \"PFC,HIP,AMY\""
         ],
         "faq": [
-          {"issue": "全是红点", "fix": "加上 --color_points_by_group"},
-          {"issue": "按 V 没反应 / Step 3 报 Camera view JSON not found", "fix": "重新跑 --export_camera_view，确认终端出现 Saved camera view to:，或检查 visualization/{sample}_brainrender_view.json"},
-          {"issue": "unrecognized arguments: HIP AMY", "fix": "PowerShell 中 --group_names 未加引号"},
-          {"issue": "ModuleNotFoundError: pipeline_modules", "fix": "设置 PYTHONPATH=S:\\Yifu 并在仓库根目录运行"},
-          {"issue": "ModuleNotFoundError: brainrender", "fix": "必须在 napari 环境运行，不能用 yifu"},
-          {"issue": "Atlas not downloaded", "fix": "在 napari 环境下载 Allen atlas，或复制 ~/.brainglobe 缓存"},
-          {"issue": "ACC 与 PFC 点数重叠", "fix": "设计如此，两组都含 ACA；按组截图时各组独立过滤"}
+          {
+            "issue": "全是红点",
+            "fix": "加上 --color_points_by_group"
+          },
+          {
+            "issue": "按 V 没反应 / Step 3 报 Camera view JSON not found",
+            "fix": "重新跑 --export_camera_view，确认终端出现 Saved camera view to:，或检查 visualization/{sample}_brainrender_view.json"
+          },
+          {
+            "issue": "unrecognized arguments: HIP AMY",
+            "fix": "PowerShell 中 --group_names 未加引号"
+          },
+          {
+            "issue": "ModuleNotFoundError: pipeline_modules",
+            "fix": "设置 PYTHONPATH=S:\\Yifu 并在仓库根目录运行"
+          },
+          {
+            "issue": "ModuleNotFoundError: brainrender",
+            "fix": "必须在 napari 环境运行，不能用 yifu"
+          },
+          {
+            "issue": "Atlas not downloaded",
+            "fix": "在 napari 环境下载 Allen atlas，或复制 ~/.brainglobe 缓存"
+          },
+          {
+            "issue": "ACC 与 PFC 点数重叠",
+            "fix": "设计如此，两组都含 ACA；按组截图时各组独立过滤"
+          }
         ],
         "pipeline_relation": "依赖 registration（transforms）、segmentation（mask zarr）、atlas warp 后的体积或 points.csv。脚本内部自动推断坐标单位/轴序。"
       },
@@ -555,16 +895,48 @@
         "Region groups JSON and Allen region CSV must be available"
       ],
       "inputs": {
-        "sample_dir": { "type": "dir", "required": true },
-        "groups_json": { "type": "path", "default": "config/region_groups.json" },
-        "cfg": { "type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV" },
-        "metric": { "type": "string", "default": "Signal Count", "examples": ["Signal Count", "Signal Voxels", "Voxel Density", "Left Signal Count", "Right Signal Count"] },
-        "input_excel": { "type": "path|null", "default": null },
-        "output_prefix": { "type": "path|null", "default": null, "description": "Defaults to sample_dir/<sample_dir_name>" }
+        "sample_dir": {
+          "type": "dir",
+          "required": true
+        },
+        "groups_json": {
+          "type": "path",
+          "default": "config/region_groups.json"
+        },
+        "cfg": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        },
+        "metric": {
+          "type": "string",
+          "default": "Signal Count",
+          "examples": [
+            "Signal Count",
+            "Signal Voxels",
+            "Voxel Density",
+            "Left Signal Count",
+            "Right Signal Count"
+          ]
+        },
+        "input_excel": {
+          "type": "path|null",
+          "default": null
+        },
+        "output_prefix": {
+          "type": "path|null",
+          "default": null,
+          "description": "Defaults to sample_dir/<sample_dir_name>"
+        }
       },
       "outputs": {
-        "region_group_signal_count_csv": { "type": "path", "description": "<output_prefix>_region_group_signal_count.csv" },
-        "region_group_signal_count_xlsx": { "type": "path", "description": "<output_prefix>_region_group_signal_count.xlsx" }
+        "region_group_signal_count_csv": {
+          "type": "path",
+          "description": "<output_prefix>_region_group_signal_count.csv"
+        },
+        "region_group_signal_count_xlsx": {
+          "type": "path",
+          "description": "<output_prefix>_region_group_signal_count.xlsx"
+        }
       },
       "common_commands": [
         {
@@ -586,27 +958,109 @@
         "Run in an environment with pyvista and matplotlib"
       ],
       "inputs": {
-        "swc_dir": { "type": "dir", "required": true },
-        "max_files": { "type": "int", "default": 0, "description": "Limit loaded SWC files; 0 means all" },
-        "spline_factor": { "type": "int", "default": 12 },
-        "smooth_window": { "type": "int", "default": 5 },
-        "min_spacing": { "type": "float", "default": 1.0, "description": "Minimum control-point spacing in microns" },
-        "line_width": { "type": "float", "default": 5.0 },
-        "branch_point_size": { "type": "float", "default": 2.0 },
-        "color_mode": { "type": "string", "default": "diameter", "choices": ["diameter", "solid", "branch"] },
-        "branch_color": { "type": "string", "default": "#0072b2" },
-        "colormap": { "type": "string", "default": "bright" },
-        "background": { "type": "string", "default": "dark", "choices": ["dark", "paper", "black", "white"] },
-        "diameter_clip_percentiles": { "type": "pair_float", "default": [2.0, 98.0] },
-        "output": { "type": "path|null", "default": null, "description": "Save screenshot instead of opening interactive viewer" },
-        "dpi": { "type": "int", "default": 300 },
-        "window_size": { "type": "width,height", "default": "1920,1080" },
-        "camera": { "type": "string", "default": "iso", "choices": ["iso", "xy", "xz", "yz"] },
-        "parallel_projection": { "type": "bool", "default": false },
-        "save_on_close": { "type": "path|null", "default": null, "description": "Interactive mode: press S in viewer to save current view" }
+        "swc_dir": {
+          "type": "dir",
+          "required": true
+        },
+        "max_files": {
+          "type": "int",
+          "default": 0,
+          "description": "Limit loaded SWC files; 0 means all"
+        },
+        "spline_factor": {
+          "type": "int",
+          "default": 12
+        },
+        "smooth_window": {
+          "type": "int",
+          "default": 5
+        },
+        "min_spacing": {
+          "type": "float",
+          "default": 1.0,
+          "description": "Minimum control-point spacing in microns"
+        },
+        "line_width": {
+          "type": "float",
+          "default": 5.0
+        },
+        "branch_point_size": {
+          "type": "float",
+          "default": 2.0
+        },
+        "color_mode": {
+          "type": "string",
+          "default": "diameter",
+          "choices": [
+            "diameter",
+            "solid",
+            "branch"
+          ]
+        },
+        "branch_color": {
+          "type": "string",
+          "default": "#0072b2"
+        },
+        "colormap": {
+          "type": "string",
+          "default": "bright"
+        },
+        "background": {
+          "type": "string",
+          "default": "dark",
+          "choices": [
+            "dark",
+            "paper",
+            "black",
+            "white"
+          ]
+        },
+        "diameter_clip_percentiles": {
+          "type": "pair_float",
+          "default": [
+            2.0,
+            98.0
+          ]
+        },
+        "output": {
+          "type": "path|null",
+          "default": null,
+          "description": "Save screenshot instead of opening interactive viewer"
+        },
+        "dpi": {
+          "type": "int",
+          "default": 300
+        },
+        "window_size": {
+          "type": "width,height",
+          "default": "1920,1080"
+        },
+        "camera": {
+          "type": "string",
+          "default": "iso",
+          "choices": [
+            "iso",
+            "xy",
+            "xz",
+            "yz"
+          ]
+        },
+        "parallel_projection": {
+          "type": "bool",
+          "default": false
+        },
+        "save_on_close": {
+          "type": "path|null",
+          "default": null,
+          "description": "Interactive mode: press S in viewer to save current view"
+        }
       },
       "outputs": {
-        "render_png": { "type": "path", "optional": true, "description": "Screenshot path when --output is set" }
+        "render_png": {
+          "type": "path",
+          "optional": true,
+          "description": "Screenshot path when --output is set"
+        }
       },
       "common_commands": [
         {
@@ -627,21 +1081,49 @@
         },
         "pipeline_position": "binary mask Zarr → kimimaro_reconstruction.py --save_skeleton --save_swc → swc/ → render_vessels_pyvista.py --swc_dir swc/",
         "smoothing_pipeline": [
-          {"stage": 1, "name": "min_spacing filter", "description": "Remove control points closer than min_spacing um; eliminates redundant dense vertices"},
-          {"stage": 2, "name": "moving-average smooth", "description": "Sliding window (smooth_window) on interior points; endpoints preserved"},
-          {"stage": 3, "name": "spline interpolation", "description": "pv.Spline through cleaned points; n = len(points) * spline_factor"}
+          {
+            "stage": 1,
+            "name": "min_spacing filter",
+            "description": "Remove control points closer than min_spacing um; eliminates redundant dense vertices"
+          },
+          {
+            "stage": 2,
+            "name": "moving-average smooth",
+            "description": "Sliding window (smooth_window) on interior points; endpoints preserved"
+          },
+          {
+            "stage": 3,
+            "name": "spline interpolation",
+            "description": "pv.Spline through cleaned points; n = len(points) * spline_factor"
+          }
         ],
         "recommended_settings": [
-          {"scenario": "Quick preview", "flags": "--spline_factor 12 --smooth_window 5 --min_spacing 1.0"},
-          {"scenario": "Publication quality", "flags": "--spline_factor 20 --smooth_window 7 --min_spacing 2.0 --line_width 5"},
-          {"scenario": "Very noisy skeleton", "flags": "--spline_factor 20 --smooth_window 11 --min_spacing 3.0"},
-          {"scenario": "Save to file", "flags": "add --output render.png --dpi 300"}
+          {
+            "scenario": "Quick preview",
+            "flags": "--spline_factor 12 --smooth_window 5 --min_spacing 1.0"
+          },
+          {
+            "scenario": "Publication quality",
+            "flags": "--spline_factor 20 --smooth_window 7 --min_spacing 2.0 --line_width 5"
+          },
+          {
+            "scenario": "Very noisy skeleton",
+            "flags": "--spline_factor 20 --smooth_window 11 --min_spacing 3.0"
+          },
+          {
+            "scenario": "Save to file",
+            "flags": "add --output render.png --dpi 300"
+          }
         ],
         "output_modes": {
           "interactive": "Default — PyVista 3D viewer; rotate/zoom with mouse. Press S to save view when save_on_close/interactive_output set.",
           "file": "--output path.png saves screenshot and exits"
         },
-        "dependencies": ["pyvista", "numpy", "matplotlib"],
+        "dependencies": [
+          "pyvista",
+          "numpy",
+          "matplotlib"
+        ],
         "notes": [
           "SWC radius values control branch color only; visual tube width is uniform via --line_width",
           "Branch points = nodes with more than one child in SWC tree",
@@ -661,21 +1143,67 @@
         "Optional mask Zarr can gate foreground voxels before projection"
       ],
       "inputs": {
-        "sample_dir": { "type": "dir", "required": true },
-        "region": { "type": "string", "required": true, "examples": ["HIP", "PVH", "Anterior cingulate area", "295"] },
-        "cfg": { "type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV" },
-        "config": { "type": "path|null", "default": null, "description": "Optional config.json for default signal channel" },
-        "signal_zarr": { "type": "path|null", "default": null },
-        "label_zarr": { "type": "path|null", "default": null },
-        "mask_zarr": { "type": "path|null", "default": null },
-        "block_shape": { "type": "z,y,x", "default": "128,256,256" },
-        "output_dir": { "type": "path|null", "default": "sample_dir/visualization/region_mip" }
+        "sample_dir": {
+          "type": "dir",
+          "required": true
+        },
+        "region": {
+          "type": "string",
+          "required": true,
+          "examples": [
+            "HIP",
+            "PVH",
+            "Anterior cingulate area",
+            "295"
+          ]
+        },
+        "cfg": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        },
+        "config": {
+          "type": "path|null",
+          "default": null,
+          "description": "Optional config.json for default signal channel"
+        },
+        "signal_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "label_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "mask_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "block_shape": {
+          "type": "z,y,x",
+          "default": "128,256,256"
+        },
+        "output_dir": {
+          "type": "path|null",
+          "default": "sample_dir/visualization/region_mip"
+        }
       },
       "outputs": {
-        "horizontal_mip_tiff": { "type": "path", "description": "{sample}_{region}_{horizontal}.tiff" },
-        "coronal_mip_tiff": { "type": "path", "description": "{sample}_{region}_{coronal}.tiff" },
-        "sagittal_mip_tiff": { "type": "path", "description": "{sample}_{region}_{sagittal}.tiff" },
-        "summary_json": { "type": "path", "description": "{sample}_{region}_mip_summary.json" }
+        "horizontal_mip_tiff": {
+          "type": "path",
+          "description": "{sample}_{region}_{horizontal}.tiff"
+        },
+        "coronal_mip_tiff": {
+          "type": "path",
+          "description": "{sample}_{region}_{coronal}.tiff"
+        },
+        "sagittal_mip_tiff": {
+          "type": "path",
+          "description": "{sample}_{region}_{sagittal}.tiff"
+        },
+        "summary_json": {
+          "type": "path",
+          "description": "{sample}_{region}_mip_summary.json"
+        }
       },
       "common_commands": [
         {
@@ -699,21 +1227,81 @@
         "Region query resolves against pipeline_modules/registration/Region_Csv_Rev1_updated.CSV by acronym, full name, or numeric id"
       ],
       "inputs": {
-        "sample_dir": { "type": "dir", "required": true },
-        "region": { "type": "string", "required": true, "examples": ["HIP", "PVH", "295"] },
-        "export_mode": { "type": "string", "default": "signal", "examples": ["signal", "mask", "region"] },
-        "source": { "type": "string", "default": "auto", "examples": ["auto", "tiff", "zarr"] },
-        "channels": { "type": "string|null", "default": null, "examples": ["1,2,3"], "description": "Multi-channel batch export directly from TIFF stacks" },
-        "signal_ch": { "type": "string|null", "default": null, "description": "Single-channel mode signal channel label" },
-        "cfg": { "type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV" },
-        "config": { "type": "path|null", "default": null },
-        "workers": { "type": "int", "default": 0, "description": "Parallel slice workers in TIFF mode; 0 uses cpu_count // 2" },
-        "output_dir": { "type": "path|null", "default": "sample_dir/visualization/region_masked/{ch}_{region}_{mode}" },
-        "output_root": { "type": "path|null", "default": "sample_dir/visualization/region_masked" }
+        "sample_dir": {
+          "type": "dir",
+          "required": true
+        },
+        "region": {
+          "type": "string",
+          "required": true,
+          "examples": [
+            "HIP",
+            "PVH",
+            "295"
+          ]
+        },
+        "export_mode": {
+          "type": "string",
+          "default": "signal",
+          "examples": [
+            "signal",
+            "mask",
+            "region"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "default": "auto",
+          "examples": [
+            "auto",
+            "tiff",
+            "zarr"
+          ]
+        },
+        "channels": {
+          "type": "string|null",
+          "default": null,
+          "examples": [
+            "1,2,3"
+          ],
+          "description": "Multi-channel batch export directly from TIFF stacks"
+        },
+        "signal_ch": {
+          "type": "string|null",
+          "default": null,
+          "description": "Single-channel mode signal channel label"
+        },
+        "cfg": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        },
+        "config": {
+          "type": "path|null",
+          "default": null
+        },
+        "workers": {
+          "type": "int",
+          "default": 0,
+          "description": "Parallel slice workers in TIFF mode; 0 uses cpu_count // 2"
+        },
+        "output_dir": {
+          "type": "path|null",
+          "default": "sample_dir/visualization/region_masked/{ch}_{region}_{mode}"
+        },
+        "output_root": {
+          "type": "path|null",
+          "default": "sample_dir/visualization/region_masked"
+        }
       },
       "outputs": {
-        "masked_tiff_stack": { "type": "dir", "description": "C1*.tiff slices with region mask applied" },
-        "summary_json": { "type": "path", "description": "{ch}_{region}_{mode}_summary.json" }
+        "masked_tiff_stack": {
+          "type": "dir",
+          "description": "C1*.tiff slices with region mask applied"
+        },
+        "summary_json": {
+          "type": "path",
+          "description": "{ch}_{region}_{mode}_summary.json"
+        }
       },
       "common_commands": [
         {

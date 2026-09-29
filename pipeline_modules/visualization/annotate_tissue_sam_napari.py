@@ -4,7 +4,19 @@ Draw a box on one slice, segment that slice, then propagate through Z with
 Segment All Slices (Shift+S). This is meant for tissue envelopes that automatic
 hysteresis cannot close across a notch or gap.
 
-CLI::
+组织选区 (tissue ROI): the per-sample envelope this tool produces. Standard
+location is ``<sample_dir>/tissue_roi.zarr`` — open a sample with ONE command::
+
+    python -m pipeline_modules.visualization.annotate_tissue_sam_napari --sample-dir <sample_dir>
+
+The QC volume to annotate is located automatically
+(``<sample>/*_surface_homogenized_qc.zarr``). If none exists yet, create it
+first::
+
+    python -m pipeline_modules.preprocessing.surface_brightness_homogenize \
+        --input_dir <sample_dir>/ch0 --output_zarr <sample_dir>/ch0_surface_homogenized.zarr --qc_only
+
+Explicit paths still work::
 
     python -m pipeline_modules.visualization.annotate_tissue_sam_napari --input ch0_surface_homogenized_qc.zarr --output ch0_tissue_mask.zarr
 """
@@ -12,10 +24,13 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
+
+from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
 # Windows: torchvision can load JPEG/PNG DLLs that break Pillow unless Image is imported first.
 import PIL.Image  # noqa: F401
@@ -39,6 +54,45 @@ Then run homogenize with --tissue_mask pointing at the saved zarr, using the sam
 def _default_output(input_path: Path) -> Path:
     stem = input_path.stem.removesuffix("_qc")
     return input_path.with_name(f"{stem}_tissue_mask.zarr")
+
+
+TISSUE_ROI_FILENAME = "tissue_roi.zarr"
+
+
+def tissue_roi_output_path(sample_dir: str | Path) -> Path:
+    """组织选区 standard location: one fixed name per sample."""
+    return Path(sample_dir) / TISSUE_ROI_FILENAME
+
+
+def find_tissue_qc_volume(sample_dir: str | Path) -> Path:
+    """Locate the homogenize QC volume to annotate inside a sample dir."""
+    sample = Path(sample_dir)
+    if not sample.is_dir():
+        raise PipelineError(
+            ErrorCode.INPUT_NOT_FOUND,
+            "sample_dir does not exist",
+            context={"sample_dir": str(sample)},
+        )
+    candidates = sorted(sample.glob("*_surface_homogenized_qc.zarr"))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise PipelineError(
+            ErrorCode.INPUT_NOT_FOUND,
+            "no *_surface_homogenized_qc.zarr in sample_dir; create the QC volume first",
+            context={
+                "sample_dir": str(sample),
+                "next_step": (
+                    "python -m pipeline_modules.preprocessing.surface_brightness_homogenize "
+                    f"--input_dir {sample / 'ch0'} --output_zarr {sample / 'ch0_surface_homogenized.zarr'} --qc_only"
+                ),
+            },
+        )
+    raise PipelineError(
+        ErrorCode.ARGUMENT_INVALID,
+        "multiple QC volumes found; pass --input explicitly",
+        context={"sample_dir": str(sample), "candidates": [str(p) for p in candidates]},
+    )
 
 
 def _to_uint8(volume: np.ndarray) -> np.ndarray:
@@ -242,17 +296,22 @@ def launch_annotator(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Annotate a tissue envelope with micro-SAM 3D box prompts and save a mask Zarr",
+        description="Annotate the 组织选区 (tissue ROI) with micro-SAM 3D box prompts and save a mask Zarr",
+    )
+    parser.add_argument(
+        "--sample-dir",
+        default=None,
+        help="One-command mode: locate the QC volume automatically and save to <sample_dir>/tissue_roi.zarr",
     )
     parser.add_argument(
         "--input",
-        required=True,
+        default=None,
         help="QC Zarr from surface homogenize (channel downsampled_input) or a 3D Zarr volume",
     )
     parser.add_argument(
         "--output",
         default=None,
-        help="Output mask Zarr (default: <input without _qc>_tissue_mask.zarr)",
+        help="Output mask Zarr (sample-dir mode: <sample_dir>/tissue_roi.zarr; --input mode: <input without _qc>_tissue_mask.zarr)",
     )
     parser.add_argument(
         "--channel",
@@ -279,11 +338,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Input not found: {input_path}", file=sys.stderr)
-        return 1
-    output = Path(args.output) if args.output else _default_output(input_path)
+    try:
+        if args.sample_dir:
+            input_path = find_tissue_qc_volume(args.sample_dir)
+            output = Path(args.output) if args.output else tissue_roi_output_path(args.sample_dir)
+        elif args.input:
+            input_path = Path(args.input)
+            if not input_path.exists():
+                raise PipelineError(
+                    ErrorCode.INPUT_NOT_FOUND,
+                    "input volume not found",
+                    context={"input": str(input_path)},
+                )
+            output = Path(args.output) if args.output else _default_output(input_path)
+        else:
+            raise PipelineError(
+                ErrorCode.ARGUMENT_INVALID,
+                "pass either --sample-dir (recommended) or --input",
+            )
+    except PipelineError as exc:
+        print(json.dumps(exc.to_dict(), indent=2, ensure_ascii=False), file=sys.stderr)
+        return exc.exit_code
     embedding_path = Path(args.embedding_path) if args.embedding_path else output.with_name(f"{output.stem}_embeddings")
 
     volume, attrs = load_volume_for_annotation(input_path, channel=args.channel)
