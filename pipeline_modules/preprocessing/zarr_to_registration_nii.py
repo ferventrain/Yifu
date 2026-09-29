@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline_modules.utils.run_manifest import write_run_manifest
-from pipeline_modules.utils.zarr_io import open_zarr_array
+from pipeline_modules.utils.zarr_io import open_zarr_array, read_zarr_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ def resolve_input_resolution_xyz(
 
     native = tuple(float(v) for v in native_resolution_xyz)
     try:
-        attrs = zarr.open_group(str(input_zarr), mode="r").attrs
+        attrs = read_zarr_attrs(input_zarr)
         stride = attrs.get("ims_stride_xyz")
         if stride and len(stride) == 3 and all(float(v) > 0 for v in stride):
             res = tuple(native[i] * float(stride[i]) for i in range(3))
@@ -99,6 +99,14 @@ def convert_zarr_to_registration_nii(
         raise FileExistsError(f"Output NIfTI already exists: {output_path}")
 
     array = open_zarr_array(input_path, dataset_name=dataset_name)
+    try:  # fail fast with a clear message instead of async task errors mid-run
+        _ = np.asarray(array[tuple(0 for _ in array.shape)])
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Opened {input_path} but cannot read its data ({type(exc).__name__}: {exc}). "
+            "The store format is not readable by this zarr build; re-export it with "
+            "ims_to_zarr (group store, dataset '0', blosc compressor)."
+        ) from exc
     nz, ny, nx = (int(value) for value in array.shape)
     res_x, res_y, res_z = input_resolution_xyz
     tgt_x, tgt_y, tgt_z = target_resolution_xyz

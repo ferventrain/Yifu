@@ -12,7 +12,7 @@ CLI::
 
     python -m pipeline_modules.preprocessing.ims_to_zarr \
         --input sample.ims --output sample.zarr --channels 0 \
-        --chunk_size 32,256,256
+        --chunk_size 256,256,256
 
 Single ``--channels`` values write the Zarr store to ``--output`` directly;
 multi-channel specs write ``<output>/ch{N}.zarr`` per channel (a trailing
@@ -77,7 +77,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RESOLUTION_LEVEL = 0
 DEFAULT_TIMEPOINT = 0
-DEFAULT_IMS_CHUNK_SIZE = (32, 256, 256)
+DEFAULT_IMS_CHUNK_SIZE = (256, 256, 256)
 
 
 def _require_h5py():
@@ -234,6 +234,14 @@ def _write_ims_coarse_attrs(
     group.attrs["ims_channel"] = int(channel)
     group.attrs["ims_resolution_level"] = int(resolution_level)
     group.attrs["ims_stride_xyz"] = [float(v) for v in stride_xyz]
+    try:
+        from pipeline_modules.utils.zarr_io import read_zarr_shape
+
+        shape = read_zarr_shape(output_zarr)
+        if shape:
+            group.attrs["shape_zyx"] = [int(v) for v in shape]
+    except Exception:  # noqa: BLE001 - shape attr is best-effort
+        pass
 
 
 def _coarse_reg_output_path(output: str | Path, channels: list[int], reg_channel: int) -> Path:
@@ -511,7 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk_size",
         default=",".join(str(v) for v in DEFAULT_IMS_CHUNK_SIZE),
-        help="Zarr chunk size z,y,x (default: 32,256,256). z sets the streaming read slab.",
+        help="Zarr chunk size z,y,x (default: 256,256,256, matching cfos inference patches). z sets the streaming read slab.",
     )
     parser.add_argument("--resolution_level", type=int, default=DEFAULT_RESOLUTION_LEVEL, help="IMS ResolutionLevel to read")
     parser.add_argument(

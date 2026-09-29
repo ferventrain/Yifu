@@ -115,30 +115,12 @@ def segment_chunk(img, threshold, sigma, min_size, output_mode: str = "label"):
 
 
 def _find_incomplete_z_ranges(data_out, shape, chunks):
-    import zarr
-    store = data_out.store if hasattr(data_out, 'store') else data_out.chunk_store
-    array_path = getattr(data_out, "path", "")
-    dim_sep = getattr(data_out, "_dimension_separator", ".")
-    prefix = f"{array_path}/" if array_path else ""
+    try:
+        from pipeline_modules.utils.zarr_io import list_existing_chunk_indices
+    except ImportError:
+        from ..utils.zarr_io import list_existing_chunk_indices
 
-    existing = set()
-    for raw_key in store.keys():
-        key = str(raw_key)
-        if prefix and not key.startswith(prefix):
-            continue
-        rel = key[len(prefix):] if prefix else key
-        if rel in {".zarray", ".zattrs", ".zgroup", "zarr.json"}:
-            continue
-        if rel.startswith("."):
-            continue
-        parts = rel.split(dim_sep)
-        if len(parts) != 3:
-            continue
-        try:
-            idx = tuple(int(part) for part in parts)
-        except ValueError:
-            continue
-        existing.add(idx)
+    existing = set(list_existing_chunk_indices(data_out))
 
     z_chunk_size = chunks[0]
     n_z_chunks = (shape[0] + z_chunk_size - 1) // z_chunk_size

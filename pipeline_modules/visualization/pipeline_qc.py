@@ -154,17 +154,21 @@ def _match_plane(presence: np.ndarray, plane: np.ndarray) -> np.ndarray:
     return out
 
 
-def _resample_plane(volume_plane: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+def _resample_plane(volume_plane: np.ndarray, target_shape: tuple[int, int], *, preserve_values: bool = False) -> np.ndarray:
     """Nearest-neighbour resample a full-res label/hemisphere plane onto the
     exact NIfTI grid. Integer-stride slicing ([::14]) drifts progressively
     against the true 13.68-voxel NIfTI spacing (several pixels at the frame
-    edge), which reads as registration error in the overlay."""
+    edge), which reads as registration error in the overlay.
+
+    ``preserve_values`` keeps multi-valued planes (hemisphere 0/1/2) intact;
+    the default binarizes, which is wrong for anything but presence masks."""
     from scipy import ndimage
 
     if volume_plane.shape == target_shape:
         return volume_plane
     factors = (target_shape[0] / volume_plane.shape[0], target_shape[1] / volume_plane.shape[1])
-    return ndimage.zoom(volume_plane.astype(np.uint8), factors, order=0).astype(bool)
+    resampled = ndimage.zoom(volume_plane.astype(np.uint8), factors, order=0)
+    return resampled if preserve_values else resampled.astype(bool)
 
 
 def measure_boundary_alignment(nii_path: Path, label_zarr_path: Path) -> dict:
@@ -237,7 +241,7 @@ def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_p
         label_planes["coronal"] = _resample_plane(np.asarray(label[:, ly // 2, :]) > 0, coronal_target)
         label_planes["sagittal"] = _resample_plane(np.asarray(label[:, :, lx // 2]) > 0, sagittal_target)
     if hemi is not None:
-        hemi_plane = _resample_plane(np.asarray(hemi[lz // 2]), planes["axial"].shape)
+        hemi_plane = _resample_plane(np.asarray(hemi[lz // 2]), planes["axial"].shape, preserve_values=True)
 
     import zarr as _zarr
 

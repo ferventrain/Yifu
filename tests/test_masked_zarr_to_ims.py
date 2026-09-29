@@ -280,7 +280,7 @@ def test_write_mask_ims_pyramid_max_levels(tmp_path: Path):
     mask[4, 0, 0] = 0
     mask[4, 0, 1] = 0
     mask[4, 1, 0] = 0
-    mask[5, 1, 1] = 0  # 4 of 8 -> MAX pooling still keeps the dot visible
+    mask[5, 1, 1] = 0  # 4 of 8 -> max pooling keeps the dot's peak visible
     mask_zarr = _write_mask_zarr(tmp_path / "mask.zarr", mask)
     output_ims = tmp_path / "masked.ims"
 
@@ -303,8 +303,8 @@ def test_write_mask_ims_pyramid_max_levels(tmp_path: Path):
         assert int(level1_data[2, 0, 0]) == 1  # max pooling keeps sparse dots
         level2 = handle["DataSet/ResolutionLevel 2/TimePoint 0/Channel 0/Data"]
         assert level2.shape == (2, 4, 4)
-        level2_data = np.asarray(level2[:])
-        assert int(level2_data[1, 1, 1]) == 1  # grown footprint at coarse level
+        # Max pooling keeps dot peaks at every level (sparse-signal semantics).
+        assert int(np.asarray(level2[:]).max()) == 1
         assert "ResolutionLevel 3" not in handle["DataSet"]
         level2_channel = handle["DataSet/ResolutionLevel 2/TimePoint 0/Channel 0"]
         assert _hdf_attr_text(level2_channel.attrs["ImageSizeZ"]) == "2"

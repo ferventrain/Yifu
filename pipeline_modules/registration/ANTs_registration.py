@@ -283,6 +283,19 @@ class BidirectionalRegistration:
             self.sample_dir / f"ch{self.signal_channel}.zarr",
             self.sample_dir / f"ch{self.register_channel}.zarr",
         ]
+        # Metadata-only first: works for ANY v2 store regardless of codec/async
+        # readability (plain-array stores included).
+        try:
+            from pipeline_modules.utils.zarr_io import read_zarr_shape
+
+            for zarr_path in possible_zarrs:
+                if zarr_path.exists():
+                    shape = read_zarr_shape(zarr_path)
+                    if shape:
+                        logger.info("Inferred shape from zarr metadata %s: %s", zarr_path, shape)
+                        return tuple(int(v) for v in shape)
+        except Exception as exc:  # noqa: BLE001 - fall through to data-open path
+            logger.debug("Metadata shape inference failed: %s", exc)
         for zarr_path in possible_zarrs:
             if zarr_path.exists():
                 try:

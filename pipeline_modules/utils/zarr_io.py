@@ -66,6 +66,53 @@ def _group_member(group: Any, name: str) -> Any | None:
         return None
 
 
+def read_zarr_shape(path_like, dataset_name: str = "0"):
+    """Metadata-only shape resolution: parses .zarray JSON directly.
+
+    Immune to codec/async read issues; works for plain-array stores, group-with-
+    dataset stores, and stores the running zarr version cannot fully decode.
+    """
+    import json
+
+    path = Path(path_like)
+    if not path.exists():
+        return None
+
+    def _from_zarray(p):
+        f = p / ".zarray"
+        if f.exists():
+            try:
+                meta = json.loads(f.read_text(encoding="utf-8"))
+                shape = meta.get("shape")
+                if shape:
+                    return tuple(int(v) for v in shape)
+            except (ValueError, OSError):
+                pass
+        return None
+
+    for candidate in (path, path / dataset_name):
+        shape = _from_zarray(candidate)
+        if shape:
+            return shape
+    try:
+        return tuple(int(v) for v in open_zarr_array(path, dataset_name=dataset_name).shape)
+    except Exception:
+        return None
+
+
+def read_zarr_attrs(path_like) -> dict:
+    """Best-effort attrs read that tolerates plain-array stores (no group)."""
+    zarr = _zarr()
+    path = Path(path_like)
+    try:
+        return dict(zarr.open_group(str(path), mode="r").attrs)
+    except Exception:
+        pass
+    try:
+        return dict(zarr.open(str(path), mode="r").attrs)
+    except Exception:
+        return {}
+
 def open_zarr_array(path_like: str | Path, dataset_name: str = "0") -> Any:
     """Open a Zarr group or array and return the image array (default dataset ``0``)."""
     zarr = _zarr()

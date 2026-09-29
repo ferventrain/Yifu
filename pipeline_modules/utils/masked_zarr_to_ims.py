@@ -556,12 +556,10 @@ def _downsample_channel_level(
     chunk_size: tuple[int, int, int],
     z_block: int,
     label: str,
-    grow: bool = False,
 ) -> tuple[int, int, int]:
-    """Downsample one level; ``grow`` applies 3x3x3 maximum-filter growth so
-    sparse dots keep a visible footprint at coarse levels."""
-    from scipy.ndimage import maximum_filter
-
+    """Downsample one level. Real arivis files use plain MEAN at every level
+    for every channel (measured against the source files); display prominence
+    of sparse features comes from the tight ColorRange, not from pooling."""
     previous_shape = tuple(int(v) for v in previous.shape)
     out_shape = tuple(v // 2 for v in previous_shape)
     depth, height, _ = out_shape
@@ -570,18 +568,11 @@ def _downsample_channel_level(
     progress = tqdm(total=depth, desc=f"IMS pyramid {label}", unit="slice", file=sys.stderr)
     try:
         for z0, z1 in iter_z_ranges(depth, z_block):
-            hz0, hz1 = (max(0, z0 - 1), min(depth, z1 + 1)) if grow else (z0, z1)
             for y0 in range(0, height, band_rows):
                 y1 = min(y0 + band_rows, height)
-                hy0, hy1 = (max(0, y0 - 1), min(height, y1 + 1)) if grow else (y0, y1)
-                slab = np.asarray(previous[2 * hz0 : 2 * hz1, 2 * hy0 : 2 * hy1, : 2 * out_shape[2]])
-                down = down_fn(slab)
-                if grow:
-                    down = maximum_filter(down, size=3)
-                target[z0:z1, y0:y1, :] = down[
-                    (z0 - hz0) : (z0 - hz0) + (z1 - z0), (y0 - hy0) : (y0 - hy0) + (y1 - y0)
-                ]
-                del slab, down
+                slab = np.asarray(previous[2 * z0 : 2 * z1, 2 * y0 : 2 * y1, : 2 * out_shape[2]])
+                target[z0:z1, y0:y1, :] = down_fn(slab)
+                del slab
             progress.update(z1 - z0)
     finally:
         progress.close()
@@ -631,13 +622,14 @@ def _write_pyramid_levels(
             _downsample_channel_level(
                 current[entry.index],
                 dataset,
-                # Sparse masked signals need max pooling to stay visible at
-                # coarse levels; dense source channels read naturally with mean.
+                # Sparse masked signals MUST use max pooling: mean dilutes a
+                # ~125-voxel dot to exact zero by level 4-5, making the channel
+                # vanish at low zoom (dense source channels keep plain mean,
+                # matching real arivis files).
                 method="max" if entry.source == "mask" else "mean",
                 chunk_size=chunk_size,
                 z_block=z_block,
                 label=f"L{level} ch{entry.index}",
-                grow=entry.source == "mask" and level >= 2,
             )
             _set_attr(
                 level_group[f"Channel {entry.index}"],
