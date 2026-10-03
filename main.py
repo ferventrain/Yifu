@@ -639,19 +639,30 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
     save_hemisphere_zarr = bool(reg_cfg.get("save_upsampled_label_hemisphere_zarr", False))
     hemisphere_zarr_path = sample_dir / "atlas_label_hemisphere.zarr"
     if save_hemisphere_zarr and not hemisphere_zarr_path.exists():
-        hemisphere_input = warped_label_zarr_path if warped_label_zarr_path.exists() else warped_label_dir
-        if not Path(hemisphere_input).exists():
-            print(f"Error: Hemisphere Zarr requested, but atlas label input is unavailable at {hemisphere_input}.")
-            sys.exit(1)
-        chunk_str = format_csv(zarr_cfg["chunk_size"])
-        cmd = (
-            f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
-            f'--input "{hemisphere_input}" '
-            f'--output "{hemisphere_zarr_path}" '
-            f'--chunk_size "{chunk_str}" '
-            f'--dataset_name "0"'
-        )
-        run_command(cmd, "2.3 Convert atlas label to hemisphere Zarr")
+        transforms_dir = sample_dir / "transforms"
+        if transforms_dir.is_dir() and any(transforms_dir.glob("fwd_*")):
+            # Preferred: warp the standard-space midline plane with the saved
+            # registration transform (split follows the registered midline).
+            cmd = (
+                f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
+                f'--sample_dir "{sample_dir}" '
+                f'--output "{hemisphere_zarr_path}"'
+            )
+            run_command(cmd, "2.3 Hemisphere Zarr from registration transform")
+        else:
+            hemisphere_input = warped_label_zarr_path if warped_label_zarr_path.exists() else warped_label_dir
+            if not Path(hemisphere_input).exists():
+                print(f"Error: Hemisphere Zarr requested, but atlas label input is unavailable at {hemisphere_input}.")
+                sys.exit(1)
+            chunk_str = format_csv(zarr_cfg["chunk_size"])
+            cmd = (
+                f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
+                f'--input "{hemisphere_input}" '
+                f'--output "{hemisphere_zarr_path}" '
+                f'--chunk_size "{chunk_str}" '
+                f'--dataset_name "0"'
+            )
+            run_command(cmd, "2.3 Convert atlas label to hemisphere Zarr (single-plane fallback)")
     elif save_hemisphere_zarr:
         print_skip(f"Hemisphere Zarr already exists: {hemisphere_zarr_path}")
 

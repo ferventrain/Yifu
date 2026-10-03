@@ -152,6 +152,7 @@ class BidirectionalRegistration:
         # Load Atlas
         self.atlas_image = ants.image_read(atlas_image_path)
         self.atlas_label_id_lut: np.ndarray | None = None
+        self.atlas_label_path = atlas_label_path
         self.atlas_label = self._load_encoded_atlas_label(atlas_label_path)
         
         # Force direction matrix to identity to avoid flipping/reflection
@@ -536,14 +537,23 @@ class BidirectionalRegistration:
                         if hemisphere_zarr.exists():
                             logger.info("Hemisphere atlas label Zarr already exists at %s. Skipping conversion.", hemisphere_zarr)
                         else:
-                            from pipeline_modules.registration.atlas_label_to_hemisphere import convert_atlas_label_to_hemisphere
+                            from pipeline_modules.registration.atlas_label_to_hemisphere import (
+                                convert_hemisphere_from_transform,
+                            )
 
-                            hemisphere_input = label_zarr if label_zarr.exists() else label_dir
-                            convert_atlas_label_to_hemisphere(
-                                hemisphere_input,
+                            # Warp the standard-space midline with this
+                            # registration's own transform (in-memory objects).
+                            convert_hemisphere_from_transform(
+                                self.sample_dir,
                                 hemisphere_zarr,
-                                chunk_size=self.zarr_chunk_size,
-                                dataset_name="0",
+                                atlas_label_tiff=self.atlas_label_path,
+                                transformlist=results["transforms"]["fwdtransforms"],
+                                fixed_image=self.register_image,
+                                target_shape=self.original_shape,
+                                # NOTE: do NOT pass self.atlas_image here — its
+                                # direction was forced to identity AFTER the label
+                                # image was created; the label warp used the
+                                # original atlas direction, and so must this.
                             )
 
                     if not self.save_upsampled_label and label_dir.exists():

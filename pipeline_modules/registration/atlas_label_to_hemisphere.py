@@ -352,10 +352,174 @@ def convert_atlas_label_to_hemisphere(
 convert_atlas_label_to_hemisphere_zarr = convert_atlas_label_to_hemisphere
 
 
+def _resolve_default_atlas_label() -> Path:
+    import os
+
+    return Path(os.environ.get("YIFU_ATLAS_LABEL", r"H:\Yifu_data\reference\atlas_label.tiff"))
+
+
+def _standard_space_hemi(label_arr_xyz: np.ndarray) -> tuple[np.ndarray, float]:
+    """Paint left/right on a standard-space annotation in ANTs order (X,Y,Z)
+    around the annotation's x centroid. The reference annotation merges
+    left/right structure pairs (every label straddles the midline), so the
+    global x centroid IS the midline."""
+    mask = label_arr_xyz > 0
+    xs = np.nonzero(mask.any(axis=(1, 2)))[0]
+    if xs.size == 0:
+        raise ValueError("atlas label volume is empty")
+    weights = mask.sum(axis=(1, 2)).astype(np.float64)
+    mid = float((xs * weights[xs]).sum() / weights[xs].sum())
+    hemi = np.zeros(label_arr_xyz.shape, dtype=np.uint8)
+    left_plane = np.arange(label_arr_xyz.shape[0])[:, None, None] < mid
+    hemi[mask & left_plane] = LEFT_ID
+    hemi[mask & ~left_plane] = RIGHT_ID
+    return hemi, mid
+
+
+def _upsample_hemi_and_write(warped_zyx: np.ndarray, target_shape, output_zarr: Path,
+                             chunk=(256, 256, 256)) -> np.ndarray:
+    """Nearest-neighbour upsample to the sample grid (z: round-linspace index,
+    xy: cv2 nearest) and write in z-batches so each zarr chunk compresses once.
+    Returns the per-z left/right boundary curve."""
+    import cv2
+
+    from pipeline_modules.utils.zarr_io import create_output_zarr
+
+    z_indices = np.round(np.linspace(0, warped_zyx.shape[0] - 1, target_shape[0])).astype(int)
+    root, dataset = create_output_zarr(output_zarr, list(target_shape), chunk, np.dtype("uint8"))
+    boundary = np.full(target_shape[0], np.nan)
+    target_xy = (int(target_shape[2]), int(target_shape[1]))
+    batch_z = int(chunk[0])
+    for z0 in range(0, target_shape[0], batch_z):
+        z1 = min(z0 + batch_z, target_shape[0])
+        batch = np.empty((z1 - z0, target_shape[1], target_shape[2]), dtype=np.uint8)
+        for i, sz in enumerate(z_indices[z0:z1]):
+            plane = warped_zyx[sz]
+            if plane.shape[1] != target_shape[1] or plane.shape[2] != target_shape[2]:
+                plane = cv2.resize(plane, target_xy, interpolation=cv2.INTER_NEAREST)
+            batch[i] = plane
+            cols_l = np.nonzero((plane == int(LEFT_ID)).any(axis=0))[0]
+            cols_r = np.nonzero((plane == int(RIGHT_ID)).any(axis=0))[0]
+            if cols_l.size and cols_r.size:
+                boundary[z0 + i] = (cols_l.max() + 1 + cols_r.min()) / 2.0
+        dataset[z0:z1] = batch
+    good = ~np.isnan(boundary)
+    if good.any():
+        idx = np.arange(boundary.shape[0])
+        boundary = np.interp(idx, idx[good], boundary[good])
+    root.attrs["midline_method"] = "warped standard-space midplane (nearest-neighbour)"
+    root.attrs["split_x"] = int(np.ceil(np.nanmedian(boundary))) if good.any() else 0
+    root.attrs["split_x_per_z"] = [round(float(v), 2) for v in boundary]
+    root.attrs["source"] = "hemisphere_from_transform"
+    return boundary
+
+
+def convert_hemisphere_from_transform(
+    sample_dir: str | Path,
+    output_zarr: str | Path | None = None,
+    atlas_label_tiff: str | Path | None = None,
+    *,
+    transformlist: list | None = None,
+    fixed_image=None,
+    atlas_image=None,
+    target_shape=None,
+) -> dict[str, Any]:
+    """Preferred hemisphere method: paint the STANDARD-SPACE midline plane on
+    the annotation and warp it with the exact transform that produced
+    upsampled_atlas_label. The split surface is the registered midline itself
+    (bends and yaws with the sample, poles included).
+
+    Post-run CLI usage reads everything from sample_dir (transforms/ +
+    ch0_downsample/volume.nii.gz). Inside the registration flow the in-memory
+    objects can be passed instead: transformlist=reg_result['fwdtransforms'],
+    fixed_image=register_image, atlas_image=atlas_image,
+    target_shape=original_shape.
+    """
+    import ants
+
+    from pipeline_modules.registration.label_codec import load_label_array_preserving_ids
+
+    started_at = time.time()
+    sample_dir = Path(sample_dir)
+    output_zarr = Path(output_zarr) if output_zarr else sample_dir / "atlas_label_hemisphere.zarr"
+    atlas_label_tiff = Path(atlas_label_tiff) if atlas_label_tiff else _resolve_default_atlas_label()
+    atlas_tiff = atlas_label_tiff.with_name("atlas.tiff")
+    if not atlas_label_tiff.exists():
+        raise FileNotFoundError(str(atlas_label_tiff))
+
+    if transformlist is None:
+        transforms_dir = sample_dir / "transforms"
+        transformlist = [
+            str(p)
+            for p in sorted(
+                (q for q in transforms_dir.iterdir() if q.name.startswith("fwd_")),
+                key=lambda q: int(q.name.split("_")[1]),
+            )
+        ]
+        if not transformlist:
+            raise FileNotFoundError(f"no fwd_* transforms under {transforms_dir}")
+    if fixed_image is None:
+        from pipeline_modules.registration.ANTs_registration import _ants_image_read
+
+        reference_nii = sample_dir / "ch0_downsample" / "volume.nii.gz"
+        if not reference_nii.exists():
+            raise FileNotFoundError(str(reference_nii))
+        fixed_image = _ants_image_read(reference_nii)
+        fixed_image.set_direction(np.eye(3))  # same direction forcing as registration
+    if target_shape is None:
+        label_meta = sample_dir / "upsampled_atlas_label.zarr" / "0" / ".zarray"
+        if not label_meta.exists():
+            raise FileNotFoundError(str(label_meta))
+        target_shape = tuple(json.loads(label_meta.read_text(encoding="utf-8"))["shape"])
+
+    label_arr_xyz = load_label_array_preserving_ids(atlas_label_tiff)  # (X, Y, Z)
+    hemi_xyz, mid = _standard_space_hemi(label_arr_xyz)
+    if atlas_image is None:
+        if not atlas_tiff.exists():
+            raise FileNotFoundError(str(atlas_tiff))
+        atlas_image = ants.image_read(str(atlas_tiff))
+    hemi_img = ants.from_numpy(
+        hemi_xyz,
+        spacing=atlas_image.spacing,
+        origin=atlas_image.origin,
+        direction=atlas_image.direction,
+    )
+    logger.info("standard-space midline x=%.1f; warping with fwd transforms", mid)
+    warped = ants.apply_transforms(
+        fixed=fixed_image,
+        moving=hemi_img,
+        transformlist=[str(t) for t in transformlist],
+        interpolator="nearestNeighbor",
+    )
+    warped_zyx = np.transpose(np.asarray(warped.numpy(), dtype=np.uint8), (2, 1, 0))  # -> z,y,x
+    if not np.any(warped_zyx > 0):
+        raise RuntimeError("warped hemisphere volume is empty - transform/grid mismatch")
+
+    boundary = _upsample_hemi_and_write(warped_zyx, target_shape, output_zarr)
+    logger.info(
+        "hemisphere zarr written: %s (boundary median %d, curve %.0f..%.0f, %.0fs)",
+        output_zarr,
+        int(np.nanmedian(boundary)),
+        np.nanmin(boundary),
+        np.nanmax(boundary),
+        time.time() - started_at,
+    )
+    return {
+        "success": True,
+        "output_zarr": str(output_zarr),
+        "target_shape": list(target_shape),
+        "standard_midline_x": round(mid, 2),
+        "split_x": int(np.ceil(np.nanmedian(boundary))),
+        "elapsed_s": round(time.time() - started_at, 1),
+    }
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert atlas label Zarr or TIFF stack to hemisphere label Zarr")
-    parser.add_argument("--input", required=True, help="Input atlas label .zarr or TIFF folder")
+    parser = argparse.ArgumentParser(description="Convert atlas label to hemisphere label Zarr")
+    parser.add_argument("--input", default="", help="Label method: warped atlas label .zarr or TIFF folder (single global split)")
+    parser.add_argument("--sample_dir", default="", help="Transform method (preferred): sample dir with transforms/ + ch0_downsample/volume.nii.gz")
     parser.add_argument("--output", required=True, help="Output hemisphere .zarr path")
+    parser.add_argument("--atlas_label", default="", help="Standard-space annotation tiff (transform method)")
     parser.add_argument("--chunk_size", default="256,256,256", help="Chunk size z,y,x")
     parser.add_argument(
         "--compressor",
@@ -365,20 +529,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if bool(args.input) == bool(args.sample_dir):
+        parser.error("provide exactly one of --input (label method) or --sample_dir (transform method)")
+    return args
 
 
 def main() -> int:
     args = parse_args()
     _configure_logging(args.json_logs)
     try:
-        result = convert_atlas_label_to_hemisphere(
-            args.input,
-            args.output,
-            _coerce_chunk_size(args.chunk_size),
-            compressor=args.compressor,
-            dataset_name=args.dataset_name,
-        )
+        if args.sample_dir:
+            result = convert_hemisphere_from_transform(
+                args.sample_dir,
+                args.output,
+                args.atlas_label or None,
+            )
+        else:
+            result = convert_atlas_label_to_hemisphere(
+                args.input,
+                args.output,
+                _coerce_chunk_size(args.chunk_size),
+                compressor=args.compressor,
+                dataset_name=args.dataset_name,
+            )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except Exception as exc:  # pragma: no cover

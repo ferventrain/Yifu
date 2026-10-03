@@ -246,9 +246,12 @@ def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_p
     import zarr as _zarr
 
     try:
-        split_x = dict(_zarr.open(str(hemi_zarr_path), mode="r").attrs).get("split_x")
+        _attrs = dict(_zarr.open(str(hemi_zarr_path), mode="r").attrs)
+        split_x = _attrs.get("split_x")
+        split_per_z = _attrs.get("split_x_per_z")
     except Exception:
         split_x = None
+        split_per_z = None
 
     images = []
     for name, plane in planes.items():
@@ -258,9 +261,24 @@ def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_p
             rgb[_label_contour(_match_plane(presence, plane))] = (255, 60, 60)
         img = Image.fromarray(rgb)
         draw = ImageDraw.Draw(img)
-        if name in ("axial", "coronal") and split_x:
-            # cols are the x axis on both views; scale full-res split into nii x.
-            draw.line([(int(split_x / fx), 0), (int(split_x / fx), img.height)], fill=(255, 220, 0), width=2)
+        # cols are the x axis on both views; scale full-res split into nii x.
+        if name == "axial" and (split_x or split_per_z):
+            full_x = split_per_z[lz // 2] if split_per_z else split_x
+            col = int(full_x / fx)
+            draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
+        elif name == "coronal" and (split_x or split_per_z):
+            if split_per_z and lz:
+                # per-z midline curve: rows are nii z, cols are nii x
+                fz = lz / max(nz, 1)
+                step = max(1, lz // 64)
+                pts = []
+                for zf in range(0, lz, step):
+                    pts += [int(split_per_z[zf] / fx), int(zf / fz)]
+                pts += [int(split_per_z[-1] / fx), int((lz - 1) / fz)]
+                draw.line(pts, fill=(255, 220, 0), width=2)
+            else:
+                col = int(split_x / fx)
+                draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
         draw.text((6, 4), name, fill=(255, 255, 255))
         images.append(img)
 
