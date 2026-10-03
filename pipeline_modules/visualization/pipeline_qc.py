@@ -327,29 +327,42 @@ def save_segmentation_blocks(signal_zarr_path: Path, mask_zarr_path: Path, label
         if not np.any(mask_block > 0):
             continue
         signal_block = np.asarray(signal[z0:z0 + bz, y0:y0 + by, x0:x0 + bx])
-        # One OME-Zarr store per block, single (c, z, y, x) array with channel
-        # 0 = raw signal, channel 1 = mask (0/1). NGFF multiscales + omero
-        # metadata make napari (napari-ome-zarr) open it directly via
-        # drag-and-drop and split the two channels into named layers.
+        # One OME-Zarr store per block with TWO layers: `raw` (image layer,
+        # adjust contrast) and `labels/mask` (OME-NGFF labels layer, adjust
+        # colormap/opacity). Dragging the .zarr into napari yields two
+        # independent layers instead of two blended channels.
         block_path = out_dir / f"block_{len(written):02d}.zarr"
-        stacked = np.stack([signal_block, mask_block.astype(signal_block.dtype)])
-        group = open_output_group(block_path, overwrite=True)
-        create_array(group, "0", shape=stacked.shape, chunks=(2, min(32, bz), by, bx),
-                     dtype=stacked.dtype, data=stacked)
-        group.attrs["multiscales"] = ome_ngff_multiscales(
-            ["0"], ndim=4, base_scale=(1.0, resolution_xyz[2], resolution_xyz[1], resolution_xyz[0]),
-            name=f"{sample_name} QC block",
+        scale_zyx = (resolution_xyz[2], resolution_xyz[1], resolution_xyz[0])
+        top = open_output_group(block_path, overwrite=True)
+        top.attrs["block_offset_zyx"] = [z0, y0, x0]
+        top.attrs["block_shape_zyx"] = [bz, by, bx]
+        top.attrs["sample"] = sample_name
+        top.attrs["layers"] = {"raw": "raw signal", "labels/mask": "segmentation mask"}
+        raw_group = open_output_group(block_path / "raw", overwrite=True)
+        create_array(raw_group, "0", shape=signal_block.shape, chunks=(min(32, bz), by, bx),
+                     dtype=signal_block.dtype, data=signal_block)
+        raw_group.attrs["multiscales"] = ome_ngff_multiscales(
+            ["0"], ndim=3, base_scale=scale_zyx, name=f"{sample_name} raw",
         )
-        group.attrs["omero"] = {
+        raw_group.attrs["omero"] = {
             "channels": [
                 {"label": "signal", "color": "FFFF00", "window": {"start": 0, "end": 65535}, "active": True},
-                {"label": "mask", "color": "FF0000", "window": {"start": 0, "end": 1}, "active": True},
             ],
         }
-        group.attrs["block_offset_zyx"] = [z0, y0, x0]
-        group.attrs["block_shape_zyx"] = [bz, by, bx]
-        group.attrs["sample"] = sample_name
-        group.attrs["channels"] = {"0": "raw signal", "1": "segmentation mask"}
+        # zarr does not auto-create intermediate .zgroup metadata: the labels
+        # parent must be an explicit group or it is invisible to readers.
+        open_output_group(block_path / "labels", overwrite=True)
+        mask_group = open_output_group(block_path / "labels" / "mask", overwrite=True)
+        mask_block = mask_block.astype(np.uint8)
+        create_array(mask_group, "0", shape=mask_block.shape, chunks=(min(32, bz), by, bx),
+                     dtype=mask_block.dtype, data=mask_block)
+        mask_group.attrs["multiscales"] = ome_ngff_multiscales(
+            ["0"], ndim=3, base_scale=scale_zyx, name="mask",
+        )
+        mask_group.attrs["image-label"] = {
+            "version": "0.4",
+            "source": {"image": "../../raw"},
+        }
         written.append(block_path)
         logger.info("saved QC block %s at zyx=%s", block_path.name, (z0, y0, x0))
     if len(written) < N_SEG_BLOCKS:
