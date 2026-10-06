@@ -1,18 +1,20 @@
 """Render coronal slab-MIP screenshots from a brain Zarr at bregma AP coordinates.
 
-The tool intentionally avoids re-running registration. Two anchor modes:
+The tool intentionally avoids re-running registration. Two spaces:
 
-* **manual (default line)**: state where bregma sits on the sample AP axis
-  (``--bregma-index`` or ``--bregma-offset-mm`` + ``--anterior``) and correct
-  the cutting angle with ``--tilt-deg``. Works on any Zarr, needs only voxel
-  size, and renders a sheared slab maximum-intensity projection.
-* **transforms (best-effort enhancement)**: if the sample was already
-  registered by the pipeline, the stored ANTs ``transforms/`` files are tried
-  as a bregma anchor, cross-validated against ``upsampled_atlas_label.zarr``
-  on an interior atlas landmark. Fresh registration is never run (it takes
-  ~45 min per sample); when the check cannot pass -- no matching label zarr,
-  or the physical-space bookkeeping does not verify -- the tool demands a
-  manual anchor instead of guessing.
+* **atlas (default, ``--space atlas``)**: the slab is cut in standard atlas
+  space (AP window around the bregma coordinate), every atlas-grid point of
+  the slab is mapped back to native image space with the stored pipeline
+  ``transforms/`` (fwd, atlas->downsample grid, then the same index rescale
+  the pipeline used to write ``upsampled_atlas_label.zarr``), the full-res
+  signal Zarr is sampled at those points, and the MIP is taken along the
+  atlas AP axis -- an orthogonal camera view down the atlas AP axis. The
+  transform convention is cross-validated against ``upsampled_atlas_label.zarr``
+  on an interior atlas landmark before any sampling.
+* **native (``--space native``)**: slab taken directly on the sample AP axis
+  with a manual bregma anchor (``--bregma-index`` or ``--bregma-offset-mm`` +
+  ``--anterior``) and optional ``--tilt-deg`` angle correction; transforms
+  only serve as an anchor. Works on any Zarr without registration outputs.
 
 Sample Zarr convention (same as the rest of the repo): arrays are ``(z, y, x)``
 with z = DV (the TIFF stack axis), y = AP, x = ML. A coronal MIP therefore has
@@ -432,6 +434,326 @@ def resolve_display_vmax(mip: np.ndarray, *, percentile: float, explicit: float 
 
 
 # ---------------------------------------------------------------------------
+# Atlas-space slab MIP (slab cut in atlas space, sampled back in native space)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AtlasSlabGeometry:
+    """Fine sampling grid of an atlas-space coronal slab, in atlas voxel units."""
+
+    dv: np.ndarray  # (n_rows,) atlas DV positions, 0..n_dv-1
+    ml: np.ndarray  # (n_cols,) atlas ML positions
+    ap: np.ndarray  # (n_planes,) atlas AP positions spanning the slab thickness
+    coarse_ap: np.ndarray  # integer atlas AP planes mapped through the transforms
+    ap_center: float
+
+
+def atlas_slab_geometry(
+    *,
+    bregma_mm: float,
+    thickness_mm: float,
+    pitch_um: float,
+    atlas_shape_dv_ap_ml: tuple[int, int, int],
+    bregma_dv_ap_ml: tuple[int, int, int] = DEFAULT_BREGMA_DV_AP_ML,
+    atlas_res_um: float = 25.0,
+) -> AtlasSlabGeometry:
+    n_dv, n_ap, n_ml = atlas_shape_dv_ap_ml
+    if thickness_mm <= 0:
+        raise ValueError(f"--thickness-mm must be positive, got {thickness_mm}")
+    if pitch_um <= 0:
+        raise ValueError(f"pitch must be positive, got {pitch_um}")
+    # Anterior is positive bregma mm and anterior atlas AP indices are lower.
+    ap_center = float(bregma_dv_ap_ml[1]) - float(bregma_mm) * 1000.0 / atlas_res_um
+    half_vox = thickness_mm * 1000.0 / 2.0 / atlas_res_um
+    ap_lo, ap_hi = ap_center - half_vox, ap_center + half_vox
+    if ap_hi < 0 or ap_lo > n_ap - 1:
+        raise AnchorError(
+            f"Bregma {bregma_mm:+.2f} mm maps to atlas AP index {ap_center:.1f}, "
+            f"outside 0..{n_ap - 1}"
+        )
+    if ap_lo < 0 or ap_hi > n_ap - 1:
+        logger.warning("Slab extends past the atlas AP axis for bregma %+.2f; clipping.", bregma_mm)
+    n_rows = int(math.floor((n_dv - 1) * atlas_res_um / pitch_um)) + 1
+    n_cols = int(math.floor((n_ml - 1) * atlas_res_um / pitch_um)) + 1
+    thickness_um = thickness_mm * 1000.0
+    n_planes = max(2, int(math.ceil(thickness_um / pitch_um)) + 1)
+    dv = np.arange(n_rows, dtype=np.float64) * pitch_um / atlas_res_um
+    ml = np.arange(n_cols, dtype=np.float64) * pitch_um / atlas_res_um
+    ap = np.linspace(ap_lo, ap_hi, n_planes)
+    coarse_ap = np.unique(np.clip(np.rint(ap), 0, n_ap - 1).astype(np.int64))
+    return AtlasSlabGeometry(dv=dv, ml=ml, ap=ap, coarse_ap=coarse_ap, ap_center=ap_center)
+
+
+def interp_coarse_to_fine(
+    coarse: np.ndarray,
+    *,
+    coarse_ap: np.ndarray,
+    geometry: AtlasSlabGeometry,
+) -> np.ndarray:
+    """Upsample a per-plane quantity from the coarse atlas grid to the fine slab grid.
+
+    ``coarse`` has shape ``(n_dv, len(coarse_ap), n_ml)`` — axis order (DV, AP,
+    ML), matching ``meshgrid(dv, coarse_ap, ml, indexing="ij")``; the result has
+    shape ``(n_rows, n_planes, n_cols)``. Linear interpolation is exact here
+    because the SyN deformation is smooth far below the 25 um coarse spacing.
+    """
+    from scipy import ndimage as ndi
+
+    ap_coord = np.interp(geometry.ap, coarse_ap, np.arange(len(coarse_ap), dtype=np.float64))
+    dv_g, ap_g, ml_g = np.meshgrid(geometry.dv, ap_coord, geometry.ml, indexing="ij")
+    coords = [np.asarray(c, dtype=np.float32) for c in (dv_g, ap_g, ml_g)]
+    return ndi.map_coordinates(np.asarray(coarse, dtype=np.float32), coords, order=1, mode="nearest")
+
+
+def sample_mip_from_native_coords(
+    arr,
+    *,
+    z: np.ndarray,
+    y: np.ndarray,
+    x: np.ndarray,
+    tile_z: int = 32,
+    tile_x: int = 256,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Max-project native-space samples of a slab into an atlas-aligned MIP.
+
+    ``z/y/x`` are continuous native indices with shape ``(n_rows, n_planes,
+    n_cols)``. Points are grouped into tiles aligned to the zarr chunk grid so
+    each tile reads a small bounding box once; the MIP maxes over the plane
+    (slab-thickness) axis.
+    """
+    from scipy import ndimage as ndi
+
+    n_z, n_y, n_x = (int(v) for v in arr.shape)
+    n_rows, n_planes, n_cols = z.shape
+    z_f = z.ravel()
+    y_f = y.ravel()
+    x_f = x.ravel()
+    valid = (z_f >= 0) & (z_f <= n_z - 1) & (y_f >= 0) & (y_f <= n_y - 1) & (x_f >= 0) & (x_f <= n_x - 1)
+    keep = np.nonzero(valid)[0]
+    z_k, y_k, x_k = z_f[keep], y_f[keep], x_f[keep]
+    row_stride = n_planes * n_cols
+    rows_k = keep // row_stride
+    rem = keep % row_stride
+    planes_k = rem // n_cols
+    cols_k = rem % n_cols
+
+    zr = np.rint(z_k).astype(np.int64)
+    xr = np.rint(x_k).astype(np.int64)
+    n_tx = n_x // tile_x + 2
+    keys = (zr // tile_z) * n_tx + (xr // tile_x)
+    order = np.argsort(keys, kind="stable")
+    z_s, y_s, x_s = z_k[order], y_k[order], x_k[order]
+    rows_s, planes_s, cols_s = rows_k[order], planes_k[order], cols_k[order]
+    uniq, starts = np.unique(keys[order], return_index=True)
+    bounds = list(starts) + [len(keep)]
+
+    out = np.zeros((n_rows, n_cols), dtype=np.result_type(arr.dtype, np.uint16))
+    for key, i0, i1 in zip(uniq, bounds[:-1], bounds[1:]):
+        tz, tx = int(key) // n_tx, int(key) % n_tx
+        zg, yg, xg = z_s[i0:i1], y_s[i0:i1], x_s[i0:i1]
+        zs = max(0, tz * tile_z - 2)
+        ze = min(n_z, (tz + 1) * tile_z + 3)
+        xs = max(0, tx * tile_x - 2)
+        xe = min(n_x, (tx + 1) * tile_x + 3)
+        ys = max(0, int(math.floor(yg.min())) - 2)
+        ye = min(n_y, int(math.ceil(yg.max())) + 3)
+        region = np.asarray(arr[zs:ze, ys:ye, xs:xe])
+        vals = ndi.map_coordinates(
+            region,
+            [zg - zs, yg - ys, xg - xs],
+            order=1,
+            mode="constant",
+            cval=0,
+            prefilter=False,
+        )
+        for plane in np.unique(planes_s[i0:i1]):
+            m = planes_s[i0:i1] == plane
+            r, c = rows_s[i0:i1][m], cols_s[i0:i1][m]
+            out[r, c] = np.maximum(out[r, c], vals[m])
+
+    stats = {
+        "valid_fraction": float(keep.size) / float(z_f.size),
+        "tiles": int(uniq.size),
+    }
+    return out, stats
+
+
+@dataclass
+class AtlasNativeMapper:
+    """Maps atlas voxel coordinates (DV, AP, ML) to native zarr indices.
+
+    The pipeline registers with fixed = downsampled sample and moving = atlas
+    in an index-unit physical space (both NIfTIs carry spacing/origin as
+    written on disk). fwd transforms therefore map atlas voxel coordinates to
+    downsample-grid indices; the rescale to native indices mirrors exactly how
+    ``upsampled_atlas_label.zarr`` was produced (linspace endpoints on the DV
+    axis, (i + 0.5) * T/S - 0.5 on AP/ML).
+    """
+
+    transformlist: list[Path]
+    convention: str
+    atlas_origin_xyz: tuple[float, float, float]  # ANTs components (x=ML, y=AP, z=DV)
+    atlas_spacing_xyz: tuple[float, float, float]
+    fixed_origin_xyz: tuple[float, float, float]
+    fixed_spacing_xyz: tuple[float, float, float]
+    fixed_shape_xyz: tuple[int, int, int]  # (ML, AP, DV) downsample grid
+    native_shape_zyx: tuple[int, int, int]
+    label_check: str = "skipped"
+    chunk_points: int = 250_000
+
+    def _native_scales(self) -> tuple[float, float, float]:
+        """Per-axis factors (DV, AP, ML) mapping downsample indices to native."""
+        t_z, t_y, t_x = self.native_shape_zyx
+        s_x, s_y, s_z = self.fixed_shape_xyz
+        f_z = (t_z - 1.0) / (s_z - 1.0) if s_z > 1 else float(t_z)
+        return f_z, t_y / s_y, t_x / s_x
+
+    def map(self, dv: np.ndarray, ap: np.ndarray, ml: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Map atlas coordinates (any shape, broadcast together) to native (z, y, x)."""
+        import ants
+        import pandas as pd
+
+        dv = np.broadcast_to(np.asarray(dv, dtype=np.float64), np.broadcast_shapes(dv.shape, ap.shape, ml.shape))
+        ap = np.broadcast_to(np.asarray(ap, dtype=np.float64), dv.shape)
+        ml = np.broadcast_to(np.asarray(ml, dtype=np.float64), dv.shape)
+        flat_dv, flat_ap, flat_ml = dv.ravel(), ap.ravel(), ml.ravel()
+        out = np.empty((3, flat_dv.size), dtype=np.float64)
+        ao_x, ao_y, ao_z = self.atlas_origin_xyz
+        as_x, as_y, as_z = self.atlas_spacing_xyz
+        fo_x, fo_y, fo_z = self.fixed_origin_xyz
+        fs_x, fs_y, fs_z = self.fixed_spacing_xyz
+        f_z, f_y, f_x = self._native_scales()
+        for i0 in range(0, flat_dv.size, self.chunk_points):
+            i1 = min(i0 + self.chunk_points, flat_dv.size)
+            points = pd.DataFrame(
+                {
+                    "x": ao_x + as_x * flat_ml[i0:i1],
+                    "y": ao_y + as_y * flat_ap[i0:i1],
+                    "z": ao_z + as_z * flat_dv[i0:i1],
+                }
+            )
+            res = ants.apply_transforms_to_points(
+                3, points, [str(p) for p in self.transformlist]
+            )
+            down_ml = (res["x"].to_numpy(dtype=np.float64) - fo_x) / fs_x
+            down_ap = (res["y"].to_numpy(dtype=np.float64) - fo_y) / fs_y
+            down_dv = (res["z"].to_numpy(dtype=np.float64) - fo_z) / fs_z
+            out[0, i0:i1] = down_dv * f_z
+            out[1, i0:i1] = (down_ap + 0.5) * f_y - 0.5
+            out[2, i0:i1] = (down_ml + 0.5) * f_x - 0.5
+        return out[0].reshape(dv.shape), out[1].reshape(dv.shape), out[2].reshape(dv.shape)
+
+
+def _read_fixed_grid_nii(path: Path) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[int, int, int]]:
+    import ants
+
+    img = ants.image_read(str(path))
+    img.set_direction(np.eye(3))
+    return tuple(float(v) for v in img.origin), tuple(float(v) for v in img.spacing), tuple(int(v) for v in img.shape)
+
+
+def resolve_atlas_native_mapper(
+    *,
+    sample_dir: str | Path,
+    transforms_dir: str | Path,
+    atlas_image_path: str | Path,
+    atlas_label_path: str | Path,
+    label_zarr_path: str | Path,
+    native_shape_zyx: tuple[int, int, int],
+    fixed_nii: str | Path | None = None,
+    chunk_points: int = 250_000,
+) -> AtlasNativeMapper:
+    """Build an atlas->native point mapper validated on an interior landmark."""
+    import ants
+
+    transforms_dir = Path(transforms_dir)
+    fwd = sorted(transforms_dir.glob("fwd_*"), key=lambda p: p.name)
+    inv = sorted(transforms_dir.glob("inv_*"), key=lambda p: p.name)
+    if not fwd:
+        raise AnchorError(f"No fwd_* transforms in {transforms_dir}")
+
+    label_arr = None
+    if label_zarr_path and Path(label_zarr_path).exists():
+        candidate = open_zarr_dataset(Path(label_zarr_path))
+        if tuple(int(v) for v in candidate.shape) == tuple(native_shape_zyx):
+            label_arr = candidate
+    if label_arr is None:
+        raise AnchorError(
+            "Atlas-space rendering requires a shape-matching upsampled_atlas_label.zarr "
+            "for validation; re-run registration or use --space native."
+        )
+
+    landmark = _atlas_interior_landmark(atlas_label_path)
+    if landmark is None:
+        raise AnchorError("Could not pick an interior atlas landmark for validation; use --space native.")
+    (l_dv, l_ap, l_ml), expected = landmark
+
+    if fixed_nii is not None:
+        fixed_path = Path(fixed_nii)
+    else:
+        sample_dir = Path(sample_dir)
+        candidates = sorted(sample_dir.glob("*_downsample/volume.nii.gz"))
+        if not candidates:
+            candidates = sorted(transforms_dir.glob("fwd_*Warp.nii.gz"))
+        if not candidates:
+            raise AnchorError(
+                "No fixed-grid NIfTI found (expected <sample>/*_downsample/volume.nii.gz); "
+                "pass --fixed-nii or use --space native."
+            )
+        fixed_path = candidates[0]
+    fixed_origin, fixed_spacing, fixed_shape = _read_fixed_grid_nii(fixed_path)
+
+    atlas = ants.image_read(str(atlas_image_path))
+    atlas.set_direction(np.eye(3))
+    atlas_origin = tuple(float(v) for v in atlas.origin)
+    atlas_spacing = tuple(float(v) for v in atlas.spacing)
+
+    def make(transformlist: list[Path]) -> AtlasNativeMapper:
+        return AtlasNativeMapper(
+            transformlist=transformlist,
+            convention="",
+            atlas_origin_xyz=atlas_origin,
+            atlas_spacing_xyz=atlas_spacing,
+            fixed_origin_xyz=fixed_origin,
+            fixed_spacing_xyz=fixed_spacing,
+            fixed_shape_xyz=fixed_shape,
+            native_shape_zyx=native_shape_zyx,
+            chunk_points=chunk_points,
+        )
+
+    def landmark_agrees(mapper: AtlasNativeMapper) -> bool:
+        m_z, m_y, m_x = mapper.map(np.array([l_dv]), np.array([l_ap]), np.array([l_ml]))
+        z, y, x = int(round(float(m_z[0]))), int(round(float(m_y[0]))), int(round(float(m_x[0])))
+        n_dv, n_ap, n_ml = native_shape_zyx
+        if not (0 <= z < n_dv and 0 <= y < n_ap and 0 <= x < n_ml):
+            return False
+        # Tolerance of roughly one 25 um downsample voxel per axis.
+        f_z, f_y, f_x = mapper._native_scales()
+        r, c, k = (max(1, int(round(f))) for f in (f_z, f_y, f_x))
+        box = np.asarray(
+            label_arr[max(0, z - r) : z + r + 1, max(0, y - c) : y + c + 1, max(0, x - k) : x + k + 1]
+        )
+        return bool(np.any(box == expected))
+
+    candidates: list[tuple[str, list[Path]]] = [("fwd", fwd)]
+    if inv:
+        candidates.append(("inv", inv))
+    candidates.extend([("fwd-reversed", fwd[::-1]), ("inv-reversed", inv[::-1])])
+    chosen = next(((name, tl) for name, tl in candidates if tl and landmark_agrees(make(tl))), None)
+    if chosen is None:
+        raise AnchorError(
+            "Stored transforms failed the interior-landmark label check under every "
+            "transform-list convention; use --space native with a manual anchor."
+        )
+    convention, transformlist = chosen
+    mapper = make(transformlist)
+    mapper.convention = convention
+    mapper.label_check = f"ok via interior landmark (region {expected}, convention {convention}, fixed grid {fixed_path.name})"
+    return mapper
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -560,6 +882,87 @@ def _draw_scale_bar(ax, extent_ml_mm: float, extent_dv_mm: float) -> None:
             ha="center", va="bottom", fontsize=8)
 
 
+def render_atlas_slab_png(
+    mip: np.ndarray,
+    *,
+    output_path: Path,
+    bregma_mm: float,
+    thickness_mm: float,
+    pitch_um: float,
+    atlas_shape_dv_ap_ml: tuple[int, int, int],
+    atlas_res_um: float,
+    vmax: float,
+    zarr_path: Path,
+    mapper_info: str,
+    boundary_mask: np.ndarray | None = None,
+    bregma_dv_ap_ml: tuple[int, int, int] = DEFAULT_BREGMA_DV_AP_ML,
+    flip_dv: bool = False,
+    flip_ml: bool = False,
+    pool_factor: int = 1,
+    dpi: int = 200,
+) -> Path:
+    if pool_factor > 1:
+        mip = _max_pool(mip, pool_factor)
+        if boundary_mask is not None:
+            boundary_mask = _max_pool(boundary_mask.astype(np.uint8), pool_factor).astype(bool)
+    image = np.flipud(mip) if flip_dv else mip
+    image = np.fliplr(image) if flip_ml else image
+    boundary = None
+    if boundary_mask is not None:
+        boundary = np.flipud(boundary_mask) if flip_dv else boundary_mask
+        boundary = np.fliplr(boundary) if flip_ml else boundary
+
+    n_dv, n_ap, n_ml = atlas_shape_dv_ap_ml
+    extent_ml_mm = n_ml * atlas_res_um / 1000.0
+    extent_dv_mm = n_dv * atlas_res_um / 1000.0
+    aspect = extent_ml_mm / max(extent_dv_mm, 1e-6)
+    panel_h = 8.0
+    fig_w = panel_h * aspect + max(panel_h * aspect * 0.35, 2.5)
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, panel_h), dpi=dpi)
+    ax.set_facecolor("black")
+
+    ax.imshow(
+        image, cmap="gray", vmin=0.0, vmax=vmax,
+        extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
+    )
+    if boundary is not None and boundary.any():
+        overlay = np.zeros((*boundary.shape, 4), dtype=np.float32)
+        overlay[boundary] = (1.0, 1.0, 1.0, 0.85)
+        ax.imshow(overlay, extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest")
+    dv_mm = bregma_dv_ap_ml[0] * atlas_res_um / 1000.0
+    ml_mm = bregma_dv_ap_ml[2] * atlas_res_um / 1000.0
+    if flip_dv:
+        dv_mm = extent_dv_mm - dv_mm
+    if flip_ml:
+        ml_mm = extent_ml_mm - ml_mm
+    ax.plot([ml_mm - 0.2, ml_mm + 0.2], [dv_mm, dv_mm], color="cyan", linewidth=1.2)
+    ax.plot([ml_mm, ml_mm], [dv_mm - 0.2, dv_mm + 0.2], color="cyan", linewidth=1.2)
+    _draw_scale_bar(ax, extent_ml_mm, extent_dv_mm)
+
+    ax.set_title(
+        f"Atlas-space slab MIP  |  bregma AP {bregma_mm:+.2f} mm  |  slab {thickness_mm:.2f} mm",
+        color="white", fontsize=11,
+    )
+    ax.text(
+        0.5, -0.04,
+        (
+            f"orthogonal projection along atlas AP  |  pitch {pitch_um:g} um  "
+            f"atlas {n_dv}x{n_ap}x{n_ml} @ {atlas_res_um:g} um\n"
+            f"{mapper_info}  vmax={vmax:.0f}  {zarr_path.name}"
+        ),
+        transform=ax.transAxes, ha="center", va="top", color="0.75", fontsize=7,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_color("0.4")
+    fig.patch.set_facecolor("black")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=dpi, facecolor="black", bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -570,6 +973,10 @@ def render_bregma_mips(
     zarr_path: str | Path,
     bregma_mm: list[float],
     thickness_mm: float,
+    space: str = "native",
+    pitch_um: float = 5.0,
+    fixed_nii: str | Path | None = None,
+    chunk_points: int = 250_000,
     bregma_index: float | None = None,
     bregma_offset_mm: float | None = None,
     anterior: str = "low",
@@ -594,6 +1001,28 @@ def render_bregma_mips(
     max_pixels: int = 3000,
     dv_block: int = 128,
 ) -> dict[str, object]:
+    if space == "atlas":
+        return render_atlas_space_mips(
+            zarr_path=zarr_path,
+            bregma_mm=bregma_mm,
+            thickness_mm=thickness_mm,
+            pitch_um=pitch_um,
+            transforms_dir=transforms_dir,
+            atlas_image_path=atlas_image_path,
+            atlas_label_path=atlas_label_path,
+            label_zarr_path=label_zarr_path,
+            fixed_nii=fixed_nii,
+            chunk_points=chunk_points,
+            overlay_labels=overlay_labels,
+            percentile=percentile,
+            vmax=vmax,
+            flip_dv=flip_dv,
+            flip_ml=flip_ml,
+            output_dir=output_dir,
+            max_pixels=max_pixels,
+        )
+    if space != "native":
+        raise ValueError(f"space must be 'atlas' or 'native', got {space}")
     zarr_path = Path(zarr_path)
     sample_dir = zarr_path.parent
     voxel, voxel_source = resolve_voxel_xyz_um(
@@ -770,6 +1199,182 @@ def render_bregma_mips(
     }
 
 
+def _atlas_label_shape_dv_ap_ml(atlas_label_path: str | Path) -> tuple[int, int, int]:
+    import tifffile
+
+    with tifffile.TiffFile(str(atlas_label_path)) as tif:
+        n_pages = len(tif.pages)
+        page_shape = tuple(int(v) for v in tif.pages[0].shape)
+    if len(page_shape) != 2:
+        raise ValueError(f"Atlas label pages must be 2D, got {page_shape}")
+    n_ap, n_ml = page_shape
+    return n_pages, n_ap, n_ml
+
+
+def render_atlas_space_mips(
+    *,
+    zarr_path: str | Path,
+    bregma_mm: list[float],
+    thickness_mm: float,
+    pitch_um: float = 5.0,
+    transforms_dir: str | Path | None = None,
+    atlas_image_path: str | Path | None = None,
+    atlas_label_path: str | Path | None = None,
+    label_zarr_path: str | Path | None = None,
+    fixed_nii: str | Path | None = None,
+    chunk_points: int = 250_000,
+    overlay_labels: bool = True,
+    percentile: float = 99.5,
+    vmax: float | None = None,
+    flip_dv: bool = False,
+    flip_ml: bool = False,
+    output_dir: str | Path | None = None,
+    max_pixels: int = 3000,
+    tile_z: int = 32,
+    tile_x: int = 256,
+) -> dict[str, object]:
+    """Slab cut in atlas space, sampled back into native space, orthogonal AP MIP."""
+    zarr_path = Path(zarr_path)
+    sample_dir = zarr_path.parent
+    arr = open_zarr_dataset(zarr_path)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {arr.shape}")
+    native_shape = tuple(int(v) for v in arr.shape)
+
+    transforms_dir = Path(transforms_dir) if transforms_dir else sample_dir / "transforms"
+    label_zarr = Path(label_zarr_path) if label_zarr_path else sample_dir / "upsampled_atlas_label.zarr"
+
+    if atlas_image_path is None or atlas_label_path is None:
+        from pipeline_modules.utils.data_paths import reference_dir
+
+        ref_dir = reference_dir()
+        atlas_image_path = atlas_image_path or ref_dir / "atlas.tiff"
+        atlas_label_path = atlas_label_path or ref_dir / "atlas_label.tiff"
+    atlas_image_path, atlas_label_path = Path(atlas_image_path), Path(atlas_label_path)
+
+    atlas_shape = _atlas_label_shape_dv_ap_ml(atlas_label_path)
+    atlas_res_um = 25.0
+    mapper = resolve_atlas_native_mapper(
+        sample_dir=sample_dir,
+        transforms_dir=transforms_dir,
+        atlas_image_path=atlas_image_path,
+        atlas_label_path=atlas_label_path,
+        label_zarr_path=label_zarr,
+        native_shape_zyx=native_shape,
+        fixed_nii=fixed_nii,
+        chunk_points=chunk_points,
+    )
+    logger.info(
+        "Atlas->native mapper ready (%s; bregma at atlas AP index %.1f)",
+        mapper.label_check,
+        DEFAULT_BREGMA_DV_AP_ML[1],
+    )
+
+    out_dir = Path(output_dir) if output_dir else sample_dir / "visualization" / "bregma_mip"
+    atlas_label_volume = None
+    if overlay_labels:
+        import tifffile
+
+        atlas_label_volume = tifffile.imread(str(atlas_label_path))
+
+    outputs: list[dict[str, object]] = []
+    for bregma in bregma_mm:
+        geometry = atlas_slab_geometry(
+            bregma_mm=bregma,
+            thickness_mm=thickness_mm,
+            pitch_um=pitch_um,
+            atlas_shape_dv_ap_ml=atlas_shape,
+        )
+        logger.info(
+            "Mapping %d coarse atlas planes (AP %s) through transforms...",
+            geometry.coarse_ap.size, list(geometry.coarse_ap),
+        )
+        coarse_ap_idx = geometry.coarse_ap.astype(np.float64)
+        dv_grid = np.arange(atlas_shape[0], dtype=np.float64)
+        ml_grid = np.arange(atlas_shape[2], dtype=np.float64)
+        c_dv, c_ap, c_ml = np.meshgrid(dv_grid, coarse_ap_idx, ml_grid, indexing="ij")
+        c_z, c_y, c_x = mapper.map(c_dv, c_ap, c_ml)
+        fine_z = interp_coarse_to_fine(c_z, coarse_ap=coarse_ap_idx, geometry=geometry)
+        fine_y = interp_coarse_to_fine(c_y, coarse_ap=coarse_ap_idx, geometry=geometry)
+        fine_x = interp_coarse_to_fine(c_x, coarse_ap=coarse_ap_idx, geometry=geometry)
+        del c_z, c_y, c_x
+        mip, sample_stats = sample_mip_from_native_coords(
+            arr, z=fine_z, y=fine_y, x=fine_x, tile_z=tile_z, tile_x=tile_x
+        )
+        del fine_z, fine_y, fine_x
+
+        nonzero_fraction = float(np.count_nonzero(mip)) / float(mip.size)
+        eff_vmax = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
+
+        boundary = None
+        if atlas_label_volume is not None:
+            from scipy import ndimage as ndi
+
+            center_ap = int(np.clip(round(geometry.ap_center), 0, atlas_shape[1] - 1))
+            label_slice = np.asarray(atlas_label_volume[:, center_ap, :])
+            raw_mask = label_boundary_mask(label_slice)
+            boundary = ndi.zoom(
+                raw_mask,
+                (mip.shape[0] / raw_mask.shape[0], mip.shape[1] / raw_mask.shape[1]),
+                order=0,
+                mode="nearest",
+            ).astype(bool)
+
+        pool_factor = 1
+        if max_pixels > 0 and mip.shape[0] * mip.shape[1] > max_pixels * max_pixels:
+            pool_factor = int(math.ceil(math.sqrt(mip.shape[0] * mip.shape[1]) / max_pixels))
+        out_path = out_dir / (
+            f"{sample_dir.name}_{zarr_path.stem}_atlas_bregma{bregma:+.2f}mm_"
+            f"thick{thickness_mm:.2f}mm_pitch{pitch_um:g}um.png"
+        )
+        render_atlas_slab_png(
+            mip,
+            output_path=out_path,
+            bregma_mm=bregma,
+            thickness_mm=thickness_mm,
+            pitch_um=pitch_um,
+            atlas_shape_dv_ap_ml=atlas_shape,
+            atlas_res_um=atlas_res_um,
+            vmax=eff_vmax,
+            zarr_path=zarr_path,
+            mapper_info=mapper.label_check,
+            boundary_mask=boundary,
+            flip_dv=flip_dv,
+            flip_ml=flip_ml,
+            pool_factor=pool_factor,
+        )
+        outputs.append(
+            {
+                "bregma_mm": bregma,
+                "atlas_ap_center_index": round(geometry.ap_center, 1),
+                "atlas_ap_window": [round(float(geometry.ap.min()), 1), round(float(geometry.ap.max()), 1)],
+                "planes": int(geometry.ap.size),
+                "grid_rows_cols": [int(mip.shape[0]), int(mip.shape[1])],
+                "valid_sample_fraction": round(sample_stats["valid_fraction"], 4),
+                "nonzero_fraction": round(nonzero_fraction, 4),
+                "tiles": int(sample_stats["tiles"]),
+                "vmax": round(eff_vmax, 1),
+                "pool_factor": pool_factor,
+                "boundary_overlay": boundary is not None,
+                "output": str(out_path),
+            }
+        )
+        logger.info("Rendered %s", out_path)
+
+    return {
+        "zarr": str(zarr_path),
+        "space": "atlas",
+        "shape_zyx": list(native_shape),
+        "atlas_shape_dv_ap_ml": list(atlas_shape),
+        "atlas_res_um": atlas_res_um,
+        "pitch_um": pitch_um,
+        "thickness_mm": thickness_mm,
+        "transform_convention": mapper.convention,
+        "label_check": mapper.label_check,
+        "outputs": outputs,
+    }
+
+
 def _atlas_coronal_image(bregma_mm: float, atlas_label_path: str | Path | None) -> np.ndarray | None:
     if not atlas_label_path or not Path(atlas_label_path).exists():
         logger.warning("Atlas label not found (%s); skipping atlas panel.", atlas_label_path)
@@ -800,7 +1405,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Render coronal slab-MIP PNG screenshots of a brain Zarr at bregma AP "
-            "coordinates. Sample zarr axes are (z=DV, y=AP, x=ML)."
+            "coordinates. Sample zarr axes are (z=DV, y=AP, x=ML). Default --space atlas "
+            "cuts the slab in standard atlas space, maps it back to the native image "
+            "through the stored registration transforms, and renders an orthogonal "
+            "camera MIP along the atlas AP axis."
         )
     )
     parser.add_argument("--zarr", required=True, help="Signal zarr path, e.g. sample/ch1.zarr")
@@ -810,6 +1418,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--thickness-mm", required=True, type=float,
                         help="Slab thickness along AP that the MIP covers")
+    parser.add_argument(
+        "--space", choices=("atlas", "native"), default="atlas",
+        help="atlas: slab cut in atlas space, warped back to native space, orthogonal "
+             "AP MIP (requires pipeline transforms + upsampled_atlas_label.zarr). "
+             "native: slab on the sample AP axis with a manual anchor (default: atlas)",
+    )
+    parser.add_argument(
+        "--pitch-um", type=float, default=5.0,
+        help="Atlas-space sampling pitch in microns for --space atlas (default 5)",
+    )
+    parser.add_argument(
+        "--fixed-nii", default=None,
+        help="Downsample NIfTI defining the registration fixed grid; default: "
+             "<sample>/*_downsample/volume.nii.gz",
+    )
+    parser.add_argument(
+        "--chunk-points", type=int, default=250000,
+        help="Points per ANTs point-mapping call for --space atlas",
+    )
     parser.add_argument("--bregma-index", type=float, default=None,
                         help="AP index of bregma on the rendered grid (manual anchor)")
     parser.add_argument("--bregma-offset-mm", type=float, default=None,
@@ -868,6 +1495,10 @@ def main(argv: list[str] | None = None) -> int:
             zarr_path=args.zarr,
             bregma_mm=args.bregma_mm,
             thickness_mm=args.thickness_mm,
+            space=args.space,
+            pitch_um=args.pitch_um,
+            fixed_nii=args.fixed_nii,
+            chunk_points=args.chunk_points,
             bregma_index=args.bregma_index,
             bregma_offset_mm=args.bregma_offset_mm,
             anterior=args.anterior,

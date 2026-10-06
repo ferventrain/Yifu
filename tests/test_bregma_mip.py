@@ -7,12 +7,15 @@ from pipeline_modules.utils.zarr_io import create_output_zarr
 from pipeline_modules.visualization.bregma_mip import (
     AnchorError,
     ApAnchor,
+    atlas_slab_geometry,
     compute_coronal_slab_mip,
     coronal_row_ap_centers,
+    interp_coarse_to_fine,
     label_boundary_mask,
     render_bregma_mips,
     resolve_manual_anchor,
     resolve_voxel_xyz_um,
+    sample_mip_from_native_coords,
 )
 
 
@@ -108,6 +111,98 @@ class AnchorTests(unittest.TestCase):
                 n_ap_level=100, n_ap_level0=100, level=0, ap_vox_um=2.0,
                 bregma_index=None, bregma_offset_mm=10.0, anterior="low",
             )
+
+
+class AtlasSlabGeometryTests(unittest.TestCase):
+    def test_geometry_matches_bregma_convention(self):
+        geom = atlas_slab_geometry(
+            bregma_mm=1.0, thickness_mm=0.05, pitch_um=5.0,
+            atlas_shape_dv_ap_ml=(320, 528, 456),
+        )
+        # Anterior positive bregma mm -> lower atlas AP index (216 - 40).
+        self.assertAlmostEqual(geom.ap_center, 176.0)
+        self.assertAlmostEqual(float(geom.ap.min()), 175.0)
+        self.assertAlmostEqual(float(geom.ap.max()), 177.0)
+        self.assertEqual(geom.ap.size, 11)  # ceil(50/5)+1 planes
+        self.assertEqual(geom.dv.size, 319 * 25 // 5 + 1)
+        self.assertEqual(geom.ml.size, 455 * 25 // 5 + 1)
+        self.assertEqual(set(geom.coarse_ap.tolist()), {175, 176, 177})
+
+    def test_geometry_rejects_out_of_range_bregma(self):
+        with self.assertRaises(AnchorError):
+            atlas_slab_geometry(
+                bregma_mm=7.0, thickness_mm=0.04, pitch_um=5.0,
+                atlas_shape_dv_ap_ml=(320, 528, 456),
+            )
+
+    def test_single_coarse_plane_allowed_for_thin_slab(self):
+        geom = atlas_slab_geometry(
+            bregma_mm=0.0, thickness_mm=0.01, pitch_um=5.0,
+            atlas_shape_dv_ap_ml=(320, 528, 456),
+        )
+        # 10 um slab centered on AP 216: fine planes stay inside voxel 216.
+        self.assertEqual(geom.coarse_ap.size, 1)
+        self.assertEqual(int(geom.coarse_ap[0]), 216)
+
+
+class InterpCoarseToFineTests(unittest.TestCase):
+    def test_linear_ramp_interpolates_exactly(self):
+        geom = atlas_slab_geometry(
+            bregma_mm=0.0, thickness_mm=0.0625, pitch_um=12.5,
+            atlas_shape_dv_ap_ml=(7, 528, 9),
+        )
+        coarse_ap = geom.coarse_ap.astype(np.float64)
+        n_ap_c, n_dv, n_ml = len(coarse_ap), 7, 9
+        coarse = (
+            np.arange(n_dv)[:, None, None] * 10.0
+            + np.arange(n_ap_c)[None, :, None] * 100.0
+            + np.arange(n_ml)[None, None, :] * 1.0
+        )
+        fine = interp_coarse_to_fine(coarse, coarse_ap=coarse_ap, geometry=geom)
+        self.assertEqual(fine.shape, (geom.dv.size, geom.ap.size, geom.ml.size))
+        for r, dv in enumerate(geom.dv):
+            for p, ap in enumerate(geom.ap):
+                for c, ml in enumerate(geom.ml):
+                    ap_c = np.interp(ap, coarse_ap, np.arange(n_ap_c))
+                    expected = dv * 10.0 + ml + ap_c * 100.0
+                    self.assertAlmostEqual(float(fine[r, p, c]), expected, places=4)
+
+
+class SampleMipFromNativeCoordsTests(unittest.TestCase):
+    def test_matches_untiled_reference(self):
+        rng = np.random.default_rng(7)
+        volume = rng.integers(0, 4000, size=(24, 40, 60), dtype=np.uint16)
+        z = rng.uniform(0, 23, size=(6, 3, 9))
+        y = rng.uniform(0, 39, size=(6, 3, 9))
+        x = rng.uniform(0, 59, size=(6, 3, 9))
+        mip, stats = sample_mip_from_native_coords(volume, z=z, y=y, x=x, tile_z=8, tile_x=20)
+        self.assertEqual(mip.shape, (6, 9))
+        from scipy import ndimage as ndi
+
+        ref = ndi.map_coordinates(volume, [z.ravel(), y.ravel(), x.ravel()], order=1, mode="constant", cval=0)
+        ref = ref.reshape(6, 3, 9).max(axis=1)
+        np.testing.assert_allclose(mip.astype(np.float64), ref, atol=1.0)
+
+    def test_bright_spot_and_out_of_range(self):
+        volume = np.zeros((12, 20, 30), dtype=np.uint16)
+        volume[5, 10, 20] = 999
+        z = np.array([[[5.0, 50.0], [1.0, 1.0]], [[5.0, 5.0], [1.0, 1.0]]])  # (rows=2, planes=2, cols=2)
+        y = np.full((2, 2, 2), 10.0)
+        x = np.full((2, 2, 2), 20.0)
+        mip, _ = sample_mip_from_native_coords(volume, z=z, y=y, x=x, tile_z=32, tile_x=256)
+        # Out-of-range sample contributes 0; the bright voxel wins via max over planes.
+        self.assertEqual(int(mip[0, 0]), 999)
+        self.assertEqual(int(mip[0, 1]), 0)
+
+    def test_max_over_duplicate_planes(self):
+        volume = np.zeros((12, 20, 30), dtype=np.uint16)
+        volume[4, 10, 20] = 100
+        volume[6, 10, 20] = 200
+        z = np.array([[[4.0], [6.0]]])  # (rows=1, planes=2, cols=1)
+        y = np.full((1, 2, 1), 10.0)
+        x = np.full((1, 2, 1), 20.0)
+        mip, _ = sample_mip_from_native_coords(volume, z=z, y=y, x=x, tile_z=32, tile_x=256)
+        self.assertEqual(int(mip[0, 0]), 200)
 
 
 class HelperTests(unittest.TestCase):
