@@ -10,7 +10,10 @@ The tool intentionally avoids re-running registration. Two spaces:
   signal Zarr is sampled at those points, and the MIP is taken along the
   atlas AP axis -- an orthogonal camera view down the atlas AP axis. The
   transform convention is cross-validated against ``upsampled_atlas_label.zarr``
-  on an interior atlas landmark before any sampling.
+  on an interior atlas landmark before any sampling. Several same-sample
+  signal zarrs render as an additive false-color composite (``--cmap`` per
+  channel); atlas region boundaries draw as thin smooth dashed vector lines
+  (``--boundary-color/-linewidth/-style``).
 * **native (``--space native``)**: slab taken directly on the sample AP axis
   with a manual bregma anchor (``--bregma-index`` or ``--bregma-offset-mm`` +
   ``--anterior``) and optional ``--tilt-deg`` angle correction; transforms
@@ -42,6 +45,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from matplotlib import pyplot as plt  # noqa: E402
+from matplotlib.collections import LineCollection  # noqa: E402
 
 from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset  # noqa: E402
 
@@ -423,6 +427,192 @@ def label_boundary_mask(label_slice: np.ndarray) -> np.ndarray:
     return mask
 
 
+def _skeleton_paths(skel: np.ndarray) -> list[np.ndarray]:
+    """Split a 1-px boolean skeleton into (N, 2) row/col polylines.
+
+    Junction pixels (3+ neighbors) are removed first so every remaining
+    connected component is a simple path or loop; each is walked end to end.
+    """
+    from scipy import ndimage as ndi
+
+    s = np.asarray(skel, dtype=bool)
+    if not s.any():
+        return []
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    kernel[1, 1] = 0
+    neighbor_count = ndi.convolve(s.astype(np.uint8), kernel, mode="constant")
+    junction = s & (neighbor_count >= 3)
+    comp_labels, n_comp = ndi.label(s & ~junction, structure=np.ones((3, 3), dtype=bool))
+
+    def neighbors8(pt: tuple[int, int]) -> list[tuple[int, int]]:
+        y, x = pt
+        out = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                q = (y + dy, x + dx)
+                if 0 <= q[0] < s.shape[0] and 0 <= q[1] < s.shape[1] and s[q]:
+                    out.append(q)
+        return out
+
+    paths: list[np.ndarray] = []
+    for ci in range(1, n_comp + 1):
+        pts = set(map(tuple, np.argwhere(comp_labels == ci)))
+        if not pts:
+            continue
+        ends = [p for p in pts if sum(1 for q in neighbors8(p) if q in pts) == 1]
+        cur = ends[0] if ends else next(iter(pts))
+        path = [cur]
+        pts.discard(cur)
+        while pts:
+            nxt = [q for q in neighbors8(cur) if q in pts]
+            if not nxt:
+                break
+            cur = nxt[0]
+            pts.discard(cur)
+            path.append(cur)
+        if len(path) >= 2:
+            paths.append(np.asarray(path, dtype=np.float64))
+    return paths
+
+
+def label_boundary_lines_mm(
+    label_slice: np.ndarray,
+    *,
+    row_vox_um: float,
+    col_vox_um: float,
+    upsample: int = 5,
+    smoothing: float = 1.2,
+) -> list[np.ndarray]:
+    """Single smooth centerline per region boundary of a coronal label slice, in mm.
+
+    Rows are DV and cols are ML on the slice; the returned (N, 2) arrays hold
+    (x=ML mm, y=DV mm) with the origin at the slice corner, ready to draw on an
+    imshow with extent (0, W, H, 0).
+
+    Per-region contour extraction draws every shared border twice (once per
+    adjoining region). Instead the boundary band -- voxels where the label
+    changes between neighbors -- is upsampled with linear interpolation,
+    gaussian-blurred (rounding the 25 um label staircase, the heatmap slice
+    renderer recipe) and skeletonized, so each border yields exactly one
+    centerline. ``smoothing`` adds a gaussian along each line in label voxels
+    (heatmap default 1.2; 0 disables).
+    """
+    from scipy import ndimage as ndi
+    from skimage.morphology import skeletonize
+
+    from pipeline_modules.visualization.atlas_slice import _smooth_contour
+
+    labels = np.asarray(label_slice)
+    band = label_boundary_mask(labels).astype(np.float32)
+    if not band.any():
+        return []
+    fine = ndi.zoom(band, float(upsample), order=1)
+    fine = ndi.gaussian_filter(fine, sigma=max(1.0, upsample / 4.0))
+    skel = skeletonize(fine >= 0.5)
+    sigma_fine = float(smoothing) * float(upsample)
+    min_pts = max(8, 2 * upsample)
+    lines = []
+    for path in _skeleton_paths(skel):
+        if len(path) < min_pts:
+            continue
+        if sigma_fine > 0:
+            path = _smooth_contour(path, sigma_fine)
+        lines.append(np.column_stack([path[:, 1], path[:, 0]]))  # (row, col) -> (x, y)
+    x_mm = col_vox_um / (1000.0 * upsample)
+    y_mm = row_vox_um / (1000.0 * upsample)
+    max_x = (labels.shape[1] - 1) * col_vox_um / 1000.0
+    max_y = (labels.shape[0] - 1) * row_vox_um / 1000.0
+    scaled = [np.asarray(ln, dtype=np.float64) * (x_mm, y_mm) for ln in lines]
+    # Smoothing can push edge-running lines a fraction of a fine voxel outside
+    # the slice; clamp so every line stays drawable in-extent.
+    return [np.clip(ln, (0.0, 0.0), (max_x, max_y)) for ln in scaled]
+
+
+MULTI_CHANNEL_PALETTE = ("green", "magenta", "cyan", "yellow", "red", "blue", "orange")
+
+
+def resolve_channel_cmaps(n_channels: int, cmaps: list[str] | str | None) -> list[str]:
+    """Per-channel colormap list; defaults to gray, or a palette for composites."""
+    if cmaps is None:
+        return ["gray"] if n_channels == 1 else [
+            MULTI_CHANNEL_PALETTE[i % len(MULTI_CHANNEL_PALETTE)] for i in range(n_channels)
+        ]
+    if isinstance(cmaps, str):
+        cmaps = [p.strip() for p in cmaps.split(",") if p.strip()]
+    if len(cmaps) == 1 and n_channels > 1:
+        cmaps = cmaps * n_channels
+    if len(cmaps) != n_channels:
+        raise ValueError(
+            f"{n_channels} channel(s) need {n_channels} colormaps, got: {cmaps}"
+        )
+    return list(cmaps)
+
+
+def _channel_colormap(name: str):
+    """Matplotlib colormap, or a black->color ramp when ``name`` is a plain color.
+
+    Lets ``--cmap green`` / ``magenta`` work as false-color channels while real
+    colormaps (gray, viridis, ...) pass through unchanged.
+    """
+    try:
+        return plt.get_cmap(name)
+    except ValueError:
+        from matplotlib import colors as mcolors
+        from matplotlib.colors import LinearSegmentedColormap
+
+        if not mcolors.is_color_like(name):
+            raise
+        rgb = np.asarray(mcolors.to_rgb(name), dtype=np.float64)
+        peak = float(rgb.max())
+        if peak > 0:
+            rgb = rgb / peak  # CSS names like 'green' are half-brightness; saturate
+        return LinearSegmentedColormap.from_list(name, [(0.0, 0.0, 0.0), tuple(rgb)])
+
+
+def _compose_rgb(mips: list[np.ndarray], cmaps: list[str], vmaxs: list[float]) -> np.ndarray:
+    """Additive false-color composite of per-channel MIPs, clipped to [0, 1]."""
+    rgb = None
+    for mip, cmap_name, vmax in zip(mips, cmaps, vmaxs):
+        cmap = _channel_colormap(cmap_name)
+        normed = np.clip(mip.astype(np.float32) / max(float(vmax), 1e-6), 0.0, 1.0)
+        layer = np.asarray(cmap(normed), dtype=np.float32)[..., :3]
+        rgb = layer if rgb is None else rgb + layer
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _draw_boundary_lines(
+    ax,
+    lines: list[np.ndarray] | None,
+    *,
+    extent_ml_mm: float,
+    extent_dv_mm: float,
+    color: str,
+    linewidth: float,
+    style: str,
+    flip_dv: bool = False,
+    flip_ml: bool = False,
+) -> None:
+    if not lines or linewidth <= 0:
+        return
+    segments = []
+    for line in lines:
+        x = extent_ml_mm - line[:, 0] if flip_ml else line[:, 0]
+        y = extent_dv_mm - line[:, 1] if flip_dv else line[:, 1]
+        segments.append(np.column_stack([x, y]))
+    collection = LineCollection(
+        segments,
+        colors=color,
+        linewidths=linewidth,
+        linestyles=(0, (3.0, 2.4)) if style == "dashed" else "solid",
+        capstyle="round",
+        joinstyle="round",
+        antialiaseds=True,
+    )
+    ax.add_collection(collection)
+
+
 def resolve_display_vmax(mip: np.ndarray, *, percentile: float, explicit: float | None) -> float:
     if explicit is not None:
         return float(explicit)
@@ -507,24 +697,31 @@ def interp_coarse_to_fine(
 
 
 def sample_mip_from_native_coords(
-    arr,
+    arrays,
     *,
     z: np.ndarray,
     y: np.ndarray,
     x: np.ndarray,
     tile_z: int = 32,
     tile_x: int = 256,
-) -> tuple[np.ndarray, dict[str, float]]:
-    """Max-project native-space samples of a slab into an atlas-aligned MIP.
+) -> tuple[list[np.ndarray], dict[str, float]]:
+    """Max-project native-space samples of a slab into atlas-aligned MIPs.
 
     ``z/y/x`` are continuous native indices with shape ``(n_rows, n_planes,
-    n_cols)``. Points are grouped into tiles aligned to the zarr chunk grid so
-    each tile reads a small bounding box once; the MIP maxes over the plane
-    (slab-thickness) axis.
+    n_cols)``; ``arrays`` is one signal zarr per channel (same shape), each
+    yielding its own MIP. Points are grouped into tiles aligned to the zarr
+    chunk grid so each tile's bounding box is read once and shared across
+    channels; every MIP maxes over the plane (slab-thickness) axis.
     """
     from scipy import ndimage as ndi
 
-    n_z, n_y, n_x = (int(v) for v in arr.shape)
+    if not arrays:
+        raise ValueError("sample_mip_from_native_coords needs at least one channel array")
+    shape0 = tuple(int(v) for v in arrays[0].shape)
+    for a in arrays[1:]:
+        if tuple(int(v) for v in a.shape) != shape0:
+            raise ValueError("All channel zarrs must share the same (z, y, x) shape")
+    n_z, n_y, n_x = shape0
     n_rows, n_planes, n_cols = z.shape
     z_f = z.ravel()
     y_f = y.ravel()
@@ -548,7 +745,9 @@ def sample_mip_from_native_coords(
     uniq, starts = np.unique(keys[order], return_index=True)
     bounds = list(starts) + [len(keep)]
 
-    out = np.zeros((n_rows, n_cols), dtype=np.result_type(arr.dtype, np.uint16))
+    outs = [
+        np.zeros((n_rows, n_cols), dtype=np.result_type(a.dtype, np.uint16)) for a in arrays
+    ]
     for key, i0, i1 in zip(uniq, bounds[:-1], bounds[1:]):
         tz, tx = int(key) // n_tx, int(key) % n_tx
         zg, yg, xg = z_s[i0:i1], y_s[i0:i1], x_s[i0:i1]
@@ -558,25 +757,22 @@ def sample_mip_from_native_coords(
         xe = min(n_x, (tx + 1) * tile_x + 3)
         ys = max(0, int(math.floor(yg.min())) - 2)
         ye = min(n_y, int(math.ceil(yg.max())) + 3)
-        region = np.asarray(arr[zs:ze, ys:ye, xs:xe])
-        vals = ndi.map_coordinates(
-            region,
-            [zg - zs, yg - ys, xg - xs],
-            order=1,
-            mode="constant",
-            cval=0,
-            prefilter=False,
-        )
+        regions = [np.asarray(a[zs:ze, ys:ye, xs:xe]) for a in arrays]
         for plane in np.unique(planes_s[i0:i1]):
             m = planes_s[i0:i1] == plane
+            rz, ry, rx = zg[m] - zs, yg[m] - ys, xg[m] - xs
             r, c = rows_s[i0:i1][m], cols_s[i0:i1][m]
-            out[r, c] = np.maximum(out[r, c], vals[m])
+            for ci, region in enumerate(regions):
+                vals = ndi.map_coordinates(
+                    region, [rz, ry, rx], order=1, mode="constant", cval=0, prefilter=False
+                )
+                outs[ci][r, c] = np.maximum(outs[ci][r, c], vals)
 
     stats = {
         "valid_fraction": float(keep.size) / float(z_f.size),
         "tiles": int(uniq.size),
     }
-    return out, stats
+    return outs, stats
 
 
 @dataclass
@@ -781,21 +977,19 @@ def render_bregma_png(
     meta: RenderMeta,
     flip_dv: bool = False,
     flip_ml: bool = False,
-    boundary_mask: np.ndarray | None = None,
+    cmap: str = "gray",
+    boundary_lines: list[np.ndarray] | None = None,
+    boundary_color: str = "white",
+    boundary_linewidth: float = 0.35,
+    boundary_style: str = "dashed",
     atlas_slice_image: np.ndarray | None = None,
     pool_factor: int = 1,
     dpi: int = 200,
 ) -> Path:
     if pool_factor > 1:
         mip = _max_pool(mip, pool_factor)
-        if boundary_mask is not None:
-            boundary_mask = _max_pool(boundary_mask.astype(np.uint8), pool_factor).astype(bool)
     image = np.flipud(mip) if flip_dv else mip
     image = np.fliplr(image) if flip_ml else image
-    boundary = None
-    if boundary_mask is not None:
-        boundary = np.flipud(boundary_mask) if flip_dv else boundary_mask
-        boundary = np.fliplr(boundary) if flip_ml else boundary
 
     scale = 2**meta.level
     extent_ml_mm = image.shape[1] * meta.voxel_xyz_um[0] * scale / 1000.0
@@ -812,13 +1006,20 @@ def render_bregma_png(
 
     ax = axes[0]
     ax.imshow(
-        image, cmap="gray", vmin=0.0, vmax=meta.vmax,
+        image, cmap=cmap, vmin=0.0, vmax=meta.vmax,
         extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
     )
-    if boundary is not None and boundary.any():
-        overlay = np.zeros((*boundary.shape, 4), dtype=np.float32)
-        overlay[boundary] = (1.0, 1.0, 1.0, 0.85)
-        ax.imshow(overlay, extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest")
+    _draw_boundary_lines(
+        ax,
+        boundary_lines,
+        extent_ml_mm=extent_ml_mm,
+        extent_dv_mm=extent_dv_mm,
+        color=boundary_color,
+        linewidth=boundary_linewidth,
+        style=boundary_style,
+        flip_dv=flip_dv,
+        flip_ml=flip_ml,
+    )
     if meta.anchor.bregma_dv is not None and meta.anchor.bregma_ml is not None:
         dv_mm = meta.anchor.bregma_dv * meta.voxel_xyz_um[2] / 1000.0
         ml_mm = meta.anchor.bregma_ml * meta.voxel_xyz_um[0] / 1000.0
@@ -883,7 +1084,7 @@ def _draw_scale_bar(ax, extent_ml_mm: float, extent_dv_mm: float) -> None:
 
 
 def render_atlas_slab_png(
-    mip: np.ndarray,
+    mips: list[np.ndarray],
     *,
     output_path: Path,
     bregma_mm: float,
@@ -891,10 +1092,14 @@ def render_atlas_slab_png(
     pitch_um: float,
     atlas_shape_dv_ap_ml: tuple[int, int, int],
     atlas_res_um: float,
-    vmax: float,
-    zarr_path: Path,
+    vmaxs: list[float],
+    cmaps: list[str],
+    zarr_paths: list[Path],
     mapper_info: str,
-    boundary_mask: np.ndarray | None = None,
+    boundary_lines: list[np.ndarray] | None = None,
+    boundary_color: str = "white",
+    boundary_linewidth: float = 0.35,
+    boundary_style: str = "dashed",
     bregma_dv_ap_ml: tuple[int, int, int] = DEFAULT_BREGMA_DV_AP_ML,
     flip_dv: bool = False,
     flip_ml: bool = False,
@@ -902,15 +1107,10 @@ def render_atlas_slab_png(
     dpi: int = 200,
 ) -> Path:
     if pool_factor > 1:
-        mip = _max_pool(mip, pool_factor)
-        if boundary_mask is not None:
-            boundary_mask = _max_pool(boundary_mask.astype(np.uint8), pool_factor).astype(bool)
-    image = np.flipud(mip) if flip_dv else mip
+        mips = [_max_pool(m, pool_factor) for m in mips]
+    image = _compose_rgb(mips, cmaps, vmaxs)
+    image = np.flipud(image) if flip_dv else image
     image = np.fliplr(image) if flip_ml else image
-    boundary = None
-    if boundary_mask is not None:
-        boundary = np.flipud(boundary_mask) if flip_dv else boundary_mask
-        boundary = np.fliplr(boundary) if flip_ml else boundary
 
     n_dv, n_ap, n_ml = atlas_shape_dv_ap_ml
     extent_ml_mm = n_ml * atlas_res_um / 1000.0
@@ -922,13 +1122,19 @@ def render_atlas_slab_png(
     ax.set_facecolor("black")
 
     ax.imshow(
-        image, cmap="gray", vmin=0.0, vmax=vmax,
-        extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
+        image, extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
     )
-    if boundary is not None and boundary.any():
-        overlay = np.zeros((*boundary.shape, 4), dtype=np.float32)
-        overlay[boundary] = (1.0, 1.0, 1.0, 0.85)
-        ax.imshow(overlay, extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest")
+    _draw_boundary_lines(
+        ax,
+        boundary_lines,
+        extent_ml_mm=extent_ml_mm,
+        extent_dv_mm=extent_dv_mm,
+        color=boundary_color,
+        linewidth=boundary_linewidth,
+        style=boundary_style,
+        flip_dv=flip_dv,
+        flip_ml=flip_ml,
+    )
     dv_mm = bregma_dv_ap_ml[0] * atlas_res_um / 1000.0
     ml_mm = bregma_dv_ap_ml[2] * atlas_res_um / 1000.0
     if flip_dv:
@@ -939,6 +1145,10 @@ def render_atlas_slab_png(
     ax.plot([ml_mm, ml_mm], [dv_mm - 0.2, dv_mm + 0.2], color="cyan", linewidth=1.2)
     _draw_scale_bar(ax, extent_ml_mm, extent_dv_mm)
 
+    channel_summary = " + ".join(
+        f"{p.stem}[{cmap}] vmax {vmax:.0f}"
+        for p, cmap, vmax in zip(zarr_paths, cmaps, vmaxs)
+    )
     ax.set_title(
         f"Atlas-space slab MIP  |  bregma AP {bregma_mm:+.2f} mm  |  slab {thickness_mm:.2f} mm",
         color="white", fontsize=11,
@@ -948,7 +1158,7 @@ def render_atlas_slab_png(
         (
             f"orthogonal projection along atlas AP  |  pitch {pitch_um:g} um  "
             f"atlas {n_dv}x{n_ap}x{n_ml} @ {atlas_res_um:g} um\n"
-            f"{mapper_info}  vmax={vmax:.0f}  {zarr_path.name}"
+            f"{mapper_info}\n{channel_summary}"
         ),
         transform=ax.transAxes, ha="center", va="top", color="0.75", fontsize=7,
     )
@@ -975,6 +1185,11 @@ def render_bregma_mips(
     thickness_mm: float,
     space: str = "native",
     pitch_um: float = 5.0,
+    cmaps: list[str] | str | None = None,
+    boundary_color: str = "white",
+    boundary_linewidth: float = 0.35,
+    boundary_style: str = "dashed",
+    boundary_smooth: float = 1.2,
     fixed_nii: str | Path | None = None,
     chunk_points: int = 250_000,
     bregma_index: float | None = None,
@@ -1007,6 +1222,7 @@ def render_bregma_mips(
             bregma_mm=bregma_mm,
             thickness_mm=thickness_mm,
             pitch_um=pitch_um,
+            cmaps=cmaps,
             transforms_dir=transforms_dir,
             atlas_image_path=atlas_image_path,
             atlas_label_path=atlas_label_path,
@@ -1014,6 +1230,10 @@ def render_bregma_mips(
             fixed_nii=fixed_nii,
             chunk_points=chunk_points,
             overlay_labels=overlay_labels,
+            boundary_color=boundary_color,
+            boundary_linewidth=boundary_linewidth,
+            boundary_style=boundary_style,
+            boundary_smooth=boundary_smooth,
             percentile=percentile,
             vmax=vmax,
             flip_dv=flip_dv,
@@ -1145,7 +1365,12 @@ def render_bregma_mips(
         if label_arr is not None:
             center_row = int(np.clip(round((n_dv - 1) / 2.0), 0, n_dv - 1))
             center_ap = int(np.clip(round(centers[center_row]), 0, n_ap - 1))
-            boundary = label_boundary_mask(np.asarray(label_arr[:, center_ap, :]))
+            boundary = label_boundary_lines_mm(
+                np.asarray(label_arr[:, center_ap, :]),
+                row_vox_um=vox_dv,
+                col_vox_um=vox_ml,
+                smoothing=boundary_smooth,
+            )
 
         atlas_image = None
         if atlas_panel:
@@ -1157,7 +1382,7 @@ def render_bregma_mips(
         if max_pixels > 0 and mip.shape[0] * mip.shape[1] > max_pixels * max_pixels:
             pool_factor = int(math.ceil(math.sqrt(mip.shape[0] * mip.shape[1]) / max_pixels))
         out_path = out_dir / (
-            f"{sample_dir.name}_{zarr_path.stem}_bregma{bregma:+.2f}mm_thick{thickness_mm:.2f}mm.png"
+            f"{sample_dir.name}_{zarr_path.stem}_bregma{bregma:+.2f}mm_thick{thickness_mm:.2f}mm_{boundary_style}.png"
         )
         render_bregma_png(
             mip,
@@ -1165,7 +1390,11 @@ def render_bregma_mips(
             meta=meta,
             flip_dv=flip_dv,
             flip_ml=flip_ml,
-            boundary_mask=boundary,
+            cmap=resolve_channel_cmaps(1, cmaps)[0] if cmaps else "gray",
+            boundary_lines=boundary,
+            boundary_color=boundary_color,
+            boundary_linewidth=boundary_linewidth,
+            boundary_style=boundary_style,
             atlas_slice_image=atlas_image,
             pool_factor=pool_factor,
         )
@@ -1175,7 +1404,7 @@ def render_bregma_mips(
                 "ap_index_center": round(base_index, 1),
                 "ap_window": [lo, hi],
                 "output": str(out_path),
-                "boundary_overlay": boundary is not None,
+                "boundary_overlay": bool(boundary),
                 "atlas_panel": atlas_image is not None,
                 "pool_factor": pool_factor,
             }
@@ -1213,10 +1442,11 @@ def _atlas_label_shape_dv_ap_ml(atlas_label_path: str | Path) -> tuple[int, int,
 
 def render_atlas_space_mips(
     *,
-    zarr_path: str | Path,
+    zarr_path: str | Path | list[str | Path],
     bregma_mm: list[float],
     thickness_mm: float,
     pitch_um: float = 5.0,
+    cmaps: list[str] | str | None = None,
     transforms_dir: str | Path | None = None,
     atlas_image_path: str | Path | None = None,
     atlas_label_path: str | Path | None = None,
@@ -1224,6 +1454,10 @@ def render_atlas_space_mips(
     fixed_nii: str | Path | None = None,
     chunk_points: int = 250_000,
     overlay_labels: bool = True,
+    boundary_color: str = "white",
+    boundary_linewidth: float = 0.35,
+    boundary_style: str = "dashed",
+    boundary_smooth: float = 1.2,
     percentile: float = 99.5,
     vmax: float | None = None,
     flip_dv: bool = False,
@@ -1233,13 +1467,34 @@ def render_atlas_space_mips(
     tile_z: int = 32,
     tile_x: int = 256,
 ) -> dict[str, object]:
-    """Slab cut in atlas space, sampled back into native space, orthogonal AP MIP."""
-    zarr_path = Path(zarr_path)
-    sample_dir = zarr_path.parent
-    arr = open_zarr_dataset(zarr_path)
-    if arr.ndim != 3:
-        raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {arr.shape}")
-    native_shape = tuple(int(v) for v in arr.shape)
+    """Slab cut in atlas space, sampled back into native space, orthogonal AP MIP.
+
+    ``zarr_path`` accepts one signal zarr or several (comma-separated string or
+    list) for a false-color multi-channel composite; all channels must be zarrs
+    of the same sample (same registration outputs and shape), each drawn with
+    its own colormap from ``cmaps``.
+    """
+    if isinstance(zarr_path, str):
+        zarr_paths = [Path(p.strip()) for p in zarr_path.split(",") if p.strip()]
+    elif isinstance(zarr_path, Path):
+        zarr_paths = [zarr_path]
+    else:
+        zarr_paths = [Path(p) for p in zarr_path]
+    if not zarr_paths:
+        raise ValueError("At least one signal zarr is required")
+    sample_dir = zarr_paths[0].parent
+    if any(p.parent != sample_dir for p in zarr_paths):
+        raise ValueError(
+            "Multi-channel rendering needs zarrs of the same sample directory "
+            f"(got parents: {sorted({str(p.parent) for p in zarr_paths})})"
+        )
+    cmaps = resolve_channel_cmaps(len(zarr_paths), cmaps)
+
+    arrays = [open_zarr_dataset(p) for p in zarr_paths]
+    for p, arr in zip(zarr_paths, arrays):
+        if arr.ndim != 3:
+            raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {arr.shape} for {p}")
+    native_shape = tuple(int(v) for v in arrays[0].shape)
 
     transforms_dir = Path(transforms_dir) if transforms_dir else sample_dir / "transforms"
     label_zarr = Path(label_zarr_path) if label_zarr_path else sample_dir / "upsampled_atlas_label.zarr"
@@ -1276,6 +1531,7 @@ def render_atlas_space_mips(
         import tifffile
 
         atlas_label_volume = tifffile.imread(str(atlas_label_path))
+    boundary_upsample = int(min(8, max(2, round(atlas_res_um / pitch_um))))
 
     outputs: list[dict[str, object]] = []
     for bregma in bregma_mm:
@@ -1298,47 +1554,62 @@ def render_atlas_space_mips(
         fine_y = interp_coarse_to_fine(c_y, coarse_ap=coarse_ap_idx, geometry=geometry)
         fine_x = interp_coarse_to_fine(c_x, coarse_ap=coarse_ap_idx, geometry=geometry)
         del c_z, c_y, c_x
-        mip, sample_stats = sample_mip_from_native_coords(
-            arr, z=fine_z, y=fine_y, x=fine_x, tile_z=tile_z, tile_x=tile_x
+        mips, sample_stats = sample_mip_from_native_coords(
+            arrays, z=fine_z, y=fine_y, x=fine_x, tile_z=tile_z, tile_x=tile_x
         )
         del fine_z, fine_y, fine_x
 
-        nonzero_fraction = float(np.count_nonzero(mip)) / float(mip.size)
-        eff_vmax = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
+        channel_infos = []
+        vmaxs = []
+        for mip, cmap_name, path in zip(mips, cmaps, zarr_paths):
+            nonzero_fraction = float(np.count_nonzero(mip)) / float(mip.size)
+            eff_vmax = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
+            vmaxs.append(eff_vmax)
+            channel_infos.append(
+                {
+                    "zarr": path.name,
+                    "cmap": cmap_name,
+                    "vmax": round(eff_vmax, 1),
+                    "nonzero_fraction": round(nonzero_fraction, 4),
+                }
+            )
 
         boundary = None
         if atlas_label_volume is not None:
-            from scipy import ndimage as ndi
-
             center_ap = int(np.clip(round(geometry.ap_center), 0, atlas_shape[1] - 1))
             label_slice = np.asarray(atlas_label_volume[:, center_ap, :])
-            raw_mask = label_boundary_mask(label_slice)
-            boundary = ndi.zoom(
-                raw_mask,
-                (mip.shape[0] / raw_mask.shape[0], mip.shape[1] / raw_mask.shape[1]),
-                order=0,
-                mode="nearest",
-            ).astype(bool)
+            boundary = label_boundary_lines_mm(
+                label_slice,
+                row_vox_um=atlas_res_um,
+                col_vox_um=atlas_res_um,
+                upsample=boundary_upsample,
+                smoothing=boundary_smooth,
+            )
 
         pool_factor = 1
-        if max_pixels > 0 and mip.shape[0] * mip.shape[1] > max_pixels * max_pixels:
-            pool_factor = int(math.ceil(math.sqrt(mip.shape[0] * mip.shape[1]) / max_pixels))
+        if max_pixels > 0 and mips[0].shape[0] * mips[0].shape[1] > max_pixels * max_pixels:
+            pool_factor = int(math.ceil(math.sqrt(mips[0].shape[0] * mips[0].shape[1]) / max_pixels))
+        stem = "+".join(p.stem for p in zarr_paths)
         out_path = out_dir / (
-            f"{sample_dir.name}_{zarr_path.stem}_atlas_bregma{bregma:+.2f}mm_"
-            f"thick{thickness_mm:.2f}mm_pitch{pitch_um:g}um.png"
+            f"{sample_dir.name}_{stem}_atlas_bregma{bregma:+.2f}mm_"
+            f"thick{thickness_mm:.2f}mm_pitch{pitch_um:g}um_{boundary_style}.png"
         )
         render_atlas_slab_png(
-            mip,
+            mips,
             output_path=out_path,
             bregma_mm=bregma,
             thickness_mm=thickness_mm,
             pitch_um=pitch_um,
             atlas_shape_dv_ap_ml=atlas_shape,
             atlas_res_um=atlas_res_um,
-            vmax=eff_vmax,
-            zarr_path=zarr_path,
+            vmaxs=vmaxs,
+            cmaps=cmaps,
+            zarr_paths=zarr_paths,
             mapper_info=mapper.label_check,
-            boundary_mask=boundary,
+            boundary_lines=boundary,
+            boundary_color=boundary_color,
+            boundary_linewidth=boundary_linewidth,
+            boundary_style=boundary_style,
             flip_dv=flip_dv,
             flip_ml=flip_ml,
             pool_factor=pool_factor,
@@ -1349,26 +1620,26 @@ def render_atlas_space_mips(
                 "atlas_ap_center_index": round(geometry.ap_center, 1),
                 "atlas_ap_window": [round(float(geometry.ap.min()), 1), round(float(geometry.ap.max()), 1)],
                 "planes": int(geometry.ap.size),
-                "grid_rows_cols": [int(mip.shape[0]), int(mip.shape[1])],
+                "grid_rows_cols": [int(mips[0].shape[0]), int(mips[0].shape[1])],
                 "valid_sample_fraction": round(sample_stats["valid_fraction"], 4),
-                "nonzero_fraction": round(nonzero_fraction, 4),
                 "tiles": int(sample_stats["tiles"]),
-                "vmax": round(eff_vmax, 1),
+                "channels": channel_infos,
                 "pool_factor": pool_factor,
-                "boundary_overlay": boundary is not None,
+                "boundary_overlay": bool(boundary),
                 "output": str(out_path),
             }
         )
         logger.info("Rendered %s", out_path)
 
     return {
-        "zarr": str(zarr_path),
+        "zarr": [str(p) for p in zarr_paths],
         "space": "atlas",
         "shape_zyx": list(native_shape),
         "atlas_shape_dv_ap_ml": list(atlas_shape),
         "atlas_res_um": atlas_res_um,
         "pitch_um": pitch_um,
         "thickness_mm": thickness_mm,
+        "cmaps": cmaps,
         "transform_convention": mapper.convention,
         "label_check": mapper.label_check,
         "outputs": outputs,
@@ -1411,7 +1682,33 @@ def build_parser() -> argparse.ArgumentParser:
             "camera MIP along the atlas AP axis."
         )
     )
-    parser.add_argument("--zarr", required=True, help="Signal zarr path, e.g. sample/ch1.zarr")
+    parser.add_argument(
+        "--zarr", required=True,
+        help="Signal zarr path, e.g. sample/ch1.zarr; comma-separate several channels "
+             "of the same sample for a false-color composite (e.g. ch1.zarr,ch2.zarr)",
+    )
+    parser.add_argument(
+        "--cmap", default="",
+        help="Colormap per channel, comma-separated (e.g. green,magenta); default gray "
+             "for one channel or a color palette when several zarrs are given",
+    )
+    parser.add_argument(
+        "--boundary-color", default="white",
+        help="Color of the atlas region boundary overlay (default white)",
+    )
+    parser.add_argument(
+        "--boundary-linewidth", type=float, default=0.35,
+        help="Boundary line width in points (default 0.35)",
+    )
+    parser.add_argument(
+        "--boundary-style", choices=("dashed", "solid"), default="dashed",
+        help="Boundary line style (default dashed)",
+    )
+    parser.add_argument(
+        "--boundary-smooth", type=float, default=1.2,
+        help="Boundary smoothing gaussian in atlas label voxels, heatmap-style "
+             "(default 1.2; 0 disables)",
+    )
     parser.add_argument(
         "--bregma-mm", required=True, type=parse_bregma_list,
         help="AP mm relative to bregma (anterior positive); comma list allowed",
@@ -1497,6 +1794,11 @@ def main(argv: list[str] | None = None) -> int:
             thickness_mm=args.thickness_mm,
             space=args.space,
             pitch_um=args.pitch_um,
+            cmaps=args.cmap or None,
+            boundary_color=args.boundary_color,
+            boundary_linewidth=args.boundary_linewidth,
+            boundary_style=args.boundary_style,
+            boundary_smooth=args.boundary_smooth,
             fixed_nii=args.fixed_nii,
             chunk_points=args.chunk_points,
             bregma_index=args.bregma_index,

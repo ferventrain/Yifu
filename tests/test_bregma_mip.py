@@ -7,12 +7,15 @@ from pipeline_modules.utils.zarr_io import create_output_zarr
 from pipeline_modules.visualization.bregma_mip import (
     AnchorError,
     ApAnchor,
+    _compose_rgb,
     atlas_slab_geometry,
     compute_coronal_slab_mip,
     coronal_row_ap_centers,
     interp_coarse_to_fine,
+    label_boundary_lines_mm,
     label_boundary_mask,
     render_bregma_mips,
+    resolve_channel_cmaps,
     resolve_manual_anchor,
     resolve_voxel_xyz_um,
     sample_mip_from_native_coords,
@@ -175,13 +178,14 @@ class SampleMipFromNativeCoordsTests(unittest.TestCase):
         z = rng.uniform(0, 23, size=(6, 3, 9))
         y = rng.uniform(0, 39, size=(6, 3, 9))
         x = rng.uniform(0, 59, size=(6, 3, 9))
-        mip, stats = sample_mip_from_native_coords(volume, z=z, y=y, x=x, tile_z=8, tile_x=20)
-        self.assertEqual(mip.shape, (6, 9))
+        mips, stats = sample_mip_from_native_coords([volume], z=z, y=y, x=x, tile_z=8, tile_x=20)
+        self.assertEqual(len(mips), 1)
+        self.assertEqual(mips[0].shape, (6, 9))
         from scipy import ndimage as ndi
 
         ref = ndi.map_coordinates(volume, [z.ravel(), y.ravel(), x.ravel()], order=1, mode="constant", cval=0)
         ref = ref.reshape(6, 3, 9).max(axis=1)
-        np.testing.assert_allclose(mip.astype(np.float64), ref, atol=1.0)
+        np.testing.assert_allclose(mips[0].astype(np.float64), ref, atol=1.0)
 
     def test_bright_spot_and_out_of_range(self):
         volume = np.zeros((12, 20, 30), dtype=np.uint16)
@@ -189,7 +193,8 @@ class SampleMipFromNativeCoordsTests(unittest.TestCase):
         z = np.array([[[5.0, 50.0], [1.0, 1.0]], [[5.0, 5.0], [1.0, 1.0]]])  # (rows=2, planes=2, cols=2)
         y = np.full((2, 2, 2), 10.0)
         x = np.full((2, 2, 2), 20.0)
-        mip, _ = sample_mip_from_native_coords(volume, z=z, y=y, x=x, tile_z=32, tile_x=256)
+        mips, _ = sample_mip_from_native_coords([volume], z=z, y=y, x=x, tile_z=32, tile_x=256)
+        mip = mips[0]
         # Out-of-range sample contributes 0; the bright voxel wins via max over planes.
         self.assertEqual(int(mip[0, 0]), 999)
         self.assertEqual(int(mip[0, 1]), 0)
@@ -201,8 +206,95 @@ class SampleMipFromNativeCoordsTests(unittest.TestCase):
         z = np.array([[[4.0], [6.0]]])  # (rows=1, planes=2, cols=1)
         y = np.full((1, 2, 1), 10.0)
         x = np.full((1, 2, 1), 20.0)
-        mip, _ = sample_mip_from_native_coords(volume, z=z, y=y, x=x, tile_z=32, tile_x=256)
-        self.assertEqual(int(mip[0, 0]), 200)
+        mips, _ = sample_mip_from_native_coords([volume], z=z, y=y, x=x, tile_z=32, tile_x=256)
+        self.assertEqual(int(mips[0][0, 0]), 200)
+
+    def test_multi_channel_matches_single(self):
+        rng = np.random.default_rng(11)
+        v1 = rng.integers(0, 4000, size=(16, 30, 40), dtype=np.uint16)
+        v2 = rng.integers(0, 4000, size=(16, 30, 40), dtype=np.uint16)
+        z = rng.uniform(0, 15, size=(5, 2, 7))
+        y = rng.uniform(0, 29, size=(5, 2, 7))
+        x = rng.uniform(0, 39, size=(5, 2, 7))
+        multi, _ = sample_mip_from_native_coords([v1, v2], z=z, y=y, x=x, tile_z=8, tile_x=16)
+        single1, _ = sample_mip_from_native_coords([v1], z=z, y=y, x=x, tile_z=8, tile_x=16)
+        single2, _ = sample_mip_from_native_coords([v2], z=z, y=y, x=x, tile_z=8, tile_x=16)
+        np.testing.assert_array_equal(multi[0], single1[0])
+        np.testing.assert_array_equal(multi[1], single2[0])
+        with self.assertRaises(ValueError):
+            sample_mip_from_native_coords([v1, v2[:8]], z=z, y=y, x=x)
+
+
+class ChannelHelpersTests(unittest.TestCase):
+    def test_resolve_channel_cmaps_defaults(self):
+        self.assertEqual(resolve_channel_cmaps(1, None), ["gray"])
+        self.assertEqual(resolve_channel_cmaps(3, None), ["green", "magenta", "cyan"])
+        self.assertEqual(resolve_channel_cmaps(2, "hot"), ["hot", "hot"])
+        self.assertEqual(resolve_channel_cmaps(2, "green,magenta"), ["green", "magenta"])
+        with self.assertRaises(ValueError):
+            resolve_channel_cmaps(2, "gray,gray,gray")
+
+    def test_compose_rgb_single_gray(self):
+        mip = np.array([[0, 500], [1000, 2000]], dtype=np.uint16)
+        rgb = _compose_rgb([mip], ["gray"], [1000.0])
+        self.assertEqual(rgb.shape, (2, 2, 3))
+        self.assertAlmostEqual(float(rgb[0, 0].max()), 0.0)
+        self.assertAlmostEqual(float(rgb[1, 1].max()), 1.0)  # clipped above vmax
+        self.assertAlmostEqual(float(rgb[0, 1].max()), 0.5, delta=0.01)  # 8-bit cmap
+
+    def test_compose_rgb_two_channels_additive_clipped(self):
+        a = np.full((2, 2), 800, dtype=np.uint16)
+        b = np.full((2, 2), 600, dtype=np.uint16)
+        rgb = _compose_rgb([a, b], ["red", "green"], [1000.0, 1000.0])
+        # 0.8 red + 0.6 green, no channel clipping, no overflow above 1.
+        self.assertAlmostEqual(float(rgb[0, 0, 0]), 0.8, delta=0.01)
+        self.assertAlmostEqual(float(rgb[0, 0, 1]), 0.6, delta=0.01)
+        self.assertAlmostEqual(float(rgb[0, 0, 2]), 0.0)
+
+
+class BoundaryLinesTests(unittest.TestCase):
+    def test_lines_in_mm_bounds(self):
+        labels = np.zeros((20, 30), dtype=np.int32)
+        labels[:, 15:] = 7
+        labels[8:12, 4:9] = 12
+        lines = label_boundary_lines_mm(labels, row_vox_um=25.0, col_vox_um=25.0, upsample=5)
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertEqual(line.shape[1], 2)
+            self.assertGreaterEqual(float(line[:, 0].min()), 0.0)
+            self.assertLessEqual(float(line[:, 0].max()), 30 * 25.0 / 1000.0)
+            self.assertGreaterEqual(float(line[:, 1].min()), 0.0)
+            self.assertLessEqual(float(line[:, 1].max()), 20 * 25.0 / 1000.0)
+
+    def test_shared_border_drawn_once(self):
+        # Two adjoining regions: the shared border must yield exactly one line,
+        # not one contour per region.
+        labels = np.zeros((20, 30), dtype=np.int32)
+        labels[:, :15] = 7
+        labels[:, 15:] = 12
+        lines = label_boundary_lines_mm(labels, row_vox_um=25.0, col_vox_um=25.0, upsample=5)
+        self.assertEqual(len(lines), 1)
+        x = lines[0][:, 0]
+        self.assertGreater(float(x.min()), 14 * 25.0 / 1000.0 - 0.03)
+        self.assertLess(float(x.max()), 16 * 25.0 / 1000.0 + 0.03)
+
+    def test_smoothing_rounds_the_band_centerline(self):
+        # A staircase diagonal border must come out with rounded corners only:
+        # consecutive segments turn gently (no hard 90 deg staircase steps).
+        labels = np.zeros((40, 40), dtype=np.int32)
+        split = np.concatenate([np.full(8, c) for c in (10, 14, 18, 22, 26)])
+        for r in range(40):
+            labels[r, : split[r]] = 7
+            labels[r, split[r] :] = 12
+        lines = label_boundary_lines_mm(labels, row_vox_um=25.0, col_vox_um=25.0, upsample=5)
+        self.assertTrue(lines)
+        line = max(lines, key=len)
+        d = np.diff(line, axis=0)
+        d = d / np.clip(np.linalg.norm(d, axis=1, keepdims=True), 1e-9, None)
+        dots = np.clip(np.sum(d[1:] * d[:-1], axis=1), -1.0, 1.0)
+        # A raw staircase corner would give cos ~ 0 (90 deg turn); smoothed
+        # corners keep every turn below ~14 deg.
+        self.assertTrue(float(dots.min()) > 0.97)
 
 
 class HelperTests(unittest.TestCase):
@@ -280,9 +372,10 @@ class RenderEndToEndTests(unittest.TestCase):
             _, label_arr = create_output_zarr(
                 sample_dir / "upsampled_atlas_label.zarr", shape, (4, 8, 8), "uint32"
             )
+            # Split along ML so the coronal slice at the anchor AP really has a boundary.
             label_arr[:, :, :] = 0
-            label_arr[:, :16, :] = 100
-            label_arr[:, 16:, :] = 200
+            label_arr[:, :, :8] = 100
+            label_arr[:, :, 8:] = 200
 
             payload = render_bregma_mips(
                 zarr_path=sample_dir / "ch1.zarr",
