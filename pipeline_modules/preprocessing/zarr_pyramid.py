@@ -314,7 +314,11 @@ def write_preview_zarr(
         raise PipelineError(ErrorCode.ARGUMENT_INVALID, "Preview factor is too large for this volume", {"shape": list(src.shape), "factor": factor})
 
     root = _open_output_group(zarr, out_path)
-    root.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}]}]
+    try:
+        from pipeline_modules.utils.zarr_io import ome_ngff_multiscales
+    except ImportError:
+        from ..utils.zarr_io import ome_ngff_multiscales
+    root.attrs["multiscales"] = ome_ngff_multiscales(["0"], ndim=3)
     chunks = tuple(min(c, s) for c, s in zip((32, 256, 256), out_shape))
     dst = _create_array(
         root,

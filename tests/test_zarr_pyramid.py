@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -38,3 +39,17 @@ def test_add_resolution_pyramid_writes_ngff_levels(tmp_path: Path):
     assert scales[0]["axes"][0]["name"] == "z"
     assert len(scales[0]["datasets"]) == result["levels"]
     assert scales[0]["datasets"][1]["coordinateTransformations"][0]["scale"][0] == 4.0
+
+
+def test_preview_zarr_multiscales_has_axes_and_scale(tmp_path: Path):
+    """write_preview_zarr must emit full NGFF metadata (napari contract)."""
+    import tifffile
+    from pipeline_modules.preprocessing.zarr_pyramid import write_preview_zarr
+
+    src = tmp_path / "src.zarr"
+    write_array(src, np.arange(64, dtype=np.uint16).reshape(4, 4, 4), chunks=(2, 2, 2))
+    result = write_preview_zarr(src, factor=2)
+    attrs = json.loads((Path(result["output_zarr"]) / ".zattrs").read_text(encoding="utf-8"))
+    ms = attrs["multiscales"][0]
+    assert [a["name"] for a in ms["axes"]] == ["z", "y", "x"]
+    assert ms["datasets"][0]["coordinateTransformations"][0]["scale"] == [1.0, 1.0, 1.0]

@@ -1017,7 +1017,12 @@ def homogenize_surface_brightness(
             dtype=dtype,
             compressor=resolved_compressor,
         )
-        root.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}]}]
+        # Full NGFF axes + ct (bare multiscales breaks ome-zarr readers).
+        try:
+            from pipeline_modules.utils.zarr_io import ome_ngff_multiscales
+        except ImportError:
+            from ..utils.zarr_io import ome_ngff_multiscales
+        root.attrs["multiscales"] = ome_ngff_multiscales(["0"], ndim=3)
 
     def _homogenize_index(index: int) -> np.ndarray:
         image = np.asarray(tifffile.imread(str(tiff_files[index])))

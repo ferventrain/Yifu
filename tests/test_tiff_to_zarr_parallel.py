@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,3 +91,22 @@ class TiffToZarrParallelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNgffMetadataContract(unittest.TestCase):
+    def test_multiscales_has_axes_and_coordinate_transformations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "ch0"
+            output_zarr = root / "ch0.zarr"
+            input_dir.mkdir()
+            for index in range(4):
+                tifffile.imwrite(str(input_dir / f"C1{index:06d}.tif"), np.full((4, 5), index, dtype=np.uint16))
+            convert_tiff_to_zarr(input_dir, output_zarr, chunk_size=(2, 4, 5), workers=1)
+
+            attrs = json.loads((output_zarr / ".zattrs").read_text(encoding="utf-8"))
+            ms = attrs["multiscales"][0]
+            self.assertIn("axes", ms, "napari-ome-zarr assumes 5D when axes are missing")
+            self.assertEqual([a["name"] for a in ms["axes"]], ["z", "y", "x"])
+            for dataset in ms["datasets"]:
+                self.assertIn("coordinateTransformations", dataset)

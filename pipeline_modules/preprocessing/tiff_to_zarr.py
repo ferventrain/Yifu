@@ -300,10 +300,13 @@ def convert_tiff_to_zarr(
         dtype=dtype,
         compressor=resolved_compressor,
     )
-    root.attrs["multiscales"] = [{
-        "version": "0.4",
-        "datasets": [{"path": dataset_name}],
-    }]
+    # Full NGFF axes + coordinateTransformations — a bare multiscales makes
+    # ome-zarr readers (napari-ome-zarr) assume 5D and fail to open the store.
+    try:
+        from pipeline_modules.utils.zarr_io import ome_ngff_multiscales
+    except ImportError:
+        from ..utils.zarr_io import ome_ngff_multiscales
+    root.attrs["multiscales"] = ome_ngff_multiscales([dataset_name], ndim=3)
 
     read_batch = resolve_read_z_chunk(chunk_size[0], read_z_chunk)
     worker_count = resolve_tiff_workers(
