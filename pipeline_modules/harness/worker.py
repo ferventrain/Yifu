@@ -54,6 +54,7 @@ from pipeline_modules.harness.verify import (
     write_artifact_manifest,
 )
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
+from pipeline_modules.utils.run_manifest import collect_code_version
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -231,6 +232,7 @@ class HarnessWorker:
         job["ended_at"] = None
         job["error"] = None
         job["cancel_requested"] = False
+        job["code_version"] = collect_code_version()
         self.store.save_job(job)
         touch_heartbeat(progress_path(job_id, self.store.active))
 

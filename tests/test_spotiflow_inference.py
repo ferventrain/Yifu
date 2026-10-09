@@ -16,6 +16,11 @@ class _FakeSpotiflow:
     _prob_thresh = [0.35]
     predict_calls = 0
 
+    def __init__(self):
+        # Real models expose their inference config; the pipeline reads
+        # compute_flow from it to decide subpixel refinement.
+        self.config = type("Config", (), {"compute_flow": True})()
+
     @classmethod
     def from_folder(cls, *args, **kwargs):
         return cls()

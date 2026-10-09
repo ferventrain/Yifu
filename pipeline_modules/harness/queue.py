@@ -27,6 +27,7 @@ from pipeline_modules.harness.results import load_config
 from pipeline_modules.harness.timing import load_timing_history
 from pipeline_modules.harness.verify import normalize_error
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
+from pipeline_modules.utils.run_manifest import collect_code_version
 
 JOB_STATUSES = ("queued", "running", "verifying", "succeeded", "failed", "cancelled", "stalled")
 #: Statuses that mean "this sample already has an active run" for dedupe.
@@ -162,6 +163,9 @@ class ActiveStore:
             "cancel_requested": False,
             "project_name": cfg.get("project_name"),
             "extra_args": [str(item) for item in (extra_args or [])],
+            # Code pin at submission; the worker re-stamps this when the job
+            # actually starts, in case the queue sat through a code change.
+            "code_version": collect_code_version(),
         }
         write_json_atomic(job_file(job_id, self.active), record)
         ids = self._queue_ids()

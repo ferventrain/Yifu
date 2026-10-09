@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import zarr
 
+from pipeline_modules.utils.zarr_io import write_array
 from pipeline_modules.tubule_reconstruction.mask_downsample import (
     block_reduce_binary,
     default_occupancy_threshold,
@@ -81,11 +82,10 @@ def test_lee_skeleton_is_thin_tube(tmp_path: Path):
 
 
 def test_native_radius_recovers_cylinder_radius(tmp_path: Path):
-    root = zarr.open_group(str(tmp_path / "mask.zarr"), mode="w")
     volume = np.zeros((48, 32, 32), dtype=np.uint8)
     yy, xx = np.ogrid[:32, :32]
     volume[:, (yy - 16) ** 2 + (xx - 16) ** 2 <= 5**2] = 1
-    root.create_dataset("0", data=volume, chunks=(16, 16, 16), dtype=np.uint8)
+    write_array(tmp_path / "mask.zarr", volume, chunks=(16, 16, 16))
 
     out_dir = tmp_path / "ve"
     summary = reconstruct_vessel_express(
@@ -114,10 +114,9 @@ def test_upsample_coarse_coords_lands_in_native_cell():
 
 
 def test_preview_chunks_max_pool_4x(tmp_path: Path):
-    root = zarr.open_group(str(tmp_path / "mask.zarr"), mode="w")
     volume = np.zeros((16, 16, 16), dtype=np.uint8)
     volume[:, 8, 8] = 1
-    root.create_dataset("0", data=volume, chunks=(8, 8, 8), dtype=np.uint8)
+    write_array(tmp_path / "mask.zarr", volume, chunks=(8, 8, 8))
     summary = run_preview_chunks(
         tmp_path / "mask.zarr",
         tmp_path / "preview",
@@ -237,8 +236,8 @@ def test_native_edt_radius_on_cylinder(tmp_path: Path):
     vol = np.zeros((40, 40, 40), dtype=np.uint8)
     yy, xx = np.ogrid[:40, :40]
     vol[:, (yy - 20) ** 2 + (xx - 20) ** 2 <= 6**2] = 1
-    root = zarr.open_group(str(tmp_path / "mask.zarr"), mode="w")
-    root.create_dataset("0", data=vol, chunks=(16, 16, 16))
+    write_array(tmp_path / "mask.zarr", vol, chunks=(16, 16, 16))
+    root = zarr.open_group(str(tmp_path / "mask.zarr"), mode="r")
     pts = np.array([[20, 20, 20]], dtype=np.int64)
     radii = sample_native_edt_radii(
         root["0"],

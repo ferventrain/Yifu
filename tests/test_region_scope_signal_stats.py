@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,10 +10,20 @@ from pipeline_modules.utils.zarr_io import write_array
 from pipeline_modules.visualization.region_scope_signal_stats import compute_region_scope_signal_stats
 
 
+def _write_min_config(root: Path) -> Path:
+    config_path = root / "config.json"
+    config_path.write_text(
+        json.dumps({"input": {"channels": {"signal": "3", "registration": "0"}}}),
+        encoding="utf-8",
+    )
+    return config_path
+
+
 class RegionScopeSignalStatsTests(unittest.TestCase):
     def test_compute_region_scope_signal_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            config_path = _write_min_config(root)
             mask_path = root / "mask.zarr"
             label_path = root / "label.zarr"
             signal_path = root / "signal.zarr"
@@ -36,6 +47,7 @@ class RegionScopeSignalStatsTests(unittest.TestCase):
                     sample_dir=root,
                     region_query="HIP",
                     signal_ch="ch3",
+                    config_path=config_path,
                     mask_zarr_path=mask_path,
                     label_zarr_path=label_path,
                     signal_zarr_path=signal_path,

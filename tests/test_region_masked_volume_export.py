@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,16 @@ from pipeline_modules.visualization.region_masked_volume_export import (
     export_region_masked_volume_tiffs_for_channels,
     export_region_masked_volume_tiffs_from_tiff,
 )
+
+
+def _write_min_config(root: Path) -> Path:
+    config_path = root / "config.json"
+    config_path.write_text(
+        json.dumps({"input": {"channels": {"signal": "3", "registration": "0"}}}),
+        encoding="utf-8",
+    )
+    return config_path
+
 class RegionMaskedVolumeExportTests(unittest.TestCase):
     def test_masked_signal_slice_applies_region_and_mask(self):
         signal = np.array([[10, 20], [30, 40]], dtype=np.uint16)
@@ -79,6 +90,7 @@ class RegionMaskedVolumeExportTests(unittest.TestCase):
                     sample_dir=root,
                     region_query="HIP",
                     signal_ch="ch3",
+                    config_path=_write_min_config(root),
                     signal_tiff_dir=signal_dir,
                     label_tiff_dir=label_dir,
                     export_mode="signal",

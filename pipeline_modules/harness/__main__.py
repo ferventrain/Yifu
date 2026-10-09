@@ -134,6 +134,7 @@ def cmd_preflight(args: argparse.Namespace, store: ActiveStore) -> int:
     store.validate_sample_dir(spec.sample_dir)
     store.validate_config(spec.config_path)
     from pipeline_modules.harness.worker import worker_snapshot
+    from pipeline_modules.utils.run_manifest import collect_code_version
 
     print(
         json.dumps(
@@ -146,6 +147,7 @@ def cmd_preflight(args: argparse.Namespace, store: ActiveStore) -> int:
                 "required_outputs": [str(p) for p in required_outputs(spec.sample_dir, config, list(spec.extra_args))],
                 "active_run": (store.find_active_for_sample(spec.sample_dir) or {}).get("id"),
                 "worker": worker_snapshot(store.active),
+                "code_version": collect_code_version(),
             },
             indent=2,
             ensure_ascii=False,

@@ -68,12 +68,14 @@ def test_compute_block_qc_metrics_emits_one_record_per_block(tmp_path: Path):
     )
 
     assert len(records) == 8
-    assert records[0]["sample_id"] == "sample"
-    assert records[0]["block_id"] == "block_000001"
-    assert records[0]["chunk_index"] == "0.0.0"
-    assert records[0]["block_start_zyx"] == "0,0,0"
-    assert records[0]["block_stop_zyx"] == "2,2,2"
-    assert records[0]["block_shape_zyx"] == "2,2,2"
+    # Records are collected by a thread pool, so order is not guaranteed —
+    # look the block up by its chunk index instead of taking records[0].
+    first = next(record for record in records if record["chunk_index"] == "0.0.0")
+    assert first["sample_id"] == "sample"
+    assert first["block_id"] == "sample_0-0-0"
+    assert first["block_start_zyx"] == "0,0,0"
+    assert first["block_stop_zyx"] == "2,2,2"
+    assert first["block_shape_zyx"] == "2,2,2"
 
 
 def test_compute_block_qc_metrics_skips_low_signal_blocks(tmp_path: Path):
@@ -195,7 +197,8 @@ def test_build_review_queue_uses_small_component_ratio_in_score(tmp_path: Path):
 
 
 def test_export_block_previews_writes_image_and_mask_tiffs(tmp_path: Path):
-    image = np.arange(64, dtype=np.uint16).reshape(4, 4, 4)
+    # +100 so every block passes the default skip_below_threshold=100 QC gate.
+    image = np.arange(64, dtype=np.uint16).reshape(4, 4, 4) + 100
     mask = np.zeros((4, 4, 4), dtype=np.uint8)
     mask[0:2, 0:2, 0:2] = 1
     prob = np.full((4, 4, 4), 0.95, dtype=np.float32)

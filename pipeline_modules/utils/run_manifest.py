@@ -9,6 +9,9 @@ This lets agents (and humans) answer three questions without rereading code:
 1. Did this directory come from a specific pipeline run?
 2. What inputs and parameters produced it?
 3. What output files are expected to exist, and at what sizes?
+
+Plus, since schema 2, which code produced it: the ``code`` section pins the
+repo's git commit (and dirty state) plus key package versions.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import json
 import os
 import platform
 import socket
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -25,7 +29,62 @@ from typing import Any, Iterable, Mapping
 
 
 MANIFEST_FILENAME = "_run_manifest.json"
-MANIFEST_SCHEMA_VERSION = "1"
+MANIFEST_SCHEMA_VERSION = "2"
+
+#: Packages whose versions matter for reproducing pipeline outputs. Missing
+#: ones are silently skipped so manifests never fail because of them.
+TRACKED_PACKAGES = ("numpy", "scipy", "torch", "zarr", "numcodecs", "ants", "cv2", "h5py")
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _git(repo_root: Path, *args: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def collect_code_version(repo_root: str | Path | None = None) -> dict[str, Any]:
+    """Best-effort code pin: git commit/branch/dirty of the pipeline repo.
+
+    Never raises; every field degrades to ``None`` when git is missing or the
+    folder is not a repository (e.g. code copied to a data disk).
+    """
+    root = Path(repo_root) if repo_root else _REPO_ROOT
+    commit = _git(root, "rev-parse", "HEAD")
+    dirty: bool | None = None
+    if commit is not None:
+        status = _git(root, "status", "--porcelain")
+        dirty = bool(status)
+    return {
+        "git_commit": commit,
+        "git_branch": _git(root, "rev-parse", "--abbrev-ref", "HEAD"),
+        "git_dirty": dirty,
+        "repo_root": str(root),
+    }
+
+
+def package_versions() -> dict[str, str]:
+    """Versions of the tracked scientific packages that are installed."""
+    import importlib.metadata
+
+    versions: dict[str, str] = {}
+    for name in TRACKED_PACKAGES:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except Exception:
+            continue
+    return versions
 
 
 def _sanitize_for_json(value: Any) -> Any:
@@ -101,6 +160,10 @@ def build_run_manifest(
         "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
         "ended_at": datetime.fromtimestamp(ended_at, tz=timezone.utc).isoformat(),
         "duration_seconds": float(ended_at - started_at),
+        "code": {
+            **collect_code_version(),
+            "packages": package_versions(),
+        },
         "host": {
             "hostname": socket.gethostname(),
             "platform": platform.platform(),

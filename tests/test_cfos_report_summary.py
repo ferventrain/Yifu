@@ -10,7 +10,7 @@ from pipeline_modules.visualization.cfos_report_summary import (
     summary_json_path,
     write_summary_json,
 )
-from tests.test_cfos_report_data import write_density_excel, write_groups_json, write_region_csv
+from test_cfos_report_data import write_density_excel, write_groups_json, write_region_csv
 
 
 def test_build_summary_payload_fields(tmp_path):

@@ -9,10 +9,43 @@ project_root = Path(__file__).parent
 sys.path.append(str(project_root))
 PYTHON_EXE = sys.executable
 
+from pipeline_modules.utils.step_markers import mark_step_complete, step_or_legacy_complete
+
+
+def _marker_check(outputs, inputs, payload, outputs_present):
+    """step_or_legacy_complete with a stub lane: always incomplete so every
+    step still builds and records its command."""
+    if _STUB["enabled"]:
+        return False, "stub mode"
+    return step_or_legacy_complete(outputs, inputs, payload, outputs_present)
+
+
+def _mark_done(outputs, inputs, payload):
+    """mark_step_complete with a stub lane: touch the declared outputs (empty
+    files; directories get a ``.stub`` placeholder) so downstream exists()
+    gates keep the wiring flowing without running anything."""
+    if not _STUB["enabled"]:
+        mark_step_complete(outputs, inputs, payload)
+        return
+    for raw in outputs:
+        path = Path(raw)
+        if path.suffix in {"", ".zarr"}:
+            path.mkdir(parents=True, exist_ok=True)
+            if not any(path.iterdir()):
+                (path / ".stub").touch()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+
 MAIN_PIPELINE_REGISTRATION_MODE = "atlas2image"
 PIPELINE_STEP_COUNT = 6
 _PROGRESS = None
 _STEP_TOTAL = PIPELINE_STEP_COUNT
+
+#: Stub-run state: when enabled, every shell command is recorded and skipped
+#: (no algorithm runs) while each step still touches its declared outputs, so
+#: the whole 6-step wiring is exercised in seconds on a bare sample dir.
+_STUB = {"enabled": False, "commands": []}
 
 
 def print_pipeline_banner(sample_dir, config_path):
@@ -46,6 +79,13 @@ def print_note(message):
 
 def run_command(cmd, desc, *, show_command=True):
     """Run a shell command and print output."""
+    if _STUB["enabled"]:
+        _STUB["commands"].append({"desc": desc, "cmd": cmd})
+        print(f"  STUB: {desc}")
+        if _PROGRESS is not None:
+            _PROGRESS.note(f"STUB: {desc}")
+        return
+
     print(f"\n  >> {desc}")
     if show_command:
         print(f"     Command: {cmd}")
@@ -219,15 +259,18 @@ def ensure_signal_tiff_dir(sample_dir, signal_ch, preprocessing_cfg, *, output_d
     preprocessor = Preprocessor(preprocessing_cfg)
     if preprocessor.steps:
         enhanced_dir = Path(output_dir) if output_dir is not None else sample_dir / f"ch{signal_ch}_preprocessed"
-        success = preprocessor.process_folder(
-            input_folder=current_signal_tiff_dir,
-            output_folder=enhanced_dir,
-            max_workers=None,
-            resume=True,
-        )
-        if not success:
-            print("Preprocessing failed, exiting.")
-            sys.exit(1)
+        if _STUB["enabled"]:
+            print(f"  STUB: preprocess {len(preprocessor.steps)} step(s) over {current_signal_tiff_dir}")
+        else:
+            success = preprocessor.process_folder(
+                input_folder=current_signal_tiff_dir,
+                output_folder=enhanced_dir,
+                max_workers=None,
+                resume=True,
+            )
+            if not success:
+                print("Preprocessing failed, exiting.")
+                sys.exit(1)
         current_signal_tiff_dir = enhanced_dir
     else:
         print_note("No TIFF enhancement steps enabled; using raw signal channel.")
@@ -237,33 +280,37 @@ def ensure_signal_tiff_dir(sample_dir, signal_ch, preprocessing_cfg, *, output_d
 
 def ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg):
     zarr_path = sample_dir / f"ch{signal_ch}.zarr"
+    payload = {"step": "signal_zarr", "chunk_size": list(zarr_cfg["chunk_size"])}
 
-    if zarr_path.exists():
-        print_skip(f"Signal Zarr already exists: {zarr_path}")
+    complete, reason = _marker_check([zarr_path], [signal_tiff_dir], payload, lambda: zarr_path.exists())
+    if complete:
+        print_skip(f"Signal Zarr up to date ({reason}): {zarr_path}")
     else:
+        if zarr_path.exists():
+            print_note(f"Signal Zarr exists but {reason}; rebuilding to avoid a partial store.")
         run_tiff_to_zarr(
             signal_tiff_dir,
             zarr_path,
             zarr_cfg["chunk_size"],
             "3.3 Convert signal TIFF to Zarr",
         )
+        _mark_done([zarr_path], [signal_tiff_dir], payload)
 
     return zarr_path
 
 
-def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
+def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res, halo_mask=True):
     reg_downsample_dir = sample_dir / f"ch{reg_ch}_downsample"
     reg_nifti_path = reg_downsample_dir / "volume.nii.gz"
 
-    if reg_nifti_path.exists():
-        print_skip(f"Registration downsample already exists: {reg_nifti_path}")
-        return
-
+    halo_flag = "" if halo_mask else " --no-halo_mask"
     target_str = ",".join(f"{float(value):.4f}" for value in target_res)
     reg_tiff_dir = sample_dir / f"ch{reg_ch}"
     reg_zarr_path = sample_dir / f"ch{reg_ch}.zarr"
     reg_downsampled_zarr = sample_dir / f"ch{reg_ch}_downsampled.zarr"
 
+    # Resolve the source branch first so the completion marker can be checked
+    # against the exact inputs/payload of the command that would run.
     if not reg_tiff_dir.exists() and reg_downsampled_zarr.exists():
         from pipeline_modules.preprocessing.zarr_to_registration_nii import resolve_input_resolution_xyz
 
@@ -276,11 +323,16 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
             f'--output_nii "{reg_nifti_path}" '
             f'--input_resolution_xyz "{input_str}" '
             f'--target_resolution_xyz "{target_str}"'
+            f"{halo_flag}"
         )
-        run_command(cmd, "1.1 Downsample registration channel (from coarse Zarr)")
-        return
-
-    if not reg_tiff_dir.exists() and reg_zarr_path.exists():
+        desc = "1.1 Downsample registration channel (from coarse Zarr)"
+        source_input, payload = reg_downsampled_zarr, {
+            "step": "registration_downsample",
+            "variant": "coarse_zarr",
+            "target_resolution_xyz": list(target_res),
+            "halo_mask": bool(halo_mask),
+        }
+    elif not reg_tiff_dir.exists() and reg_zarr_path.exists():
         input_str = ",".join(f"{float(value):.4f}" for value in input_res)
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.zarr_to_registration_nii '
@@ -288,23 +340,46 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res):
             f'--output_nii "{reg_nifti_path}" '
             f'--input_resolution_xyz "{input_str}" '
             f'--target_resolution_xyz "{target_str}"'
+            f"{halo_flag}"
         )
-        run_command(cmd, "1.1 Downsample registration channel (from Zarr)")
+        desc = "1.1 Downsample registration channel (from Zarr)"
+        source_input, payload = reg_zarr_path, {
+            "step": "registration_downsample",
+            "variant": "zarr",
+            "input_resolution_xyz": list(input_res),
+            "target_resolution_xyz": list(target_res),
+            "halo_mask": bool(halo_mask),
+        }
+    else:
+        try:
+            factor_str = calculate_downsample_factor_str(input_res, target_res)
+            print_note(f"Downsample factors (z,y,x): {factor_str}")
+        except ValueError as exc:
+            print(f"Error calculating downsample factors from config: {exc}")
+            sys.exit(1)
+
+        cmd = (
+            f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.downsample '
+            f'--input_folder "{reg_tiff_dir}" '
+            f'--factor "{factor_str}"'
+        )
+        desc = "1.1 Downsample registration channel"
+        source_input, payload = reg_tiff_dir, {
+            "step": "registration_downsample",
+            "variant": "tiff",
+            "input_resolution_xyz": list(input_res),
+            "target_resolution_xyz": list(target_res),
+            "halo_mask": bool(halo_mask),
+        }
+
+    complete, reason = _marker_check([reg_nifti_path], [source_input], payload, lambda: reg_nifti_path.exists())
+    if complete:
+        print_skip(f"Registration downsample up to date ({reason}): {reg_nifti_path}")
         return
-
-    try:
-        factor_str = calculate_downsample_factor_str(input_res, target_res)
-        print_note(f"Downsample factors (z,y,x): {factor_str}")
-    except ValueError as exc:
-        print(f"Error calculating downsample factors from config: {exc}")
-        sys.exit(1)
-
-    cmd = (
-        f'"{PYTHON_EXE}" -m pipeline_modules.preprocessing.downsample '
-        f'--input_folder "{reg_tiff_dir}" '
-        f'--factor "{factor_str}"'
-    )
-    run_command(cmd, "1.1 Downsample registration channel")
+    if reg_nifti_path.exists():
+        print_note(f"Registration NIfTI exists but {reason}; rebuilding.")
+    run_command(cmd, desc)
+    _mark_done([reg_nifti_path], [source_input], payload)
 
 
 def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_zarr_path=None):
@@ -479,14 +554,23 @@ def ensure_spotiflow_outputs(
     if label_zarr_path or model_cfg.get("label_zarr"):
         outputs.append(region_counts_csv)
 
+    sf_inputs = [zarr_path]
+    if label_zarr_path and Path(label_zarr_path).exists():
+        sf_inputs.append(Path(label_zarr_path))
+    sf_payload = {"step": "spotiflow", "config": model_cfg}
+
     force_rerun = spotiflow_outputs_are_stale(model_cfg, outputs)
-    outputs_ready = all(Path(path).exists() for path in outputs)
     if force_rerun:
         print_note("Spotiflow model is newer than existing outputs; rerunning detection.")
 
-    if outputs_ready and not force_rerun:
-        print_skip(f"Spotiflow outputs already exist: {output_csv}")
+    complete, reason = _marker_check(
+        outputs, sf_inputs, sf_payload, lambda: all(Path(path).exists() for path in outputs)
+    )
+    if complete and not force_rerun:
+        print_skip(f"Spotiflow outputs up to date ({reason}): {output_csv}")
         return output_csv, region_counts_csv, summary_json
+    if not complete and outputs and all(Path(path).exists() for path in outputs):
+        print_note(f"Spotiflow outputs exist but {reason}; rerunning detection.")
 
     cmd = build_spotiflow_command(
         model_cfg,
@@ -498,6 +582,7 @@ def ensure_spotiflow_outputs(
         density_cfg_path=density_cfg_path,
     )
     run_command(cmd, "4.1 Spotiflow whole-brain signal detection")
+    _mark_done(outputs, sf_inputs, sf_payload)
     return output_csv, region_counts_csv, summary_json
 
 
@@ -529,14 +614,32 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     if force_rerun:
         print_note("cFos U-Net checkpoint is newer than existing outputs; rerunning segmentation.")
 
-    if not force_rerun and mask_zarr_path.exists() and probability_ready:
-        print_skip(f"Mask Zarr already exists: {mask_zarr_path}")
-        if not export_mask_tiff:
-            return mask_zarr_path, mask_tiff_dir
+    seg_outputs = [mask_zarr_path]
+    if probability_zarr_path is not None:
+        seg_outputs.append(probability_zarr_path)
+    if export_mask_tiff:
+        seg_outputs.append(mask_tiff_dir)
+    seg_inputs = [zarr_path]
+    if seg_cfg["method"] == "cfos_unet":
+        checkpoint_path = cfos_unet_checkpoint_path(seg_cfg["cfos_unet"])
+        if checkpoint_path is not None and checkpoint_path.exists():
+            seg_inputs.append(checkpoint_path)
+    seg_payload = {"step": "segmentation", "method": seg_cfg["method"], "config": seg_cfg}
 
-    if export_mask_tiff and not force_rerun and directory_has_files(mask_tiff_dir) and probability_ready:
-        print_skip(f"Mask TIFF folder already exists: {mask_tiff_dir}")
+    seg_legacy_present = lambda: (
+        mask_zarr_path.exists()
+        and probability_ready
+        and (not export_mask_tiff or directory_has_files(mask_tiff_dir))
+    )
+    complete, reason = _marker_check(seg_outputs, seg_inputs, seg_payload, seg_legacy_present)
+    if not force_rerun and complete:
+        print_skip(f"Segmentation outputs up to date ({reason}): {mask_zarr_path}")
         return mask_zarr_path, mask_tiff_dir
+    if reason.startswith(("step parameters changed", "input changed", "input missing")):
+        force_rerun = True
+        print_note(f"Segmentation invalidated ({reason}); rerunning.")
+    elif not force_rerun and (mask_zarr_path.exists() or directory_has_files(mask_tiff_dir)):
+        print_note(f"Segmentation outputs exist but {reason}; completing missing pieces.")
 
     segmentation_ran = False
     if force_rerun or not seg_target_mask.exists() or not probability_ready:
@@ -579,6 +682,7 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
     elif not export_mask_tiff:
         print_skip("Mask TIFF export disabled (segmentation.export_mask_tiff=false).")
 
+    _mark_done(seg_outputs, seg_inputs, seg_payload)
     return mask_zarr_path, mask_tiff_dir
 
 
@@ -596,15 +700,31 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
         print_skip("Atlas label outputs disabled (save_upsampled_label and save_upsampled_label_zarr are both false).")
         return None, None
 
-    requested_outputs_exist = (
+    atlas_path = resolve_project_path(reg_cfg["atlas_path"])
+    annotation_path = resolve_project_path(reg_cfg["annotation_path"])
+    transforms_dir = sample_dir / "transforms"
+    reg_nifti_path = sample_dir / f"ch{reg_ch}_downsample" / "volume.nii.gz"
+    # 2.1 registration marker: the label outputs 2.1 actually writes (label
+    # Zarr from 2.2 and hemisphere Zarr from 2.3 have their own markers, so a
+    # deleted downstream Zarr never triggers an expensive re-registration).
+    # Transforms are deliberately NOT tracked: older runs may lack them and
+    # the hemisphere step has a transform-less fallback.
+    reg_outputs = ([warped_label_dir] if save_label_tiff else []) + (
+        [warped_label_zarr_path] if save_label_zarr and not save_label_tiff else []
+    )
+    reg_inputs = [atlas_path, annotation_path, reg_nifti_path]
+    reg_payload = {"step": "ants_registration", "config": reg_cfg, "signal_ch": signal_ch, "reg_ch": reg_ch}
+    reg_legacy_present = lambda: (
         (not save_label_tiff or directory_has_files(warped_label_dir))
         and (not save_label_zarr or warped_label_zarr_path.exists())
     )
-    if requested_outputs_exist:
-        print_skip("Registration label outputs already exist.")
+
+    complete, reason = _marker_check(reg_outputs, reg_inputs, reg_payload, reg_legacy_present)
+    if complete:
+        print_skip(f"Registration outputs up to date ({reason}).")
     else:
-        atlas_path = resolve_project_path(reg_cfg["atlas_path"])
-        annotation_path = resolve_project_path(reg_cfg["annotation_path"])
+        if warped_label_zarr_path.exists() or directory_has_files(warped_label_dir):
+            print_note(f"Registration outputs exist but {reason}; re-registering.")
         transform_type = reg_cfg.get("transform_type", "SyN")
         cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.registration.ANTs_registration '
@@ -620,51 +740,81 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
             f'--config "{config_path}"'
         )
         run_command(cmd, "2.1 ANTs registration (atlas -> image)")
+        _mark_done(reg_outputs, reg_inputs, reg_payload)
 
     # Ensure label Zarr for downstream modules when requested. Older registration
     # runs may have produced only the TIFF stack.
-    if save_label_zarr and not warped_label_zarr_path.exists():
-        if not directory_has_files(warped_label_dir):
-            print(f"Error: Label Zarr requested, but TIFF stack is unavailable at {warped_label_dir}.")
-            sys.exit(1)
-        run_tiff_to_zarr(
-            warped_label_dir,
-            warped_label_zarr_path,
-            zarr_cfg["chunk_size"],
-            "2.2 Convert atlas label TIFF to Zarr",
-        )
+    zarr_payload = {"step": "label_tiff_to_zarr", "chunk_size": list(zarr_cfg["chunk_size"])}
+    if save_label_zarr and warped_label_zarr_path.exists() and not directory_has_files(warped_label_dir):
+        # Production keeps only the Zarr (the TIFF stack is removed below when
+        # save_upsampled_label=false); with the source gone there is nothing to
+        # rebuild from, so the existing Zarr stands.
+        print_skip(f"Atlas label Zarr exists (TIFF source removed): {warped_label_zarr_path}")
     elif save_label_zarr:
-        print_skip(f"Atlas label Zarr already exists: {warped_label_zarr_path}")
+        zarr_complete, zarr_reason = _marker_check(
+            [warped_label_zarr_path], [warped_label_dir], zarr_payload, lambda: warped_label_zarr_path.exists()
+        )
+        if zarr_complete:
+            print_skip(f"Atlas label Zarr up to date ({zarr_reason}): {warped_label_zarr_path}")
+        else:
+            if not directory_has_files(warped_label_dir):
+                print(f"Error: Label Zarr requested, but TIFF stack is unavailable at {warped_label_dir}.")
+                sys.exit(1)
+            if warped_label_zarr_path.exists():
+                print_note(f"Atlas label Zarr exists but {zarr_reason}; rebuilding.")
+            run_tiff_to_zarr(
+                warped_label_dir,
+                warped_label_zarr_path,
+                zarr_cfg["chunk_size"],
+                "2.2 Convert atlas label TIFF to Zarr",
+            )
+            _mark_done([warped_label_zarr_path], [warped_label_dir], zarr_payload)
 
     save_hemisphere_zarr = bool(reg_cfg.get("save_upsampled_label_hemisphere_zarr", False))
     hemisphere_zarr_path = sample_dir / "atlas_label_hemisphere.zarr"
-    if save_hemisphere_zarr and not hemisphere_zarr_path.exists():
-        transforms_dir = sample_dir / "transforms"
+    if save_hemisphere_zarr:
         if transforms_dir.is_dir() and any(transforms_dir.glob("fwd_*")):
             # Preferred: warp the standard-space midline plane with the saved
             # registration transform (split follows the registered midline).
-            cmd = (
-                f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
-                f'--sample_dir "{sample_dir}" '
-                f'--output "{hemisphere_zarr_path}"'
-            )
-            run_command(cmd, "2.3 Hemisphere Zarr from registration transform")
+            hemi_payload = {"step": "hemisphere_from_transform"}
+            hemi_inputs = [transforms_dir]
         else:
             hemisphere_input = warped_label_zarr_path if warped_label_zarr_path.exists() else warped_label_dir
             if not Path(hemisphere_input).exists():
                 print(f"Error: Hemisphere Zarr requested, but atlas label input is unavailable at {hemisphere_input}.")
                 sys.exit(1)
-            chunk_str = format_csv(zarr_cfg["chunk_size"])
-            cmd = (
-                f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
-                f'--input "{hemisphere_input}" '
-                f'--output "{hemisphere_zarr_path}" '
-                f'--chunk_size "{chunk_str}" '
-                f'--dataset_name "0"'
-            )
-            run_command(cmd, "2.3 Convert atlas label to hemisphere Zarr (single-plane fallback)")
-    elif save_hemisphere_zarr:
-        print_skip(f"Hemisphere Zarr already exists: {hemisphere_zarr_path}")
+            hemi_payload = {
+                "step": "hemisphere_from_label",
+                "chunk_size": list(zarr_cfg["chunk_size"]),
+                "dataset_name": "0",
+            }
+            hemi_inputs = [hemisphere_input]
+        hemi_complete, hemi_reason = _marker_check(
+            [hemisphere_zarr_path], hemi_inputs, hemi_payload, lambda: hemisphere_zarr_path.exists()
+        )
+        if hemi_complete:
+            print_skip(f"Hemisphere Zarr up to date ({hemi_reason}): {hemisphere_zarr_path}")
+        else:
+            if hemisphere_zarr_path.exists():
+                print_note(f"Hemisphere Zarr exists but {hemi_reason}; rebuilding.")
+            if hemi_payload["step"] == "hemisphere_from_transform":
+                cmd = (
+                    f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
+                    f'--sample_dir "{sample_dir}" '
+                    f'--output "{hemisphere_zarr_path}"'
+                )
+                run_command(cmd, "2.3 Hemisphere Zarr from registration transform")
+            else:
+                chunk_str = format_csv(zarr_cfg["chunk_size"])
+                cmd = (
+                    f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
+                    f'--input "{hemisphere_input}" '
+                    f'--output "{hemisphere_zarr_path}" '
+                    f'--chunk_size "{chunk_str}" '
+                    f'--dataset_name "0"'
+                )
+                run_command(cmd, "2.3 Convert atlas label to hemisphere Zarr (single-plane fallback)")
+            _mark_done([hemisphere_zarr_path], hemi_inputs, hemi_payload)
 
     if not save_label_tiff and directory_has_files(warped_label_dir):
         remove_path(warped_label_dir)
@@ -1102,7 +1252,17 @@ def main():
         default=None,
         help="Write structured progress JSON for the pipeline harness UI",
     )
+    parser.add_argument(
+        "--stub",
+        action="store_true",
+        help="Stub run: record every step's command and touch its outputs "
+        "without running any algorithm (wiring check for CI/tests)",
+    )
     args = parser.parse_args()
+
+    if args.stub:
+        _STUB["enabled"] = True
+        print("Running Pipeline in STUB mode (commands recorded, nothing executes).")
 
     if args.test:
         print("Running Pipeline in TEST Mode...")
@@ -1143,6 +1303,14 @@ def main():
 
     try:
         _run_pipeline(args, cfg, config_path, sample_dir)
+        if _STUB["enabled"]:
+            summary = {
+                "stub": True,
+                "command_count": len(_STUB["commands"]),
+                "commands": [entry["desc"] for entry in _STUB["commands"]],
+            }
+            print("STUB_SUMMARY " + json.dumps(summary, ensure_ascii=False))
+            return
         if _PROGRESS is not None:
             from pipeline_modules.harness.results import collect_existing_results
 
@@ -1219,12 +1387,16 @@ def _run_pipeline(args, cfg, config_path, sample_dir):
         return
 
     print_step(1, "Registration channel downsample")
-    ensure_registration_downsample(
-        sample_dir,
-        reg_ch,
-        cfg["input"]["resolution_xyz"],
-        preprocessing_cfg["downsample"]["target_resolution_xyz"],
-    )
+    if args.skip_registration:
+        print_skip("Registration channel downsample skipped (--skip_registration).")
+    else:
+        ensure_registration_downsample(
+            sample_dir,
+            reg_ch,
+            cfg["input"]["resolution_xyz"],
+            preprocessing_cfg["downsample"]["target_resolution_xyz"],
+            halo_mask=bool(reg_cfg.get("halo_mask", True)),
+        )
 
     print_step(2, "Atlas registration and label outputs")
     warped_label_dir = warped_label_zarr = None
@@ -1321,7 +1493,7 @@ def _run_pipeline(args, cfg, config_path, sample_dir):
             print_note(f"Per-region signal counts CSV: {region_counts_csv}")
         else:
             print_skip("Per-region counts skipped (atlas label Zarr unavailable).")
-        if Path(region_counts_csv).exists():
+        if not _STUB["enabled"] and Path(region_counts_csv).exists():
             from pipeline_modules.utils.deliverable_paths import brain_distribution_stats_xlsx
 
             output_excel = brain_distribution_stats_xlsx(sample_dir, f"ch{signal_ch}")

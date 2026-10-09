@@ -15,6 +15,13 @@ cfos 任务从 `config/config_cfos_template.json` 生成 config，只改每样�
 `input.channels`（cfos 惯例 signal=ch1/registration=ch0，非标准排布先核对）。其余参数保持 template
 默认，要动阈值、模型、postprocess 等先问用户。全脑 normalization（normalize_scope=global）、
 256³ 推理块、hemisphere 半球统计、postprocess（max_single_slice_voxels=300）是基线，不调。
+配准基线（2026-10-03 固化）：配准输入先做光晕裁切掩膜（`registration.halo_mask`，默认开，
+由 zarr_to_registration_nii 在建 25µm volume 时执行）；形变 `registration.grad_step=0.15`、
+`registration.syn_iterations=[70,50,30,10]`（比旧标准 0.1/40x20x0 强，用于组织变形大的样本）。
+2026-10-08 追加：`registration.n4_preprocess`（配准前 SimpleITK 带掩码 N4，用 halo 的
+brain_mask）与 `registration.rigid_preflight_qc`（主配准前 ~20s 刚体粗配准 + QC 图）默认开，
+产出 `<sample>/qc/registration_rigid_check.png` 与 `registration_final_check.png`，Pipeline
+Monitor 任务卡片可直接点开查看；关掉用 false。AIND 对照实验结论：CC+大迭代档形变过度不采用。
 血管任务不套 cfos template（等用户的血管 template 固化）。
 
 ## 组织选区（tissue ROI）
@@ -28,6 +35,14 @@ python -m pipeline_modules.visualization.annotate_tissue_sam_napari --sample-dir
 
 QC 卷不存在时错误里会给出 `surface_brightness_homogenize --qc_only` 的生成命令；消费用
 `--tissue_mask <sample>/tissue_roi.zarr`。入口详情见 `pipeline_modules/visualization/capability_manifest.json`。
+
+## 开发约定
+
+改 main.py 流程、加新步骤或新模块接线后，必须跑一遍 stub 接线测试（不跑算法、几秒完成，
+验证 6 步路径/键名/分支不断链），并让 `tests/test_main_stub_run.py` 的 EXPECTED_COMMANDS
+覆盖新步骤的命令描述。手动跑法：在空样本目录放 config 后
+`python main.py --config <cfg> --sample_dir <dir> --stub`，末行 `STUB_SUMMARY` 应列出全部命令。
+新模块自身的算法测试照常进 `tests/`；失败测试不修就删或改，不留长期红测试。
 
 ## 标准入口
 

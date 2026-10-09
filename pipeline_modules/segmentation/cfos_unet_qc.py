@@ -346,6 +346,10 @@ def compute_sample_qc_metrics(
         uncertainty_low=uncertainty_low,
         uncertainty_high=uncertainty_high,
         small_component_max_voxels=small_component_max_voxels,
+        # Sample totals must aggregate over the WHOLE volume; skipping dark
+        # blocks (a review-queue concept) would break voxel conservation.
+        skip_empty_blocks=False,
+        skip_below_threshold=None,
     )
     arrays = _load_qc_arrays(
         mask_zarr=mask_zarr,
