@@ -85,7 +85,32 @@ def test_convert_ims_channel_to_zarr_roundtrip(tmp_path: Path):
     assert np.array_equal(np.asarray(array[:]), volumes[0])
 
     compressor_meta = json.loads((output_zarr / "0" / ".zarray").read_text())["compressor"]
+    assert compressor_meta["id"] == "blosc"
+    assert compressor_meta["cname"] == "zstd"
+    assert result["compressor"].startswith("blosc(")
+
+
+def test_convert_ims_channel_to_zarr_legacy_gzip(tmp_path: Path):
+    ims_path = tmp_path / "sample.ims"
+    volumes = _write_synthetic_ims(ims_path, shape=(8, 16, 16), chunks=(4, 8, 8))
+    output_zarr = tmp_path / "legacy.zarr"
+
+    result = convert_ims_channel_to_zarr(
+        ims_path,
+        output_zarr,
+        channel=0,
+        chunk_size=(4, 8, 8),
+        compressor="gzip",
+        gzip_level=2,
+        write_manifest=False,
+    )
+
+    assert result["success"]
+    assert result["compressor"] == "gzip(level=2)"
+    compressor_meta = json.loads((output_zarr / "0" / ".zarray").read_text())["compressor"]
     assert compressor_meta["id"] == "gzip"
+    assert compressor_meta["level"] == 2
+    assert np.array_equal(np.asarray(open_zarr_array(output_zarr)[:]), volumes[0])
 
 
 def test_convert_ims_channel_to_zarr_resume_skips_written_chunks(tmp_path: Path):

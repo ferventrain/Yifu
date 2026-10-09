@@ -57,6 +57,7 @@ try:
         create_output_zarr,
         list_array_keys,
         list_existing_chunk_indices,
+        resolve_compressor,
     )
 except ImportError:  # pragma: no cover
     from .tiff_to_zarr import _configure_logging
@@ -217,7 +218,14 @@ def ims_level_stride_xyz(ims_path: str | Path, resolution_level: int) -> list[fl
         if level == 0:
             return [1.0, 1.0, 1.0]
         shape_full = _shape_for_level(handle, 0)
-    return [shape_full[i] / max(shape_coarse[i], 1) for i in range(3)]
+    ratio = [shape_full[i] / max(shape_coarse[i], 1) for i in range(3)]
+    # Pyramid levels padded up to tile multiples (MegaSpim L2 is zero-filled
+    # beyond extent/4) make the shape ratio undershoot the true stride; snap to
+    # 2**level when close, keep the exact ratio for non power-of-two pyramids.
+    power = float(2**level)
+    if all(abs(r - power) <= 0.1 * power for r in ratio):
+        return [power, power, power]
+    return ratio
 
 
 def _write_ims_coarse_attrs(
@@ -300,6 +308,40 @@ def _open_or_create_target(
     return array, set()
 
 
+def _resolve_ims_compressor(compressor: Any, gzip_level: int) -> Any:
+    """Resolve the ``compressor`` argument into a numcodecs codec.
+
+    ``"default"``/``"fast"``/``"none"`` map through :func:`resolve_compressor`
+    (default = Blosc zstd + SHUFFLE); ``"gzip"`` keeps the legacy GZip codec
+    with ``gzip_level`` for stores that must stay byte-compatible with old
+    conversions.
+    """
+    if compressor == "gzip":
+        try:
+            from numcodecs import GZip
+
+            return GZip(level=max(1, int(gzip_level)))
+        except Exception as exc:  # pragma: no cover - numcodecs without GZip
+            raise PipelineError(
+                ErrorCode.DEPENDENCY_MISSING,
+                "numcodecs with GZip support is required",
+                {"dependency": "numcodecs", "error": str(exc)},
+            ) from exc
+    return resolve_compressor(compressor)
+
+
+def _describe_compressor(codec: Any) -> str:
+    if codec is None:
+        return "none"
+    try:
+        config = dict(codec.get_config())
+        name = str(config.pop("id", getattr(codec, "codec_id", "codec")))
+        parts = ", ".join(f"{key}={value}" for key, value in sorted(config.items()))
+        return f"{name}({parts})" if parts else name
+    except Exception:
+        return repr(codec)
+
+
 def convert_ims_channel_to_zarr(
     input_ims: str | Path,
     output_zarr: str | Path,
@@ -308,26 +350,22 @@ def convert_ims_channel_to_zarr(
     resolution_level: int = DEFAULT_RESOLUTION_LEVEL,
     timepoint: int = DEFAULT_TIMEPOINT,
     chunk_size: tuple[int, int, int] | str = DEFAULT_IMS_CHUNK_SIZE,
+    compressor: Any = "default",
     gzip_level: int = 1,
     hdf_cache_mb: int = DEFAULT_IMS_HDF_CACHE_MB,
     write_manifest: bool = True,
 ) -> dict[str, Any]:
-    """Stream one IMS channel into a Zarr volume, skipping chunks already written."""
-    from numcodecs import GZip
+    """Stream one IMS channel into a Zarr volume, skipping chunks already written.
 
+    New stores default to Blosc zstd + SHUFFLE compression; pass
+    ``compressor="gzip"`` (with ``gzip_level``) to keep writing legacy GZip
+    stores. Resumed stores keep whatever codec they were created with.
+    """
     started_at = time.time()
     input_path = Path(input_ims)
     output_path = Path(output_zarr)
     chunks_requested = _coerce_chunk_size(chunk_size)
-
-    try:
-        compressor = GZip(level=max(1, int(gzip_level)))
-    except Exception as exc:  # pragma: no cover - numcodecs without GZip
-        raise PipelineError(
-            ErrorCode.DEPENDENCY_MISSING,
-            "numcodecs with GZip support is required",
-            {"dependency": "numcodecs", "error": str(exc)},
-        ) from exc
+    codec = _resolve_ims_compressor(compressor, gzip_level)
 
     with open_ims_dataset(
         input_path,
@@ -345,7 +383,7 @@ def convert_ims_channel_to_zarr(
             shape=shape,
             chunks=chunks,
             dtype=dtype,
-            compressor=compressor,
+            compressor=codec,
         )
 
         grid = tuple(max(1, (shape[i] + chunks[i] - 1) // chunks[i]) for i in range(3))
@@ -403,7 +441,7 @@ def convert_ims_channel_to_zarr(
         "total_chunks": total_chunks,
         "written_chunks": written,
         "skipped_chunks": skipped,
-        "compressor": f"gzip(level={gzip_level})",
+        "compressor": _describe_compressor(codec),
         "source_compression": info.compression,
     }
     result["duration_seconds"] = time.time() - started_at
@@ -435,6 +473,7 @@ def convert_ims_to_zarr(
     chunk_size: tuple[int, int, int] | str = DEFAULT_IMS_CHUNK_SIZE,
     resolution_level: int = DEFAULT_RESOLUTION_LEVEL,
     timepoint: int = DEFAULT_TIMEPOINT,
+    compressor: Any = "default",
     gzip_level: int = 1,
     hdf_cache_mb: int = DEFAULT_IMS_HDF_CACHE_MB,
     reg_channel: int | None = None,
@@ -463,6 +502,7 @@ def convert_ims_to_zarr(
                 resolution_level=resolution_level,
                 timepoint=timepoint,
                 chunk_size=chunk_size,
+                compressor=compressor,
                 gzip_level=gzip_level,
                 hdf_cache_mb=hdf_cache_mb,
             )
@@ -481,6 +521,7 @@ def convert_ims_to_zarr(
                 resolution_level=int(reg_resolution_level),
                 timepoint=timepoint,
                 chunk_size=chunk_size,
+                compressor=compressor,
                 gzip_level=gzip_level,
                 hdf_cache_mb=hdf_cache_mb,
             )
@@ -536,7 +577,14 @@ def parse_args() -> argparse.Namespace:
         help="IMS ResolutionLevel for --reg_channel (default: 2)",
     )
     parser.add_argument("--timepoint", type=int, default=DEFAULT_TIMEPOINT, help="IMS TimePoint to read")
-    parser.add_argument("--gzip_level", type=int, default=1, help="Zarr gzip compression level (default: 1)")
+    parser.add_argument(
+        "--compressor",
+        default="default",
+        choices=["default", "fast", "gzip", "none"],
+        help="Zarr compression: default = Blosc zstd+SHUFFLE (clevel 5), fast = lz4, "
+        "gzip = legacy GZip (use with --gzip_level), none (default: default)",
+    )
+    parser.add_argument("--gzip_level", type=int, default=1, help="GZip level, only used with --compressor gzip (default: 1)")
     parser.add_argument("--hdf_cache_mb", type=int, default=DEFAULT_IMS_HDF_CACHE_MB, help="HDF5 chunk cache size in MB")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()
@@ -591,6 +639,7 @@ def main() -> int:
             chunk_size=args.chunk_size,
             resolution_level=int(args.resolution_level),
             timepoint=int(args.timepoint),
+            compressor=args.compressor,
             gzip_level=int(args.gzip_level),
             hdf_cache_mb=int(args.hdf_cache_mb),
             reg_channel=reg_channel,
