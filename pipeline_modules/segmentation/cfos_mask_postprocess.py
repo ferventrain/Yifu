@@ -74,23 +74,33 @@ def downsample_mask_zarr(
     ds_region = None if region_id_array is None else np.zeros(ds_shape, dtype=np.uint8)
     active_z_indices: list[int] = []
 
-    for ds_z in tqdm(range(ds_shape[0]), desc="Downsample mask", unit="slab"):
-        z0 = ds_z * factor
-        slab = np.asarray(mask_in[z0 : z0 + factor], dtype=np.uint8) > 0
-        ds_mask[ds_z] = block_reduce(
-            slab.astype(np.uint8),
+    # Read z blocks aligned to the source chunk depth: factor-slice reads on
+    # deep-chunked Zarrs decompress every touched chunk once per 4 slices.
+    # Cap the block by bytes so uint32 labels never materialize huge slabs.
+    chunk_z = max(1, int(mask_in.chunks[0]) if getattr(mask_in, "chunks", None) else factor)
+    per_slice = int(height) * int(width) * int(np.dtype(mask_in.dtype).itemsize)
+    slice_cap = max(factor, (4 * 1024**3) // max(per_slice, 1))
+    slice_cap -= slice_cap % factor
+    z_block = max(factor, min(chunk_z, slice_cap))
+    for zb0 in tqdm(range(0, depth, z_block), desc="Downsample mask", unit="block"):
+        zb1 = min(zb0 + z_block, depth)
+        slab = (np.asarray(mask_in[zb0:zb1], dtype=np.uint8) > 0).astype(np.uint8)
+        ds_mask[zb0 // factor : zb1 // factor] = block_reduce(
+            slab,
             block_size=(factor, factor, factor),
             func=np.max,
-        )[0]
+        )
         if ds_region is not None:
-            label_slab = np.asarray(label_in[z0 : z0 + factor])
+            label_slab = np.asarray(label_in[zb0:zb1])
             region_slab = _build_region_slice(label_slab, region_id_array).astype(np.uint8)
-            ds_region[ds_z] = block_reduce(
+            ds_region[zb0 // factor : zb1 // factor] = block_reduce(
                 region_slab,
                 block_size=(factor, factor, factor),
                 func=np.max,
-            )[0]
-            if ds_region[ds_z].any():
+            )
+            active = np.nonzero(ds_region[zb0 // factor : zb1 // factor].any(axis=(1, 2)))[0]
+            for ds_z in active:
+                z0 = (zb0 // factor + int(ds_z)) * factor
                 active_z_indices.extend(range(z0, z0 + factor))
 
     return ds_mask, ds_region, active_z_indices
@@ -171,12 +181,25 @@ def upsample_keep_slice(ds_keep: np.ndarray, factor: int, height: int, width: in
 
 
 def _downsample_foreground(label_arr, factor: int, ds_shape: tuple[int, int, int]) -> np.ndarray:
-    """Max-pool (label > 0) onto the downsampled grid, streaming z slabs."""
+    """Max-pool (label > 0) onto the downsampled grid, streaming z blocks
+    aligned to the source chunk depth (factor-slice reads on deep-chunked
+    Zarrs re-decompress every chunk once per few slices). Blocks are
+    byte-capped so uint32 labels never materialize huge slabs."""
     ds = np.zeros(ds_shape, dtype=np.uint8)
-    for z0 in range(0, int(label_arr.shape[0]), factor):
-        z1 = min(z0 + factor, int(label_arr.shape[0]))
-        slab = (np.asarray(label_arr[z0:z1]) > 0).astype(np.uint8)
-        ds[z0 // factor] = block_reduce(slab, block_size=(factor, factor, factor), func=np.max)[0]
+    depth = int(label_arr.shape[0])
+    per_slice = int(label_arr.shape[1]) * int(label_arr.shape[2]) * int(np.dtype(label_arr.dtype).itemsize)
+    chunk_z = max(1, int(label_arr.chunks[0]) if getattr(label_arr, "chunks", None) else factor)
+    slice_cap = max(factor, (4 * 1024**3) // max(per_slice, 1))
+    slice_cap -= slice_cap % factor
+    z_block = max(factor, min(chunk_z, slice_cap))
+    for zb0 in range(0, depth, z_block):
+        zb1 = min(zb0 + z_block, depth)
+        slab = (np.asarray(label_arr[zb0:zb1]) > 0).astype(np.uint8)
+        ds[zb0 // factor : zb1 // factor] = block_reduce(
+            slab,
+            block_size=(factor, factor, factor),
+            func=np.max,
+        )
     return ds
 
 
@@ -321,38 +344,55 @@ def postprocess_cfos_mask_3d(
 
     depth, height, width = (int(mask_in.shape[0]), int(mask_in.shape[1]), int(mask_in.shape[2]))
     active_z_set = set(active_z_indices) if active_z_indices else None
-    for z_idx in tqdm(range(depth), desc="Apply 3D filter", unit="slice"):
-        mask_slice = np.asarray(mask_in[z_idx], dtype=np.uint8) > 0
+
+    def _keep_block(z0: int, z1: int, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        """ds_keep tile upsampled by factor on every axis, cropped to the tile.
+
+        Voxel-wise identical to the per-slice upsample_keep_slice: the value at
+        (z, y, x) is ds_keep[z // factor, y // factor, x // factor]."""
+        f = int(downsample_factor)
+        block = ds_keep[z0 // f : -(-z1 // f), y0 // f : -(-y1 // f), x0 // f : -(-x1 // f)]
+        if f > 1:
+            block = np.repeat(np.repeat(np.repeat(block, f, axis=0), f, axis=1), f, axis=2)
+        return block[: z1 - z0, : y1 - y0, : x1 - x0]
+
+    # Chunk-aligned tiles: reading/writing per z-slice on deep-chunked Zarr
+    # re-decompresses every touched chunk once per slice (~65 s/slice on
+    # 256^3 chunks); a whole-chunk tile is decompressed exactly once.
+    chunk_zyx = tuple(max(1, int(c)) for c in mask_in.chunks)
+    z_edges = list(range(0, depth, chunk_zyx[0])) + [depth]
+    y_edges = list(range(0, height, chunk_zyx[1])) + [height]
+    x_edges = list(range(0, width, chunk_zyx[2])) + [width]
+    tiles = [
+        (z0, z1, y0, y1, x0, x1)
+        for z0, z1 in zip(z_edges, z_edges[1:])
+        for y0, y1 in zip(y_edges, y_edges[1:])
+        for x0, x1 in zip(x_edges, x_edges[1:])
+    ]
+    for z0, z1, y0, y1, x0, x1 in tqdm(tiles, desc="Apply 3D filter", unit="tile"):
+        mask_block = np.asarray(mask_in[z0:z1, y0:y1, x0:x1], dtype=np.uint8) > 0
         if label_in is not None and region_id_array is not None:
-            if active_z_set is not None and z_idx not in active_z_set:
-                filtered = mask_slice.astype(np.uint8)
-            else:
-                ds_z = z_idx // downsample_factor
-                keep_slice = upsample_keep_slice(
-                    ds_keep[ds_z],
-                    downsample_factor,
-                    height,
-                    width,
-                )
-                region_slice = _build_region_slice(np.asarray(label_in[z_idx]), region_id_array)
+            label_block = np.asarray(label_in[z0:z1, y0:y1, x0:x1])
+            filtered = np.empty(mask_block.shape, dtype=np.uint8)
+            for zi, z_idx in enumerate(range(z0, z1)):
+                mask_slice = mask_block[zi]
+                if active_z_set is not None and z_idx not in active_z_set:
+                    filtered[zi] = mask_slice
+                    continue
+                keep_slice = _keep_block(z_idx, z_idx + 1, y0, y1, x0, x1)[0]
+                region_slice = _build_region_slice(label_block[zi], region_id_array)
                 filtered_inside = mask_slice & (keep_slice > 0)
                 if region_outside == "keep":
-                    filtered = np.where(region_slice, filtered_inside, mask_slice).astype(np.uint8)
+                    filtered[zi] = np.where(region_slice, filtered_inside, mask_slice)
                 else:
-                    filtered = (filtered_inside & region_slice).astype(np.uint8)
+                    filtered[zi] = filtered_inside & region_slice
         else:
-            ds_z = z_idx // downsample_factor
-            keep_slice = upsample_keep_slice(
-                ds_keep[ds_z],
-                downsample_factor,
-                height,
-                width,
-            )
-            filtered = (mask_slice & (keep_slice > 0)).astype(np.uint8)
-        mask_out[z_idx] = filtered
+            keep_block = _keep_block(z0, z1, y0, y1, x0, x1)
+            filtered = (mask_block & (keep_block > 0)).astype(np.uint8)
+        mask_out[z0:z1, y0:y1, x0:x1] = filtered
         if masked_out is not None:
-            signal_slice = np.asarray(signal[z_idx])
-            masked_out[z_idx] = np.where(filtered > 0, signal_slice, 0)
+            signal_block = np.asarray(signal[z0:z1, y0:y1, x0:x1])
+            masked_out[z0:z1, y0:y1, x0:x1] = np.where(filtered > 0, signal_block, 0)
 
     exports: dict[str, str] = {"filtered_mask_zarr": str(output_mask_zarr)}
     if masked_signal_zarr is not None:

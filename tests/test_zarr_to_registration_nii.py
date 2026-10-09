@@ -46,10 +46,12 @@ def test_convert_rescales_and_matches_nifti_convention(tmp_path):
         output_nii,
         input_resolution_xyz=(12.0, 12.0, 16.0),
         target_resolution_xyz=(24.0, 24.0, 32.0),
+        halo_mask=False,
     )
 
     assert result["input_shape_zyx"] == [16, 64, 48]
     assert result["output_shape_zyx"] == [8, 32, 24]
+    assert result["halo_mask"] == {"applied": False}
 
     image = nib.load(str(output_nii))
     # Convention matches the proven dbdb36 registration: (z, y, x) transposed
@@ -66,6 +68,53 @@ def test_convert_rescales_and_matches_nifti_convention(tmp_path):
 
     original = json.loads((tmp_path / "ch0_downsample" / "original_shape.json").read_text(encoding="utf-8"))
     assert original["original_shape"] == [16, 64, 48]
+    assert original["halo_mask"] == {"applied": False}
+    assert not (tmp_path / "ch0_downsample" / "brain_mask.nii.gz").exists()
+
+
+def test_convert_halo_mask_zeroes_background(tmp_path):
+    """Bright blob in a nonzero noise floor: everything outside the (eroded)
+    blob must be zeroed, a brain_mask.nii.gz must be written with the same
+    geometry as volume.nii.gz, and provenance recorded."""
+    rng = np.random.default_rng(7)
+    nz, ny, nx = 24, 48, 40
+    volume = rng.integers(30, 60, size=(nz, ny, nx)).astype(np.uint16)  # noise floor, never zero
+    volume[6:18, 14:34, 10:30] = rng.integers(800, 1200, size=(12, 20, 20))  # bright "brain"
+
+    input_zarr = tmp_path / "in.zarr"
+    _write_input_zarr(input_zarr, volume)
+    out_dir = tmp_path / "ch0_downsample"
+    output_nii = out_dir / "volume.nii.gz"
+
+    result = convert_zarr_to_registration_nii(
+        input_zarr,
+        output_nii,
+        input_resolution_xyz=(12.0, 12.0, 16.0),
+        target_resolution_xyz=(24.0, 24.0, 32.0),
+    )
+
+    assert result["halo_mask"]["applied"] is True
+    assert result["halo_mask"]["voxels"] > 0
+
+    data = np.asanyarray(nib.load(str(output_nii)).dataobj)
+    assert data.min() == 0  # background zeroed
+    bright = data >= 400
+    assert bright.sum() > 0  # bright tissue kept
+    # Resampled grid (12,24,20) zyx: blob 3:9,7:17,5:15 -> eroded 5:7,9:15,7:13.
+    # The (x,y,z) NIfTI interior of the blob must survive the 2-voxel erosion.
+    assert data[7:13, 9:15, 5:7].min() >= 400
+
+    mask_img = nib.load(str(out_dir / "brain_mask.nii.gz"))
+    assert mask_img.shape == data.shape
+    assert np.allclose(mask_img.affine, np.eye(4))
+    mask_data = np.asanyarray(mask_img.dataobj)
+    assert set(np.unique(mask_data)) <= {0, 1}
+    # mask covers every nonzero voxel of the masked volume
+    assert np.array_equal(mask_data.astype(bool), data > 0)
+
+    original = json.loads((out_dir / "original_shape.json").read_text(encoding="utf-8"))
+    assert original["halo_mask"]["applied"] is True
+    assert original["halo_mask"]["threshold"] > 0
 
 
 def test_convert_rejects_missing_input_and_existing_output(tmp_path):

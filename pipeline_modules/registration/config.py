@@ -79,6 +79,27 @@ class RegistrationCfg(BaseModel):
         "SyN",
         description="ANTs transform type: Rigid, Affine, SyN, SyNRA",
     )
+    grad_step: float = Field(
+        0.1,
+        gt=0.0,
+        description="ANTs SyN gradient step size; larger values allow stronger deformation",
+    )
+    syn_iterations: List[int] = Field(
+        [40, 20, 0],
+        description=(
+            "SyN multi-resolution iterations per level; the level count sets the "
+            "shrink factors (2^k) and smoothing sigmas. Last level may be 0 (converge only)."
+        ),
+    )
+    halo_mask: bool = Field(
+        True,
+        description=(
+            "Zero the registration input outside an auto-detected brain mask "
+            "(Otsu-based, halo rim eroded) so the scattering halo around the "
+            "tissue cannot inflate the atlas. Applied when the registration "
+            "NIfTI is built; see preprocessing.zarr_to_registration_nii."
+        ),
+    )
     allow_reflection: bool = Field(
         False,
         description="Allow ANTs reflection during registration (usually disabled to avoid flipping)",

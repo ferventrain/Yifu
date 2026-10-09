@@ -79,6 +79,87 @@ def _zoom_to_shape(volume: np.ndarray, target_shape: tuple[int, int, int]) -> np
     return ndimage.zoom(volume, factors, order=1, mode="nearest", prefilter=True)
 
 
+def _otsu_threshold(values: np.ndarray) -> float:
+    """Otsu inter-class variance maximum over a 256-bin histogram.
+
+    Same algorithm as skimage.filters.threshold_otsu, kept local so the
+    masking does not depend on an optional dependency.
+    """
+    hist, edges = np.histogram(values, bins=256)
+    centers = (edges[:-1] + edges[1:]) / 2
+    weights = hist.astype(np.float64)
+    total = weights.sum()
+    if total == 0:
+        return float(centers[0])
+    best, threshold = -1.0, float(centers[0])
+    cum_w = np.cumsum(weights)
+    cum_m = np.cumsum(weights * centers)
+    end_m = cum_m[-1]
+    for i in range(1, len(centers)):
+        w0, w1 = cum_w[i - 1], total - cum_w[i - 1]
+        if w0 == 0 or w1 == 0:
+            continue
+        m0 = cum_m[i - 1] / w0
+        m1 = (end_m - cum_m[i - 1]) / w1
+        var = w0 * w1 * (m0 - m1) ** 2
+        if var > best:
+            best, threshold = var, float(centers[i])
+    return threshold
+
+
+def compute_halo_brain_mask(volume: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Auto brain mask that cuts the scattering halo around the tissue.
+
+    Rationale: LSFM backgrounds are not zero (noise floor + a dim halo of
+    scattered signal around the tissue). Mutual information treats that rim
+    as "dark tissue", which lets the atlas inflate past the true boundary.
+    The mask zeroes everything outside the brain so the registration metric
+    sees a real background on both sides.
+
+    Gaussian smooth (sigma 1.2) -> Otsu threshold on positive voxels, floored
+    at 0.35 * p99 -> binary closing (2 iters) -> fill holes -> largest
+    connected component -> erode 2 voxels (50 um at the 25 um grid) to remove
+    the halo rim itself from the registration volume.
+    """
+    from scipy import ndimage
+
+    smooth = ndimage.gaussian_filter(volume.astype(np.float32), sigma=1.2)
+    positive = smooth[smooth > 0]
+    if positive.size == 0:
+        stats = {"applied": True, "threshold": 0.0, "otsu": 0.0, "p99": 0.0, "voxels": int(volume.size)}
+        return np.ones(volume.shape, dtype=bool), stats
+    p99 = float(np.percentile(positive, 99))
+    otsu = _otsu_threshold(positive)
+    threshold = max(otsu, 0.35 * p99)
+
+    mask = smooth > threshold
+    structure = ndimage.generate_binary_structure(3, 1)
+    mask = ndimage.binary_closing(mask, structure=structure, iterations=2)
+    mask = ndimage.binary_fill_holes(mask)
+    labels, count = ndimage.label(mask)
+    if count > 1:
+        sizes = ndimage.sum(mask, labels, range(1, count + 1))
+        mask = labels == (1 + int(np.argmax(sizes)))
+    mask = ndimage.binary_erosion(mask, structure=structure, iterations=2)
+
+    stats = {
+        "applied": True,
+        "threshold": round(float(threshold), 3),
+        "otsu": round(float(otsu), 3),
+        "p99": round(p99, 3),
+        "voxels": int(mask.sum()),
+    }
+    logger.info(
+        "Halo mask: otsu=%.1f p99=%.1f -> thr=%.1f, kept %d/%d voxels",
+        otsu,
+        p99,
+        threshold,
+        int(mask.sum()),
+        mask.size,
+    )
+    return mask, stats
+
+
 def convert_zarr_to_registration_nii(
     input_zarr: str | Path,
     output_nii: str | Path,
@@ -86,8 +167,19 @@ def convert_zarr_to_registration_nii(
     input_resolution_xyz: tuple[float, float, float],
     target_resolution_xyz: tuple[float, float, float],
     dataset_name: str = "0",
+    flip_y: bool = False,
+    halo_mask: bool = True,
 ) -> dict:
-    """Rescale a Zarr volume to the target isotropic spacing and write a NIfTI."""
+    """Rescale a Zarr volume to the target isotropic spacing and write a NIfTI.
+
+    ``flip_y`` mirrors along the sample's y axis: for samples whose xy plane
+    is mounted upside-down relative to the atlas (ANTs with
+    allow_reflection=false cannot fix a handedness flip).
+
+    ``halo_mask`` (default on) zeroes everything outside an auto-detected
+    brain mask before writing, so the scattering halo around the tissue never
+    reaches the registration metric. The mask is also saved next to the NIfTI
+    as ``brain_mask.nii.gz``."""
     import nibabel as nib
     from scipy import ndimage
 
@@ -141,6 +233,19 @@ def convert_zarr_to_registration_nii(
     volume_u16 = np.clip(np.rint(volume), 0, 65535).astype(np.uint16)
     del volume
 
+    halo_stats: dict = {"applied": False}
+    if halo_mask:
+        mask, halo_stats = compute_halo_brain_mask(volume_u16)
+        volume_u16 = np.where(mask, volume_u16, 0).astype(np.uint16)
+        del mask
+
+    if flip_y:
+        # Mirror along the sample's y axis: for samples whose xy plane is
+        # mounted upside-down relative to the atlas (ANTs with
+        # allow_reflection=false cannot fix a handedness flip).
+        volume_u16 = volume_u16[:, ::-1, :]
+        logger.info("flip_y applied: volume mirrored along y")
+
     # NIfTI convention of the proven dbdb36 production registration: (z, y, x)
     # transposed to (x, y, z) with a UNIT diagonal affine. The reference atlas
     # TIFF carries no spacing metadata and the registration loads it at unit
@@ -153,16 +258,30 @@ def convert_zarr_to_registration_nii(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     nib.save(nib.Nifti1Image(volume_xyz, affine), str(output_path))
 
+    if halo_mask:
+        # Same geometry as volume.nii.gz (xyz transpose + unit affine) so the
+        # mask can be overlaid on the registration volume directly.
+        mask_nii_path = output_path.parent / "brain_mask.nii.gz"
+        nib.save(nib.Nifti1Image(np.where(volume_xyz > 0, 1, 0).astype(np.uint8), affine), str(mask_nii_path))
+
     with (output_path.parent / "original_shape.json").open("w", encoding="utf-8") as handle:
-        json.dump({"original_shape": [nz, ny, nx], "spacing_xyz": [res_x, res_y, res_z]}, handle)
+        json.dump(
+            {
+                "original_shape": [nz, ny, nx],
+                "spacing_xyz": [res_x, res_y, res_z],
+                "halo_mask": halo_stats,
+            },
+            handle,
+        )
 
     return {
         "input_zarr": str(input_path),
-        "output_nii": str(output_path),
+        "output_nii": str(output_nii),
         "input_shape_zyx": [nz, ny, nx],
         "output_shape_zyx": [out_nz, out_ny, out_nx],
         "input_resolution_xyz": [res_x, res_y, res_z],
         "target_resolution_xyz": [tgt_x, tgt_y, tgt_z],
+        "halo_mask": halo_stats,
     }
 
 
@@ -175,6 +294,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input_resolution_xyz", required=True, help='Input voxel size um "x,y,z"')
     parser.add_argument("--target_resolution_xyz", default="25.0,25.0,25.0", help='Target voxel size um "x,y,z"')
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
+    parser.add_argument(
+        "--flip_y",
+        action="store_true",
+        help="Mirror along the sample y axis (upside-down xy plane samples)",
+    )
+    parser.add_argument(
+        "--halo_mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto brain mask before writing: zero out the scattering halo "
+        "around the tissue so registration cannot inflate past the boundary "
+        "(default on; --no-halo_mask to disable)",
+    )
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser
 
@@ -193,6 +325,8 @@ def main() -> int:
         input_resolution_xyz=parse_resolution_xyz(args.input_resolution_xyz),
         target_resolution_xyz=parse_resolution_xyz(args.target_resolution_xyz),
         dataset_name=args.dataset_name,
+        flip_y=args.flip_y,
+        halo_mask=args.halo_mask,
     )
     write_run_manifest(
         Path(args.output_nii).parent,
@@ -203,6 +337,8 @@ def main() -> int:
             "input_resolution_xyz": args.input_resolution_xyz,
             "target_resolution_xyz": args.target_resolution_xyz,
             "dataset_name": args.dataset_name,
+            "flip_y": args.flip_y,
+            "halo_mask": args.halo_mask,
         },
         outputs=[Path(args.output_nii)],
         started_at=started_at,

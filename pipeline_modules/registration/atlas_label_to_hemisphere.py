@@ -355,7 +355,15 @@ convert_atlas_label_to_hemisphere_zarr = convert_atlas_label_to_hemisphere
 def _resolve_default_atlas_label() -> Path:
     import os
 
-    return Path(os.environ.get("YIFU_ATLAS_LABEL", r"H:\Yifu_data\reference\atlas_label.tiff"))
+    explicit = os.environ.get("YIFU_ATLAS_LABEL")
+    if explicit:
+        return Path(explicit)
+    data_dir = os.environ.get("YIFU_DATA_DIR")
+    if data_dir:
+        candidate = Path(data_dir) / "reference" / "atlas_label.tiff"
+        if candidate.exists():
+            return candidate
+    return Path(r"H:\Yifu_data\reference\atlas_label.tiff")
 
 
 def _standard_space_hemi(label_arr_xyz: np.ndarray) -> tuple[np.ndarray, float]:

@@ -3,6 +3,11 @@
 Computes length / diameter / tortuosity / branch-point / volume / surface / loop
 metrics from kimimaro CSVs or EDT polyline ``skeleton_edges.csv`` and writes a
 per-mouse statistics workbook plus distribution figures.
+
+Also computes chord-based branching angles at junction nodes (from the branch
+table, joining ``skeleton_vertices.csv`` for kimimaro tables that store no
+endpoint coordinates), and — when ``--mask_zarr`` is given — voxel-boundary
+surface area and box-counting fractal dimension of the binary mask.
 """
 from __future__ import annotations
 
@@ -23,6 +28,8 @@ import pandas as pd
 DEFAULT_LENGTH_BIN_EDGES = (0.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
 DEFAULT_DIAM_BIN_EDGES = (0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0)
 DEFAULT_TORT_BIN_EDGES = (1.0, 1.1, 1.2, 1.5, 2.0, 3.0, 5.0)
+DEFAULT_ANGLE_BIN_EDGES = tuple(range(0, 181, 15))
+DEFAULT_FD_BOX_SIZES_UM = (32.0, 64.0, 128.0, 256.0, 512.0)
 
 EDGE_CHUNK = 5_000_000
 VERTEX_CHUNK = 5_000_000
@@ -346,6 +353,164 @@ def stream_edt_branches(edge_csv):
     }
 
 
+def _load_vertex_coords(vertex_csv, needed_keys):
+    """Stream ``skeleton_vertices.csv`` and return (sorted_keys, coords) for needed keys.
+
+    Keys are the packed ``(skeleton_id, node_id)`` int64 identity used elsewhere
+    in this module. Rows whose key is not requested are skipped; coordinates are
+    returned in the same order as ``sorted_keys``.
+    """
+    key_parts = []
+    coord_parts = []
+    usecols = ["skeleton_id", "node_id", "z_um", "y_um", "x_um"]
+    for chunk in pd.read_csv(vertex_csv, usecols=usecols, chunksize=VERTEX_CHUNK, low_memory=False):
+        skeleton_id = pd.to_numeric(chunk["skeleton_id"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+        node_id = pd.to_numeric(chunk["node_id"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+        keys = skeleton_id * NODE_KEY_STRIDE + node_id
+        match = np.isin(keys, needed_keys)
+        if not match.any():
+            continue
+        key_parts.append(keys[match])
+        coord_parts.append(chunk.loc[match, ["z_um", "y_um", "x_um"]].to_numpy(dtype=np.float64))
+    if not key_parts:
+        return np.empty(0, dtype=np.int64), np.empty((0, 3), dtype=np.float64)
+    keys = np.concatenate(key_parts)
+    coords = np.concatenate(coord_parts)
+    order = np.argsort(keys, kind="mergesort")
+    keys = keys[order]
+    coords = coords[order]
+    keep = np.concatenate([[True], np.diff(keys) != 0])
+    return keys[keep], coords[keep]
+
+
+def _map_vertex_coords(lookup_keys, lookup_coords, keys):
+    """Coordinates for ``keys`` via binary search in the sorted lookup; NaN rows missing."""
+    coords = np.full((len(keys), 3), np.nan, dtype=np.float64)
+    if len(lookup_keys) == 0:
+        return coords
+    pos = np.searchsorted(lookup_keys, keys)
+    inside = (pos < len(lookup_keys)) & (lookup_keys[np.clip(pos, 0, len(lookup_keys) - 1)] == keys)
+    coords[inside] = lookup_coords[pos[inside]]
+    return coords
+
+
+def compute_branch_angles(branch_table, vertex_csv=None):
+    """Chord-based branching angles at junction nodes.
+
+    For every branch endpoint whose degree is >= 3 (a junction), the local
+    branch direction is approximated by the chord from the junction to the
+    branch's opposite endpoint (endpoint-to-endpoint direction; tortuous
+    branches are therefore approximations). All pairwise angles between chords
+    meeting at the same junction are collected — a bifurcation yields 3 angles.
+
+    Endpoint coordinates come from the branch table itself when present
+    (vessel_express tables), otherwise from ``skeleton_vertices.csv`` via
+    ``vertex_csv`` (kimimaro tables). Returns None when neither is available
+    (e.g. EDT per-edge tables carry no junction geometry).
+    """
+    required = {"skeleton_id", "start_node", "end_node", "start_degree", "end_degree"}
+    missing = sorted(required.difference(branch_table.columns))
+    if missing:
+        return None
+    skeleton_id = pd.to_numeric(branch_table["skeleton_id"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+    start_key = skeleton_id * NODE_KEY_STRIDE + pd.to_numeric(branch_table["start_node"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+    end_key = skeleton_id * NODE_KEY_STRIDE + pd.to_numeric(branch_table["end_node"], errors="coerce").fillna(-2).to_numpy(dtype=np.int64)
+    start_degree = pd.to_numeric(branch_table["start_degree"], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+    end_degree = pd.to_numeric(branch_table["end_degree"], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+    is_loop = (
+        branch_table["is_loop"].fillna(False).astype(bool).to_numpy()
+        if "is_loop" in branch_table.columns
+        else np.zeros(len(branch_table), dtype=bool)
+    )
+
+    coord_columns = {
+        "source_z_um", "source_y_um", "source_x_um",
+        "target_z_um", "target_y_um", "target_x_um",
+    }
+    if coord_columns.issubset(branch_table.columns):
+        start_xyz = branch_table[["source_z_um", "source_y_um", "source_x_um"]].to_numpy(dtype=np.float64)
+        end_xyz = branch_table[["target_z_um", "target_y_um", "target_x_um"]].to_numpy(dtype=np.float64)
+    else:
+        if vertex_csv is None or not Path(vertex_csv).exists():
+            return None
+        needed = np.unique(np.concatenate([start_key, end_key]))
+        lookup_keys, lookup_coords = _load_vertex_coords(vertex_csv, needed)
+        start_xyz = _map_vertex_coords(lookup_keys, lookup_coords, start_key)
+        end_xyz = _map_vertex_coords(lookup_keys, lookup_coords, end_key)
+
+    usable = np.isfinite(start_xyz).all(axis=1) & np.isfinite(end_xyz).all(axis=1) & ~is_loop & (start_key != end_key)
+    junction_keys = np.concatenate([start_key[usable & (start_degree >= 3)], end_key[usable & (end_degree >= 3)]])
+    vectors = np.concatenate(
+        [end_xyz[usable & (start_degree >= 3)] - start_xyz[usable & (start_degree >= 3)],
+         start_xyz[usable & (end_degree >= 3)] - end_xyz[usable & (end_degree >= 3)]]
+    )
+    norms = np.linalg.norm(vectors, axis=1)
+    keep = norms > EUCLIDEAN_MIN_UM
+    junction_keys = junction_keys[keep]
+    unit_vectors = vectors[keep] / norms[keep][:, None]
+    if len(junction_keys) == 0:
+        return {"angles_deg": np.empty(0, dtype=np.float64), "junction_mean_deg": np.empty(0, dtype=np.float64)}
+
+    order = np.argsort(junction_keys, kind="mergesort")
+    junction_keys = junction_keys[order]
+    unit_vectors = unit_vectors[order]
+    boundaries = np.concatenate([[0], np.flatnonzero(np.diff(junction_keys)) + 1, [len(junction_keys)]])
+    angles = []
+    junction_means = []
+    for begin, end in zip(boundaries[:-1], boundaries[1:]):
+        vectors_at_junction = unit_vectors[begin:end]
+        if len(vectors_at_junction) < 2:
+            continue
+        dots = vectors_at_junction @ vectors_at_junction.T
+        iu = np.triu_indices(len(vectors_at_junction), k=1)
+        junction_angles = np.degrees(np.arccos(np.clip(dots[iu], -1.0, 1.0)))
+        angles.append(junction_angles)
+        junction_means.append(float(np.mean(junction_angles)))
+    if angles:
+        angles_deg = np.concatenate(angles)
+    else:
+        angles_deg = np.empty(0, dtype=np.float64)
+    return {"angles_deg": angles_deg, "junction_mean_deg": np.asarray(junction_means, dtype=np.float64)}
+
+
+def summarize_branch_angles(angle_result):
+    if angle_result is None:
+        return None
+    angles = angle_result["angles_deg"]
+    junction_means = angle_result["junction_mean_deg"]
+    if angles.size == 0:
+        return {"num_junctions_measured": 0}
+    return {
+        "num_junctions_measured": int(junction_means.size),
+        "branch_angle_pair_count": int(angles.size),
+        "branch_angle_mean_deg": float(np.mean(angles)),
+        "branch_angle_median_deg": float(np.median(angles)),
+        "branch_angle_sd_deg": float(np.std(angles)),
+        "branch_angle_junction_mean_deg": float(np.mean(junction_means)) if junction_means.size else np.nan,
+    }
+
+
+def build_branch_angle_rows(angles_deg):
+    counts, _ = np.histogram(angles_deg, bins=list(DEFAULT_ANGLE_BIN_EDGES))
+    total = int(counts.sum())
+    rows = []
+    edges = list(DEFAULT_ANGLE_BIN_EDGES)
+    for index, count in enumerate(counts):
+        lower = edges[index]
+        upper = edges[index + 1]
+        label = f"{lower:g}-{upper:g}" if index < len(counts) - 1 else f">={lower:g}"
+        rows.append(
+            {
+                "angle_bin_deg": label,
+                "lower_deg": lower,
+                "upper_deg": upper,
+                "pair_count": int(count),
+                "pair_percent": float(count / max(total, 1) * 100.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def spill_degree_stats(spill_dir):
     """Degree histograms from EDT chunk spill pickles (core skeleton voxels)."""
     stats = empty_vertex_stats()
@@ -586,6 +751,163 @@ def plot_tortuosity_histogram(tortuosity, output_path):
     save_figure(fig, output_path)
 
 
+def plot_branch_angle_distribution(angle_df, output_path):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    labels = [row["angle_bin_deg"] for _, row in angle_df.iterrows()]
+    counts = angle_df["pair_count"].to_numpy(dtype=np.float64)
+    ax.bar(range(len(labels)), counts, color="#CCB974")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_xlabel("Branching angle (deg, chord-based, junction pairwise)")
+    ax.set_ylabel("Angle pair count")
+    ax.set_title("Branching angle distribution at junctions")
+    save_figure(fig, output_path)
+
+
+def plot_fractal_dimension(points_df, fd, output_path):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    box_um = points_df["box_um"].to_numpy(dtype=np.float64)
+    occupied = points_df["occupied_boxes"].to_numpy(dtype=np.float64)
+    valid = occupied > 0
+    ax.scatter(box_um[valid], occupied[valid], color="#64B5CD")
+    if valid.sum() >= 2:
+        slope = -fd if np.isfinite(fd) else np.nan
+        xs = np.array([box_um[valid].min(), box_um[valid].max()])
+        log_ys = np.log(occupied[valid][0]) + slope * (np.log(xs) - np.log(box_um[valid][0]))
+        ax.plot(xs, np.exp(log_ys), "--", color="#4C72B0", label=f"FD = {fd:.3f}" if np.isfinite(fd) else "FD = n/a")
+        ax.legend()
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Box size (um)")
+    ax.set_ylabel("Occupied boxes")
+    ax.set_title("Box-counting fractal dimension of vessel mask")
+    save_figure(fig, output_path)
+
+
+def open_mask_array(mask_zarr, dataset_name="0"):
+    import zarr
+
+    group = zarr.open(str(mask_zarr), mode="r")
+    if dataset_name in group:
+        return group[dataset_name]
+    arrays = list(group.arrays())
+    if len(arrays) == 1:
+        return arrays[0][1]
+    raise ValueError(f"Dataset {dataset_name!r} not found in {mask_zarr}")
+
+
+def _chunk_slices(mask, chunk_index):
+    return tuple(
+        slice(
+            int(chunk_index[axis]) * int(mask.chunks[axis]),
+            min(int((chunk_index[axis] + 1) * int(mask.chunks[axis])), int(mask.shape[axis])),
+        )
+        for axis in range(3)
+    )
+
+
+def _read_block_with_halo(mask, slices_zyx, halo=1):
+    """Read a core region that always comes back with exactly ``halo`` voxels of
+    context on every side; context beyond volume edges is virtual background."""
+    padded_lo = [max(0, s.start - halo) for s in slices_zyx]
+    padded_hi = [min(int(n), s.stop + halo) for s, n in zip(slices_zyx, mask.shape)]
+    block = np.asarray(mask[tuple(slice(lo, hi) for lo, hi in zip(padded_lo, padded_hi))], dtype=np.bool_)
+    pad_low = [halo - (s.start - lo) for s, lo in zip(slices_zyx, padded_lo)]
+    pad_high = [s.stop + halo - hi for s, hi in zip(slices_zyx, padded_hi)]
+    return np.pad(block, list(zip(pad_low, pad_high)), mode="constant", constant_values=False)
+
+
+def _count_exposed_faces(block):
+    """Exposed foreground face counts per axis for a bool block with one-voxel halo.
+
+    A face is exposed when the foreground voxel sits in the core region and the
+    voxel across that face is background (including halo padding at volume
+    edges), so interior chunk-seam faces are counted exactly once.
+    """
+    counts = np.zeros(3, dtype=np.int64)
+    for axis in range(3):
+        core_index = [slice(1, -1)] * 3
+        low_index = [slice(1, -1)] * 3
+        high_index = [slice(1, -1)] * 3
+        low_index[axis] = slice(0, -2)
+        high_index[axis] = slice(2, None)
+        core = block[tuple(core_index)]
+        counts[axis] = int(np.count_nonzero(core & ~block[tuple(low_index)]))
+        counts[axis] += int(np.count_nonzero(core & ~block[tuple(high_index)]))
+    return counts
+
+
+def compute_mask_surface_and_fractal(mask, resolution_xyz, box_sizes_um=DEFAULT_FD_BOX_SIZES_UM):
+    """Voxel-boundary surface area and box-counting fractal dimension in one mask pass.
+
+    Surface area counts exposed foreground voxel faces scaled by the anisotropic
+    face areas (a staircase estimate; the cylinder-model surface from skeleton
+    radii is reported separately). Fractal dimension counts occupied boxes at
+    several physical box sizes (box edge per axis = round(box_um / voxel) so
+    boxes are physical cubes up to voxel rounding; the regression uses the
+    geometric-mean box edge) and fits slope of log N vs log(1/L); requires at
+    least three sizes with >= 2 occupied boxes, else NaN.
+    """
+    resolution_zyx = np.asarray([resolution_xyz[2], resolution_xyz[1], resolution_xyz[0]], dtype=np.float64)
+    face_area_zyx = np.array(
+        [
+            resolution_zyx[1] * resolution_zyx[2],
+            resolution_zyx[0] * resolution_zyx[2],
+            resolution_zyx[0] * resolution_zyx[1],
+        ]
+    )
+    sizes_um = sorted({float(size) for size in box_sizes_um if float(size) > 0})
+    steps = [
+        tuple(max(1, int(round(size / res))) for res in resolution_zyx)
+        for size in sizes_um
+    ]
+    box_um = [
+        float(np.prod([step[axis] * resolution_zyx[axis] for axis in range(3)]) ** (1.0 / 3.0))
+        for step in steps
+    ]
+    grids = [
+        tuple(int(np.ceil(int(mask.shape[axis]) / step[axis])) for axis in range(3))
+        for step in steps
+    ]
+    occupied_parts = [[] for _ in sizes_um]
+    face_counts = np.zeros(3, dtype=np.int64)
+
+    grid = tuple(int(np.ceil(int(n) / int(c))) for n, c in zip(mask.shape, mask.chunks))
+    for chunk_index in np.ndindex(grid):
+        slices_zyx = _chunk_slices(mask, chunk_index)
+        block = _read_block_with_halo(mask, slices_zyx, halo=1)
+        if not block.any():
+            continue
+        face_counts += _count_exposed_faces(block)
+        core = block[1:-1, 1:-1, 1:-1]
+        if core.any():
+            coords_zyx = np.nonzero(core)
+            coords_zyx = np.stack(
+                [coords_zyx[axis].astype(np.int64) + slices_zyx[axis].start for axis in range(3)]
+            )
+            for size_index, step in enumerate(steps):
+                box_index = coords_zyx // np.asarray(step, dtype=np.int64)[:, None]
+                gy, gx = grids[size_index][1], grids[size_index][2]
+                box_ids = (box_index[0] * gy + box_index[1]) * gx + box_index[2]
+                occupied_parts[size_index].append(np.unique(box_ids))
+
+    occupied_counts = [
+        int(np.unique(np.concatenate(parts)).size) if parts else 0 for parts in occupied_parts
+    ]
+    points = pd.DataFrame({"box_um": box_um, "occupied_boxes": occupied_counts})
+    valid = np.asarray([(count >= 2) and (size > 0) for size, count in zip(box_um, occupied_counts)])
+    fractal_dimension = np.nan
+    if valid.sum() >= 3:
+        log_size = np.log(1.0 / np.asarray(box_um)[valid])
+        log_count = np.log(np.asarray(occupied_counts, dtype=np.float64)[valid])
+        fractal_dimension = float(np.polyfit(log_size, log_count, 1)[0])
+    return {
+        "surface_area_um2": float(face_counts @ face_area_zyx),
+        "fractal_dimension": fractal_dimension,
+        "fd_points": points,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compute comprehensive vessel network analysis report")
     parser.add_argument("--run_dir", required=True, help="Directory containing skeleton_edges.csv (kimimaro or EDT)")
@@ -594,6 +916,17 @@ def main() -> int:
     parser.add_argument("--resolution_xyz", default="1.8,1.8,2.0", help="Voxel size in um as x,y,z")
     parser.add_argument("--region_volume_um3", default="", help="Optional whole-brain vessel volume in um3 from region scan")
     parser.add_argument("--hpf_volume_um3", default="", help="Optional HPF vessel volume in um3 from region scan")
+    parser.add_argument(
+        "--mask_zarr",
+        default="",
+        help="Optional binary mask Zarr for voxel-boundary surface area and box-counting fractal dimension",
+    )
+    parser.add_argument("--mask_dataset", default="0", help="Dataset name inside --mask_zarr")
+    parser.add_argument(
+        "--fd_box_sizes_um",
+        default=",".join(str(int(size)) for size in DEFAULT_FD_BOX_SIZES_UM),
+        help="Comma-separated physical box sizes in um for fractal dimension",
+    )
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -671,6 +1004,26 @@ def main() -> int:
     summary["tortuosity_mean"] = float(np.nanmean(tortuosity)) if np.isfinite(tortuosity).any() else np.nan
     summary["tortuosity_median"] = float(np.nanmedian(tortuosity)) if np.isfinite(tortuosity).any() else np.nan
 
+    print("Computing chord-based branch angles ...")
+    angle_result = compute_branch_angles(branch_table, vertex_csv)
+    angle_summary = summarize_branch_angles(angle_result)
+    if angle_summary is not None:
+        summary.update(angle_summary)
+    else:
+        print("Branch table has no junction geometry (EDT polyline mode); angles skipped.")
+
+    fd_points = None
+    fractal_dimension = None
+    if args.mask_zarr:
+        print("Scanning mask for surface area and fractal dimension ...")
+        mask_array = open_mask_array(args.mask_zarr, dataset_name=args.mask_dataset)
+        fd_sizes = tuple(float(part) for part in args.fd_box_sizes_um.split(",") if part.strip())
+        mask_metrics = compute_mask_surface_and_fractal(mask_array, resolution, fd_sizes)
+        summary["surface_area_mask_um2"] = mask_metrics["surface_area_um2"]
+        summary["fractal_dimension_boxcount"] = mask_metrics["fractal_dimension"]
+        fd_points = mask_metrics["fd_points"]
+        fractal_dimension = mask_metrics["fractal_dimension"]
+
     mask_voxels = None
     run_summary_path = run_dir / "vessel_network_summary.json"
     if run_summary_path.exists():
@@ -711,6 +1064,15 @@ def main() -> int:
     plot_tortuosity_diameter_heatmap(tort_diam_df, figures_dir / "tortuosity_diameter_length_percent.png")
     plot_tortuosity_histogram(tortuosity, figures_dir / "tortuosity_distribution.png")
 
+    angle_df = None
+    if angle_result is not None and angle_result["angles_deg"].size:
+        angle_df = build_branch_angle_rows(angle_result["angles_deg"])
+        angle_df.to_csv(output_dir / "branch_angle_distribution.csv", index=False)
+        plot_branch_angle_distribution(angle_df, figures_dir / "branch_angle_distribution.png")
+    if fd_points is not None:
+        fd_points.to_csv(output_dir / "fractal_dimension_points.csv", index=False)
+        plot_fractal_dimension(fd_points, fractal_dimension, figures_dir / "fractal_dimension_fit.png")
+
     summary_path = output_dir / "vessel_analysis_summary.json"
     summary = jsonable(summary)
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -727,6 +1089,10 @@ def main() -> int:
                 for k, v in sorted(branch_degree_hist.items())
             ]
         ).to_excel(writer, sheet_name="branch_point_degree", index=False)
+        if angle_df is not None:
+            angle_df.to_excel(writer, sheet_name="branch_angles", index=False)
+        if fd_points is not None:
+            fd_points.to_excel(writer, sheet_name="fractal_dimension", index=False)
 
     print(f"Summary written to {summary_path}")
     print(f"Workbook written to {xlsx_path}")

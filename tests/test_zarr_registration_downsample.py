@@ -12,11 +12,12 @@ from pipeline_modules.utils.errors import PipelineError
 from pipeline_modules.utils.zarr_io import create_output_zarr
 
 
-def _write_fake_ims(path, shape_l0=(64, 64, 64), stride=4, level=2):
+def _write_fake_ims(path, shape_l0=(64, 64, 64), stride=4, level=2, shape_coarse=None):
     """Minimal IMS-like HDF5: DataSet/ResolutionLevel N/TimePoint 0/Channel 0/Data."""
     import h5py
 
-    shape_coarse = tuple(max(s // stride, 1) for s in shape_l0)
+    if shape_coarse is None:
+        shape_coarse = tuple(max(s // stride, 1) for s in shape_l0)
     with h5py.File(str(path), "w") as handle:
         for res_level, shape in ((0, shape_l0), (level, shape_coarse)):
             tp = handle.require_group(f"DataSet/ResolutionLevel {res_level}/TimePoint 0")
@@ -28,6 +29,14 @@ def test_ims_level_stride_from_shapes(tmp_path):
     _write_fake_ims(ims, shape_l0=(64, 64, 64), stride=4, level=2)
     assert ims_level_stride_xyz(ims, 2) == [4.0, 4.0, 4.0]
     assert ims_level_stride_xyz(ims, 0) == [1.0, 1.0, 1.0]
+
+
+def test_ims_level_stride_padded_pyramid(tmp_path):
+    ims = tmp_path / "sample.ims"
+    # MegaSpim export: L2 padded to tile multiples beyond extent/4 (tail is
+    # zero-filled); the true stride is still 4 despite the fractional ratio.
+    _write_fake_ims(ims, shape_l0=(3776, 10368, 7552), shape_coarse=(960, 2688, 1920))
+    assert ims_level_stride_xyz(ims, 2) == [4.0, 4.0, 4.0]
 
 
 def test_ims_level_stride_non_cubic(tmp_path):
