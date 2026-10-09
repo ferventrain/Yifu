@@ -414,3 +414,161 @@ main {
   color: var(--muted);
   padding: 1.5rem 0.25rem;
 }
+
+/* ---- project board (batch -> project -> runs) ---- */
+.batch {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  margin-bottom: 0.75rem;
+  padding: 0.5rem 0.9rem 0.8rem;
+}
+
+.batch > summary {
+  cursor: pointer;
+  font-size: 1.02rem;
+  padding: 0.2rem 0;
+  user-select: none;
+}
+
+.batch-meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-left: 0.4rem;
+}
+
+.batch-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.project-card {
+  border: 1px solid var(--panel-border);
+  border-left: 4px solid var(--queued);
+  border-radius: 8px;
+  padding: 0.65rem 0.9rem;
+  background: #fbfdff;
+}
+
+.project-card.status-running,
+.project-card.status-verifying {
+  border-left-color: var(--accent);
+}
+
+.project-card.status-failed,
+.project-card.status-stalled {
+  border-left-color: var(--danger);
+}
+
+.project-card.status-succeeded {
+  border-left-color: var(--success);
+}
+
+.card-meta.manifest {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.start-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+
+.start-row select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  background: #fff;
+  min-width: 11rem;
+}
+
+.notes textarea {
+  width: 100%;
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font: inherit;
+  resize: vertical;
+}
+
+.notes {
+  margin-top: 0.4rem;
+  border-top: 1px dashed var(--panel-border);
+  padding-top: 0.4rem;
+}
+
+.notes > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.note-log p {
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.quick-note {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.quick-note input {
+  flex: 1;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+}
+
+.error-history p {
+  margin: 0.2rem 0 0;
+  font-size: 0.82rem;
+  color: var(--danger);
+}
+
+.runs {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.run-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.run-name {
+  font-weight: 600;
+}
+
+.run-status {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.run-dur {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.run-details {
+  margin-top: 0.35rem;
+}

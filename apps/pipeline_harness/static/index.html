@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Yifu Pipeline Monitor (PM)</title>
-  <link rel="stylesheet" href="/styles.css?v=5" />
+  <link rel="stylesheet" href="/styles.css?v=7" />
 </head>
 <body>
   <header class="app-header">
@@ -40,7 +40,7 @@
           <button type="submit" class="btn primary">提交任务</button>
         </form>
       </div>
-      <p class="hint">提交命令：<code>python -m pipeline_modules.harness run --sample-dir &lt;样本目录&gt;</code>。本页面只读：刷新不会启动任何任务。</p>
+      <p class="hint">看板按 <strong>实验批 → 样本项目</strong> 分组；项目卡内选 config 后"开始/继续"（断点自动续跑，补跑放 config_1.json 即可）。自定义程序用 <code>harness wrap</code> 挂进度。刷新/GET 不会启动任何任务；开始与保存笔记是显式操作。</p>
       <p id="form-error" class="error-banner hidden"></p>
       <div id="job-list" class="job-list"></div>
     </section>
@@ -54,6 +54,6 @@
     <pre id="log-body" class="log-body"></pre>
   </dialog>
 
-  <script src="/app.js?v=5"></script>
+  <script src="/app.js?v=7"></script>
 </body>
 </html>

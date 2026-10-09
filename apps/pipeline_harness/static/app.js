@@ -1,5 +1,6 @@
 const POLL_MS = 1500;
 const STATUS_LABELS = {
+  idle: "未运行",
   queued: "等待",
   running: "运行中",
   verifying: "验证输出",
@@ -17,7 +18,7 @@ const els = {
   sampleDir: document.getElementById("sample-dir"),
   configPath: document.getElementById("config-path"),
   formError: document.getElementById("form-error"),
-  jobList: document.getElementById("job-list"),
+  board: document.getElementById("job-list"),
   logDialog: document.getElementById("log-dialog"),
   logTitle: document.getElementById("log-title"),
   logBody: document.getElementById("log-body"),
@@ -25,7 +26,8 @@ const els = {
 };
 
 let openLogJobId = null;
-const expandedResultJobs = new Set();
+const expandedBatches = new Set();
+const runOpenState = new Map(); // `${sample}::${run_id}` -> user-pinned open/closed
 let errorHoldUntil = 0;
 
 function showError(message, holdMs = 0, kind = "error") {
@@ -53,17 +55,16 @@ function formatEta(seconds) {
   return `约 ${(total / 3600).toFixed(1)} 时`;
 }
 
-// Honest progress: completed steps + real unit fraction only. Steps without
-// unit data contribute nothing beyond their boundary — never a guessed %.
-function progressPercent(job) {
-  const status = job.display_status || job.status;
+// Honest progress: completed steps + real unit fraction only.
+function progressPercent(view) {
+  const status = view.display_status || view.status;
   if (status === "succeeded" || status === "done") return 100;
-  const progress = job.progress || {};
+  const progress = view.progress || {};
   const unitTotal = Number(progress.unit_total || 0);
   const unitDone = Number(progress.unit_done || 0);
   const total = Number(progress.step_total || 0);
   const index = Number(progress.step_index || 0);
-  if (total <= 0 || index <= 0) return status === "running" ? 0 : 0;
+  if (total <= 0 || index <= 0) return 0;
   const base = ((index - 1) / total) * 100;
   const stepSpan = 100 / total;
   if (unitTotal > 0) {
@@ -89,12 +90,16 @@ async function api(path, options) {
   return payload;
 }
 
-function renderJobs(data) {
-  const jobs = data.jobs || [];
+// ------------------------------------------------------------------ board
+
+function renderBoard(data) {
+  const batches = data.batches || [];
+  const jobs = [];
+  for (const batch of batches) for (const project of batch.projects) jobs.push(...project.runs);
   els.paths.textContent = `样本根目录 ${data.analysis_root}  ·  Active ${data.active_dir}`;
   const worker = data.worker || {};
-  const running = jobs.filter((job) => (job.display_status || job.status) === "running");
-  const queued = jobs.filter((job) => job.status === "queued");
+  const running = jobs.filter((run) => (run.display_status || run.status) === "running");
+  const queued = jobs.filter((run) => run.status === "queued");
   if (worker.alive) {
     els.runner.textContent = `Worker pid ${worker.pid} 在线` + (running.length ? `，运行中 ${running.length}` : "") + (queued.length ? `，排队 ${queued.length}` : "");
     els.runner.classList.toggle("busy", running.length > 0);
@@ -103,137 +108,377 @@ function renderJobs(data) {
     els.runner.classList.remove("busy");
   }
 
-  els.jobList.replaceChildren();
-  if (!jobs.length) {
+  els.board.replaceChildren();
+  if (!batches.length) {
     const empty = document.createElement("p");
     empty.className = "empty";
-    empty.textContent = "还没有任务。用标准命令提交：python -m pipeline_modules.harness run --sample-dir <样本目录>";
-    els.jobList.appendChild(empty);
+    empty.textContent = "还没有项目。提交任务或用 wrap 挂载程序后，样本目录会自动出现在这里。";
+    els.board.appendChild(empty);
     return;
   }
-  for (const job of jobs) els.jobList.appendChild(renderCard(job));
+  for (const batch of batches) els.board.appendChild(renderBatch(batch));
 }
 
-function renderCard(job) {
+function renderBatch(batch) {
+  const box = document.createElement("details");
+  box.className = "batch";
+  const openDefault = batch.projects.some((p) => ["running", "verifying", "queued", "stalled"].includes(p.status));
+  box.open = expandedBatches.has(batch.batch) ? true : expandedBatches.size === 0 ? openDefault : expandedBatches.has(batch.batch);
+  if (box.open) expandedBatches.add(batch.batch);
+  box.addEventListener("toggle", () => {
+    if (box.open) expandedBatches.add(batch.batch);
+    else expandedBatches.delete(batch.batch);
+  });
+
+  const heading = document.createElement("summary");
+  const name = document.createElement("strong");
+  name.textContent = batch.batch;
+  const meta = document.createElement("span");
+  meta.className = "batch-meta";
+  const active = batch.projects.filter((p) => ["running", "verifying", "queued"].includes(p.status)).length;
+  const failed = batch.projects.reduce((acc, p) => acc + (p.failed_count || 0), 0);
+  meta.textContent = ` · ${batch.projects.length} 个样本` + (active ? ` · ${active} 进行中` : "") + (failed ? ` · ${failed} 次失败` : "");
+  heading.append(name, meta);
+  box.appendChild(heading);
+
+  const list = document.createElement("div");
+  list.className = "batch-projects";
+  for (const project of batch.projects) list.appendChild(renderProject(project));
+  box.appendChild(list);
+  return box;
+}
+
+function renderProject(project) {
+  const card = document.createElement("article");
+  card.className = `project-card status-${project.status}`;
+
+  // ---- header
+  const head = document.createElement("div");
+  head.className = "job-head";
+  const titleWrap = document.createElement("div");
+  const title = document.createElement("strong");
+  title.className = "job-title";
+  title.textContent = project.sample_name;
+  const badge = document.createElement("span");
+  badge.className = "job-id";
+  const parts = [];
+  if (project.runs.length) parts.push(`${project.runs.length} 次 run`);
+  if (project.failed_count) parts.push(`失败 ${project.failed_count}`);
+  badge.textContent = parts.join(" · ");
+  titleWrap.append(title, document.createElement("br"), badge);
+
+  const statusCluster = document.createElement("span");
+  statusCluster.className = "status-cluster";
+  const lamp = document.createElement("i");
+  const lampStatus = project.status === "running" || project.status === "verifying" ? project.status : project.status;
+  lamp.className = `lamp ${lampStatus}`;
+  const label = document.createElement("span");
+  label.textContent = STATUS_LABELS[project.status] || project.status;
+  statusCluster.append(lamp, label);
+  head.append(titleWrap, statusCluster);
+  card.appendChild(head);
+
+  // ---- meta: sample dir + manifest summary
+  const meta = document.createElement("p");
+  meta.className = "card-meta";
+  meta.textContent = project.sample_dir;
+  card.appendChild(meta);
+  const manifest = project.last_manifest;
+  if (manifest && manifest.module) {
+    const manLine = document.createElement("p");
+    manLine.className = "card-meta manifest";
+    const commit = manifest.git_commit ? ` @ ${manifest.git_commit}` : "";
+    const dur = manifest.duration_seconds != null ? ` · ${formatDuration(manifest.duration_seconds) || "?"}` : "";
+    manLine.textContent = `最近产物：${manifest.module}${commit}${dur} · 输出 ${manifest.outputs.length} 项`;
+    card.appendChild(manLine);
+  }
+
+  // ---- start row (one-click start / resume)
+  const startRow = document.createElement("div");
+  startRow.className = "start-row";
+  const select = document.createElement("select");
+  if (!project.configs.length) {
+    const opt = document.createElement("option");
+    opt.textContent = "(无 config*.json)";
+    opt.value = "";
+    select.appendChild(opt);
+  } else {
+    for (const name of project.configs) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      select.appendChild(opt);
+    }
+  }
+  const startBtn = document.createElement("button");
+  startBtn.type = "button";
+  startBtn.className = "btn primary";
+  const busy = Boolean(project.active_run_id);
+  startBtn.textContent = busy ? "运行中（点击重开）" : "开始 / 继续";
+  startBtn.disabled = !project.configs.length;
+  startBtn.addEventListener("click", async () => {
+    startBtn.disabled = true;
+    startBtn.textContent = "提交中…";
+    try {
+      await api("/api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sample_dir: project.sample_dir,
+          config_path: `${project.sample_dir.replace(/[\\/]+$/, "")}/${select.value}`,
+        }),
+      });
+      showError(`已提交：${project.sample_name} / ${select.value}`, 4000, "info");
+    } catch (error) {
+      showError(error.message, 6000);
+    }
+    await refresh();
+  });
+  const openBtn = document.createElement("button");
+  openBtn.type = "button";
+  openBtn.className = "btn";
+  openBtn.textContent = "打开目录";
+  openBtn.addEventListener("click", () => openPath(project.sample_dir, openBtn));
+  startRow.append(select, startBtn, openBtn);
+  card.appendChild(startRow);
+
+  // ---- notes (requirements / retro), collapsible
+  const notes = project.notes || {};
+  const notesBox = document.createElement("details");
+  notesBox.className = "notes";
+  const notesSummary = document.createElement("summary");
+  const reqPreview = (notes.requirements || "").trim().split("\n")[0] || "点击填写分析需求";
+  notesSummary.textContent = `需求：${reqPreview.slice(0, 80)}`;
+  notesBox.appendChild(notesSummary);
+
+  const reqArea = document.createElement("textarea");
+  reqArea.rows = 2;
+  reqArea.placeholder = "分析需求（这个项目要做什么、对照组、交付物…）";
+  reqArea.value = notes.requirements || "";
+  const retroArea = document.createElement("textarea");
+  retroArea.rows = 3;
+  retroArea.placeholder = "复盘（踩过的坑、失误、下次注意…）";
+  retroArea.value = notes.retro || "";
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "btn";
+  saveBtn.textContent = "保存笔记";
+  saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "保存中…";
+    try {
+      await api("/api/projects/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sample_dir: project.sample_dir,
+          requirements: reqArea.value,
+          retro: retroArea.value,
+        }),
+      });
+      showError("笔记已保存", 3000, "info");
+    } catch (error) {
+      showError(error.message, 6000);
+    }
+    saveBtn.disabled = false;
+    saveBtn.textContent = "保存笔记";
+  });
+  const noteLog = document.createElement("div");
+  noteLog.className = "note-log";
+  for (const entry of notes.log || []) {
+    const line = document.createElement("p");
+    line.textContent = `${(entry.at || "").replace("T", " ").slice(0, 16)}  ${entry.text}`;
+    noteLog.appendChild(line);
+  }
+  const quickRow = document.createElement("div");
+  quickRow.className = "quick-note";
+  const quickInput = document.createElement("input");
+  quickInput.type = "text";
+  quickInput.placeholder = "记一笔（时间戳笔记），回车提交";
+  const quickBtn = document.createElement("button");
+  quickBtn.type = "button";
+  quickBtn.className = "btn";
+  quickBtn.textContent = "记一笔";
+  const submitQuick = async () => {
+    const text = quickInput.value.trim();
+    if (!text) return;
+    try {
+      await api("/api/projects/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sample_dir: project.sample_dir, append_note: text }),
+      });
+      quickInput.value = "";
+      await refresh();
+    } catch (error) {
+      showError(error.message, 6000);
+    }
+  };
+  quickBtn.addEventListener("click", submitQuick);
+  quickInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submitQuick();
+  });
+  quickRow.append(quickInput, quickBtn);
+  notesBox.append(reqArea, retroArea, saveBtn, quickRow, noteLog);
+  card.appendChild(notesBox);
+
+  // ---- error history (auto)
+  if (project.error_history && project.error_history.length) {
+    const errBox = document.createElement("details");
+    errBox.className = "results error-history";
+    const errSummary = document.createElement("summary");
+    errSummary.textContent = `报错历史（${project.error_history.length}）`;
+    errBox.appendChild(errSummary);
+    for (const item of project.error_history) {
+      const line = document.createElement("p");
+      line.textContent = `${(item.ended_at || item.run_id || "").toString().replace("T", " ").slice(0, 16)}  ${item.error || ""}`;
+      errBox.appendChild(line);
+    }
+    card.appendChild(errBox);
+  }
+
+  // ---- runs list
+  const runsBox = document.createElement("div");
+  runsBox.className = "runs";
+  for (const run of project.runs) runsBox.appendChild(renderRunRow(project, run));
+  card.appendChild(runsBox);
+  return card;
+}
+
+function renderRunRow(project, run) {
+  const wrap = document.createElement("div");
+  wrap.className = "run";
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = `run-row status-${run.display_status || run.status}`;
+  const lamp = document.createElement("i");
+  lamp.className = `lamp ${run.display_status || run.status}`;
+  const name = document.createElement("span");
+  name.className = "run-name";
+  name.textContent = run.config_name || (run.kind === "external" ? "外部程序" : run.title || run.id);
+  const statusLabel = document.createElement("span");
+  statusLabel.className = "run-status";
+  statusLabel.textContent = STATUS_LABELS[run.display_status || run.status] || run.status;
+  const dur = document.createElement("span");
+  dur.className = "run-dur";
+  dur.textContent = formatDuration(run.duration_s) || (run.started_at || run.created_at || "").toString().slice(5, 16);
+  row.append(lamp, name, statusLabel, dur);
+  wrap.appendChild(row);
+
+  const key = `${project.sample_name}::${run.id}`;
+  const defaultOpen =
+    project.runs[0] === run &&
+    ["running", "verifying", "queued", "stalled", "failed"].includes(project.status);
+  const expanded = runOpenState.has(key) ? runOpenState.get(key) : defaultOpen;
+  const details = document.createElement("div");
+  details.className = "run-details";
+  if (expanded && project.latest_full_view && run.id === project.latest_full_view.id) {
+    details.appendChild(renderRunCard(project.latest_full_view));
+  } else if (expanded) {
+    // older run without an inline full view: slim summary only
+    const line = document.createElement("p");
+    line.className = "card-meta";
+    line.textContent = run.error ? `错误：${run.error}` : `run ${run.id}（${run.kind}）· ${run.started_at || ""}`;
+    details.appendChild(line);
+  }
+  if (expanded) wrap.appendChild(details);
+  row.addEventListener("click", () => {
+    runOpenState.set(key, !expanded);
+    refresh();
+  });
+  return wrap;
+}
+
+// ------------------------------------------------------ rich run card (old)
+
+function renderRunCard(job) {
   const rawStatus = job.status || "queued";
   const status = job.display_status || rawStatus;
   const card = document.createElement("article");
   card.className = `job-card status-${status}`;
-
-  const head = document.createElement("div");
-  head.className = "job-head";
-  const titleWrap = document.createElement("div");
-  const title = document.createElement("div");
-  title.className = "job-title";
-  title.textContent = job.title || job.sample_name || job.sample_dir;
-  const idLine = document.createElement("div");
-  idLine.className = "job-id";
-  idLine.textContent = job.pid ? `${job.id}  ·  pid ${job.pid}` : job.id;
-  titleWrap.append(title, idLine);
-  const cluster = document.createElement("div");
-  cluster.className = "status-cluster";
-  const lamp = document.createElement("i");
-  lamp.className = `lamp ${status}`;
-  const label = document.createElement("span");
-  label.className = `status-label ${status}`;
-  label.textContent = STATUS_LABELS[status] || status;
-  cluster.append(lamp, label);
-  head.append(titleWrap, cluster);
-
-  const meta = document.createElement("p");
-  meta.className = "job-meta";
-  meta.textContent = job.config_path ? `${job.sample_dir}  ·  ${job.config_path}` : job.sample_dir;
-  card.append(head, meta);
-
-  // --- step / progress line (unknown stays unknown) ---
   const progress = job.progress || {};
-  const step = document.createElement("p");
-  step.className = "job-step";
-  const unitTotal = Number(progress.unit_total || 0);
-  const unitDone = Number(progress.unit_done || 0);
-  if (status === "queued") {
-    step.textContent = "等待 Worker 执行";
-  } else if (progress.step_name) {
-    const total = progress.step_total || 0;
-    const index = progress.step_index || 0;
-    const stepLabel = index && total ? `步骤 ${index}/${total}  ${progress.step_name}` : progress.step_name;
-    if (unitTotal > 0) {
-      step.textContent = `${stepLabel}  ·  ${unitDone} / ${unitTotal}`;
-    } else if (status === "running" || status === "verifying") {
-      step.textContent = `${stepLabel}  ·  进度未知`;
-    } else {
-      step.textContent = stepLabel;
-    }
-  } else if (status === "verifying") {
-    step.textContent = "正在验证输出文件";
-  }
 
-  // --- timing / heartbeat line ---
+  // step / progress line
+  const stepLine = document.createElement("p");
+  stepLine.className = "step-line";
+  if (status === "queued") {
+    stepLine.textContent = "等待 Worker 执行";
+  } else if (progress.step_name) {
+    const total = progress.step_total || "?";
+    const units = Number(progress.unit_total || 0) > 0 ? ` · ${progress.unit_done}/${progress.unit_total}` : "";
+    stepLine.textContent = `步骤 ${progress.step_index || "?"}/${total} ${progress.step_name}${units}`;
+  } else if (status === "verifying") {
+    stepLine.textContent = "正在验证输出文件";
+  } else if ((status === "running" || status === "stalled") && !progress.step_name) {
+    stepLine.textContent = "进度未知（程序未上报单位进度）";
+  }
+  card.appendChild(stepLine);
+
+  // eta line
   const etaLine = document.createElement("p");
   etaLine.className = "eta-line";
-  const parts = [];
   if (status === "running" || status === "verifying" || status === "stalled") {
-    const totalDur = formatDuration(job.duration_s);
+    const chunks = [];
+    const dur = formatDuration(job.duration_s);
+    if (dur) chunks.push(`总耗时 ${dur}`);
     const stepDur = formatDuration(job.current_step_duration_s);
-    if (totalDur) parts.push(`总耗时 ${totalDur}`);
-    if (stepDur) parts.push(`当前步骤 ${stepDur}`);
-    if (job.heartbeat_age_s != null) parts.push(`最后心跳 ${formatDuration(job.heartbeat_age_s)}前`);
-    else parts.push("最后心跳 无");
+    if (stepDur) chunks.push(`当前步骤 ${stepDur}`);
+    if (job.heartbeat_age_s != null) chunks.push(`心跳 ${job.heartbeat_age_s}s 前`);
     const eta = job.eta || {};
-    if (eta.collecting || (eta.total_remaining_s == null && eta.current_step_remaining_s == null)) {
-      parts.push("预计剩余：数据收集中");
-    } else {
-      const current = formatEta(eta.current_step_remaining_s);
+    if (!eta.collecting && (eta.current_step_remaining_s != null || eta.total_remaining_s != null)) {
+      const step = formatEta(eta.current_step_remaining_s);
       const total = formatEta(eta.total_remaining_s);
-      if (current) parts.push(`本步剩余 ${current}`);
-      if (total && total !== current) parts.push(`全部剩余 ${total}`);
+      if (step && total && step !== total) chunks.push(`本步剩余 ${step}，全部剩余 ${total}`);
+      else if (step || total) chunks.push(`预计剩余 ${step || total}`);
     }
+    etaLine.textContent = chunks.join(" · ");
   } else if (status === "succeeded" || status === "done") {
-    parts.push(job.duration_s != null ? `耗时 ${formatDuration(job.duration_s)}` : "分析完成");
+    etaLine.textContent = formatDuration(job.duration_s) ? `耗时 ${formatDuration(job.duration_s)}` : "分析完成";
   }
-  etaLine.textContent = parts.join("  ·  ");
-  card.append(step, etaLine);
+  if (etaLine.textContent) card.appendChild(etaLine);
 
+  // progress bar
   const track = document.createElement("div");
   track.className = "progress-track";
   const fill = document.createElement("div");
-  fill.className = `progress-fill ${status}`;
+  fill.className = `progress-fill status-${status}`;
   fill.style.width = `${progressPercent(job)}%`;
   track.appendChild(fill);
   card.appendChild(track);
 
-  // --- structured error panel ---
+  // error block
   const error = job.error;
-  if (error && typeof error === "object" && error.message) {
+  if (error) {
     const box = document.createElement("div");
     box.className = "error-detail";
-    const codeLine = document.createElement("p");
-    codeLine.className = "error-code";
-    codeLine.textContent = `[${error.code}]${error.step_id != null ? ` 步骤 ${error.step_id}` : ""}${error.retryable ? " · 可重试" : " · 不可自动重试"}`;
     const msgLine = document.createElement("p");
-    msgLine.textContent = error.message;
-    box.append(codeLine, msgLine);
-    if (error.suggestion) {
-      const sug = document.createElement("p");
-      sug.className = "error-suggestion";
-      sug.textContent = `建议：${error.suggestion}`;
-      box.appendChild(sug);
+    if (typeof error === "object") {
+      const head = `[${error.code || "?"}]` + (error.step_id != null ? ` 步骤 ${error.step_id}` : "") + (error.retryable ? " · 可重试" : " · 不可自动重试");
+      const headLine = document.createElement("strong");
+      headLine.textContent = head;
+      msgLine.textContent = error.message || "";
+      box.append(headLine, msgLine);
+      if (error.suggestion) {
+        const sug = document.createElement("p");
+        sug.textContent = `建议：${error.suggestion}`;
+        box.appendChild(sug);
+      }
+    } else {
+      msgLine.textContent = String(error);
+      box.appendChild(msgLine);
     }
-    card.appendChild(box);
-  } else if (typeof error === "string" && error) {
-    const box = document.createElement("div");
-    box.className = "error-detail";
-    const msgLine = document.createElement("p");
-    msgLine.textContent = error;
-    box.appendChild(msgLine);
     card.appendChild(box);
   }
 
-  // --- QC images (registration rigid/final check etc.), clickable ---
+  // qc images
   const qcImages = job.qc_images || [];
   if (qcImages.length) {
     const box = document.createElement("details");
     box.className = "results qc-images";
+    box.open = runOpenState.get(`qc::${job.id}`) === true;
+    box.addEventListener("toggle", () => {
+      runOpenState.set(`qc::${job.id}`, box.open);
+    });
     const heading = document.createElement("summary");
     heading.textContent = `QC 图（${qcImages.length}）`;
     const list = document.createElement("ul");
@@ -264,15 +509,14 @@ function renderCard(job) {
     card.appendChild(box);
   }
 
-  // --- artifact / result paths ---
-  const results = job.results || progress.results || [];
+  // results
+  const results = job.results || [];
   if ((status === "succeeded" || status === "done") && results.length) {
     const box = document.createElement("details");
     box.className = "results";
-    box.open = expandedResultJobs.has(job.id);
+    box.open = runOpenState.get(`res::${job.id}`) === true;
     box.addEventListener("toggle", () => {
-      if (box.open) expandedResultJobs.add(job.id);
-      else expandedResultJobs.delete(job.id);
+      runOpenState.set(`res::${job.id}`, box.open);
     });
     const heading = document.createElement("summary");
     heading.textContent = `结果位置（${results.length}）`;
@@ -310,6 +554,7 @@ function renderCard(job) {
     card.appendChild(box);
   }
 
+  // actions
   const actions = document.createElement("div");
   actions.className = "card-actions";
   const logBtn = document.createElement("button");
@@ -337,10 +582,12 @@ function renderCard(job) {
   return card;
 }
 
+// ------------------------------------------------------------------ actions
+
 async function refresh() {
   try {
-    const data = await api("/api/jobs");
-    renderJobs(data);
+    const data = await api("/api/projects");
+    renderBoard(data);
     if (Date.now() >= errorHoldUntil) showError("");
     if (openLogJobId && els.logDialog.open) await loadLog(openLogJobId, false);
   } catch (error) {
@@ -377,55 +624,44 @@ async function openLog(job) {
   openLogJobId = job.id;
   els.logDialog.showModal();
   els.logBody.textContent = "加载中…";
-  try {
-    await loadLog(job.id, true);
-  } catch (error) {
-    els.logBody.textContent = error.message;
-  }
+  await loadLog(job.id, true);
 }
 
 async function openPath(path, button) {
   const original = button ? button.textContent : "";
-  if (button) {
-    button.disabled = true;
-    button.textContent = "正在打开…";
-  }
+  if (button) button.textContent = "正在打开…";
   try {
-    const payload = await api("/api/open", {
+    await api("/api/open", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
     });
     if (button) button.textContent = "已打开";
-    showError(payload.opened ? `已打开 ${payload.opened}` : "", 4000, "info");
-    window.setTimeout(() => {
-      if (button && button.textContent === "已打开") button.textContent = original || "打开目录";
-      if (button) button.disabled = false;
-    }, 1500);
+    showError(`已在资源管理器打开：${path}`, 4000, "info");
   } catch (error) {
-    if (button) {
-      button.disabled = false;
-      button.textContent = original || "打开目录";
-    }
-    showError(error.message, 8000, "error");
+    if (button) button.textContent = original || "打开目录";
+    showError(error.message, 8000);
+  } finally {
+    if (button) setTimeout(() => { button.textContent = original || "打开目录"; }, 2500);
   }
 }
 
 els.form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  const sampleDir = els.sampleDir.value.trim();
+  if (!sampleDir) return;
   try {
     await api("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sample_dir: els.sampleDir.value.trim(),
-        config_path: els.configPath.value.trim(),
-      }),
+      body: JSON.stringify({ sample_dir: sampleDir, config_path: els.configPath.value.trim() }),
     });
+    els.sampleDir.value = "";
     els.configPath.value = "";
+    showError("");
     await refresh();
   } catch (error) {
-    showError(error.message);
+    showError(error.message, 8000);
   }
 });
 

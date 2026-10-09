@@ -117,6 +117,9 @@ def test_monitor_get_jobs_never_starts_worker(analysis_home: Path, monkeypatch):
     import importlib
 
     monitor = importlib.import_module("apps.pipeline_harness.main")
+    # module-level store binds env dirs at import time; rebind to this test's
+    # analysis home regardless of which test imported the module first
+    monkeypatch.setattr(monitor, "store", store)
     calls = []
     monkeypatch.setattr(
         monitor, "ensure_worker_running", lambda *a, **k: calls.append(1) or {"started": True, "worker": {"alive": True}}
