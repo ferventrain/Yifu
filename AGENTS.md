@@ -53,5 +53,10 @@ python -m pipeline_modules.harness run --sample-dir "S:/path/to/sample" \
 python -m pipeline_modules.harness cancel <run_id>                                          # 取消
 ```
 
+自定义/一次性程序要在 PM 里显示进度，默认用 wrap 包装（零改动）：
+`python -m pipeline_modules.harness wrap --sample-dir <样本目录> --title <标题> -- <任意命令>`；
+要细粒度进度就在程序里调 `progress.report(done, total, phase, sample_dir)`（详见
+`pipeline_modules/harness/capability_manifest.json` 的 progress_protocol）。
+
 提交后在 Pipeline Monitor（http://127.0.0.1:8766，只读）查看。状态语义与错误字段见
 `pipeline_modules/harness/capability_manifest.json`。拿不准时把结构化错误和日志尾部报告给用户，等指示。

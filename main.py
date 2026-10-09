@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1294,6 +1295,10 @@ def main():
     if args.progress_file:
         from pipeline_modules.harness.progress import ProgressWriter
 
+        # Export for subprocess CLIs (report_child_units): without this the
+        # unit-level progress of every module is silently lost whenever main.py
+        # runs outside the worker (manual runs, external drivers).
+        os.environ["YIFU_PROGRESS_FILE"] = str(args.progress_file)
         _PROGRESS = ProgressWriter(args.progress_file, step_total=_STEP_TOTAL)
         _PROGRESS.start_run(
             sample_dir=str(sample_dir),

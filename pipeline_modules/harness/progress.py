@@ -259,7 +259,11 @@ def report_child_units(
             started = writer.state.get("phase_started_at") or writer.state.get("step_started_at") or utc_now_iso()
         writer.set_units(done, total, phase=phase, phase_started_at=started)
     except Exception:
-        logger.debug("Could not update harness progress file", exc_info=True)
+        # A silent failure here looks like "the monitor cannot read progress";
+        # warn once per process so the broken link becomes visible.
+        if not _REPORT_WARNED["env"]:
+            _REPORT_WARNED["env"] = True
+            logger.warning("Could not update harness progress file (warned once)", exc_info=True)
 
 
 def touch_heartbeat(path: Path) -> str | None:
@@ -433,3 +437,111 @@ def _median(values: list[float]) -> float | None:
     if n % 2:
         return numbers[mid]
     return (numbers[mid - 1] + numbers[mid]) / 2.0
+
+
+# ---------------------------------------------------------------------------
+# Minimal progress API for standalone programs (schema 2, pm_progress.json)
+#
+# The full ProgressWriter contract (schema 1) is wired into main.py only.
+# Standalone drivers/manual chains kept failing to show progress because the
+# contract was implicit. These three functions are the whole contract now:
+#
+#     from pipeline_modules.harness.progress import report, report_done
+#     report(done=42, total=100, phase="apply mask", sample_dir="S:/...")
+#     report_done(sample_dir="S:/...")
+#
+# When YIFU_PROGRESS_FILE is set (inside a harness run or `harness wrap`),
+# unit fields merge into that progress.json instead (same RMW pattern as
+# report_child_units). Otherwise the well-known <sample_dir>/pm_progress.json
+# is written; the monitor reads it for external jobs automatically.
+# ---------------------------------------------------------------------------
+
+PM_PROGRESS_SCHEMA_VERSION = "2"
+PM_PROGRESS_FILENAME = "pm_progress.json"
+_REPORT_WARNED = {"env": False, "file": False}
+
+
+def _pm_progress_path(sample_dir: str | Path | None) -> Path | None:
+    if not sample_dir:
+        return None
+    return Path(sample_dir) / PM_PROGRESS_FILENAME
+
+
+def _write_pm_progress(sample_dir: str | Path, payload: dict[str, Any]) -> Path | None:
+    path = _pm_progress_path(sample_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = read_json(path, default={}) or {}
+        state.update(payload)
+        state.setdefault("schema_version", PM_PROGRESS_SCHEMA_VERSION)
+        state.setdefault("started_at", payload.get("updated_at"))
+        state["pid"] = os.getpid()
+        write_json_atomic(path, state)
+        return path
+    except OSError:
+        if not _REPORT_WARNED["file"]:
+            _REPORT_WARNED["file"] = True
+            logger.warning("Cannot write %s (warned once)", path, exc_info=True)
+        return None
+
+
+def report(
+    done: int | None = None,
+    total: int | None = None,
+    *,
+    phase: str = "",
+    sample_dir: str | Path | None = None,
+) -> None:
+    """Report progress from any program. Never raises.
+
+    Inside a harness run (YIFU_PROGRESS_FILE set) this merges unit fields into
+    the run's progress.json; otherwise it writes <sample_dir>/pm_progress.json.
+    """
+    progress_file = os.environ.get("YIFU_PROGRESS_FILE", "").strip()
+    if progress_file and (total or 0) > 0 and done is not None:
+        try:
+            report_child_units(int(done), int(total or 0), phase=phase)
+            return
+        except Exception:
+            if not _REPORT_WARNED["env"]:
+                _REPORT_WARNED["env"] = True
+                logger.warning("report() via YIFU_PROGRESS_FILE failed (warned once)", exc_info=True)
+    if sample_dir is None:
+        return
+    payload: dict[str, Any] = {"status": "running", "updated_at": utc_now_iso()}
+    if done is not None:
+        payload["done"] = int(done)
+    if total is not None:
+        payload["total"] = int(total)
+    if phase:
+        payload["phase"] = str(phase)
+    _write_pm_progress(sample_dir, payload)
+
+
+def report_done(*, sample_dir: str | Path | None = None, message: str = "") -> None:
+    """Mark the program finished successfully (pm_progress.json)."""
+    if sample_dir is None:
+        return
+    payload: dict[str, Any] = {"status": "done", "updated_at": utc_now_iso()}
+    done, total = _last_done_total(sample_dir)
+    if total:
+        payload["done"] = payload["total"] = int(total)
+    if message:
+        payload["phase"] = str(message)
+    _write_pm_progress(sample_dir, payload)
+
+
+def report_failed(message: str, *, sample_dir: str | Path | None = None) -> None:
+    """Mark the program failed (pm_progress.json)."""
+    if sample_dir is None:
+        return
+    _write_pm_progress(
+        sample_dir,
+        {"status": "failed", "updated_at": utc_now_iso(), "error": str(message)},
+    )
+
+
+def _last_done_total(sample_dir: str | Path) -> tuple[int | None, int | None]:
+    path = _pm_progress_path(sample_dir)
+    state = read_json(path, default={}) or {}
+    return state.get("done"), state.get("total")

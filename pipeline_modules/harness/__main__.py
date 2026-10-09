@@ -79,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
     attach.add_argument("--module-progress", default="", help="Path to module _progress.json for ETA")
     attach.add_argument("--step-total", type=int, default=7)
 
+    from pipeline_modules.harness.wrap import build_parser as _wrap_parser
+
+    wrap = sub.add_parser(
+        "wrap",
+        help="Run any command as a tracked job with progress (the default way to make a program monitorable)",
+    )
+    _wrap_parser(wrap)
+
     sub.add_parser("list", help="Print jobs as JSON (read-only)")
     return parser
 
@@ -211,6 +219,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(record, indent=2, ensure_ascii=False))
             return 0
+        if args.subcommand == "wrap":
+            from pipeline_modules.harness.wrap import run_wrap
+
+            return run_wrap(args)
     except PipelineError as exc:
         print(json.dumps(exc.to_dict(), indent=2, ensure_ascii=False), file=sys.stderr)
         return exc.exit_code

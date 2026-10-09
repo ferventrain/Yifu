@@ -10,7 +10,10 @@
     "function": "pipeline_modules.harness.__main__.cmd_run",
     "description": "推荐且唯一推荐的提交方式。校验 sample_dir（须在 analysis root 下）与 config.json，按样本去重（同一样本已有 queued/running 任务时返回原 run_id），创建任务记录，启动或复用唯一 detached worker，立即打印 {run_id, log_path, progress_path, monitor} 后退出。关闭终端不影响运行。",
     "outputs": {
-      "run_id": { "type": "string", "description": "<utcstamp>-<sample-slug>，用于 cancel/list 与 Monitor 查看" }
+      "run_id": {
+        "type": "string",
+        "description": "<utcstamp>-<sample-slug>，用于 cancel/list 与 Monitor 查看"
+      }
     }
   },
   "agent_rules": "宗旨：少命令（只用标准入口，不写 run.py）、不猜（只认状态和结构化错误，不解析日志）、少改（普通失败不引发改代码）。需要新代码时先与用户确认放置位置：现有仓库，还是项目文件夹下用完即删。完整规则见仓库根 AGENTS.md。",
@@ -31,11 +34,22 @@
       "function": "pipeline_modules.harness.__main__.cmd_run",
       "description": "标准提交入口（同 recommended_entrypoint）。--extra-arg 只接受白名单 flag：--skip_registration / --only_tubule / --only_region_analysis；不接受任意 shell 命令。",
       "inputs": {
-        "sample_dir": { "type": "path", "required": true, "description": "Must be a subdirectory of the analysis root, not the _active/jobs|runs bookkeeping folders" },
-        "config_path": { "type": "path|null", "default": null, "description": "Defaults to sample_dir/config.json" }
+        "sample_dir": {
+          "type": "path",
+          "required": true,
+          "description": "Must be a subdirectory of the analysis root, not the _active/jobs|runs bookkeeping folders"
+        },
+        "config_path": {
+          "type": "path|null",
+          "default": null,
+          "description": "Defaults to sample_dir/config.json"
+        }
       },
       "outputs": {
-        "job": { "type": "object", "description": "Queued job record; run_id printed as JSON on stdout" }
+        "job": {
+          "type": "object",
+          "description": "Queued job record; run_id printed as JSON on stdout"
+        }
       }
     },
     {
@@ -43,28 +57,47 @@
       "cli": "python -m pipeline_modules.harness preflight --sample-dir <sample>",
       "function": "pipeline_modules.harness.__main__.cmd_preflight",
       "description": "Submit 前的一次只读校验：sample_dir、config.json、pipeline mode、required outputs 与当前 worker 状态。不创建任务。",
-      "outputs": { "status": { "type": "object", "description": "{status: ok, pipeline, required_outputs, active_run, worker}" } }
+      "outputs": {
+        "status": {
+          "type": "object",
+          "description": "{status: ok, pipeline, required_outputs, active_run, worker}"
+        }
+      }
     },
     {
       "id": "cancel_job",
       "cli": "python -m pipeline_modules.harness cancel <run_id>",
       "function": "pipeline_modules.harness.worker.request_cancel",
       "description": "协作式取消：写 cancel flag，worker 终止 pipeline 进程树并把任务标记 cancelled。queued 任务直接取消。",
-      "outputs": { "result": { "type": "object", "description": "{job_id, status: cancelled|cancel_requested}" } }
+      "outputs": {
+        "result": {
+          "type": "object",
+          "description": "{job_id, status: cancelled|cancel_requested}"
+        }
+      }
     },
     {
       "id": "list_jobs",
       "cli": "python -m pipeline_modules.harness list",
       "function": "pipeline_modules.harness.__main__.cmd_list",
       "description": "只读列出任务（含 display_status、heartbeat_age_s、duration_s、结构化 error）。REST 等价：GET http://127.0.0.1:8766/api/jobs —— GET 不会启动任何任务。",
-      "outputs": { "jobs": { "type": "array" } }
+      "outputs": {
+        "jobs": {
+          "type": "array"
+        }
+      }
     },
     {
       "id": "run_worker",
       "cli": "python -m pipeline_modules.harness worker",
       "function": "pipeline_modules.harness.worker.HarnessWorker.run_forever",
       "description": "内部入口：detached 串行 worker。由 run/POST 自动启动，一般不需要手动调用。持有 _active/worker.lock 独占锁；空闲 30 分钟自动退出；崩溃重启后会收养仍存活的 pipeline 子进程，或把失去心跳的 running 任务标记 stalled。",
-      "outputs": { "exit": { "type": "int", "description": "0 on idle timeout or clean stop" } }
+      "outputs": {
+        "exit": {
+          "type": "int",
+          "description": "0 on idle timeout or clean stop"
+        }
+      }
     },
     {
       "id": "attach_external_job",
@@ -72,23 +105,55 @@
       "cli": "python -m pipeline_modules.harness attach --sample-dir <s> --title <t> --pid <p> --log <l> --status <f>",
       "description": "LEGACY/定制流程：把 main.py 表达不了的自定义 driver 挂到 PM。状态文件首行 RUNNING/ALL DONE/FAILED/CANCELLED，第二行 started_at ISO。同一样本重复 attach 会更新而不是复制记录。标准流程不要用这个，用 run。",
       "inputs": {
-        "sample_dir": { "type": "path", "required": true },
-        "title": { "type": "string", "required": true },
-        "pid": { "type": "int|null", "default": null },
-        "log_path": { "type": "path", "required": true },
-        "status_path": { "type": "path", "required": true },
-        "config_path": { "type": "path|null", "default": null },
-        "command": { "type": "string", "default": "" },
-        "step_total": { "type": "int", "default": 7 }
+        "sample_dir": {
+          "type": "path",
+          "required": true
+        },
+        "title": {
+          "type": "string",
+          "required": true
+        },
+        "pid": {
+          "type": "int|null",
+          "default": null
+        },
+        "log_path": {
+          "type": "path",
+          "required": true
+        },
+        "status_path": {
+          "type": "path",
+          "required": true
+        },
+        "config_path": {
+          "type": "path|null",
+          "default": null
+        },
+        "command": {
+          "type": "string",
+          "default": ""
+        },
+        "step_total": {
+          "type": "int",
+          "default": 7
+        }
       },
-      "outputs": { "job": { "type": "object" } }
+      "outputs": {
+        "job": {
+          "type": "object"
+        }
+      }
     },
     {
       "id": "enqueue_job",
       "function": "pipeline_modules.harness.queue.ActiveStore.add_job",
       "cli": "python -m pipeline_modules.harness enqueue --sample-dir <sample>",
       "description": "LEGACY：只入队不启动 worker（与旧脚本兼容）。推荐改用 run_sample。",
-      "outputs": { "job": { "type": "object" } }
+      "outputs": {
+        "job": {
+          "type": "object"
+        }
+      }
     },
     {
       "id": "serve_pipeline_monitor",
@@ -96,8 +161,14 @@
       "cli": "python -m apps.pipeline_harness --host 127.0.0.1 --port 8766",
       "description": "启动 Pipeline Monitor（只读 UI）。REST：GET /api/meta, GET /api/jobs（只读）, GET /api/jobs/{id}/log, GET /api/jobs/{id}/artifacts, POST /api/jobs（提交+启动 worker）, POST /api/queue/start（显式启动 worker）, POST /api/jobs/{id}/cancel, POST /api/queue/cancel, DELETE /api/jobs/{id}, POST /api/open。GET 请求永远不会启动任务。",
       "inputs": {
-        "host": { "type": "string", "default": "127.0.0.1" },
-        "port": { "type": "int", "default": 8766 }
+        "host": {
+          "type": "string",
+          "default": "127.0.0.1"
+        },
+        "port": {
+          "type": "int",
+          "default": 8766
+        }
       }
     }
   ],
@@ -119,7 +190,15 @@
   },
   "queue_semantics": {
     "storage": "YIFU_ANALYSIS_ROOT/_active: queue.json (ordered ids), jobs/*.json (records), runs/<job_id>/ (progress.json + stdout.log + artifacts.json + cancel.flag), worker.json (worker liveness), worker.lock (exclusive), logs/worker.log",
-    "statuses": ["queued", "running", "verifying", "succeeded", "failed", "cancelled", "stalled"],
+    "statuses": [
+      "queued",
+      "running",
+      "verifying",
+      "succeeded",
+      "failed",
+      "cancelled",
+      "stalled"
+    ],
     "status_meanings": {
       "queued": "已提交等待执行",
       "running": "runner 进程和 heartbeat 正常",
@@ -134,9 +213,26 @@
     "readonly_monitor": "GET /api/jobs 与页面刷新不做任何状态变更；只有 提交/显式启动 worker/取消/worker 推进队列 会改变状态"
   },
   "progress_protocol": {
-    "file": "runs/<job_id>/progress.json (atomic writes)",
-    "fields": ["run_id", "status", "step_index", "step_total", "step_name", "unit_done", "unit_total", "message", "started_at", "step_started_at", "heartbeat_at"],
+    "default_for_new_programs": "harness wrap: python -m pipeline_modules.harness wrap --sample-dir <dir> --title <标题> -- <任意命令>。自动挂任务、记录日志、心跳，把子进程 stdout 里的 PROGRESS <done>/<total> [phase] 行转成进度；子进程若调 progress.report() 也直接生效（wrap 会设 YIFU_PROGRESS_FILE）。什么都不打印的程序也有活性/耗时/日志尾。",
+    "file": "runs/<job_id>/progress.json (atomic writes, schema 1, 由 main.py/worker 写)",
+    "fields": [
+      "run_id",
+      "status",
+      "step_index",
+      "step_total",
+      "step_name",
+      "unit_done",
+      "unit_total",
+      "message",
+      "run_started_at",
+      "step_started_at",
+      "phase_started_at",
+      "heartbeat_at"
+    ],
+    "field_note": "时间戳字段为 run_started_at（不是 started_at）",
     "unknown_units": "unit_total 为 null 表示进度未知；UI 显示『进度未知』，禁止伪造百分比或 ETA",
-    "module_api": "pipeline_modules.harness.runcontext.RunContext (start_step/progress/heartbeat/log/register_output/check_cancelled/finish_step)；旧模块可继续用 report_child_units"
+    "module_api": "细粒度进度：pipeline_modules.harness.progress.report(done, total, phase, sample_dir) / report_done / report_failed——环境变量 YIFU_PROGRESS_FILE 存在时并入 run 进度，否则写 <sample_dir>/pm_progress.json（schema 2：done/total/phase/status）。PM 对 external 任务自动回退读 pm_progress.json，读取端宽容（unit_done/done、percent 别名都认）。",
+    "env_chain": "main.py 收到 --progress_file 时会导出 YIFU_PROGRESS_FILE，手动跑 main.py 子模块单位进度不丢",
+    "external_jobs": "attach_external 的 inputs 含 module_progress_path（可选）；缺省时按 sample_dir 找 pm_progress.json；external 任务存活时由 sync_external_job 打 heartbeat_at（不再恒显『失联』）"
   }
 }

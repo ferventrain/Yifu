@@ -300,6 +300,9 @@ class ActiveStore:
             job["error"] = None
             job["ended_at"] = None
             job["step_name"] = first.replace("RUNNING", "", 1).strip() or first or "运行中"
+            # Liveness stamp: without heartbeat_at the monitor shows every
+            # running external job as "stalled" (decorate_views keys on it).
+            job["heartbeat_at"] = utc_now_iso()
             if parsed.get("started_at"):
                 job["started_at"] = parsed["started_at"]
         elif first.startswith("RUNNING"):
@@ -319,7 +322,7 @@ class ActiveStore:
         if parsed.get("step_index"):
             job["step_index"] = parsed["step_index"]
         job["status_line"] = first
-        module_prog = _read_module_progress(job.get("module_progress_path"))
+        module_prog = _external_module_progress(job)
         if module_prog:
             job["module_progress"] = module_prog
             phase = str(module_prog.get("phase") or "").strip()
@@ -409,7 +412,7 @@ class ActiveStore:
         job_id = str(job["id"])
         log_file = job.get("log_path") or str(stdout_log_path(job_id, self.active))
         if str(job.get("kind") or "") == "external":
-            module_prog = job.get("module_progress") or _read_module_progress(job.get("module_progress_path"))
+            module_prog = job.get("module_progress") or _external_module_progress(job)
             unit_done = int((module_prog or {}).get("unit_done") or 0)
             unit_total = int((module_prog or {}).get("unit_total") or 0)
             phase = str((module_prog or {}).get("phase") or "")
@@ -424,6 +427,7 @@ class ActiveStore:
                 "unit_done": unit_done,
                 "unit_total": unit_total,
                 "unit_phase": phase,
+                "heartbeat_at": job.get("heartbeat_at"),
             }
             if job.get("status") == "running" and unit_total > 0:
                 eta = estimate_unit_eta(
@@ -488,10 +492,62 @@ class ActiveStore:
 
 
 def _read_module_progress(path_value: str | None) -> dict[str, Any] | None:
+    """Lenient unit-progress reader.
+
+    Accepts the original flat schema (``unit_done/unit_total/phase/
+    phase_started_at`` — what vessel_express writes) AND the minimal
+    ``pm_progress.json`` schema (``done/total/phase`` — what
+    ``progress.report()`` writes), plus common aliases (``percent``, message).
+    Always returns schema-1 shaped fields or None; never raises.
+    """
     if not path_value:
         return None
     payload = read_json(Path(path_value), default=None)
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+
+    def _first(*keys):
+        for key in keys:
+            value = payload.get(key)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                return value
+        return None
+
+    total = _first("unit_total", "total")
+    done = _first("unit_done", "done")
+    phase = _first("phase", "unit_phase", "message")
+    started = _first("phase_started_at")
+
+    if total is None and done is None:
+        percent = _first("percent", "progress")
+        if isinstance(percent, (int, float)) and 0.0 <= float(percent) <= 100.0:
+            total, done = 100, float(percent)
+
+    try:
+        normalized: dict[str, Any] = {
+            "unit_done": int(done) if done is not None else 0,
+            "unit_total": int(total) if total is not None else 0,
+            "phase": str(phase or ""),
+            "phase_started_at": str(started) if started else None,
+        }
+    except (TypeError, ValueError):
+        return None
+    if normalized["unit_total"] <= 0 and not normalized["phase"]:
+        return None
+    return normalized
+
+
+def _external_module_progress(job: dict[str, Any]) -> dict[str, Any] | None:
+    """External unit progress: explicit path first, then <sample>/pm_progress.json."""
+    module_prog = _read_module_progress(job.get("module_progress_path"))
+    if module_prog is not None:
+        return module_prog
+    sample_dir = str(job.get("sample_dir") or "").strip()
+    if not sample_dir:
+        return None
+    from pipeline_modules.harness.progress import PM_PROGRESS_FILENAME
+
+    return _read_module_progress(str(Path(sample_dir) / PM_PROGRESS_FILENAME))
 
 
 def _parse_status_file(path_value: str | None) -> dict[str, Any]:
