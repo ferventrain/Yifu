@@ -72,6 +72,82 @@ def _ants_image_read(path):
     return ants.image_read(path_str)
 
 
+def n4_bias_correct_masked(volume_xyz: np.ndarray, mask_xyz: np.ndarray, spacing_xyz) -> np.ndarray:
+    """Mask-constrained N4 bias correction via SimpleITK.
+
+    ANTsPy 0.6.3 on Windows crashes natively (0xC0000005) in
+    n4_bias_field_correction as soon as a mask is passed, so the mask-fit
+    variant runs through SimpleITK with AIND-equivalent settings
+    ([50]x4 iterations, tol 1e-7). Arrays are (x,y,z); spacing is (sx,sy,sz).
+    """
+    import SimpleITK as sitk
+
+    arr = np.transpose(volume_xyz, (2, 1, 0)).astype(np.float32)  # -> z,y,x
+    msk = (np.transpose(mask_xyz, (2, 1, 0)) > 0).astype(np.uint8)
+    spacing = tuple(float(v) for v in reversed(spacing_xyz))  # sitk axes are x,y,z
+    image = sitk.GetImageFromArray(arr)
+    image.SetSpacing(spacing)
+    mask_img = sitk.GetImageFromArray(msk)
+    mask_img.SetSpacing(spacing)
+    n4 = sitk.N4BiasFieldCorrectionImageFilter()
+    n4.SetMaximumNumberOfIterations([50, 50, 50, 50])
+    n4.SetConvergenceThreshold(1e-7)
+    corrected = n4.Execute(sitk.Cast(image, sitk.sitkFloat32), mask_img)
+    return np.transpose(sitk.GetArrayFromImage(corrected), (2, 1, 0))  # -> x,y,z
+
+
+def render_alignment_check_png(fixed_ants, warped_ants, out_png: Path, title: str) -> None:
+    """3x3 QC grid (axial/coronal/sagittal x sample/warped/overlay+diff-ish).
+
+    Volumes are ANTs images in (x,y,z) array layout; plane conventions match
+    pipeline_qc: axial (y,x), coronal (z,x), sagittal (z,y).
+    """
+    from PIL import Image, ImageDraw
+    from pipeline_modules.visualization.pipeline_qc import (
+        _difference_panel,
+        _norm_u8,
+        _overlay_panel,
+    )
+
+    fixed = fixed_ants.numpy()
+    warped = warped_ants.numpy()
+    nx, ny, nz = fixed.shape
+    fixed_u8 = _norm_u8(fixed)
+    warped_u8 = _norm_u8(warped)
+    planes = {
+        "axial": (np.transpose(fixed_u8[:, :, nz // 2]), np.transpose(warped_u8[:, :, nz // 2])),
+        "coronal": (np.transpose(fixed_u8[:, ny // 2, :]), np.transpose(warped_u8[:, ny // 2, :])),
+        "sagittal": (fixed_u8[nx // 2, :, :], warped_u8[nx // 2, :, :]),
+    }
+    rows = []
+    for name, (a, b) in planes.items():
+        row = []
+        for arr, label in (
+            (np.dstack([a] * 3), f"{name} sample"),
+            (np.dstack([b] * 3), f"{name} warped"),
+            (_overlay_panel(a, b), f"{name} overlay"),
+            (_difference_panel(a, b), f"{name} diff"),
+        ):
+            img = Image.fromarray(arr)
+            ImageDraw.Draw(img).text((3, 2), label, fill=(255, 255, 255))
+            row.append(img)
+        rows.append(row)
+    gap = 12
+    width = max(sum(img.width for img in row) + gap * (len(row) - 1) for row in rows)
+    heights = [max(img.height for img in row) for row in rows]
+    sheet = Image.new("RGB", (width, sum(heights) + gap * (len(rows) - 1) + 22), (20, 20, 20))
+    ImageDraw.Draw(sheet).text((6, 2), title, fill=(255, 255, 0))
+    y = 22
+    for row, h in zip(rows, heights):
+        x = 0
+        for img in row:
+            sheet.paste(img, (x, y))
+            x += img.width + gap
+        y += h + gap
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out_png)
+
+
 def _write_tiff_volume_batch(job: dict[str, object]) -> int:
     arr = job["arr"]
     start = int(job["start"])
@@ -193,6 +269,20 @@ class BidirectionalRegistration:
         if config_path and os.path.exists(config_path):
             registration_config = full_config.get("registration", {})
         self.registration_config = registration_config
+        self.grad_step = float(registration_config.get("grad_step", 0.1))
+        self.syn_iterations = tuple(
+            int(v) for v in registration_config.get("syn_iterations", (40, 20, 0))
+        )
+        # 2026-10-08 additions (AIND comparison outcome): N4 bias correction
+        # before histogram matching, and a fast rigid pre-pass whose QC image
+        # catches catastrophic misalignment ~20s into the run.
+        self.n4_preprocess = bool(registration_config.get("n4_preprocess", True))
+        self.rigid_preflight_qc = bool(registration_config.get("rigid_preflight_qc", True))
+        logger.info(
+            "SyN deformation params: grad_step=%s, syn_iterations=%s",
+            self.grad_step,
+            self.syn_iterations,
+        )
 
         # Flip atlas if configured
         flip_atlas = registration_config.get("flip_atlas", [False, False, False])
@@ -372,10 +462,58 @@ class BidirectionalRegistration:
             fixed=fixed,
             moving=moving,
             type_of_transform=reg_type,
-            grad_step=0.1,
+            grad_step=self.grad_step,
+            reg_iterations=self.syn_iterations,
             aff_random_sampling_rate=0.5,
             aff_do_reflection=False,
             **kwargs
+        )
+
+    def _apply_n4_preprocess(self, fixed: ants.ANTsImage) -> ants.ANTsImage:
+        """N4 bias correction (mask-constrained, SimpleITK) before matching.
+
+        Uses the halo brain_mask.nii.gz written next to the registration
+        volume; skips with a warning when absent (e.g. halo_mask disabled).
+        """
+        import nibabel as nib
+
+        mask_path = self.sample_dir / f"ch{self.register_channel}_downsample" / "brain_mask.nii.gz"
+        if not mask_path.exists():
+            logger.warning("N4 skipped: brain mask not found at %s", mask_path)
+            return fixed
+        mask = np.asanyarray(nib.load(str(mask_path)).dataobj) > 0
+        started = time.time()
+        corrected = n4_bias_correct_masked(fixed.numpy(), mask, fixed.spacing)
+        logger.info("N4 bias correction done in %.0fs (mask=%s)", time.time() - started, mask_path.name)
+        return ants.from_numpy(
+            corrected.astype(np.float32),
+            spacing=fixed.spacing,
+            origin=fixed.origin,
+            direction=fixed.direction,
+        )
+
+    def _run_rigid_preflight_qc(self, fixed: ants.ANTsImage, moving: ants.ANTsImage) -> None:
+        """Fast rigid pre-pass (~20s) + QC image for early failure detection.
+
+        Diagnostic only: its transform is NOT chained into the main
+        registration; a bad rigid overlay here means the run should be
+        cancelled instead of waiting out the full SyN.
+        """
+        started = time.time()
+        rigid = ants.registration(
+            fixed=fixed,
+            moving=moving,
+            type_of_transform="Rigid",
+            aff_metric="mattes",
+            aff_iterations=[60, 30, 15, 5],
+        )
+        out_png = self.sample_dir / "qc" / "registration_rigid_check.png"
+        render_alignment_check_png(
+            fixed, rigid["warpedmovout"], out_png,
+            "rigid pre-check: sample | rigid-warped atlas | overlay | diff",
+        )
+        logger.info(
+            "Rigid pre-check done in %.0fs -> %s", time.time() - started, out_png
         )
 
     def register(self, mode: str = 'atlas2image', registration_type: str = 'SyN', **kwargs) -> Dict:
@@ -383,19 +521,34 @@ class BidirectionalRegistration:
         if mode not in ['atlas2image', 'image2atlas']:
             raise ValueError(f"Invalid mode: {mode}")
 
+        fixed = self.register_image
+        if self.n4_preprocess:
+            fixed = self._apply_n4_preprocess(fixed)
+
         # Histogram matching (Sample matches Atlas)
         logger.info("Performing histogram matching (Sample -> Atlas)...")
-        self.register_image = ants.histogram_match_image(self.register_image, self.atlas_image)
+        self.register_image = ants.histogram_match_image(fixed, self.atlas_image)
 
         if mode == 'atlas2image':
+            if self.rigid_preflight_qc:
+                self._run_rigid_preflight_qc(self.register_image, self.atlas_image)
             logger.info("Mode: Atlas -> Image")
             reg_result = self._perform_registration(
-                fixed=self.register_image, 
-                moving=self.atlas_image, 
-                reg_type=registration_type, 
+                fixed=self.register_image,
+                moving=self.atlas_image,
+                reg_type=registration_type,
                 **kwargs
             )
-            
+            try:
+                render_alignment_check_png(
+                    self.register_image,
+                    reg_result['warpedmovout'],
+                    self.sample_dir / "qc" / "registration_final_check.png",
+                    "final check: sample | SyN-warped atlas | overlay | diff",
+                )
+            except Exception:
+                logger.exception("final registration QC render failed (non-fatal)")
+
             # Apply transform to Atlas Label
             warped_label = ants.apply_transforms(
                 fixed=self.register_image,
@@ -403,7 +556,7 @@ class BidirectionalRegistration:
                 transformlist=reg_result['fwdtransforms'],
                 interpolator='nearestNeighbor'
             )
-            
+
             return {
                 'warped_image': reg_result['warpedmovout'],
                 'warped_label': warped_label,
@@ -703,6 +856,10 @@ def main():
             label_zarr = sample_dir / "upsampled_atlas_label.zarr"
             if label_zarr.exists():
                 _output_files.append(label_zarr)
+            for qc_name in ("registration_rigid_check.png", "registration_final_check.png"):
+                qc_png = sample_dir / "qc" / qc_name
+                if qc_png.exists():
+                    _output_files.append(qc_png)
             write_run_manifest(
                 sample_dir,
                 module="registration.ANTs_registration",

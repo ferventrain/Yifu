@@ -41,7 +41,7 @@ from pipeline_modules.harness.worker import (
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
 STATIC_DIR = APP_DIR / "static"
-ASSET_VERSION = "5"
+ASSET_VERSION = "6"
 
 def _resolve_pipeline_python() -> str | None:
     for key in ("YIFU_PYTHON", "YIFU_PYTHON_EXE"):
@@ -83,11 +83,75 @@ async def pipeline_error_handler(_request, exc: PipelineError):
 def _jobs_payload() -> dict[str, Any]:
     """Assemble the job view. Read-only: never spawns, never mutates."""
     return {
-        "jobs": decorate_views(store.list_job_views(), store.active),
+        "jobs": [_attach_qc_images(view) for view in decorate_views(store.list_job_views(), store.active)],
         "worker": worker_snapshot(store.active),
         "analysis_root": str(store.root),
         "active_dir": str(store.active),
     }
+
+
+_QC_IMAGE_DIR = "qc"
+_QC_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+
+def _attach_qc_images(view: dict[str, Any]) -> dict[str, Any]:
+    """List <sample>/qc/*.png for the job card (read-only glob, newest first).
+
+    Rendered by the registration step (rigid/final check) and the post-run QC
+    module; each entry carries a PM-served URL so the browser can open it
+    without file:// restrictions.
+    """
+    sample_dir = str(view.get("sample_dir") or "").strip()
+    if not sample_dir:
+        return view
+    qc_dir = Path(sample_dir) / _QC_IMAGE_DIR
+    images: list[dict[str, str]] = []
+    try:
+        for path in sorted(qc_dir.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True):
+            images.append({"name": path.name, "path": str(path), "url": f"/api/file?path={path}"})
+    except OSError:
+        pass
+    if images:
+        view["qc_images"] = images[:8]
+    return view
+
+
+_FILE_SUFFIXES = (".png", ".jpg", ".jpeg", ".json", ".txt", ".log", ".csv")
+
+
+@app.get("/api/file")
+def api_file(path: str = Query(..., min_length=1)):
+    """Serve a single file (read-only) so QC images open in the browser.
+
+    Restricted to the analysis root / active dir and to viewable suffixes —
+    this is a viewer, not a general file server.
+    """
+    from fastapi.responses import FileResponse
+
+    target = Path(path).expanduser()
+    try:
+        target = target.resolve()
+    except OSError as exc:
+        raise PipelineError(ErrorCode.ARGUMENT_INVALID, str(exc)) from exc
+    if not (is_under(target, store.root) or is_under(target, store.active)):
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            f"路径不在分析根目录内: {target}",
+            context={"path": str(target), "root": str(store.root)},
+        )
+    if not target.is_file():
+        raise PipelineError(
+            ErrorCode.INPUT_NOT_FOUND,
+            f"文件不存在: {target}",
+            context={"path": str(target)},
+        )
+    if target.suffix.lower() not in _FILE_SUFFIXES:
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            f"不支持的文件类型: {target.suffix}",
+            context={"path": str(target)},
+        )
+    return FileResponse(str(target))
 
 
 @app.get("/api/meta")

@@ -132,6 +132,38 @@ def test_monitor_get_jobs_never_starts_worker(analysis_home: Path, monkeypatch):
     assert len(calls) == 1  # explicit submit may start the worker
 
 
+# 2b. monitor surfaces sample qc images with PM-served clickable URLs
+def test_monitor_lists_qc_images_and_serves_files(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("fastapi")
+    sample = _write_sample(analysis_home, "mouse03")
+    qc_dir = sample / "qc"
+    qc_dir.mkdir()
+    rigid_png = qc_dir / "registration_rigid_check.png"
+    rigid_png.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+    store = ActiveStore()
+    store.add_job(sample)
+
+    import importlib
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    # the module-level store binds env dirs at import time; rebind to this
+    # test's analysis home (the module may already be cached by an earlier test)
+    monkeypatch.setattr(monitor, "store", store)
+    payload = monitor.api_jobs()
+    job = next(j for j in payload["jobs"] if j["sample_name"] == "mouse03")
+    assert job["qc_images"][0]["name"] == "registration_rigid_check.png"
+    assert job["qc_images"][0]["url"].startswith("/api/file?path=")
+
+    # the served route returns the actual bytes (read-only viewer)
+    response = monitor.api_file(path=str(rigid_png))
+    assert rigid_png.name in str(response.filename) or response.media_type
+
+    # paths outside the analysis root are rejected
+    with pytest.raises(PipelineError):
+        monitor.api_file(path=str(Path(__file__).absolute()))
+
+
 # 3. running jobs get heartbeats
 def test_touch_heartbeat_updates_running_progress(analysis_home: Path):
     sample = _write_sample(analysis_home)

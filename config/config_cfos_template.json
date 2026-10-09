@@ -78,7 +78,17 @@
     "flip_atlas": [false, false, false],
         "save_upsampled_label": false,
         "save_upsampled_label_zarr": true,
-        "save_upsampled_label_hemisphere_zarr": true
+        "save_upsampled_label_hemisphere_zarr": true,
+      "grad_step": 0.15,
+      "syn_iterations": [
+        70,
+        50,
+        30,
+        10
+      ],
+      "halo_mask": true,
+      "n4_preprocess": true,
+      "rigid_preflight_qc": true
   },
   "segmentation": {
     "method": "cfos_unet",

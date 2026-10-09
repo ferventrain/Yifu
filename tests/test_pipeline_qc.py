@@ -122,3 +122,32 @@ def test_qc_flags_oversampled_grid(tmp_path):
     nib.save(nib.Nifti1Image(np.transpose(nii_zyx, (2, 1, 0)), np.eye(4)), sample / "ch0_downsample" / "volume.nii.gz")
     verdict = _run(sample)
     assert verdict["checks"]["grid_shape"]["status"] == "FAIL"
+
+
+def test_registration_views_five_panel_grid(tmp_path):
+    """The AIND-style grid renders 5 columns (sample/atlas/warped/overlay/
+    difference) x 3 direction rows plus the axial L/R check row."""
+    sample = _build_sample(tmp_path)
+    config = json.loads((sample / "config.json").read_text(encoding="utf-8"))
+
+    atlas_dir = tmp_path / "reference"
+    atlas_dir.mkdir()
+    atlas_zyx = np.zeros((20, 24, 16), dtype=np.uint16)
+    atlas_zyx[2:18, 3:21, 2:14] = 600
+    tifffile.imwrite(atlas_dir / "atlas.tiff", atlas_zyx)
+    config["registration"] = {"atlas_path": str(atlas_dir / "atlas.tiff")}
+    (sample / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    _run(sample)
+    png = sample / "qc" / "registration_views.png"
+    assert png.exists()
+
+    from PIL import Image
+
+    img = Image.open(png)
+    z, y, x = 20, 24, 16  # synthetic full_shape
+    col_gap = 16 * 4      # 5 panels per direction row
+    expected_w = max(x * 5 + col_gap, y * 5 + col_gap)  # sagittal panels are y-wide
+    assert img.width == expected_w
+    row_heights = [y, z, z, y]  # axial, coronal, sagittal, L/R check
+    assert img.height == sum(row_heights) + 16 * 3

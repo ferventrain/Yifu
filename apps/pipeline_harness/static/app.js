@@ -229,6 +229,41 @@ function renderCard(job) {
     card.appendChild(box);
   }
 
+  // --- QC images (registration rigid/final check etc.), clickable ---
+  const qcImages = job.qc_images || [];
+  if (qcImages.length) {
+    const box = document.createElement("details");
+    box.className = "results qc-images";
+    const heading = document.createElement("summary");
+    heading.textContent = `QC 图（${qcImages.length}）`;
+    const list = document.createElement("ul");
+    for (const item of qcImages) {
+      const li = document.createElement("li");
+      const link = document.createElement("a");
+      link.href = item.url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = item.name;
+      li.append(link, document.createTextNode(`  ${item.path} `));
+      const actions = document.createElement("span");
+      actions.className = "result-actions";
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "linkish";
+      copyBtn.textContent = "复制";
+      copyBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        navigator.clipboard.writeText(item.path);
+      });
+      actions.append(copyBtn);
+      li.appendChild(actions);
+      list.appendChild(li);
+    }
+    box.append(heading, list);
+    card.appendChild(box);
+  }
+
   // --- artifact / result paths ---
   const results = job.results || progress.results || [];
   if ((status === "succeeded" || status === "done") && results.length) {

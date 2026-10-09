@@ -238,3 +238,79 @@ class TestMergeAtlasRegionsHelpers:
         merge_mapping, summaries = build_nearest_ancestor_mapping(nodes, target_specs)
         # Everything should map to root (id=1)
         assert len(merge_mapping) > 0
+
+
+# ---------------------------------------------------------------------------
+# N4 (SimpleITK masked) + alignment-check QC rendering
+# ---------------------------------------------------------------------------
+
+
+class TestN4AndAlignmentCheck:
+    def test_n4_bias_correct_masked_flattens_gradient(self):
+        ants = pytest.importorskip("ants")
+        pytest.importorskip("SimpleITK")
+        import numpy as np
+
+        from pipeline_modules.registration.ANTs_registration import n4_bias_correct_masked
+
+        shape = (24, 24, 24)
+        zz, yy, xx = np.mgrid[0:24, 0:24, 0:24]
+        blob = 500.0 * np.exp(-((zz - 12) ** 2 + (yy - 12) ** 2 + (xx - 12) ** 2) / 40.0)
+        bias = 1.0 + 0.5 * xx / 24.0  # smooth x-ramp: classic bias field
+        volume = (blob * bias).astype(np.float32)
+        mask = blob > 50.0
+
+        corrected = n4_bias_correct_masked(volume, mask, (1.0, 1.0, 1.0))
+        assert corrected.shape == shape
+        assert np.isfinite(corrected).all()
+        # the corrected volume's x-dependence inside the blob must shrink
+        def _x_slope(vol):
+            vals = [vol[:, :, i][mask[:, :, i]].mean() for i in range(4, 20)]
+            return abs(vals[-1] - vals[0]) / max(vals[0], 1e-6)
+        assert _x_slope(corrected) < _x_slope(volume)
+
+    def test_render_alignment_check_png_writes_grid(self, tmp_path: Path):
+        ants = pytest.importorskip("ants")
+        pytest.importorskip("PIL")
+        import numpy as np
+        from PIL import Image
+
+        from pipeline_modules.registration.ANTs_registration import render_alignment_check_png
+
+        shape = (16, 20, 24)  # x, y, z
+        zz, yy, xx = np.mgrid[0:16, 0:20, 0:24]
+        blob = 800 * np.exp(-((zz - 8) ** 2 + (yy - 10) ** 2 + (xx - 12) ** 2) / 30.0)
+        fixed = ants.from_numpy(blob.astype(np.float32), spacing=(1.0, 1.0, 1.0))
+        warped = ants.from_numpy(
+            np.roll(blob, 2, axis=1).astype(np.float32), spacing=(1.0, 1.0, 1.0)
+        )
+
+        out_png = tmp_path / "qc" / "check.png"
+        render_alignment_check_png(fixed, warped, out_png, "unit-test")
+        assert out_png.exists()
+        with Image.open(out_png) as img:
+            # 3 rows x 4 columns of small planes on a dark sheet
+            assert img.width > 4 * 10
+            assert img.height > 3 * 10
+
+    def test_rigid_preflight_qc_runs_and_renders(self, tmp_path: Path):
+        """End-to-end smoke of the preflight path with tiny ANTs images,
+        guarding against ants-version parameter drift (e.g. random_seed)."""
+        ants = pytest.importorskip("ants")
+        import numpy as np
+
+        from pipeline_modules.registration.ANTs_registration import (
+            BidirectionalRegistration,
+        )
+
+        registrator = BidirectionalRegistration.__new__(BidirectionalRegistration)
+        registrator.sample_dir = tmp_path
+        shape = (24, 24, 24)
+        zz, yy, xx = np.mgrid[0:24, 0:24, 0:24]
+        blob = 900 * np.exp(-((zz - 12) ** 2 + (yy - 12) ** 2 + (xx - 12) ** 2) / 30.0)
+        fixed = ants.from_numpy(blob.astype(np.float32), spacing=(1.0, 1.0, 1.0))
+        moved = ants.from_numpy(
+            np.roll(blob, 2, axis=1).astype(np.float32), spacing=(1.0, 1.0, 1.0)
+        )
+        registrator._run_rigid_preflight_qc(fixed, moved)
+        assert (tmp_path / "qc" / "registration_rigid_check.png").exists()
