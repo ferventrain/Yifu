@@ -1020,15 +1020,6 @@ def render_bregma_png(
         flip_dv=flip_dv,
         flip_ml=flip_ml,
     )
-    if meta.anchor.bregma_dv is not None and meta.anchor.bregma_ml is not None:
-        dv_mm = meta.anchor.bregma_dv * meta.voxel_xyz_um[2] / 1000.0
-        ml_mm = meta.anchor.bregma_ml * meta.voxel_xyz_um[0] / 1000.0
-        if flip_dv:
-            dv_mm = extent_dv_mm - dv_mm
-        if flip_ml:
-            ml_mm = extent_ml_mm - ml_mm
-        ax.plot([ml_mm - 0.2, ml_mm + 0.2], [dv_mm, dv_mm], color="cyan", linewidth=1.2)
-        ax.plot([ml_mm, ml_mm], [dv_mm - 0.2, dv_mm + 0.2], color="cyan", linewidth=1.2)
     _draw_scale_bar(ax, extent_ml_mm, extent_dv_mm)
 
     ax.set_title(
@@ -1100,7 +1091,6 @@ def render_atlas_slab_png(
     boundary_color: str = "white",
     boundary_linewidth: float = 0.35,
     boundary_style: str = "dashed",
-    bregma_dv_ap_ml: tuple[int, int, int] = DEFAULT_BREGMA_DV_AP_ML,
     flip_dv: bool = False,
     flip_ml: bool = False,
     pool_factor: int = 1,
@@ -1135,14 +1125,6 @@ def render_atlas_slab_png(
         flip_dv=flip_dv,
         flip_ml=flip_ml,
     )
-    dv_mm = bregma_dv_ap_ml[0] * atlas_res_um / 1000.0
-    ml_mm = bregma_dv_ap_ml[2] * atlas_res_um / 1000.0
-    if flip_dv:
-        dv_mm = extent_dv_mm - dv_mm
-    if flip_ml:
-        ml_mm = extent_ml_mm - ml_mm
-    ax.plot([ml_mm - 0.2, ml_mm + 0.2], [dv_mm, dv_mm], color="cyan", linewidth=1.2)
-    ax.plot([ml_mm, ml_mm], [dv_mm - 0.2, dv_mm + 0.2], color="cyan", linewidth=1.2)
     _draw_scale_bar(ax, extent_ml_mm, extent_dv_mm)
 
     channel_summary = " + ".join(
