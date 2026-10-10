@@ -10,11 +10,17 @@
 
 ## 参数基线（cfos）
 
-cfos 任务从 `config/config_cfos_template.json` 生成 config，只改每样本必查项：
-`project_name`、`input.resolution_xyz`（从 ims 元数据取真实体素大小，MegaSpim 恒为 1.8/1.8/2.0）、
-`input.channels`（cfos 惯例 signal=ch1/registration=ch0，非标准排布先核对）。其余参数保持 template
-默认，要动阈值、模型、postprocess 等先问用户。全脑 normalization（normalize_scope=global）、
-256³ 推理块、hemisphere 半球统计、postprocess（max_single_slice_voxels=300）是基线，不调。
+**运行模式（2026-10-09 起）**：每开一次任务写一个该 run 专属 config，放样本目录（config.json 为基底，
+补跑依次 config_1.json、config_2.json…，PM 项目卡下拉可选）。run config **只需写要覆盖的字段**——
+缺省键自动继承同目录 config.json，再继承 `config/config_cfos_template.json`（深合并，list/标量整体覆盖）。
+跳过环节用顶层布尔：`"skip_registration": true`（复用已有配准产物）、`"only_tubule": true`、
+`"only_region_analysis": true`（与命令行 extra-arg 等效，PM 一键开始也能用）。
+
+首次为样本建 config 时仍按必查项核对：`project_name`、`input.resolution_xyz`（从 ims 元数据取真实体素
+大小，MegaSpim 恒为 1.8/1.8/2.0）、`input.channels`（cfos 惯例 signal=ch1/registration=ch0，非标准排布
+先核对）。其余参数保持 template 默认，要动阈值、模型、postprocess 等先问用户。全脑 normalization
+（normalize_scope=global）、256³ 推理块、hemisphere 半球统计、postprocess（max_single_slice_voxels=300、
+edge_shrink_factor=0.99 脑表面 mesh 收缩剔除，读注册产物 `<label>_ds_brain_mask.zarr` 缓存）是基线，不调。
 配准基线（2026-10-03 固化）：配准输入先做光晕裁切掩膜（`registration.halo_mask`，默认开，
 由 zarr_to_registration_nii 在建 25µm volume 时执行）；形变 `registration.grad_step=0.15`、
 `registration.syn_iterations=[70,50,30,10]`（比旧标准 0.1/40x20x0 强，用于组织变形大的样本）。

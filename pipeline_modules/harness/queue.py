@@ -111,7 +111,9 @@ class ActiveStore:
                 context={"config_path": str(path)},
             )
         try:
-            cfg = load_config(path)
+            from pipeline_modules.utils.config_layering import resolve_partial_config
+
+            path, cfg = resolve_partial_config(path)
         except (OSError, json.JSONDecodeError) as exc:
             raise PipelineError(
                 ErrorCode.CONFIG_INVALID,

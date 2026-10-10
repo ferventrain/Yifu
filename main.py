@@ -101,9 +101,12 @@ def run_command(cmd, desc, *, show_command=True):
 
 
 def load_config(config_path):
-    """Load JSON config."""
-    with open(config_path, "r", encoding="utf-8-sig") as f:
-        return json.load(f)
+    """Load JSON config (partial run-configs inherit missing keys from the
+    sample's config.json, then the cfos template)."""
+    from pipeline_modules.utils.config_layering import resolve_partial_config
+
+    _path, cfg = resolve_partial_config(config_path)
+    return cfg
 
 
 def resolve_project_path(path_value):
@@ -1289,6 +1292,13 @@ def main():
     cfg = load_config(config_path)
     sample_dir = Path(args.sample_dir)
     print_pipeline_banner(sample_dir, config_path)
+
+    # config-level skip flags work like their CLI extra-arg counterparts, so
+    # partial run-configs (config_1.json...) can skip stages from the board's
+    # one-click start without command-line access
+    args.skip_registration = bool(getattr(args, "skip_registration", False)) or bool(cfg.get("skip_registration"))
+    for _flag in ("only_tubule", "only_region_analysis"):
+        setattr(args, _flag, bool(getattr(args, _flag, False)) or bool(cfg.get(_flag)))
 
     global _PROGRESS, _STEP_TOTAL
     from pipeline_modules.harness.progress import planned_step_names

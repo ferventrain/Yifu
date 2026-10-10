@@ -43,7 +43,10 @@ def required_outputs(sample_dir: str | Path, config: dict[str, Any], extra_args:
     """
     extras = [str(item) for item in (extra_args or [])]
     layout = layout_from_config(sample_dir, config)
-    if "--only_tubule" in extras or "--only_region_analysis" in extras:
+    # config-level flags mirror the CLI extra-args (partial run-configs can
+    # skip stages without command-line access)
+    config_only_tubule = bool(config.get("only_tubule")) or bool(config.get("only_region_analysis"))
+    if "--only_tubule" in extras or "--only_region_analysis" in extras or config_only_tubule:
         return [layout.tubule_region_summary_csv]
     if pipeline_mode(config) == PIPELINE_MODE_SPINAL_CORD:
         return [layout.spinal_segment_stats_xlsx]
