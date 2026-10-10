@@ -266,7 +266,7 @@ def run_threshold_segmentation(
     }
     manifest_path = write_run_manifest(
         output_zarr,
-        module="segmentation",
+        module="segmentation.intensity_threshold",
         entrypoint="run_threshold_segmentation",
         inputs={
             "input_zarr": str(input_path),

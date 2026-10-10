@@ -15,6 +15,7 @@ const els = {
   paths: document.getElementById("header-paths"),
   benchStats: document.getElementById("bench-stats"),
   runner: document.getElementById("runner-status"),
+  resources: document.getElementById("resource-panel"),
   form: document.getElementById("add-form"),
   sampleDir: document.getElementById("sample-dir"),
   configPath: document.getElementById("config-path"),
@@ -172,6 +173,102 @@ function renderBoard(data) {
     els.board.appendChild(renderOtherSection(otherBatches, order));
   }
   currentSampleOrder = order;
+  renderResourcePanel(data.resources || null, batches);
+}
+
+async function setPriority(sampleDir, level) {
+  try {
+    await api("/api/projects/priority", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sample_dir: sampleDir, level }),
+    });
+  } catch (error) {
+    showError(error.message, 6000);
+  }
+  await refresh();
+}
+
+function renderResourcePanel(resources, batches) {
+  if (!els.resources) return;
+  els.resources.replaceChildren();
+  if (!resources) return;
+
+  const title = document.createElement("h3");
+  title.textContent = "资源与决策";
+  els.resources.appendChild(title);
+
+  // capacity bars
+  for (const [label, used, total, unit] of [
+    ["CPU", resources.used.cpu, resources.capacity.cpu, "核"],
+    ["GPU", resources.used.gpu, resources.capacity.gpu, "卡"],
+  ]) {
+    const row = document.createElement("div");
+    row.className = "res-row";
+    const head = document.createElement("div");
+    head.className = "res-head";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const num = document.createElement("strong");
+    num.textContent = `${used}${total ? ` / ${total}` : ""}${unit ? ` ${unit}` : ""}`;
+    head.append(name, num);
+    const track = document.createElement("div");
+    track.className = "res-track";
+    const bar = document.createElement("div");
+    bar.className = `res-bar${total && used / total > 0.85 ? " hot" : ""}`;
+    bar.style.width = total ? `${Math.min(100, (used / total) * 100)}%` : "0%";
+    track.appendChild(bar);
+    row.append(head, track);
+    els.resources.appendChild(row);
+  }
+
+  // active tasks draw
+  if ((resources.active_tasks || []).length) {
+    const head = document.createElement("h4");
+    head.textContent = "运行中占用";
+    els.resources.appendChild(head);
+    for (const task of resources.active_tasks) {
+      const line = document.createElement("div");
+      line.className = "res-task";
+      const name = document.createElement("span");
+      name.className = "res-task-name";
+      name.textContent = task.sample;
+      const draw = document.createElement("span");
+      draw.className = "res-task-draw";
+      const parts = [`CPU ${task.cpu}`];
+      if (task.gpu) parts.push(`GPU ${task.gpu}`);
+      const rem = formatEta(task.remaining_s);
+      if (rem) parts.push(`剩 ${rem}`);
+      draw.textContent = parts.join("，");
+      line.append(name, draw);
+      els.resources.appendChild(line);
+    }
+  } else {
+    const idle = document.createElement("p");
+    idle.className = "res-note";
+    idle.textContent = "当前没有运行中的任务";
+    els.resources.appendChild(idle);
+  }
+
+  // reference costs + verdict
+  const head2 = document.createElement("h4");
+  head2.textContent = "可否加跑一个";
+  els.resources.appendChild(head2);
+  for (const cost of resources.profile_costs || []) {
+    const line = document.createElement("div");
+    line.className = "res-verdict";
+    const name = document.createElement("span");
+    name.textContent = cost.label;
+    const draw = document.createElement("span");
+    draw.textContent = `CPU ${cost.cpu}${cost.gpu ? ` + GPU ${cost.gpu}` : ""}`;
+    const verdict = document.createElement("span");
+    const cpuOk = (resources.free.cpu ?? 0) >= cost.cpu;
+    const gpuOk = (resources.free.gpu ?? 0) >= cost.gpu;
+    verdict.className = cpuOk && gpuOk ? "ok" : "bad";
+    verdict.textContent = cpuOk && gpuOk ? "可跑" : gpuOk ? "CPU 不足" : "GPU 占用";
+    line.append(name, draw, verdict);
+    els.resources.appendChild(line);
+  }
 }
 
 function batchHeader(batch) {
@@ -248,7 +345,8 @@ function renderProject(project) {
   }
 
   const card = document.createElement("article");
-  card.className = `project-card status-${project.status}` + (project.anomaly ? " anomalous" : "");
+  const pcls = project.priority != null ? ` has-p${project.priority}` : "";
+  card.className = `project-card status-${project.status}${project.anomaly ? " anomalous" : ""}${pcls}`;
   card.dataset.sampleKey = key;
 
   // drag & drop (priority)
@@ -286,15 +384,24 @@ function renderProject(project) {
 
   const statusCluster = document.createElement("span");
   statusCluster.className = "status-cluster";
+  const pBadge = document.createElement("button");
+  pBadge.type = "button";
+  pBadge.className = `pbadge${project.priority != null ? ` p${project.priority}` : ""}`;
+  pBadge.title = "优先级：点击循环 P0–P3";
+  pBadge.textContent = project.priority != null ? `P${project.priority}` : "—";
+  pBadge.addEventListener("click", () => {
+    const next = project.priority == null ? 0 : (project.priority + 1) % 4;
+    setPriority(project.sample_dir, next);
+  });
   const lamp = document.createElement("i");
   lamp.className = `lamp ${project.status}`;
   const label = document.createElement("span");
   label.textContent = STATUS_LABELS[project.status] || project.status;
-  statusCluster.append(lamp, label);
+  statusCluster.append(pBadge, lamp, label);
   head.append(titleWrap, statusCluster);
   card.appendChild(head);
 
-  // ---- chips: anomaly / profile / priority / estimate
+  // ---- chips: anomaly / profile / estimate
   const chips = document.createElement("div");
   chips.className = "chip-row";
   if (project.anomaly) {
@@ -307,12 +414,6 @@ function renderProject(project) {
     const chip = document.createElement("span");
     chip.className = "chip";
     chip.textContent = project.profile_label;
-    chips.appendChild(chip);
-  }
-  if (project.priority_rank != null) {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    chip.textContent = `优先级 ${project.priority_rank + 1}`;
     chips.appendChild(chip);
   }
   if (project.estimate && project.estimate.seconds) {
@@ -506,23 +607,12 @@ function renderProject(project) {
     event.preventDefault();
     card.classList.remove("drag-over");
     if (!dragSampleKey || dragSampleKey === key) return;
-    const order = [...currentSampleOrder];
-    const from = order.findIndex((dir) => sampleKey(dir) === dragSampleKey);
-    const to = order.findIndex((dir) => sampleKey(dir) === key);
-    if (from < 0 || to < 0) return;
-    order.splice(to, 0, order.splice(from, 1)[0]);
+    const draggedDir = currentSampleOrder.find((dir) => sampleKey(dir) === dragSampleKey);
     dragSampleKey = null;
-    try {
-      await api("/api/projects/order", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ordered: order }),
-      });
-      showError("优先级已更新", 2500, "info");
-    } catch (error) {
-      showError(error.message, 6000);
-    }
-    await refresh();
+    if (!draggedDir) return;
+    // drop A onto B: A takes B's priority level (drag assigns priority,
+    // dropping onto an unprioritized card clears it)
+    await setPriority(draggedDir, project.priority != null ? project.priority : -1);
   });
 
   nodeCache.set(key, card);

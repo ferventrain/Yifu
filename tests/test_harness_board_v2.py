@@ -31,7 +31,7 @@ def _write_sample(root: Path, name: str) -> Path:
     return sample
 
 
-def test_board_order_persists_and_sorts(analysis_home: Path):
+def test_board_priority_persists_and_sorts(analysis_home: Path):
     pytest.importorskip("fastapi")
     import importlib
 
@@ -48,21 +48,62 @@ def test_board_order_persists_and_sorts(analysis_home: Path):
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(monitor, "store", store)
 
-    result = monitor.api_projects_order(monitor.BoardOrderBody(ordered=[str(b), str(a), str(c)]))
-    assert result["order"]["sample_order"][0] == str(b)
+    # aaa -> P0, bbb -> P2 via the priority endpoint
+    monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(a), level=0))
+    result = monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(b), level=2))
+    assert str(a) in result["priorities"] or str(a).replace("\\", "/") in result["priorities"]
 
     payload = monitor.api_projects()
-    names = [p["sample_name"] for p in payload["batches"][0]["projects"]]
-    assert names == ["bbb", "aaa", "ccc"], names
+    projects = payload["batches"][0]["projects"]
+    # P0 first, then P2, then unprioritized
+    assert [p["sample_name"] for p in projects] == ["aaa", "bbb", "ccc"]
+    assert projects[0]["priority"] == 0
+    assert projects[1]["priority"] == 2
+    assert projects[2]["priority"] is None
 
-    # only [c, b] pinned -> aaa (unpinned) sorts after pinned ones
-    monitor.api_projects_order(monitor.BoardOrderBody(ordered=[str(c), str(b)]))
+    # clearing (level=-1) drops it back among the unprioritized
+    monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(a), level=-1))
     payload = monitor.api_projects()
     names = [p["sample_name"] for p in payload["batches"][0]["projects"]]
-    assert names == ["ccc", "bbb", "aaa"], names
+    assert names[0] == "bbb" and "aaa" in names[1:]
 
     with pytest.raises(Exception):
-        monitor.api_projects_order(monitor.BoardOrderBody(ordered=[str(Path(__file__).absolute())]))
+        monitor.api_projects_priority(
+            monitor.ProjectPriorityBody(sample_dir=str(Path(__file__).absolute()), level=0)
+        )
+    monkeypatch.undo()
+
+
+def test_resources_payload_reports_draw_and_capacity(analysis_home: Path):
+    pytest.importorskip("fastapi")
+    import importlib
+
+    from datetime import datetime, timedelta, timezone
+
+    sample = _write_sample(analysis_home / "batchX", "ot")
+    (sample / "config.json").write_text(
+        json.dumps({"input": {"channels": {"signal": "1", "registration": "0"}},
+                    "segmentation": {"method": "cfos_unet"}}),
+        encoding="utf-8",
+    )
+    store = ActiveStore()
+    job = store.add_job(sample)
+    job["status"] = "running"
+    job["started_at"] = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    store.save_job(job)
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(monitor, "store", store)
+    payload = monitor.api_projects()
+    resources = payload["resources"]
+    assert resources["capacity"]["cpu"] >= 1
+    assert resources["capacity"]["gpu"] >= 0
+    # one running cfos-unet task draws cpu 8 / gpu 1
+    assert resources["used"] == {"cpu": 8, "gpu": 1}
+    assert resources["active_tasks"][0]["profile"] == "cfos-unet"
+    labels = {cost["label"] for cost in resources["profile_costs"]}
+    assert {"血管", "cFos UNet", "cFos 阈值"} <= labels
     monkeypatch.undo()
 
 
@@ -119,7 +160,7 @@ def test_estimate_from_timing_history(analysis_home: Path):
     project = payload["batches"][0]["projects"][0]
     assert project["estimate"] is not None
     assert project["estimate"]["seconds"] == 7200.0
-    assert "历史中位" in project["estimate"]["basis"]
+    assert "统一估时" in project["estimate"]["basis"]
     monkeypatch.undo()
 
 
@@ -232,62 +273,67 @@ def test_manifest_status_field_and_incomplete_exclusion(analysis_home: Path):
     projects_mod._STAGE_CACHE["at"] = 0.0
 
 
-def test_estimate_separates_profiles(analysis_home: Path):
-    """vessel and cfos samples must not share one estimate number."""
+def test_estimate_is_config_driven(analysis_home: Path):
+    """Estimates come from config content x manifest stage medians, NOT from
+    the sample's own run history: unet costs more than threshold, postprocess
+    and skip_registration adjust the sum."""
     pytest.importorskip("fastapi")
+    import apps.pipeline_harness.projects as projects_mod
     import importlib
 
-    def _seed(sample: Path, duration: float, config: dict) -> None:
-        from datetime import datetime, timedelta, timezone
+    projects_mod._STAGE_CACHE["payload"] = None
+    projects_mod._STAGE_CACHE["at"] = 0.0
 
-        sample.mkdir(parents=True, exist_ok=True)
-        (sample / "config.json").write_text(json.dumps(config), encoding="utf-8")
-        store = ActiveStore()
-        job = store.add_job(sample)
-        ended = datetime.now(timezone.utc)
-        started = ended - timedelta(seconds=duration)
-        job.update(
-            {
-                "status": "succeeded",
-                "started_at": started.isoformat(),
-                "ended_at": ended.isoformat(),
-            }
-        )
-        store.save_job(job)
-
-    vessel_cfg = {
-        "input": {"channels": {"signal": "1", "registration": "0"}},
-        "tubule_reconstruction": {"enabled": True},
+    # seed per-stage medians via run manifests with the fine module names
+    stage_seconds = {
+        "preprocessing": 600.0,
+        "pipeline_modules.preprocessing.zarr_to_registration_nii": 300.0,
+        "registration.ANTs_registration": 3600.0,
+        "segmentation.cfos_unet_inference": 7200.0,
+        "segmentation.intensity_threshold": 600.0,
+        "registration.region_signal_analysis_zarr_graph": 3000.0,
+        "visualization.pipeline_qc": 60.0,
     }
+    for name, seconds in stage_seconds.items():
+        sample = analysis_home / f"stage_{name.split('.')[-1]}"
+        sample.mkdir(parents=True, exist_ok=True)
+        (sample / "_run_manifest.json").write_text(
+            json.dumps({"module": name, "duration_seconds": seconds}), encoding="utf-8"
+        )
+
     unet_cfg = {
         "input": {"channels": {"signal": "1", "registration": "0"}},
-        "segmentation": {"method": "cfos_unet"},
+        "segmentation": {"method": "cfos_unet", "postprocess": {"enabled": True}},
     }
-    _seed(analysis_home / "b1" / "vesselA", 3600.0, vessel_cfg)
-    _seed(analysis_home / "b1" / "vesselB", 4200.0, vessel_cfg)
-    _seed(analysis_home / "b2" / "unetA", 18000.0, unet_cfg)
-    _seed(analysis_home / "b2" / "unetB", 21600.0, unet_cfg)
-    newbie = analysis_home / "b3" / "newbie"
-    newbie.mkdir(parents=True)
-    (newbie / "config.json").write_text(json.dumps(unet_cfg), encoding="utf-8")
-    ActiveStore().add_job(newbie)  # queued, never succeeded
+    thr_cfg = {
+        "input": {"channels": {"signal": "1", "registration": "0"}},
+        "segmentation": {"method": "threshold", "postprocess": {"enabled": False}},
+    }
+    skip_cfg = dict(unet_cfg)
+    skip_cfg["skip_registration"] = True
+
+    for name, cfg in (("unetA", unet_cfg), ("thrA", thr_cfg), ("skipA", skip_cfg)):
+        sample = analysis_home / "bx" / name
+        sample.mkdir(parents=True, exist_ok=True)
+        (sample / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        ActiveStore().add_job(sample)
 
     monitor = importlib.import_module("apps.pipeline_harness.main")
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(monitor, "store", ActiveStore())
     payload = monitor.api_projects()
-
     estimates = {}
-    profiles = {}
     for batch in payload["batches"]:
         for project in batch["projects"]:
             estimates[project["sample_name"]] = project["estimate"]
-            profiles[project["sample_name"]] = project["profile"]
 
-    assert profiles["vesselA"] == "vessel"
-    assert profiles["unetA"] == "cfos-unet"
-    assert estimates["vesselA"]["seconds"] == 3600.0
-    assert estimates["unetA"]["seconds"] == 18000.0
-    assert estimates["newbie"]["seconds"] == 19800.0
-    assert "同类" in estimates["newbie"]["basis"]
+    common = 600 + 300 + 3000 + 60
+    assert estimates["unetA"]["seconds"] == common + 3600 + 7200
+    assert estimates["thrA"]["seconds"] == common + 3600 + 600
+    assert estimates["skipA"]["seconds"] == common + 7200
+    assert "UNet" in estimates["unetA"]["basis"]
+    assert "阈值" in estimates["thrA"]["basis"]
+    assert "按 config 估算" in estimates["unetA"]["basis"]
     monkeypatch.undo()
+    projects_mod._STAGE_CACHE["payload"] = None
+    projects_mod._STAGE_CACHE["at"] = 0.0

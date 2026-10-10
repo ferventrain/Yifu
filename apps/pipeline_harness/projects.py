@@ -176,27 +176,56 @@ def _project_sort_key(project: dict[str, Any]) -> tuple[int, str]:
     return (0, str(stamp))
 
 
-# ------------------------------------------------------- board order (priority)
+# ------------------------------------------------------- board priorities (P0-P3)
 
 BOARD_FILENAME = "pm_board.json"
-BOARD_SCHEMA_VERSION = "1"
+BOARD_SCHEMA_VERSION = "2"
+PRIORITY_LEVELS = (0, 1, 2, 3)  # P0 highest
+PRIORITY_LABELS = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
 
 
-def read_board_order(active_dir: Path) -> list[str]:
+def read_board_priorities(active_dir: Path) -> dict[str, int]:
+    """{normalized sample_dir: level 0..3} from <active>/pm_board.json."""
     payload = read_json(active_dir / BOARD_FILENAME, default=None)
     if not isinstance(payload, dict):
-        return []
-    order = payload.get("sample_order")
-    return [str(item) for item in order if isinstance(item, str)] if isinstance(order, list) else []
+        return {}
+    raw = payload.get("priorities")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for sample_dir, level in raw.items():
+        try:
+            level_int = int(level)
+        except (TypeError, ValueError):
+            continue
+        if level_int in PRIORITY_LEVELS:
+            out[_norm_key(str(sample_dir))] = level_int
+    return out
 
 
-def write_board_order(active_dir: Path, ordered: list[str]) -> dict[str, Any]:
+def write_board_priority(active_dir: Path, sample_dir: str, level: int | None) -> dict[str, Any]:
+    """Set one sample's priority level (level=None clears it)."""
     path = active_dir / BOARD_FILENAME
-    state = {
-        "schema_version": BOARD_SCHEMA_VERSION,
-        "sample_order": [str(item) for item in ordered],
-        "updated_at": utc_now_iso(),
-    }
+    state = read_json(path, default=None) or {}
+    if not isinstance(state, dict):
+        state = {}
+    priorities = state.get("priorities")
+    if not isinstance(priorities, dict):
+        priorities = {}
+    # index by the original stored casing when present, else by given path
+    stored_key = None
+    for key in list(priorities.keys()):
+        if _norm_key(str(key)) == _norm_key(sample_dir):
+            stored_key = key
+            break
+    key = stored_key if stored_key is not None else str(sample_dir)
+    if level is None:
+        priorities.pop(key, None)
+    else:
+        priorities[key] = int(level)
+    state["priorities"] = priorities
+    state["schema_version"] = BOARD_SCHEMA_VERSION
+    state["updated_at"] = utc_now_iso()
     write_json_atomic(path, state)
     return state
 
@@ -281,37 +310,228 @@ def _succeeded_durations(runs: list[dict[str, Any]]) -> list[float]:
     ]
 
 
-def estimate_project_seconds(
+# ------------------------------------------------------- config-driven estimates
+#
+# Estimate a run from the config it would use: sum per-stage medians from run
+# manifests, selecting stages by config content (segmentation method,
+# postprocess on/off, skip flags). Module names were too coarse historically
+# ("segmentation" covered unet AND threshold; "preprocessing" several steps),
+# so fine names (segmentation.cfos_unet_inference, ...) are preferred and the
+# coarse bucket is the labelled fallback until samples accumulate.
+
+
+def _norm_module(name: str) -> str:
+    return str(name).removeprefix("pipeline_modules.")
+
+
+def _stage_median_map(root: Path, active_dir: Path) -> dict[str, float]:
+    payload = collect_stage_times(root, active_dir)
+    return {_norm_module(stage["module"]): float(stage["median_s"] or 0.0) for stage in payload["stages"]}
+
+
+def estimate_for_config(
+    cfg: dict[str, Any] | None, stage_medians: dict[str, float]
+) -> dict[str, Any] | None:
+    """Sum per-stage medians selected by the config. Returns seconds + basis."""
+    if not isinstance(cfg, dict):
+        return None
+    stages: list[tuple[str, float, str]] = []  # (label, seconds, note)
+
+    def _pick(*names: str) -> tuple[float | None, str]:
+        for name in names:
+            if name in stage_medians and stage_medians[name] > 0:
+                return stage_medians[name], name
+        return None, names[-1]
+
+    seg = (cfg.get("segmentation") or {})
+    method = str(seg.get("method") or "").strip().lower()
+    post_cfg = seg.get("postprocess") or {}
+    post_on = bool(post_cfg.get("enabled"))
+
+    picked, _ = _pick("preprocessing")
+    if picked:
+        stages.append(("预处理", picked, ""))
+    picked, _ = _pick("preprocessing.zarr_to_registration_nii")
+    if picked:
+        stages.append(("配准下采样", picked, ""))
+    if not cfg.get("skip_registration"):
+        picked, _ = _pick("registration.ANTs_registration")
+        if picked:
+            stages.append(("配准", picked, ""))
+
+    if method in {"", "cfos_unet"}:
+        picked, src = _pick("segmentation.cfos_unet_inference", "segmentation")
+        if picked:
+            stages.append(("分割（UNet）" if src.startswith("segmentation.cf") else "分割（UNet，混合口径）", picked, ""))
+    elif method in {"threshold", "intensity"}:
+        picked, src = _pick("segmentation.intensity_threshold", "segmentation")
+        if picked:
+            stages.append(("分割（阈值）" if src.startswith("segmentation.in") else "分割（阈值，混合口径）", picked, ""))
+    elif method == "spotiflow":
+        picked, _ = _pick("segmentation.spotiflow_inference")
+        if picked:
+            stages.append(("分割（Spotiflow）", picked, ""))
+
+    if post_on:
+        if "segmentation.cfos_mask_postprocess" in stage_medians:
+            stages.append(("后处理", stage_medians["segmentation.cfos_mask_postprocess"], ""))
+        else:
+            stages.append(("后处理", 0.0, "数据积累中"))
+    else:
+        stages.append(("后处理", 0.0, "未开启"))
+
+    if not cfg.get("only_tubule") and not cfg.get("only_region_analysis"):
+        picked, _ = _pick("registration.region_signal_analysis_zarr_graph")
+        if picked:
+            stages.append(("区域统计", picked, ""))
+    if (cfg.get("tubule_reconstruction") or {}).get("enabled"):
+        tubule_total = sum(
+            median
+            for name, median in stage_medians.items()
+            if name.startswith("tubule_reconstruction.")
+        )
+        if tubule_total:
+            stages.append(("血管重建", tubule_total, ""))
+    picked, _ = _pick("visualization.pipeline_qc")
+    if picked:
+        stages.append(("QC", picked, ""))
+
+    known = [seconds for _label, seconds, _note in stages if seconds > 0]
+    if len(known) < 2:
+        return None
+    seconds = sum(seconds for _label, seconds, _note in stages)
+    labels = "＋".join(label for label, seconds, _note in stages if seconds > 0)
+    notes = [note for _l, _s, note in stages if note]
+    basis = f"按 config 估算：{labels}"
+    if notes:
+        basis += f"（{'，'.join(notes)}）"
+    return {"seconds": round(seconds, 1), "basis": basis}
+
+
+def generic_estimate(timing_history: dict[str, list[float]]) -> dict[str, Any] | None:
+    """No usable config yet: one number for everyone (step-median sum)."""
+    totals = [
+        _median(values)
+        for name, values in timing_history.items()
+        if name in _CANONICAL_STEP_NAMES
+    ]
+    totals = [value for value in totals if value]
+    if len(totals) >= 3:
+        return {"seconds": round(sum(totals), 1), "basis": "统一估时（config 未定，历史步骤中位）"}
+    return None
+
+
+def _project_estimate(
     runs: list[dict[str, Any]],
-    profile_peer_durations: list[float],
+    sample_dir: str,
+    stage_medians: dict[str, float],
     timing_history: dict[str, list[float]],
 ) -> dict[str, Any] | None:
-    """Estimate a full run for this sample, most specific evidence first:
+    """Config-driven estimate; own run history is deliberately NOT used."""
+    cfg = None
+    for run in runs:
+        cfg = _read_config_cached(run.get("config_path"))
+        if cfg:
+            break
+    if cfg is None:
+        cfg = _read_config_cached(str(Path(sample_dir) / "config.json"))
+    estimate = estimate_for_config(cfg, stage_medians)
+    if estimate:
+        return estimate
+    return generic_estimate(timing_history)
 
-    1. the sample's own succeeded-run median;
-    2. the median over succeeded runs of samples sharing its pipeline
-       profile (vessel vs cfos-unet vs threshold vs spinal);
-    3. the active dir's global step-median sum (generic fallback).
-    Honest null when nothing is known.
-    """
-    own = _succeeded_durations(runs)
-    if own:
-        return {"seconds": round(_median(own) or 0.0, 1), "basis": f"该样本 {len(own)} 次完成 run 中位"}
-    if profile_peer_durations:
-        return {
-            "seconds": round(_median(profile_peer_durations) or 0.0, 1),
-            "basis": f"同类完成 run 中位（{len(profile_peer_durations)} 次）",
-        }
-    if timing_history:
-        totals = [
-            _median(values)
-            for name, values in timing_history.items()
-            if name in _CANONICAL_STEP_NAMES
-        ]
-        totals = [value for value in totals if value]
-        if len(totals) >= 3:
-            return {"seconds": round(sum(totals), 1), "basis": "通用历史中位（全部步骤）"}
-    return None
+
+# ------------------------------------------------------------- resource model
+#
+# Rough v1 (user: rules can be simple now, refined later): each task draws a
+# constant footprint by pipeline profile; capacity is auto-detected.
+
+
+PROFILE_COSTS = {
+    "cfos-unet": {"cpu": 8, "gpu": 1},
+    "cfos-threshold": {"cpu": 4, "gpu": 0},
+    "cfos-spotiflow": {"cpu": 8, "gpu": 1},
+    "vessel": {"cpu": 8, "gpu": 0},
+    "spinal": {"cpu": 8, "gpu": 0},
+    "generic": {"cpu": 8, "gpu": 0},
+}
+
+_CAPACITY_CACHE: dict[str, Any] = {"at": 0.0, "payload": None}
+
+
+def detect_capacity() -> dict[str, int]:
+    """CPU cores + GPU count, auto-detected (cached 5 min)."""
+    import os
+    import subprocess
+    import time as _time
+
+    now = _time.time()
+    if _CAPACITY_CACHE["payload"] is not None and now - _CAPACITY_CACHE["at"] < 300.0:
+        return _CAPACITY_CACHE["payload"]
+    cpu = None
+    try:
+        import psutil
+
+        cpu = psutil.cpu_count(logical=False)  # physical cores
+    except Exception:
+        cpu = None
+    cpu = cpu or os.cpu_count() or 8
+    gpus = 0
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--list-gpus"], capture_output=True, text=True, timeout=10
+        )
+        if proc.returncode == 0:
+            gpus = len([line for line in proc.stdout.splitlines() if line.strip()])
+    except (OSError, subprocess.SubprocessError):
+        gpus = 0
+    payload = {"cpu": int(cpu), "gpu": int(gpus)}
+    _CAPACITY_CACHE["at"] = now
+    _CAPACITY_CACHE["payload"] = payload
+    return payload
+
+
+def build_resources(views: list[dict[str, Any]]) -> dict[str, Any]:
+    """Live draw + capacity + reference costs for the decision panel."""
+    capacity = detect_capacity()
+    tasks = []
+    for view in views:
+        status = str(view.get("display_status") or view.get("status"))
+        if status not in {"running", "verifying", "stalled"}:
+            continue
+        profile = pipeline_profile(_read_config_cached(view.get("config_path")))
+        cost = PROFILE_COSTS.get(profile, PROFILE_COSTS["generic"])
+        eta = view.get("eta") or {}
+        progress = view.get("progress") or {}
+        tasks.append(
+            {
+                "sample": view.get("sample_name") or view.get("title"),
+                "profile": profile,
+                "profile_label": PROFILE_LABELS.get(profile, profile),
+                "cpu": cost["cpu"],
+                "gpu": cost["gpu"],
+                "remaining_s": eta.get("total_remaining_s"),
+                "step": progress.get("step_name") or "",
+            }
+        )
+    used_cpu = sum(task["cpu"] for task in tasks)
+    used_gpu = sum(task["gpu"] for task in tasks)
+    return {
+        "capacity": capacity,
+        "used": {"cpu": used_cpu, "gpu": used_gpu},
+        "free": {"cpu": max(capacity["cpu"] - used_cpu, 0), "gpu": max(capacity["gpu"] - used_gpu, 0)},
+        "active_tasks": tasks,
+        "profile_costs": [
+            {
+                "profile": profile,
+                "label": label,
+                "cpu": PROFILE_COSTS[profile]["cpu"],
+                "gpu": PROFILE_COSTS[profile]["gpu"],
+            }
+            for profile, label in PROFILE_LABELS.items()
+            if profile != "generic"
+        ],
+    }
 
 
 # ------------------------------------------------------------- stage durations
@@ -426,13 +646,14 @@ def group_into_batches(
     views: list[dict[str, Any]],
     *,
     active_dir: str | Path | None = None,
-    board_order: list[str] | None = None,
+    board_priorities: dict[str, int] | None = None,
     timing_history: dict[str, list[float]] | None = None,
+    stage_medians: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Group decorated job views into 项目(batch) → 样本(sample) cards.
 
-    Ordering inside a batch: user priority (board_order index) first, then
-    newest activity; anomalous samples (dir missing/empty) always last.
+    Ordering inside a batch: P0 < P1 < P2 < P3 < 无优先级, then newest
+    activity; anomalous samples (dir missing/empty) always last.
     ``under_active`` marks batches living under the active dir so the UI can
     show them first by default.
     """
@@ -454,7 +675,7 @@ def group_into_batches(
         row["full_view"] = view  # stripped below
         project["runs"].append(row)
 
-    order_rank = {_norm_key(item): index for index, item in enumerate(board_order or [])}
+    priority_map = {_norm_key(k): v for k, v in (board_priorities or {}).items()}
     active_key = _norm_key(str(active_dir)) if active_dir else None
 
     batches: dict[str, dict[str, Any]] = {}
@@ -490,7 +711,7 @@ def group_into_batches(
         project["configs"] = list_sample_configs(sample_path)
         project["last_manifest"] = latest_run_manifest_summary(sample_path)
         project["anomaly"] = _sample_anomaly(sample_path)
-        project["priority_rank"] = order_rank.get(_norm_key(project["sample_dir"]))
+        project["priority"] = priority_map.get(_norm_key(project["sample_dir"]))
 
         batch_dir = sample_path.parent
         batch_key = _norm_key(str(batch_dir))
@@ -505,42 +726,47 @@ def group_into_batches(
         )
         batch["projects"].append(project)
 
-    # profile pass + per-profile peer durations, then estimates
-    profile_durations: dict[str, list[float]] = {}
+    # profile pass + config-driven estimates (own run history deliberately
+    # NOT used — different configs cost different amounts)
     for project in by_sample.values():
         profile = _project_profile(project["runs"])
         project["profile"] = profile
         project["profile_label"] = PROFILE_LABELS.get(profile, profile)
-        profile_durations.setdefault(profile, []).extend(_succeeded_durations(project["runs"]))
-    for project in by_sample.values():
-        project["estimate"] = estimate_project_seconds(
-            project["runs"],
-            profile_durations.get(project["profile"]) or [],
-            timing_history or {},
+        project["estimate"] = _project_estimate(
+            project["runs"], project["sample_dir"], stage_medians or {}, timing_history or {}
         )
 
     def _batch_sort(batch: dict[str, Any]) -> tuple[int, str]:
         return (0 if batch.get("under_active") else 1, str(batch["batch"]).lower())
 
     def _project_rank(project: dict[str, Any]) -> tuple[int, int, int, str]:
-        priority = project.get("priority_rank")
+        priority = project.get("priority")
         anomaly = 1 if project.get("anomaly") else 0
+        newest = project["runs"][0] if project["runs"] else {}
+        stamp = str(newest.get("started_at") or newest.get("created_at") or "")
         return (
             anomaly,
             0 if priority is not None else 1,
             priority if priority is not None else 10**9,
-            str(project["sample_name"]).lower(),
+            stamp,
         )
 
     batch_list = sorted(batches.values(), key=_batch_sort)
     for batch in batch_list:
-        batch["projects"].sort(key=_project_rank)
+        batch["projects"].sort(key=_project_rank, reverse=False)
     return batch_list
 
 
 def projects_payload(store: Any, views: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "batches": group_into_batches(views),
+        "batches": group_into_batches(
+            views,
+            active_dir=store.active,
+            board_priorities=read_board_priorities(store.active),
+            timing_history={},
+            stage_medians=_stage_median_map(store.root, store.active),
+        ),
+        "resources": build_resources(views),
         "worker": None,  # filled by caller
         "analysis_root": str(store.root),
         "active_dir": str(store.active),

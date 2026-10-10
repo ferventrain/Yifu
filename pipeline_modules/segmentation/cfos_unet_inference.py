@@ -371,7 +371,7 @@ def run_cfos_unet_inference(
     }
     manifest_path = write_run_manifest(
         output_zarr,
-        module="segmentation",
+        module="segmentation.cfos_unet_inference",
         entrypoint="run_cfos_unet_inference",
         inputs={
             "input_zarr": str(input_path),
