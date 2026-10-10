@@ -32,7 +32,7 @@ const els = {
 };
 
 let openLogJobId = null;
-const expandedBatches = new Set();
+const batchOpenState = new Map(); // batch name -> user-pinned open/closed
 const runOpenState = new Map(); // "<scope>::<id>" -> pinned open/closed
 const nodeCache = new Map(); // sample key -> live card element (focus protection)
 let currentSampleOrder = []; // flat display order of sample_dirs
@@ -338,12 +338,11 @@ function renderBatch(batch) {
   const box = document.createElement("details");
   box.className = "batch" + (batch.priority != null ? ` has-p${batch.priority}` : "");
   const hasActive = batch.projects.some((p) => ["running", "verifying", "queued", "stalled"].includes(p.status));
-  box.open = expandedBatches.has(batch.batch) ? true : expandedBatches.size === 0 ? hasActive : expandedBatches.has(batch.batch);
-  if (box.open) expandedBatches.add(batch.batch);
-  box.addEventListener("toggle", () => {
-    if (box.open) expandedBatches.add(batch.batch);
-    else expandedBatches.delete(batch.batch);
-  });
+  // three-state memory: once the user toggles a batch, their choice sticks
+  // across polls; the auto-open default only applies before any interaction
+  const userChoice = batchOpenState.get(batch.batch);
+  box.open = userChoice != null ? userChoice : hasActive;
+  box.addEventListener("toggle", () => batchOpenState.set(batch.batch, box.open));
   box.appendChild(batchHeader(batch));
   const list = document.createElement("div");
   list.className = "batch-projects";
@@ -355,11 +354,8 @@ function renderBatch(batch) {
 function renderOtherSection(batches, orderSink) {
   const box = document.createElement("details");
   box.className = "batch other-root";
-  box.open = expandedBatches.has("__other_root__");
-  box.addEventListener("toggle", () => {
-    if (box.open) expandedBatches.add("__other_root__");
-    else expandedBatches.delete("__other_root__");
-  });
+  box.open = batchOpenState.get("__other_root__") === true;
+  box.addEventListener("toggle", () => batchOpenState.set("__other_root__", box.open));
   const heading = document.createElement("summary");
   const name = document.createElement("strong");
   name.className = "batch-name";
