@@ -41,7 +41,7 @@ from pipeline_modules.harness.worker import (
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
 STATIC_DIR = APP_DIR / "static"
-ASSET_VERSION = "7"
+ASSET_VERSION = "8"
 
 def _resolve_pipeline_python() -> str | None:
     for key in ("YIFU_PYTHON", "YIFU_PYTHON_EXE"):
@@ -179,20 +179,63 @@ def api_jobs() -> dict[str, Any]:
 
 @app.get("/api/projects")
 def api_projects() -> dict[str, Any]:
-    """Project board: jobs grouped by sample (project) -> parent dir (batch).
+    """Project board: jobs grouped by sample (项目) -> parent dir (batch).
 
     Read-only like /api/jobs — grouping plus small reads from the sample dir
     (notes file, config list, newest run manifest). Never starts anything.
+    Batches under the active dir are marked ``under_active`` (UI shows them
+    first); project order honours the saved board priority (pm_board.json).
     """
-    from apps.pipeline_harness.projects import group_into_batches
+    from apps.pipeline_harness.projects import group_into_batches, read_board_order
+    from pipeline_modules.harness.timing import load_timing_history
 
     payload = _jobs_payload()
     return {
-        "batches": group_into_batches(payload["jobs"]),
+        "batches": group_into_batches(
+            payload["jobs"],
+            active_dir=store.active,
+            board_order=read_board_order(store.active),
+            timing_history=load_timing_history(store.active),
+        ),
         "worker": payload["worker"],
         "analysis_root": payload["analysis_root"],
         "active_dir": payload["active_dir"],
     }
+
+
+class BoardOrderBody(BaseModel):
+    ordered: list[str] = Field(..., min_length=1)
+
+
+@app.post("/api/projects/order")
+def api_projects_order(body: BoardOrderBody) -> dict[str, Any]:
+    """Persist the dragged project priority order (<active>/pm_board.json)."""
+    from apps.pipeline_harness.projects import write_board_order
+
+    root_key = str(store.root).replace("\\", "/").rstrip("/").lower()
+    for item in body.ordered:
+        target = Path(item)
+        try:
+            resolved = str(target.resolve()).replace("\\", "/").rstrip("/").lower()
+        except OSError:
+            resolved = str(target).replace("\\", "/").rstrip("/").lower()
+        if root_key not in resolved:
+            raise PipelineError(
+                ErrorCode.ARGUMENT_INVALID,
+                f"路径不在分析根目录内: {item}",
+                context={"path": item, "root": str(store.root)},
+            )
+    state = write_board_order(store.active, body.ordered)
+    return {"order": state}
+
+
+@app.get("/api/stage-times")
+def api_stage_times() -> dict[str, Any]:
+    """Per-module duration stats aggregated from run manifests (read-only,
+    cached 5 min) — the 环节耗时 view."""
+    from apps.pipeline_harness.projects import collect_stage_times
+
+    return collect_stage_times(store.root, store.active)
 
 
 @app.post("/api/projects/notes")

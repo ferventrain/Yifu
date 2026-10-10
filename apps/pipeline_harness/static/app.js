@@ -23,12 +23,23 @@ const els = {
   logTitle: document.getElementById("log-title"),
   logBody: document.getElementById("log-body"),
   logClose: document.getElementById("log-close"),
+  stageDialog: document.getElementById("stage-dialog"),
+  stageBody: document.getElementById("stage-body"),
+  stageClose: document.getElementById("stage-close"),
+  stageBtn: document.getElementById("stage-times-btn"),
 };
 
 let openLogJobId = null;
 const expandedBatches = new Set();
-const runOpenState = new Map(); // `${sample}::${run_id}` -> user-pinned open/closed
+const runOpenState = new Map(); // "<scope>::<id>" -> pinned open/closed
+const nodeCache = new Map(); // sample key -> live card element (focus protection)
+let currentSampleOrder = []; // flat display order of sample_dirs (for drag priority)
+let dragSampleKey = null;
 let errorHoldUntil = 0;
+
+function sampleKey(sampleDir) {
+  return String(sampleDir || "").replace(/[\\/]+$/, "").toLowerCase();
+}
 
 function showError(message, holdMs = 0, kind = "error") {
   els.formError.textContent = message || "";
@@ -94,12 +105,13 @@ async function api(path, options) {
 
 function renderBoard(data) {
   const batches = data.batches || [];
-  const jobs = [];
-  for (const batch of batches) for (const project of batch.projects) jobs.push(...project.runs);
+  const runs = [];
+  for (const batch of batches) for (const project of batch.projects) runs.push(...project.runs);
+
   els.paths.textContent = `样本根目录 ${data.analysis_root}  ·  Active ${data.active_dir}`;
   const worker = data.worker || {};
-  const running = jobs.filter((run) => (run.display_status || run.status) === "running");
-  const queued = jobs.filter((run) => run.status === "queued");
+  const running = runs.filter((run) => (run.display_status || run.status) === "running");
+  const queued = runs.filter((run) => run.status === "queued");
   if (worker.alive) {
     els.runner.textContent = `Worker pid ${worker.pid} 在线` + (running.length ? `，运行中 ${running.length}` : "") + (queued.length ? `，排队 ${queued.length}` : "");
     els.runner.classList.toggle("busy", running.length > 0);
@@ -107,6 +119,14 @@ function renderBoard(data) {
     els.runner.textContent = running.length ? "有任务标记运行中但 Worker 不在线（失联）" : "Worker 离线（下次提交任务时自动启动）";
     els.runner.classList.remove("busy");
   }
+
+  // prune stale cache entries
+  const liveKeys = new Set();
+  for (const batch of batches) for (const project of batch.projects) liveKeys.add(sampleKey(project.sample_dir));
+  for (const key of nodeCache.keys()) if (!liveKeys.has(key)) nodeCache.delete(key);
+
+  const activeBatches = batches.filter((b) => b.under_active);
+  const otherBatches = batches.filter((b) => !b.under_active);
 
   els.board.replaceChildren();
   if (!batches.length) {
@@ -116,31 +136,43 @@ function renderBoard(data) {
     els.board.appendChild(empty);
     return;
   }
-  for (const batch of batches) els.board.appendChild(renderBatch(batch));
+  const order = [];
+  for (const batch of activeBatches) {
+    els.board.appendChild(renderBatch(batch));
+    for (const project of batch.projects) order.push(project.sample_dir);
+  }
+  if (otherBatches.length) {
+    els.board.appendChild(renderOtherSection(otherBatches, order));
+  }
+  currentSampleOrder = order;
 }
 
-function renderBatch(batch) {
-  const box = document.createElement("details");
-  box.className = "batch";
-  const openDefault = batch.projects.some((p) => ["running", "verifying", "queued", "stalled"].includes(p.status));
-  box.open = expandedBatches.has(batch.batch) ? true : expandedBatches.size === 0 ? openDefault : expandedBatches.has(batch.batch);
-  if (box.open) expandedBatches.add(batch.batch);
-  box.addEventListener("toggle", () => {
-    if (box.open) expandedBatches.add(batch.batch);
-    else expandedBatches.delete(batch.batch);
-  });
-
+function batchHeader(batch) {
   const heading = document.createElement("summary");
   const name = document.createElement("strong");
+  name.className = "batch-name";
   name.textContent = batch.batch;
   const meta = document.createElement("span");
   meta.className = "batch-meta";
   const active = batch.projects.filter((p) => ["running", "verifying", "queued"].includes(p.status)).length;
   const failed = batch.projects.reduce((acc, p) => acc + (p.failed_count || 0), 0);
-  meta.textContent = ` · ${batch.projects.length} 个样本` + (active ? ` · ${active} 进行中` : "") + (failed ? ` · ${failed} 次失败` : "");
+  const anomaly = batch.projects.filter((p) => p.anomaly).length;
+  meta.textContent = `${batch.projects.length} 样本` + (active ? ` · ${active} 进行中` : "") + (failed ? ` · ${failed} 失败` : "") + (anomaly ? ` · ${anomaly} 异常` : "");
   heading.append(name, meta);
-  box.appendChild(heading);
+  return heading;
+}
 
+function renderBatch(batch) {
+  const box = document.createElement("details");
+  box.className = "batch";
+  const hasActive = batch.projects.some((p) => ["running", "verifying", "queued", "stalled"].includes(p.status));
+  box.open = expandedBatches.has(batch.batch) ? true : expandedBatches.size === 0 ? hasActive : expandedBatches.has(batch.batch);
+  if (box.open) expandedBatches.add(batch.batch);
+  box.addEventListener("toggle", () => {
+    if (box.open) expandedBatches.add(batch.batch);
+    else expandedBatches.delete(batch.batch);
+  });
+  box.appendChild(batchHeader(batch));
   const list = document.createElement("div");
   list.className = "batch-projects";
   for (const project of batch.projects) list.appendChild(renderProject(project));
@@ -148,9 +180,57 @@ function renderBatch(batch) {
   return box;
 }
 
+function renderOtherSection(batches, orderSink) {
+  const box = document.createElement("details");
+  box.className = "batch other-root";
+  const heading = document.createElement("summary");
+  const name = document.createElement("strong");
+  name.className = "batch-name";
+  name.textContent = "其他目录";
+  const meta = document.createElement("span");
+  meta.className = "batch-meta";
+  meta.textContent = `${batches.length} 个批次（分析根目录下、非 _active）`;
+  heading.append(name, meta);
+  box.appendChild(heading);
+  const wrap = document.createElement("div");
+  wrap.className = "batch-projects";
+  for (const batch of batches) {
+    const inner = renderBatch(batch);
+    inner.classList.add("nested");
+    wrap.appendChild(inner);
+    for (const project of batch.projects) orderSink.push(project.sample_dir);
+  }
+  box.appendChild(wrap);
+  return box;
+}
+
+// ------------------------------------------------------------------ project
+
 function renderProject(project) {
+  const key = sampleKey(project.sample_dir);
+  const cached = nodeCache.get(key);
+  // Never swap a card the user is interacting with (typing notes, open
+  // select...) — that is what made the notes box collapse every 1.5s.
+  if (cached && cached.isConnected && cached.contains(document.activeElement)) {
+    return cached;
+  }
+
   const card = document.createElement("article");
-  card.className = `project-card status-${project.status}`;
+  card.className = `project-card status-${project.status}` + (project.anomaly ? " anomalous" : "");
+  card.dataset.sampleKey = key;
+
+  // drag & drop (priority)
+  const handle = document.createElement("span");
+  handle.className = "drag-handle";
+  handle.title = "拖动调整优先级";
+  handle.textContent = "⠿";
+  handle.draggable = true;
+  handle.addEventListener("dragstart", (event) => {
+    dragSampleKey = key;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", key);
+  });
+  card.appendChild(handle);
 
   // ---- header
   const head = document.createElement("div");
@@ -170,13 +250,35 @@ function renderProject(project) {
   const statusCluster = document.createElement("span");
   statusCluster.className = "status-cluster";
   const lamp = document.createElement("i");
-  const lampStatus = project.status === "running" || project.status === "verifying" ? project.status : project.status;
-  lamp.className = `lamp ${lampStatus}`;
+  lamp.className = `lamp ${project.status}`;
   const label = document.createElement("span");
   label.textContent = STATUS_LABELS[project.status] || project.status;
   statusCluster.append(lamp, label);
   head.append(titleWrap, statusCluster);
   card.appendChild(head);
+
+  // ---- chips: anomaly / priority / estimate
+  const chips = document.createElement("div");
+  chips.className = "chip-row";
+  if (project.anomaly) {
+    const chip = document.createElement("span");
+    chip.className = "chip danger";
+    chip.textContent = `异常：${project.anomaly}`;
+    chips.appendChild(chip);
+  }
+  if (project.priority_rank != null) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = `优先级 ${project.priority_rank + 1}`;
+    chips.appendChild(chip);
+  }
+  if (project.estimate && project.estimate.seconds) {
+    const chip = document.createElement("span");
+    chip.className = "chip estimate";
+    chip.textContent = `预计 ${formatEta(project.estimate.seconds)}（${project.estimate.basis}）`;
+    chips.appendChild(chip);
+  }
+  if (chips.childNodes.length) card.appendChild(chips);
 
   // ---- meta: sample dir + manifest summary
   const meta = document.createElement("p");
@@ -242,10 +344,13 @@ function renderProject(project) {
   startRow.append(select, startBtn, openBtn);
   card.appendChild(startRow);
 
-  // ---- notes (requirements / retro), collapsible
+  // ---- notes (requirements / retro), state survives polling
   const notes = project.notes || {};
+  const notesKey = `notes::${key}`;
   const notesBox = document.createElement("details");
   notesBox.className = "notes";
+  notesBox.open = runOpenState.get(notesKey) === true;
+  notesBox.addEventListener("toggle", () => runOpenState.set(notesKey, notesBox.open));
   const notesSummary = document.createElement("summary");
   const reqPreview = (notes.requirements || "").trim().split("\n")[0] || "点击填写分析需求";
   notesSummary.textContent = `需求：${reqPreview.slice(0, 80)}`;
@@ -309,6 +414,7 @@ function renderProject(project) {
         body: JSON.stringify({ sample_dir: project.sample_dir, append_note: text }),
       });
       quickInput.value = "";
+      nodeCache.delete(key); // allow re-render with the new log line
       await refresh();
     } catch (error) {
       showError(error.message, 6000);
@@ -342,6 +448,40 @@ function renderProject(project) {
   runsBox.className = "runs";
   for (const run of project.runs) runsBox.appendChild(renderRunRow(project, run));
   card.appendChild(runsBox);
+
+  // ---- drag & drop targets
+  card.addEventListener("dragover", (event) => {
+    if (dragSampleKey && dragSampleKey !== key) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      card.classList.add("drag-over");
+    }
+  });
+  card.addEventListener("dragleave", () => card.classList.remove("drag-over"));
+  card.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    card.classList.remove("drag-over");
+    if (!dragSampleKey || dragSampleKey === key) return;
+    const order = [...currentSampleOrder];
+    const from = order.findIndex((dir) => sampleKey(dir) === dragSampleKey);
+    const to = order.findIndex((dir) => sampleKey(dir) === key);
+    if (from < 0 || to < 0) return;
+    order.splice(to, 0, order.splice(from, 1)[0]);
+    dragSampleKey = null;
+    try {
+      await api("/api/projects/order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ordered: order }),
+      });
+      showError("优先级已更新", 2500, "info");
+    } catch (error) {
+      showError(error.message, 6000);
+    }
+    await refresh();
+  });
+
+  nodeCache.set(key, card);
   return card;
 }
 
@@ -365,7 +505,7 @@ function renderRunRow(project, run) {
   row.append(lamp, name, statusLabel, dur);
   wrap.appendChild(row);
 
-  const key = `${project.sample_name}::${run.id}`;
+  const key = `${sampleKey(project.sample_dir)}::${run.id}`;
   const defaultOpen =
     project.runs[0] === run &&
     ["running", "verifying", "queued", "stalled", "failed"].includes(project.status);
@@ -375,7 +515,6 @@ function renderRunRow(project, run) {
   if (expanded && project.latest_full_view && run.id === project.latest_full_view.id) {
     details.appendChild(renderRunCard(project.latest_full_view));
   } else if (expanded) {
-    // older run without an inline full view: slim summary only
     const line = document.createElement("p");
     line.className = "card-meta";
     line.textContent = run.error ? `错误：${run.error}` : `run ${run.id}（${run.kind}）· ${run.started_at || ""}`;
@@ -389,7 +528,7 @@ function renderRunRow(project, run) {
   return wrap;
 }
 
-// ------------------------------------------------------ rich run card (old)
+// ------------------------------------------------------ rich run card
 
 function renderRunCard(job) {
   const rawStatus = job.status || "queued";
@@ -398,7 +537,6 @@ function renderRunCard(job) {
   card.className = `job-card status-${status}`;
   const progress = job.progress || {};
 
-  // step / progress line
   const stepLine = document.createElement("p");
   stepLine.className = "step-line";
   if (status === "queued") {
@@ -414,7 +552,6 @@ function renderRunCard(job) {
   }
   card.appendChild(stepLine);
 
-  // eta line
   const etaLine = document.createElement("p");
   etaLine.className = "eta-line";
   if (status === "running" || status === "verifying" || status === "stalled") {
@@ -437,7 +574,6 @@ function renderRunCard(job) {
   }
   if (etaLine.textContent) card.appendChild(etaLine);
 
-  // progress bar
   const track = document.createElement("div");
   track.className = "progress-track";
   const fill = document.createElement("div");
@@ -446,7 +582,6 @@ function renderRunCard(job) {
   track.appendChild(fill);
   card.appendChild(track);
 
-  // error block
   const error = job.error;
   if (error) {
     const box = document.createElement("div");
@@ -470,15 +605,12 @@ function renderRunCard(job) {
     card.appendChild(box);
   }
 
-  // qc images
   const qcImages = job.qc_images || [];
   if (qcImages.length) {
     const box = document.createElement("details");
     box.className = "results qc-images";
     box.open = runOpenState.get(`qc::${job.id}`) === true;
-    box.addEventListener("toggle", () => {
-      runOpenState.set(`qc::${job.id}`, box.open);
-    });
+    box.addEventListener("toggle", () => runOpenState.set(`qc::${job.id}`, box.open));
     const heading = document.createElement("summary");
     heading.textContent = `QC 图（${qcImages.length}）`;
     const list = document.createElement("ul");
@@ -509,15 +641,12 @@ function renderRunCard(job) {
     card.appendChild(box);
   }
 
-  // results
   const results = job.results || [];
   if ((status === "succeeded" || status === "done") && results.length) {
     const box = document.createElement("details");
     box.className = "results";
     box.open = runOpenState.get(`res::${job.id}`) === true;
-    box.addEventListener("toggle", () => {
-      runOpenState.set(`res::${job.id}`, box.open);
-    });
+    box.addEventListener("toggle", () => runOpenState.set(`res::${job.id}`, box.open));
     const heading = document.createElement("summary");
     heading.textContent = `结果位置（${results.length}）`;
     const list = document.createElement("ul");
@@ -554,7 +683,6 @@ function renderRunCard(job) {
     card.appendChild(box);
   }
 
-  // actions
   const actions = document.createElement("div");
   actions.className = "card-actions";
   const logBtn = document.createElement("button");
@@ -580,6 +708,53 @@ function renderRunCard(job) {
   }
   card.appendChild(actions);
   return card;
+}
+
+// ------------------------------------------------------------ stage-times view
+
+async function openStageTimes() {
+  els.stageDialog.showModal();
+  els.stageBody.textContent = "统计中…";
+  try {
+    const data = await api("/api/stage-times");
+    renderStageTimes(data);
+  } catch (error) {
+    els.stageBody.textContent = `加载失败：${error.message}`;
+  }
+}
+
+function renderStageTimes(data) {
+  const stages = data.stages || [];
+  els.stageBody.replaceChildren();
+  if (!stages.length) {
+    els.stageBody.textContent = `没有找到 run manifest（扫描 ${data.manifests_scanned} 个）。`;
+    return;
+  }
+  const meta = document.createElement("p");
+  meta.className = "stage-meta";
+  meta.textContent = `扫描 ${data.manifests_scanned} 个 run manifest · 按中位耗时排序 · ${String(data.generated_at).replace("T", " ").slice(0, 16)}`;
+  els.stageBody.appendChild(meta);
+  const maxMedian = Math.max(...stages.map((s) => s.median_s), 1);
+  for (const stage of stages) {
+    const row = document.createElement("div");
+    row.className = "stage-row";
+    const head = document.createElement("div");
+    head.className = "stage-head";
+    const name = document.createElement("strong");
+    name.textContent = stage.module;
+    const stat = document.createElement("span");
+    stat.className = "stage-stat";
+    stat.textContent = `中位 ${formatDuration(stage.median_s) || "?"} · 均值 ${formatDuration(stage.mean_s) || "?"} · ${stage.count} 次`;
+    head.append(name, stat);
+    const track = document.createElement("div");
+    track.className = "stage-track";
+    const bar = document.createElement("div");
+    bar.className = "stage-bar";
+    bar.style.width = `${Math.max(2, (stage.median_s / maxMedian) * 100)}%`;
+    track.appendChild(bar);
+    row.append(head, track);
+    els.stageBody.appendChild(row);
+  }
 }
 
 // ------------------------------------------------------------------ actions
@@ -669,6 +844,11 @@ els.logClose.addEventListener("click", () => {
   openLogJobId = null;
   els.logDialog.close();
 });
+
+if (els.stageBtn) els.stageBtn.addEventListener("click", openStageTimes);
+if (els.stageClose) {
+  els.stageClose.addEventListener("click", () => els.stageDialog.close());
+}
 
 refresh();
 setInterval(refresh, POLL_MS);

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Yifu Pipeline Monitor (PM)</title>
-  <link rel="stylesheet" href="/styles.css?v=7" />
+  <link rel="stylesheet" href="/styles.css?v=8" />
 </head>
 <body>
   <header class="app-header">
@@ -28,6 +28,7 @@
         <span><i class="lamp stalled"></i>失联</span>
       </div>
       <div class="toolbar">
+        <button type="button" id="stage-times-btn" class="btn ghost">环节耗时</button>
         <form id="add-form" class="add-form">
           <label>
             样本目录
@@ -46,6 +47,14 @@
     </section>
   </main>
 
+  <dialog id="stage-dialog" class="log-dialog stage-dialog">
+    <div class="log-head">
+      <strong>各环节平均用时（run manifest 汇总）</strong>
+      <button type="button" id="stage-close" class="btn">关闭</button>
+    </div>
+    <div id="stage-body" class="stage-body"></div>
+  </dialog>
+
   <dialog id="log-dialog" class="log-dialog">
     <div class="log-head">
       <strong id="log-title">日志</strong>
@@ -54,6 +63,6 @@
     <pre id="log-body" class="log-body"></pre>
   </dialog>
 
-  <script src="/app.js?v=7"></script>
+  <script src="/app.js?v=8"></script>
 </body>
 </html>
