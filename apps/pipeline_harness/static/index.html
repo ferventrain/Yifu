@@ -3,16 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Yifu Pipeline Monitor (PM)</title>
-  <link rel="stylesheet" href="/styles.css?v=9" />
+  <title>Yifu 流水线监控台</title>
+  <link rel="stylesheet" href="/styles.css?v=10" />
 </head>
 <body>
   <header class="app-header">
     <div class="brand">
-      <h1>Yifu Pipeline Monitor <span class="pm-abbr">(PM)</span></h1>
+      <h1>Yifu 流水线监控台<span class="pm-abbr">PM</span></h1>
       <p class="subtitle" id="header-paths">Loading…</p>
     </div>
     <div class="header-meta">
+      <div id="bench-stats" class="bench-stats"></div>
       <span id="runner-status" class="header-status">读取中</span>
     </div>
   </header>
@@ -28,20 +29,20 @@
         <span><i class="lamp stalled"></i>失联</span>
       </div>
       <div class="toolbar">
-        <button type="button" id="stage-times-btn" class="btn ghost">环节耗时</button>
         <form id="add-form" class="add-form">
           <label>
             样本目录
-            <input id="sample-dir" type="text" required placeholder="S:\Arivis_Analysis\sample_name" />
+            <input id="sample-dir" type="text" required placeholder="S:\Arivis_Analysis\_active\实验批\样本" />
           </label>
           <label>
-            config.json
-            <input id="config-path" type="text" placeholder="留空则使用 样本目录\config.json" />
+            config（可选，默认 config.json）
+            <input id="config-path" type="text" placeholder="config_1.json 补跑时填写" />
           </label>
-          <button type="submit" class="btn primary">提交任务</button>
+          <button type="submit" class="btn primary">开始分析</button>
         </form>
+        <button type="button" id="stage-times-btn" class="btn ghost">环节耗时</button>
       </div>
-      <p class="hint">看板按 <strong>实验批 → 样本项目</strong> 分组；项目卡内选 config 后"开始/继续"（断点自动续跑，补跑放 config_1.json 即可）。自定义程序用 <code>harness wrap</code> 挂进度。刷新/GET 不会启动任何任务；开始与保存笔记是显式操作。</p>
+      <p class="hint">看板按实验批分组；样本行内选 config 开始（断点自动续跑，补跑放 config_1.json）。拖动样本行左侧手柄调整优先级。刷新页面不会启动任何任务；开始、保存笔记、取消是显式操作。</p>
       <p id="form-error" class="error-banner hidden"></p>
       <div id="job-list" class="job-list"></div>
     </section>
@@ -63,6 +64,6 @@
     <pre id="log-body" class="log-body"></pre>
   </dialog>
 
-  <script src="/app.js?v=9"></script>
+  <script src="/app.js?v=10"></script>
 </body>
 </html>

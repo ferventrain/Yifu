@@ -2,15 +2,10 @@
 minimal machine verdict.
 
 Outputs under <sample>/qc/:
-  registration_views.png  - AIND-style five-panel registration QC grid, one
-                            row per orthogonal direction: sample NIfTI
-                            (fixed) with registered label contour (red) and
-                            hemisphere split line (yellow) | atlas template
-                            (moving) | warped atlas in sample space | RGB
-                            overlay (sample=green, warped=magenta) | signed
-                            difference (red=sample brighter, blue=warped
-                            brighter). An axial L/R hemisphere-check row is
-                            appended when the hemisphere Zarr exists.
+  registration_views.png  - three orthogonal mid-planes of the (coarse)
+                            registration NIfTI, per-view normalized, with the
+                            registered label contour (red) and the hemisphere
+                            split line (yellow, axial+coronal views).
   seg_blocks/block_NN.zarr- N random full-resolution blocks, dataset '0' =
                             raw signal, dataset '1' = segmentation mask.
   verdict.json            - four hard checks only (label magnitude, hemisphere
@@ -18,8 +13,8 @@ Outputs under <sample>/qc/:
                             correlation). overall FAIL must stop the queue.
 
 Designed to be cheap: reads the ~250 MB NIfTI, mid-plane slices of the label
-Zarr, the small warped-atlas TIFF stack, the atlas template and a handful of
-64x512x512 blocks — never a full-resolution volume scan.
+Zarr, the small warped-atlas TIFF stack, and a handful of 64x512x512 blocks —
+never a full-resolution volume scan.
 """
 from __future__ import annotations
 
@@ -217,91 +212,7 @@ def measure_boundary_alignment(nii_path: Path, label_zarr_path: Path) -> dict:
     }
 
 
-def _plane_to_grid(plane: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
-    """Bilinear-resample a grayscale plane onto the NIfTI display grid."""
-    from scipy import ndimage
-
-    if plane.shape == target_shape:
-        return plane.astype(np.float32)
-    factors = (target_shape[0] / plane.shape[0], target_shape[1] / plane.shape[1])
-    return ndimage.zoom(plane.astype(np.float32), factors, order=1)
-
-
-def _placeholder_panel(plane: np.ndarray, title: str) -> "Image.Image":
-    from PIL import Image, ImageDraw
-
-    img = Image.new("RGB", (plane.shape[1], plane.shape[0]), (48, 48, 48))
-    draw = ImageDraw.Draw(img)
-    draw.text((6, 4), title, fill=(200, 200, 200))
-    return img
-
-
-def _overlay_panel(sample: np.ndarray, warped: np.ndarray) -> np.ndarray:
-    """Green = sample only, magenta = warped atlas only, white = both."""
-    rgb = np.zeros((*sample.shape, 3), dtype=np.uint8)
-    rgb[..., 1] = sample
-    rgb[..., 0] = warped
-    rgb[..., 2] = warped
-    return rgb
-
-
-def _difference_panel(sample: np.ndarray, warped: np.ndarray) -> np.ndarray:
-    """Diverging residual: red = sample brighter, blue = warped brighter."""
-    delta = sample.astype(np.int16) - warped.astype(np.int16)
-    rgb = np.full((*sample.shape, 3), 24, dtype=np.uint8)
-    rgb[..., 0] = np.clip(delta, 0, 255).astype(np.uint8)
-    rgb[..., 2] = np.clip(-delta, 0, 255).astype(np.uint8)
-    return rgb
-
-
-def _read_tiff_stack_planes(stack_path: Path | None) -> dict[str, np.ndarray] | None:
-    """Mid-planes (axial/coronal/sagittal, display orientation) of a z,y,x TIFF stack."""
-    if stack_path is None:
-        return None
-    try:
-        import tifffile
-
-        if stack_path.is_file():
-            stack = np.asarray(tifffile.imread(str(stack_path)))
-        elif stack_path.is_dir():
-            slices = sorted(stack_path.glob("*.tif*"))
-            if not slices:
-                return None
-            stack = np.stack([tifffile.imread(str(s)) for s in slices])
-        else:
-            return None
-    except Exception:
-        logger.warning("could not read TIFF stack for QC panels: %s", stack_path)
-        return None
-    if stack.ndim != 3:
-        return None
-    nz, ny, nx = stack.shape
-    return {
-        "axial": stack[nz // 2],          # (y, x)
-        "coronal": stack[:, ny // 2, :],  # (z, x)
-        "sagittal": stack[:, :, nx // 2], # (z, y)
-    }
-
-
-def render_registration_views(
-    nii_path: Path,
-    label_zarr_path: Path,
-    hemi_zarr_path: Path,
-    out_png: Path,
-    *,
-    warped_dir: Path | None = None,
-    atlas_path: Path | None = None,
-) -> None:
-    """Five-panel registration QC per orthogonal direction (AIND-style).
-
-    Columns per direction row: sample NIfTI (fixed) with warped-label contour
-    and hemisphere split line | atlas template (moving) | warped atlas in
-    sample space | RGB overlay (sample=green, warped=magenta) | signed
-    difference (sample-warped; red=sample brighter, blue=warped brighter).
-    Missing atlas/warped inputs render as labelled gray placeholders so the
-    grid stays comparable across samples. An extra axial L/R hemisphere-check
-    row is appended when the hemisphere Zarr exists.
-    """
+def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_path: Path, out_png: Path) -> None:
     import nibabel as nib
     from PIL import Image, ImageDraw
 
@@ -342,31 +253,19 @@ def render_registration_views(
         split_x = None
         split_per_z = None
 
-    atlas_planes = _read_tiff_stack_planes(atlas_path)
-    warped_planes = _read_tiff_stack_planes(warped_dir)
-
-    def _source_plane(source: dict[str, np.ndarray] | None, name: str, target_shape) -> np.ndarray | None:
-        if source is None:
-            return None
-        raw = source.get(name)
-        if raw is None:
-            return None
-        return _norm_u8(_plane_to_grid(raw, target_shape))
-
-    COLUMN_TITLES = ("sample", "atlas", "warped", "overlay", "difference")
-    rows: list[list[Image.Image]] = []
+    images = []
     for name, plane in planes.items():
-        sample_panel_rgb = np.repeat(plane[..., None], 3, axis=2)
+        rgb = np.repeat(plane[..., None], 3, axis=2)
         presence = label_planes.get(name)
         if presence is not None:
-            sample_panel_rgb[_label_contour(_match_plane(presence, plane))] = (255, 60, 60)
-        sample_img = Image.fromarray(sample_panel_rgb)
-        draw = ImageDraw.Draw(sample_img)
+            rgb[_label_contour(_match_plane(presence, plane))] = (255, 60, 60)
+        img = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(img)
         # cols are the x axis on both views; scale full-res split into nii x.
         if name == "axial" and (split_x or split_per_z):
             full_x = split_per_z[lz // 2] if split_per_z else split_x
             col = int(full_x / fx)
-            draw.line([(col, 0), (col, sample_img.height)], fill=(255, 220, 0), width=2)
+            draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
         elif name == "coronal" and (split_x or split_per_z):
             if split_per_z and lz:
                 # per-z midline curve: rows are nii z, cols are nii x
@@ -379,32 +278,9 @@ def render_registration_views(
                 draw.line(pts, fill=(255, 220, 0), width=2)
             else:
                 col = int(split_x / fx)
-                draw.line([(col, 0), (col, sample_img.height)], fill=(255, 220, 0), width=2)
-        draw.text((6, 4), f"{name} {COLUMN_TITLES[0]}", fill=(255, 255, 255))
-
-        row = [sample_img]
-        atlas_plane = _source_plane(atlas_planes, name, plane.shape)
-        warped_plane = _source_plane(warped_planes, name, plane.shape)
-        if atlas_plane is not None:
-            img = Image.fromarray(np.repeat(atlas_plane[..., None], 3, axis=2))
-            ImageDraw.Draw(img).text((6, 4), f"{name} {COLUMN_TITLES[1]}", fill=(255, 255, 255))
-            row.append(img)
-        else:
-            row.append(_placeholder_panel(plane, f"{name} {COLUMN_TITLES[1]} (missing)"))
-        if warped_plane is not None:
-            img = Image.fromarray(np.repeat(warped_plane[..., None], 3, axis=2))
-            ImageDraw.Draw(img).text((6, 4), f"{name} {COLUMN_TITLES[2]}", fill=(255, 255, 255))
-            row.append(img)
-            overlay = Image.fromarray(_overlay_panel(plane, warped_plane))
-            ImageDraw.Draw(overlay).text((6, 4), f"{name} {COLUMN_TITLES[3]}", fill=(255, 255, 255))
-            row.append(overlay)
-            difference = Image.fromarray(_difference_panel(plane, warped_plane))
-            ImageDraw.Draw(difference).text((6, 4), f"{name} {COLUMN_TITLES[4]}", fill=(255, 255, 255))
-            row.append(difference)
-        else:
-            for column in (2, 3, 4):
-                row.append(_placeholder_panel(plane, f"{name} {COLUMN_TITLES[column]} (missing)"))
-        rows.append(row)
+                draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
+        draw.text((6, 4), name, fill=(255, 255, 255))
+        images.append(img)
 
     # Hemisphere-verification panel: axial plane tinted left=red / right=blue
     # on the autofluorescence background — shows whether the split plane
@@ -415,24 +291,16 @@ def render_registration_views(
         rgb[matched == 1] = (255, 90, 90)
         rgb[matched == 2] = (90, 120, 255)
         img = Image.fromarray(rgb)
-        ImageDraw.Draw(img).text((6, 4), "axial L/R check", fill=(255, 255, 255))
-        rows.append([img])
+        draw = ImageDraw.Draw(img)
+        draw.text((6, 4), "axial L/R check", fill=(255, 255, 255))
+        images.append(img)
 
-    row_gap = 16
-    col_gap = 16
-    sheet_w = max(
-        sum(img.width for img in row) + col_gap * (len(row) - 1) for row in rows
-    )
-    row_heights = [max(img.height for img in row) for row in rows]
-    sheet_h = sum(row_heights) + row_gap * (len(rows) - 1)
-    sheet = Image.new("RGB", (sheet_w, sheet_h), (20, 20, 20))
-    y_off = 0
-    for row, height in zip(rows, row_heights):
-        x_off = 0
-        for img in row:
-            sheet.paste(img, (x_off, y_off))
-            x_off += img.width + col_gap
-        y_off += height + row_gap
+    height = max(img.height for img in images)
+    sheet = Image.new("RGB", (sum(img.width for img in images) + 16 * (len(images) - 1), height), (20, 20, 20))
+    offset = 0
+    for img in images:
+        sheet.paste(img, (offset, 0))
+        offset += img.width + 16
     sheet.save(out_png)
 
 
@@ -459,42 +327,29 @@ def save_segmentation_blocks(signal_zarr_path: Path, mask_zarr_path: Path, label
         if not np.any(mask_block > 0):
             continue
         signal_block = np.asarray(signal[z0:z0 + bz, y0:y0 + by, x0:x0 + bx])
-        # One OME-Zarr store per block with TWO layers: `raw` (image layer,
-        # adjust contrast) and `labels/mask` (OME-NGFF labels layer, adjust
-        # colormap/opacity). Dragging the .zarr into napari yields two
-        # independent layers instead of two blended channels.
+        # One OME-Zarr store per block, single (c, z, y, x) array with channel
+        # 0 = raw signal, channel 1 = mask (0/1). NGFF multiscales + omero
+        # metadata make napari (napari-ome-zarr) open it directly via
+        # drag-and-drop and split the two channels into named layers.
         block_path = out_dir / f"block_{len(written):02d}.zarr"
-        scale_zyx = (resolution_xyz[2], resolution_xyz[1], resolution_xyz[0])
-        top = open_output_group(block_path, overwrite=True)
-        top.attrs["block_offset_zyx"] = [z0, y0, x0]
-        top.attrs["block_shape_zyx"] = [bz, by, bx]
-        top.attrs["sample"] = sample_name
-        top.attrs["layers"] = {"raw": "raw signal", "labels/mask": "segmentation mask"}
-        raw_group = open_output_group(block_path / "raw", overwrite=True)
-        create_array(raw_group, "0", shape=signal_block.shape, chunks=(min(32, bz), by, bx),
-                     dtype=signal_block.dtype, data=signal_block)
-        raw_group.attrs["multiscales"] = ome_ngff_multiscales(
-            ["0"], ndim=3, base_scale=scale_zyx, name=f"{sample_name} raw",
+        stacked = np.stack([signal_block, mask_block.astype(signal_block.dtype)])
+        group = open_output_group(block_path, overwrite=True)
+        create_array(group, "0", shape=stacked.shape, chunks=(2, min(32, bz), by, bx),
+                     dtype=stacked.dtype, data=stacked)
+        group.attrs["multiscales"] = ome_ngff_multiscales(
+            ["0"], ndim=4, base_scale=(1.0, resolution_xyz[2], resolution_xyz[1], resolution_xyz[0]),
+            name=f"{sample_name} QC block",
         )
-        raw_group.attrs["omero"] = {
+        group.attrs["omero"] = {
             "channels": [
                 {"label": "signal", "color": "FFFF00", "window": {"start": 0, "end": 65535}, "active": True},
+                {"label": "mask", "color": "FF0000", "window": {"start": 0, "end": 1}, "active": True},
             ],
         }
-        # zarr does not auto-create intermediate .zgroup metadata: the labels
-        # parent must be an explicit group or it is invisible to readers.
-        open_output_group(block_path / "labels", overwrite=True)
-        mask_group = open_output_group(block_path / "labels" / "mask", overwrite=True)
-        mask_block = mask_block.astype(np.uint8)
-        create_array(mask_group, "0", shape=mask_block.shape, chunks=(min(32, bz), by, bx),
-                     dtype=mask_block.dtype, data=mask_block)
-        mask_group.attrs["multiscales"] = ome_ngff_multiscales(
-            ["0"], ndim=3, base_scale=scale_zyx, name="mask",
-        )
-        mask_group.attrs["image-label"] = {
-            "version": "0.4",
-            "source": {"image": "../../raw"},
-        }
+        group.attrs["block_offset_zyx"] = [z0, y0, x0]
+        group.attrs["block_shape_zyx"] = [bz, by, bx]
+        group.attrs["sample"] = sample_name
+        group.attrs["channels"] = {"0": "raw signal", "1": "segmentation mask"}
         written.append(block_path)
         logger.info("saved QC block %s at zyx=%s", block_path.name, (z0, y0, x0))
     if len(written) < N_SEG_BLOCKS:
@@ -514,7 +369,6 @@ def run_qc(
     signal_zarr_path: Path | None = None,
     mask_zarr_path: Path | None = None,
     output_dir: Path | None = None,
-    atlas_path: Path | None = None,
 ) -> dict:
     sample_dir = Path(sample_dir)
     signal_ch = str(config["input"]["channels"]["signal"])
@@ -542,22 +396,8 @@ def run_qc(
     except Exception:
         logger.exception("boundary alignment measurement failed")
 
-    if atlas_path is None:
-        raw_atlas = str((config.get("registration") or {}).get("atlas_path") or "").strip()
-        if raw_atlas:
-            from pipeline_modules.utils.data_paths import expand_config_path
-
-            atlas_path = expand_config_path(raw_atlas)
-
     try:
-        render_registration_views(
-            nii_path,
-            label_zarr_path,
-            hemi_zarr_path,
-            output_dir / "registration_views.png",
-            warped_dir=warped_dir,
-            atlas_path=atlas_path,
-        )
+        render_registration_views(nii_path, label_zarr_path, hemi_zarr_path, output_dir / "registration_views.png")
     except Exception:
         logger.exception("registration views failed")
 
@@ -602,7 +442,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--signal_zarr", default="")
     parser.add_argument("--mask_zarr", default="")
     parser.add_argument("--output_dir", default="")
-    parser.add_argument("--atlas", default="", help="Override atlas template path (defaults to registration.atlas_path)")
     return parser.parse_args()
 
 
@@ -624,7 +463,6 @@ def main() -> int:
         signal_zarr_path=Path(args.signal_zarr) if args.signal_zarr else None,
         mask_zarr_path=Path(args.mask_zarr) if args.mask_zarr else None,
         output_dir=Path(args.output_dir) if args.output_dir else None,
-        atlas_path=Path(args.atlas) if args.atlas else None,
     )
     write_run_manifest(
         sample_dir / "qc",

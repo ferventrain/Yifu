@@ -13,6 +13,7 @@ const STATUS_LABELS = {
 
 const els = {
   paths: document.getElementById("header-paths"),
+  benchStats: document.getElementById("bench-stats"),
   runner: document.getElementById("runner-status"),
   form: document.getElementById("add-form"),
   sampleDir: document.getElementById("sample-dir"),
@@ -103,15 +104,41 @@ async function api(path, options) {
 
 // ------------------------------------------------------------------ board
 
+function renderBenchStats(running, queued, samples, failed) {
+  if (!els.benchStats) return;
+  els.benchStats.replaceChildren();
+  for (const [value, label, cls] of [
+    [running, "运行", "is-run"],
+    [queued, "排队", ""],
+    [samples, "样本", ""],
+    [failed, "失败", failed ? "is-bad" : ""],
+  ]) {
+    const stat = document.createElement("span");
+    stat.className = `bench-stat ${cls}`.trim();
+    const num = document.createElement("strong");
+    num.textContent = value;
+    const lab = document.createElement("span");
+    lab.textContent = label;
+    stat.append(num, lab);
+    els.benchStats.appendChild(stat);
+  }
+}
+
 function renderBoard(data) {
   const batches = data.batches || [];
   const runs = [];
   for (const batch of batches) for (const project of batch.projects) runs.push(...project.runs);
 
-  els.paths.textContent = `样本根目录 ${data.analysis_root}  ·  Active ${data.active_dir}`;
+  els.paths.textContent = `${data.analysis_root}  /  ${data.active_dir}`;
   const worker = data.worker || {};
   const running = runs.filter((run) => (run.display_status || run.status) === "running");
   const queued = runs.filter((run) => run.status === "queued");
+  const sampleCount = batches.reduce((acc, b) => acc + b.projects.length, 0);
+  const failedCount = batches.reduce(
+    (acc, b) => acc + b.projects.filter((p) => ["failed", "stalled"].includes(p.status)).length,
+    0
+  );
+  renderBenchStats(running.length, queued.length, sampleCount, failedCount);
   if (worker.alive) {
     els.runner.textContent = `Worker pid ${worker.pid} 在线` + (running.length ? `，运行中 ${running.length}` : "") + (queued.length ? `，排队 ${queued.length}` : "");
     els.runner.classList.toggle("busy", running.length > 0);
@@ -157,7 +184,7 @@ function batchHeader(batch) {
   const active = batch.projects.filter((p) => ["running", "verifying", "queued"].includes(p.status)).length;
   const failed = batch.projects.reduce((acc, p) => acc + (p.failed_count || 0), 0);
   const anomaly = batch.projects.filter((p) => p.anomaly).length;
-  meta.textContent = `${batch.projects.length} 样本` + (active ? ` · ${active} 进行中` : "") + (failed ? ` · ${failed} 失败` : "") + (anomaly ? ` · ${anomaly} 异常` : "");
+  meta.textContent = `${batch.projects.length} 样本` + (active ? `，${active} 进行中` : "") + (failed ? `，${failed} 失败` : "") + (anomaly ? `，${anomaly} 异常` : "");
   heading.append(name, meta);
   return heading;
 }
@@ -574,7 +601,7 @@ function renderRunCard(job) {
       if (step && total && step !== total) chunks.push(`本步剩余 ${step}，全部剩余 ${total}`);
       else if (step || total) chunks.push(`预计剩余 ${step || total}`);
     }
-    etaLine.textContent = chunks.join(" · ");
+    etaLine.textContent = chunks.join("，");
   } else if (status === "succeeded" || status === "done") {
     etaLine.textContent = formatDuration(job.duration_s) ? `耗时 ${formatDuration(job.duration_s)}` : "分析完成";
   }
