@@ -1011,3 +1011,24 @@ dialog::backdrop { background: rgba(16, 24, 34, 0.35); }
   .board-layout { flex-direction: column; }
   .resource-panel { width: 100%; position: static; }
 }
+
+/* batch header: progress + remaining */
+.batch > summary { align-items: center; }
+.batch-summary { display: flex; align-items: baseline; gap: 0.5rem; min-width: 0; }
+.batch-right { margin-left: auto; display: flex; align-items: center; gap: 0.7rem; flex-shrink: 0; }
+.batch-remaining { font-family: var(--font-num); font-variant-numeric: tabular-nums; font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+.batch-progress { display: flex; width: 120px; height: 8px; border-radius: 999px; overflow: hidden; background: var(--panel-3); border: 1px solid var(--line-soft); }
+.bp-seg { display: block; height: 100%; }
+.bp-seg.ok { background: var(--ok); }
+.bp-seg.run { background: var(--run); animation: led 1.8s ease-in-out infinite; }
+.bp-seg.bad { background: var(--bad); }
+.bp-seg.idle { background: #c3ccd5; }
+
+/* priority selector */
+.prio-seg { display: inline-flex; gap: 2px; margin-left: 0.6rem; background: var(--panel-3); border: 1px solid var(--line-soft); border-radius: 6px; padding: 2px; }
+.prio-btn { border: none; background: transparent; color: var(--faint); font-family: var(--font-num); font-size: 0.66rem; font-weight: 600; padding: 0.08rem 0.42rem; border-radius: 4px; cursor: pointer; line-height: 1.5; }
+.prio-btn:hover { color: var(--muted); background: var(--panel-2); }
+.prio-btn.p0.active { background: var(--bad); color: #fff; }
+.prio-btn.p1.active { background: var(--warn); color: #fff; }
+.prio-btn.p2.active { background: var(--run); color: #fff; }
+.prio-btn.p3.active { background: #6d7a87; color: #fff; }

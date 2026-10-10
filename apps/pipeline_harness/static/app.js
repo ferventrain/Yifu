@@ -35,8 +35,7 @@ let openLogJobId = null;
 const expandedBatches = new Set();
 const runOpenState = new Map(); // "<scope>::<id>" -> pinned open/closed
 const nodeCache = new Map(); // sample key -> live card element (focus protection)
-let currentSampleOrder = []; // flat display order of sample_dirs (for drag priority)
-let dragSampleKey = null;
+let currentSampleOrder = []; // flat display order of sample_dirs
 let errorHoldUntil = 0;
 
 function sampleKey(sampleDir) {
@@ -278,11 +277,39 @@ function batchHeader(batch) {
   name.textContent = batch.batch;
   const meta = document.createElement("span");
   meta.className = "batch-meta";
-  const active = batch.projects.filter((p) => ["running", "verifying", "queued"].includes(p.status)).length;
-  const failed = batch.projects.reduce((acc, p) => acc + (p.failed_count || 0), 0);
-  const anomaly = batch.projects.filter((p) => p.anomaly).length;
-  meta.textContent = `${batch.projects.length} 样本` + (active ? `，${active} 进行中` : "") + (failed ? `，${failed} 失败` : "") + (anomaly ? `，${anomaly} 异常` : "");
-  heading.append(name, meta);
+  const progress = batch.progress || {};
+  const chunks = [];
+  if (progress.done) chunks.push(`${progress.done} 完成`);
+  if (progress.running) chunks.push(`${progress.running} 运行`);
+  if (progress.failed) chunks.push(`${progress.failed} 失败`);
+  if (progress.waiting) chunks.push(`${progress.waiting} 未跑`);
+  meta.textContent = chunks.join("，") || `${batch.projects.length} 样本`;
+
+  const wrap = document.createElement("div");
+  wrap.className = "batch-summary";
+  wrap.append(name, meta);
+
+  const right = document.createElement("div");
+  right.className = "batch-right";
+  if (batch.remaining_s != null) {
+    const rem = document.createElement("span");
+    rem.className = "batch-remaining";
+    rem.textContent = `还需 ≈ ${formatEta(batch.remaining_s)}`;
+    right.appendChild(rem);
+  }
+  if (progress.total) {
+    const bar = document.createElement("div");
+    bar.className = "batch-progress";
+    for (const [kind, cls] of [["done", "ok"], ["running", "run"], ["failed", "bad"], ["waiting", "idle"]]) {
+      if (!progress[kind]) continue;
+      const seg = document.createElement("i");
+      seg.className = `bp-seg ${cls}`;
+      seg.style.width = `${(progress[kind] / progress.total) * 100}%`;
+      bar.appendChild(seg);
+    }
+    right.appendChild(bar);
+  }
+  heading.append(wrap, right);
   return heading;
 }
 
@@ -349,24 +376,6 @@ function renderProject(project) {
   card.className = `project-card status-${project.status}${project.anomaly ? " anomalous" : ""}${pcls}`;
   card.dataset.sampleKey = key;
 
-  // drag & drop (priority)
-  const handle = document.createElement("span");
-  handle.className = "drag-handle";
-  handle.title = "拖动调整优先级";
-  handle.textContent = "⠿";
-  handle.draggable = true;
-  handle.addEventListener("dragstart", (event) => {
-    dragSampleKey = key;
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", key);
-  });
-  handle.addEventListener("dragend", () => {
-    dragSampleKey = null;
-    document.querySelectorAll(".drag-over").forEach((el) => el.classList.remove("drag-over"));
-    refresh();
-  });
-  card.appendChild(handle);
-
   // ---- header
   const head = document.createElement("div");
   head.className = "job-head";
@@ -384,20 +393,33 @@ function renderProject(project) {
 
   const statusCluster = document.createElement("span");
   statusCluster.className = "status-cluster";
-  const pBadge = document.createElement("button");
-  pBadge.type = "button";
-  pBadge.className = `pbadge${project.priority != null ? ` p${project.priority}` : ""}`;
-  pBadge.title = "优先级：点击循环 P0–P3";
-  pBadge.textContent = project.priority != null ? `P${project.priority}` : "—";
-  pBadge.addEventListener("click", () => {
-    const next = project.priority == null ? 0 : (project.priority + 1) % 4;
-    setPriority(project.sample_dir, next);
-  });
   const lamp = document.createElement("i");
   lamp.className = `lamp ${project.status}`;
   const label = document.createElement("span");
   label.textContent = STATUS_LABELS[project.status] || project.status;
-  statusCluster.append(pBadge, lamp, label);
+
+  // priority selector: small single-choice group on the row's right side
+  const prioSeg = document.createElement("span");
+  prioSeg.className = "prio-seg";
+  prioSeg.title = "紧急度";
+  for (const level of [0, 1, 2, 3]) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    const active = project.priority === level;
+    btn.className = `prio-btn p${level}${active ? " active" : ""}`;
+    btn.textContent = `P${level}`;
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+    btn.addEventListener("click", () => {
+      if (project.priority === level) {
+        setPriority(project.sample_dir, -1); // clicking the active level clears
+      } else {
+        setPriority(project.sample_dir, level);
+      }
+    });
+    prioSeg.appendChild(btn);
+  }
+
+  statusCluster.append(lamp, label, prioSeg);
   head.append(titleWrap, statusCluster);
   card.appendChild(head);
 
@@ -593,27 +615,6 @@ function renderProject(project) {
   runsBox.className = "runs";
   for (const run of project.runs) runsBox.appendChild(renderRunRow(project, run));
   card.appendChild(runsBox);
-
-  // ---- drag & drop targets
-  card.addEventListener("dragover", (event) => {
-    if (dragSampleKey && dragSampleKey !== key) {
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-      card.classList.add("drag-over");
-    }
-  });
-  card.addEventListener("dragleave", () => card.classList.remove("drag-over"));
-  card.addEventListener("drop", async (event) => {
-    event.preventDefault();
-    card.classList.remove("drag-over");
-    if (!dragSampleKey || dragSampleKey === key) return;
-    const draggedDir = currentSampleOrder.find((dir) => sampleKey(dir) === dragSampleKey);
-    dragSampleKey = null;
-    if (!draggedDir) return;
-    // drop A onto B: A takes B's priority level (drag assigns priority,
-    // dropping onto an unprioritized card clears it)
-    await setPriority(draggedDir, project.priority != null ? project.priority : -1);
-  });
 
   nodeCache.set(key, card);
   return card;
@@ -896,11 +897,7 @@ function renderStageTimes(data) {
 async function refresh() {
   try {
     const data = await api("/api/projects");
-    // freeze the board while a drag is in flight: the rebuild would remove
-    // the drag source from the DOM and cancel the drop
-    if (dragSampleKey == null) {
-      renderBoard(data);
-    }
+    renderBoard(data);
     if (Date.now() >= errorHoldUntil) showError("");
     if (openLogJobId && els.logDialog.open) await loadLog(openLogJobId, false);
   } catch (error) {

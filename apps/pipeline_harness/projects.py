@@ -751,6 +751,38 @@ def group_into_batches(
             stamp,
         )
 
+    # per-batch sample progress + remaining-time estimate
+    def _sample_outcome(project: dict[str, Any]) -> str:
+        if project.get("active_run_id"):
+            return "running"
+        status = str(project.get("status") or "idle")
+        if status in {"succeeded", "done"}:
+            return "done"
+        if status in {"failed", "stalled"}:
+            return "failed"
+        return "waiting"  # idle / cancelled / never run
+
+    for batch in batches.values():
+        counts = {"done": 0, "running": 0, "failed": 0, "waiting": 0}
+        remaining = 0.0
+        has_remaining = False
+        for project in batch["projects"]:
+            counts[_sample_outcome(project)] += 1
+            if project.get("active_run_id"):
+                eta = ((project.get("latest_full_view") or {}).get("eta")) or {}
+                eta_seconds = eta.get("total_remaining_s") or eta.get("current_step_remaining_s")
+                if eta_seconds:
+                    remaining += float(eta_seconds)
+                    has_remaining = True
+                    continue
+            if _sample_outcome(project) != "done":
+                estimate = project.get("estimate") or {}
+                if estimate.get("seconds"):
+                    remaining += float(estimate["seconds"])
+                    has_remaining = True
+        batch["progress"] = {**counts, "total": len(batch["projects"])}
+        batch["remaining_s"] = round(remaining, 1) if has_remaining else None
+
     batch_list = sorted(batches.values(), key=_batch_sort)
     for batch in batch_list:
         batch["projects"].sort(key=_project_rank, reverse=False)
