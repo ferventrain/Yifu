@@ -210,6 +210,11 @@ function renderBatch(batch) {
 function renderOtherSection(batches, orderSink) {
   const box = document.createElement("details");
   box.className = "batch other-root";
+  box.open = expandedBatches.has("__other_root__");
+  box.addEventListener("toggle", () => {
+    if (box.open) expandedBatches.add("__other_root__");
+    else expandedBatches.delete("__other_root__");
+  });
   const heading = document.createElement("summary");
   const name = document.createElement("strong");
   name.className = "batch-name";
@@ -289,13 +294,19 @@ function renderProject(project) {
   head.append(titleWrap, statusCluster);
   card.appendChild(head);
 
-  // ---- chips: anomaly / priority / estimate
+  // ---- chips: anomaly / profile / priority / estimate
   const chips = document.createElement("div");
   chips.className = "chip-row";
   if (project.anomaly) {
     const chip = document.createElement("span");
     chip.className = "chip danger";
     chip.textContent = `异常：${project.anomaly}`;
+    chips.appendChild(chip);
+  }
+  if (project.profile_label) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = project.profile_label;
     chips.appendChild(chip);
   }
   if (project.priority_rank != null) {

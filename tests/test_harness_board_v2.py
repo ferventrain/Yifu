@@ -230,3 +230,64 @@ def test_manifest_status_field_and_incomplete_exclusion(analysis_home: Path):
     monkeypatch.undo()
     projects_mod._STAGE_CACHE["payload"] = None
     projects_mod._STAGE_CACHE["at"] = 0.0
+
+
+def test_estimate_separates_profiles(analysis_home: Path):
+    """vessel and cfos samples must not share one estimate number."""
+    pytest.importorskip("fastapi")
+    import importlib
+
+    def _seed(sample: Path, duration: float, config: dict) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        sample.mkdir(parents=True, exist_ok=True)
+        (sample / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        store = ActiveStore()
+        job = store.add_job(sample)
+        ended = datetime.now(timezone.utc)
+        started = ended - timedelta(seconds=duration)
+        job.update(
+            {
+                "status": "succeeded",
+                "started_at": started.isoformat(),
+                "ended_at": ended.isoformat(),
+            }
+        )
+        store.save_job(job)
+
+    vessel_cfg = {
+        "input": {"channels": {"signal": "1", "registration": "0"}},
+        "tubule_reconstruction": {"enabled": True},
+    }
+    unet_cfg = {
+        "input": {"channels": {"signal": "1", "registration": "0"}},
+        "segmentation": {"method": "cfos_unet"},
+    }
+    _seed(analysis_home / "b1" / "vesselA", 3600.0, vessel_cfg)
+    _seed(analysis_home / "b1" / "vesselB", 4200.0, vessel_cfg)
+    _seed(analysis_home / "b2" / "unetA", 18000.0, unet_cfg)
+    _seed(analysis_home / "b2" / "unetB", 21600.0, unet_cfg)
+    newbie = analysis_home / "b3" / "newbie"
+    newbie.mkdir(parents=True)
+    (newbie / "config.json").write_text(json.dumps(unet_cfg), encoding="utf-8")
+    ActiveStore().add_job(newbie)  # queued, never succeeded
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(monitor, "store", ActiveStore())
+    payload = monitor.api_projects()
+
+    estimates = {}
+    profiles = {}
+    for batch in payload["batches"]:
+        for project in batch["projects"]:
+            estimates[project["sample_name"]] = project["estimate"]
+            profiles[project["sample_name"]] = project["profile"]
+
+    assert profiles["vesselA"] == "vessel"
+    assert profiles["unetA"] == "cfos-unet"
+    assert estimates["vesselA"]["seconds"] == 3600.0
+    assert estimates["unetA"]["seconds"] == 18000.0
+    assert estimates["newbie"]["seconds"] == 19800.0
+    assert "同类" in estimates["newbie"]["basis"]
+    monkeypatch.undo()

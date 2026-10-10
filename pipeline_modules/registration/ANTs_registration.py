@@ -18,6 +18,11 @@ try:
         load_label_array_preserving_ids,
     )
     from pipeline_modules.preprocessing.tiff_to_zarr import convert_tiff_to_zarr
+    from pipeline_modules.registration.brain_mask_ds import (
+        DS_FACTOR,
+        brain_mask_ds_path,
+        write_brain_mask_ds_from_source,
+    )
     from pipeline_modules.utils.tiff_stack_io import (
         iter_batch_ranges,
         normalize_tiff_compression,
@@ -33,6 +38,11 @@ except ImportError:
         decode_label_codes,
         ensure_label_storage_dtype,
         load_label_array_preserving_ids,
+    )
+    from .brain_mask_ds import (  # type: ignore[no-redef]
+        DS_FACTOR,
+        brain_mask_ds_path,
+        write_brain_mask_ds_from_source,
     )
 
     convert_tiff_to_zarr = None  # type: ignore[assignment]
@@ -96,18 +106,44 @@ def n4_bias_correct_masked(volume_xyz: np.ndarray, mask_xyz: np.ndarray, spacing
     return np.transpose(sitk.GetArrayFromImage(corrected), (2, 1, 0))  # -> x,y,z
 
 
+def _qc_norm_u8(plane: np.ndarray) -> np.ndarray:
+    lo, hi = np.percentile(plane, [1.0, 99.8])
+    if hi <= lo:
+        hi = lo + 1
+    return np.clip((plane.astype(np.float32) - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+
+
+def _qc_overlay_panel(sample: np.ndarray, warped: np.ndarray) -> np.ndarray:
+    """Green = sample only, magenta = warped only, white = both."""
+    rgb = np.zeros((*sample.shape, 3), dtype=np.uint8)
+    rgb[..., 1] = sample
+    rgb[..., 0] = warped
+    rgb[..., 2] = warped
+    return rgb
+
+
+def _qc_difference_panel(sample: np.ndarray, warped: np.ndarray) -> np.ndarray:
+    """Diverging residual: red = sample brighter, blue = warped brighter."""
+    delta = sample.astype(np.int16) - warped.astype(np.int16)
+    rgb = np.full((*sample.shape, 3), 24, dtype=np.uint8)
+    rgb[..., 0] = np.clip(delta, 0, 255).astype(np.uint8)
+    rgb[..., 2] = np.clip(-delta, 0, 255).astype(np.uint8)
+    return rgb
+
+
 def render_alignment_check_png(fixed_ants, warped_ants, out_png: Path, title: str) -> None:
     """3x3 QC grid (axial/coronal/sagittal x sample/warped/overlay+diff-ish).
 
     Volumes are ANTs images in (x,y,z) array layout; plane conventions match
-    pipeline_qc: axial (y,x), coronal (z,x), sagittal (z,y).
+    pipeline_qc: axial (y,x), coronal (z,x), sagittal (z,y). Panel helpers
+    are local on purpose: pipeline_qc is under active refactor and this
+    registration-side renderer must not track its churn.
     """
     from PIL import Image, ImageDraw
-    from pipeline_modules.visualization.pipeline_qc import (
-        _difference_panel,
-        _norm_u8,
-        _overlay_panel,
-    )
+
+    _difference_panel = _qc_difference_panel
+    _norm_u8 = _qc_norm_u8
+    _overlay_panel = _qc_overlay_panel
 
     fixed = fixed_ants.numpy()
     warped = warped_ants.numpy()
@@ -644,6 +680,29 @@ class BidirectionalRegistration:
             
         logger.info("Saved %d slices to %s", len(z_indices), output_path)
 
+    def _write_ds_brain_mask_cache(self, warped_label, cache_path: Path) -> None:
+        """Write the factor-4 brain-mask cache derived from the warped label.
+
+        Computed from the registration-resolution source (seconds) instead of
+        re-streamming the full-resolution upsampled label.
+        """
+        arr = warped_label.numpy()
+        source_mask = np.transpose(arr, (2, 1, 0)) != 0
+        z_indices = np.round(
+            np.linspace(0, source_mask.shape[0] - 1, self.original_shape[0])
+        ).astype(int)
+        spacing_xyz = tuple(float(s) for s in warped_label.spacing)
+        spacing_zyx = spacing_xyz[::-1]
+        target = tuple(int(v) for v in self.original_shape)
+        ds_spacing_um = [
+            spacing_zyx[i] * target[i] / source_mask.shape[i] * DS_FACTOR
+            for i in range(3)
+        ]
+        write_brain_mask_ds_from_source(
+            source_mask, z_indices, target, cache_path, spacing_zyx_um=ds_spacing_um
+        )
+        logger.info("Wrote factor-%d brain-mask cache: %s", DS_FACTOR, cache_path)
+
     def save_registration_results(self, results: Dict, save_transforms: bool = False, 
                                 save_registered_image: bool = False) -> None:
         """保存配准结果"""
@@ -708,6 +767,11 @@ class BidirectionalRegistration:
                                 # image was created; the label warp used the
                                 # original atlas direction, and so must this.
                             )
+
+                    if self.save_upsampled_label_zarr and label_zarr.exists():
+                        brain_mask_cache = brain_mask_ds_path(label_zarr)
+                        if not brain_mask_cache.exists():
+                            self._write_ds_brain_mask_cache(results["warped_label"], brain_mask_cache)
 
                     if not self.save_upsampled_label and label_dir.exists():
                         shutil.rmtree(label_dir)

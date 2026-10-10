@@ -1,24 +1,24 @@
 /* ============================================================
-   Yifu PM — 成像工作台控制台
-   石墨蓝墨底 · 状态即颜色 · DIN 仪表数字 · 清单式看板
+   Yifu PM — 成像工作台控制台（亮色）
+   冷纸灰面板 · 状态即颜色 · DIN 仪表数字 · 清单式看板
    ============================================================ */
 
 :root {
-  --ink: #0f1419;
-  --panel: #151b22;
-  --panel-2: #1a222b;
-  --panel-3: #202a35;
-  --line: #26303a;
-  --line-soft: #1e262f;
-  --text: #e3e9ee;
-  --muted: #8494a3;
-  --faint: #5c6a77;
+  --bg: #eef1f5;
+  --panel: #ffffff;
+  --panel-2: #f6f8fa;
+  --panel-3: #eceff3;
+  --line: #d7dee7;
+  --line-soft: #e7ebf0;
+  --text: #1c242e;
+  --muted: #5c6b7a;
+  --faint: #8b98a6;
 
-  --run: #4d9fff;
-  --ok: #3fbf7f;
-  --warn: #e6a23c;
-  --bad: #ef5b5b;
-  --idle: #8494a3;
+  --run: #2b7fd4;
+  --ok: #1f9d5c;
+  --warn: #c07a1d;
+  --bad: #d24a4a;
+  --idle: #8b98a6;
 
   --font-num: "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif;
   --font-ui: -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
@@ -31,14 +31,14 @@
 body {
   margin: 0;
   font-family: var(--font-ui);
-  background: var(--ink);
+  background: var(--bg);
   color: var(--text);
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
   letter-spacing: 0.005em;
 }
 
-::selection { background: rgba(77, 159, 255, 0.32); }
+::selection { background: rgba(43, 127, 212, 0.22); }
 
 :focus-visible {
   outline: 2px solid var(--run);
@@ -54,8 +54,8 @@ body {
   align-items: flex-end;
   gap: 1.25rem;
   padding: 1.3rem 1.75rem 1rem;
-  border-bottom: 1px solid var(--line-soft);
-  background: linear-gradient(180deg, #131920 0%, var(--ink) 100%);
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
 }
 
 .brand h1 {
@@ -64,6 +64,7 @@ body {
   font-weight: 600;
   font-size: 1.22rem;
   letter-spacing: 0.02em;
+  color: #101822;
 }
 
 .brand h1 .pm-abbr {
@@ -106,6 +107,7 @@ body {
   font-size: 1.3rem;
   font-variant-numeric: tabular-nums;
   line-height: 1;
+  color: #101822;
 }
 
 .bench-stat span {
@@ -114,7 +116,6 @@ body {
 }
 
 .bench-stat.is-run strong { color: var(--run); }
-.bench-stat.is-ok strong { color: var(--ok); }
 .bench-stat.is-bad strong { color: var(--bad); }
 
 .header-status {
@@ -156,26 +157,26 @@ main {
   background: var(--idle);
 }
 
-.lamp.queued { background: #6a7684; }
+.lamp.queued { background: #93a0ae; }
 .lamp.running {
   background: var(--run);
-  box-shadow: 0 0 6px rgba(77, 159, 255, 0.65);
+  box-shadow: 0 0 0 2px rgba(43, 127, 212, 0.22);
   animation: led 1.8s ease-in-out infinite;
 }
 .lamp.verifying {
-  background: #7c8cff;
-  box-shadow: 0 0 6px rgba(124, 140, 255, 0.6);
+  background: #6a7be8;
+  box-shadow: 0 0 0 2px rgba(106, 123, 232, 0.2);
   animation: led 1.8s ease-in-out infinite;
 }
-.lamp.failed { background: var(--bad); box-shadow: 0 0 6px rgba(239, 91, 91, 0.5); }
+.lamp.failed { background: var(--bad); }
 .lamp.done, .lamp.succeeded { background: var(--ok); }
-.lamp.cancelled { background: #566069; }
+.lamp.cancelled { background: #a7b1bb; }
 .lamp.stalled {
   background: var(--warn);
-  box-shadow: 0 0 6px rgba(230, 162, 60, 0.55);
+  box-shadow: 0 0 0 2px rgba(192, 122, 29, 0.22);
   animation: led 2.4s ease-in-out infinite;
 }
-.lamp.idle { background: #3c4650; }
+.lamp.idle { background: #c3ccd5; }
 
 @keyframes led {
   0%, 100% { opacity: 1; }
@@ -191,7 +192,7 @@ main {
   gap: 0.75rem 1rem;
   align-items: flex-end;
   background: var(--panel);
-  border: 1px solid var(--line-soft);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 0.85rem 1rem;
 }
@@ -220,7 +221,7 @@ main {
   padding: 0.42rem 0.6rem;
   font-size: 0.88rem;
   font-family: var(--font-num);
-  background: var(--ink);
+  background: #fff;
   color: var(--text);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
@@ -228,7 +229,7 @@ main {
 .add-form input:focus {
   outline: none;
   border-color: var(--run);
-  box-shadow: 0 0 0 3px rgba(77, 159, 255, 0.18);
+  box-shadow: 0 0 0 3px rgba(43, 127, 212, 0.15);
 }
 
 .btn {
@@ -243,25 +244,25 @@ main {
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 
-.btn:hover { background: var(--panel-3); border-color: #33404d; }
+.btn:hover { background: var(--panel-3); border-color: #c4cdd8; }
 .btn:active { background: var(--line); }
 
 .btn.primary {
   background: var(--ok);
   border-color: var(--ok);
-  color: #08130c;
+  color: #ffffff;
   font-weight: 600;
 }
 
-.btn.primary:hover { background: #4ecf8c; border-color: #4ecf8c; }
+.btn.primary:hover { background: #23ab6b; border-color: #23ab6b; }
 
 .btn.danger {
-  background: transparent;
-  border-color: rgba(239, 91, 91, 0.5);
+  background: #fff;
+  border-color: rgba(210, 74, 74, 0.5);
   color: var(--bad);
 }
 
-.btn.danger:hover { background: rgba(239, 91, 91, 0.12); border-color: var(--bad); }
+.btn.danger:hover { background: rgba(210, 74, 74, 0.08); border-color: var(--bad); }
 
 .btn.ghost {
   background: transparent;
@@ -298,7 +299,7 @@ main {
 
 .batch {
   background: var(--panel);
-  border: 1px solid var(--line-soft);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 0;
 }
@@ -334,6 +335,7 @@ main {
   font-family: var(--font-num);
   font-weight: 600;
   letter-spacing: 0.015em;
+  color: #101822;
 }
 
 .batch-meta {
@@ -349,7 +351,7 @@ main {
 }
 
 .batch.other-root {
-  background: rgba(21, 27, 34, 0.55);
+  background: #f4f6f9;
   border-style: dashed;
 }
 
@@ -387,7 +389,7 @@ main {
 
 .project-card.anomalous {
   border-left-color: var(--bad);
-  background: rgba(239, 91, 91, 0.05);
+  background: #fdf6f6;
 }
 
 .project-card.drag-over {
@@ -400,7 +402,7 @@ main {
   left: 0.55rem;
   top: 1rem;
   cursor: grab;
-  color: var(--faint);
+  color: #b3bdc7;
   font-size: 0.95rem;
   line-height: 1;
   padding: 0.2rem;
@@ -458,17 +460,17 @@ main {
 }
 
 .chip.estimate {
-  color: var(--ok);
-  border-color: rgba(63, 191, 127, 0.3);
-  background: rgba(63, 191, 127, 0.08);
+  color: #177a47;
+  border-color: rgba(31, 157, 92, 0.35);
+  background: rgba(31, 157, 92, 0.08);
   font-family: var(--font-num);
   font-variant-numeric: tabular-nums;
 }
 
 .chip.danger {
   color: var(--bad);
-  border-color: rgba(239, 91, 91, 0.35);
-  background: rgba(239, 91, 91, 0.08);
+  border-color: rgba(210, 74, 74, 0.35);
+  background: rgba(210, 74, 74, 0.07);
 }
 
 .card-meta {
@@ -493,7 +495,7 @@ main {
   padding: 0.36rem 0.55rem;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: var(--ink);
+  background: #fff;
   min-width: 11rem;
   font: inherit;
   font-size: 0.86rem;
@@ -503,7 +505,7 @@ main {
 .start-row select:focus {
   outline: none;
   border-color: var(--run);
-  box-shadow: 0 0 0 3px rgba(77, 159, 255, 0.18);
+  box-shadow: 0 0 0 3px rgba(43, 127, 212, 0.15);
 }
 
 /* ---------------- notes ---------------- */
@@ -536,13 +538,13 @@ main {
   font-size: 0.86rem;
   color: var(--text);
   resize: vertical;
-  background: var(--ink);
+  background: #fff;
 }
 
 .notes textarea:focus {
   outline: none;
   border-color: var(--run);
-  box-shadow: 0 0 0 3px rgba(77, 159, 255, 0.18);
+  box-shadow: 0 0 0 3px rgba(43, 127, 212, 0.15);
 }
 
 .note-log p {
@@ -564,14 +566,14 @@ main {
   border-radius: 6px;
   font: inherit;
   font-size: 0.84rem;
-  background: var(--ink);
+  background: #fff;
   color: var(--text);
 }
 
 .quick-note input:focus {
   outline: none;
   border-color: var(--run);
-  box-shadow: 0 0 0 3px rgba(77, 159, 255, 0.18);
+  box-shadow: 0 0 0 3px rgba(43, 127, 212, 0.15);
 }
 
 .error-history p {
@@ -595,9 +597,9 @@ main {
   gap: 0.6rem;
   width: 100%;
   padding: 0.32rem 0.6rem;
-  border: 1px solid transparent;
+  border: 1px solid var(--line-soft);
   border-radius: 6px;
-  background: rgba(15, 20, 25, 0.5);
+  background: var(--panel-2);
   cursor: pointer;
   font: inherit;
   text-align: left;
@@ -606,8 +608,8 @@ main {
 }
 
 .run-row:hover {
-  background: var(--panel-3);
-  border-color: var(--line);
+  background: #fff;
+  border-color: var(--run);
 }
 
 .run-name {
@@ -636,7 +638,7 @@ main {
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   padding: 0.8rem 0.95rem;
-  background: rgba(15, 20, 25, 0.55);
+  background: var(--panel-2);
 }
 
 .step-line { margin: 0.3rem 0 0; font-size: 0.86rem; }
@@ -651,8 +653,8 @@ main {
 
 .progress-track {
   margin-top: 0.55rem;
-  height: 5px;
-  background: #0b0f13;
+  height: 6px;
+  background: var(--panel-3);
   border-radius: 999px;
   overflow: hidden;
   border: 1px solid var(--line-soft);
@@ -671,7 +673,7 @@ main {
   content: "";
   position: absolute;
   inset: 0;
-  background: linear-gradient(100deg, transparent 25%, rgba(255, 255, 255, 0.35) 50%, transparent 75%);
+  background: linear-gradient(100deg, transparent 25%, rgba(255, 255, 255, 0.55) 50%, transparent 75%);
   animation: sweep 2.8s linear infinite;
 }
 
@@ -683,13 +685,13 @@ main {
 .progress-fill.done, .progress-fill.succeeded { background: var(--ok); }
 .progress-fill.failed { background: var(--bad); }
 .progress-fill.stalled { background: var(--warn); }
-.progress-fill.verifying { background: #7c8cff; }
+.progress-fill.verifying { background: #6a7be8; }
 
 .error-detail {
   margin-top: 0.55rem;
   padding: 0.5rem 0.7rem;
   border-left: 3px solid var(--bad);
-  background: rgba(239, 91, 91, 0.07);
+  background: rgba(210, 74, 74, 0.06);
   border-radius: 4px;
   font-size: 0.8rem;
 }
@@ -763,7 +765,7 @@ main {
   padding: 0;
   background: var(--panel);
   color: var(--text);
-  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 70px rgba(16, 24, 34, 0.22);
   overflow: hidden;
 }
 
@@ -785,13 +787,13 @@ main {
   overflow: auto;
   font-size: 0.76rem;
   font-family: "Cascadia Mono", Consolas, monospace;
-  background: #0a0e12;
+  background: #10161d;
   color: #c8d2dc;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
-dialog::backdrop { background: rgba(5, 8, 11, 0.6); }
+dialog::backdrop { background: rgba(16, 24, 34, 0.35); }
 
 .stage-dialog { width: min(58rem, 94vw); }
 
@@ -830,8 +832,8 @@ dialog::backdrop { background: rgba(5, 8, 11, 0.6); }
 }
 
 .stage-track {
-  height: 6px;
-  background: #0b0f13;
+  height: 7px;
+  background: var(--panel-3);
   border: 1px solid var(--line-soft);
   border-radius: 999px;
   overflow: hidden;

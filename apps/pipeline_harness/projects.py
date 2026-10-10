@@ -214,16 +214,94 @@ def _median(values: list[float]) -> float | None:
     return (numbers[mid - 1] + numbers[mid]) / 2.0
 
 
-def estimate_project_seconds(
-    project: dict[str, Any], timing_history: dict[str, list[float]]
-) -> dict[str, Any] | None:
-    """Rough estimate of a full pipeline run for this sample.
+#: pipeline profiles for time estimates — vessel vs cfos(unet/threshold) vs
+#: spinal run very different stage mixes, so peers must share the profile
+PROFILE_LABELS = {
+    "vessel": "血管",
+    "cfos-unet": "cFos UNet",
+    "cfos-threshold": "cFos 阈值",
+    "cfos-spotiflow": "cFos Spotiflow",
+    "spinal": "脊髓",
+    "generic": "通用",
+}
 
-    Basis 1: the active dir's timing history (median seconds per pipeline
-    step, recorded by the worker after each succeeded run) — summed over the
-    canonical steps. Basis 2: the sample's own succeeded-run average. Honest
-    null when neither exists.
+_CONFIG_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+
+
+def _read_config_cached(path_value: str | None) -> dict[str, Any] | None:
+    """Mtime-cached config read (partial configs resolved via layering)."""
+    if not path_value:
+        return None
+    path = Path(path_value)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    hit = _CONFIG_CACHE.get(str(path))
+    if hit and hit[0] == mtime:
+        return hit[1]
+    from pipeline_modules.utils.config_layering import resolve_partial_config
+
+    _p, cfg = resolve_partial_config(path)
+    _CONFIG_CACHE[str(path)] = (mtime, cfg)
+    return cfg
+
+
+def pipeline_profile(cfg: dict[str, Any] | None) -> str:
+    if not isinstance(cfg, dict):
+        return "generic"
+    if bool((cfg.get("tubule_reconstruction") or {}).get("enabled")):
+        return "vessel"
+    if str(cfg.get("mode") or "").lower() == "spinal_cord" or bool((cfg.get("spinal_cord") or {}).get("enabled")):
+        return "spinal"
+    method = str(((cfg.get("segmentation") or {}).get("method")) or "").strip().lower()
+    if method == "cfos_unet":
+        return "cfos-unet"
+    if method in {"threshold", "intensity"}:
+        return "cfos-threshold"
+    if method == "spotiflow":
+        return "cfos-spotiflow"
+    return "cfos-unet"
+
+
+def _project_profile(runs: list[dict[str, Any]]) -> str:
+    for run in runs:
+        cfg = _read_config_cached(run.get("config_path"))
+        if cfg:
+            return pipeline_profile(cfg)
+    return "generic"
+
+
+def _succeeded_durations(runs: list[dict[str, Any]]) -> list[float]:
+    return [
+        float(run["duration_s"])
+        for run in runs
+        if run.get("duration_s")
+        and str(run.get("display_status") or run.get("status")) in {"succeeded", "done"}
+    ]
+
+
+def estimate_project_seconds(
+    runs: list[dict[str, Any]],
+    profile_peer_durations: list[float],
+    timing_history: dict[str, list[float]],
+) -> dict[str, Any] | None:
+    """Estimate a full run for this sample, most specific evidence first:
+
+    1. the sample's own succeeded-run median;
+    2. the median over succeeded runs of samples sharing its pipeline
+       profile (vessel vs cfos-unet vs threshold vs spinal);
+    3. the active dir's global step-median sum (generic fallback).
+    Honest null when nothing is known.
     """
+    own = _succeeded_durations(runs)
+    if own:
+        return {"seconds": round(_median(own) or 0.0, 1), "basis": f"该样本 {len(own)} 次完成 run 中位"}
+    if profile_peer_durations:
+        return {
+            "seconds": round(_median(profile_peer_durations) or 0.0, 1),
+            "basis": f"同类完成 run 中位（{len(profile_peer_durations)} 次）",
+        }
     if timing_history:
         totals = [
             _median(values)
@@ -232,14 +310,7 @@ def estimate_project_seconds(
         ]
         totals = [value for value in totals if value]
         if len(totals) >= 3:
-            return {"seconds": round(sum(totals), 1), "basis": "历史中位（全部步骤）"}
-    durations = [
-        float(run["duration_s"])
-        for run in project.get("runs", [])
-        if run.get("duration_s") and str(run.get("display_status") or run.get("status")) in {"succeeded", "done"}
-    ]
-    if durations:
-        return {"seconds": round(sum(durations) / len(durations), 1), "basis": f"该样本 {len(durations)} 次完成 run 均值"}
+            return {"seconds": round(sum(totals), 1), "basis": "通用历史中位（全部步骤）"}
     return None
 
 
@@ -419,7 +490,6 @@ def group_into_batches(
         project["configs"] = list_sample_configs(sample_path)
         project["last_manifest"] = latest_run_manifest_summary(sample_path)
         project["anomaly"] = _sample_anomaly(sample_path)
-        project["estimate"] = estimate_project_seconds(project, timing_history or {})
         project["priority_rank"] = order_rank.get(_norm_key(project["sample_dir"]))
 
         batch_dir = sample_path.parent
@@ -434,6 +504,20 @@ def group_into_batches(
             },
         )
         batch["projects"].append(project)
+
+    # profile pass + per-profile peer durations, then estimates
+    profile_durations: dict[str, list[float]] = {}
+    for project in by_sample.values():
+        profile = _project_profile(project["runs"])
+        project["profile"] = profile
+        project["profile_label"] = PROFILE_LABELS.get(profile, profile)
+        profile_durations.setdefault(profile, []).extend(_succeeded_durations(project["runs"]))
+    for project in by_sample.values():
+        project["estimate"] = estimate_project_seconds(
+            project["runs"],
+            profile_durations.get(project["profile"]) or [],
+            timing_history or {},
+        )
 
     def _batch_sort(batch: dict[str, Any]) -> tuple[int, str]:
         return (0 if batch.get("under_active") else 1, str(batch["batch"]).lower())
