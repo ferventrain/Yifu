@@ -230,6 +230,11 @@ function renderProject(project) {
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("text/plain", key);
   });
+  handle.addEventListener("dragend", () => {
+    dragSampleKey = null;
+    document.querySelectorAll(".drag-over").forEach((el) => el.classList.remove("drag-over"));
+    refresh();
+  });
   card.appendChild(handle);
 
   // ---- header
@@ -291,7 +296,8 @@ function renderProject(project) {
     manLine.className = "card-meta manifest";
     const commit = manifest.git_commit ? ` @ ${manifest.git_commit}` : "";
     const dur = manifest.duration_seconds != null ? ` · ${formatDuration(manifest.duration_seconds) || "?"}` : "";
-    manLine.textContent = `最近产物：${manifest.module}${commit}${dur} · 输出 ${manifest.outputs.length} 项`;
+    const incomplete = manifest.status === "incomplete" ? " · ⚠️ 未跑完" : "";
+    manLine.textContent = `最近产物：${manifest.module}${commit}${dur} · 输出 ${manifest.outputs.length} 项${incomplete}`;
     card.appendChild(manLine);
   }
 
@@ -762,7 +768,11 @@ function renderStageTimes(data) {
 async function refresh() {
   try {
     const data = await api("/api/projects");
-    renderBoard(data);
+    // freeze the board while a drag is in flight: the rebuild would remove
+    // the drag source from the DOM and cancel the drop
+    if (dragSampleKey == null) {
+      renderBoard(data);
+    }
     if (Date.now() >= errorHoldUntil) showError("");
     if (openLogJobId && els.logDialog.open) await loadLog(openLogJobId, false);
   } catch (error) {

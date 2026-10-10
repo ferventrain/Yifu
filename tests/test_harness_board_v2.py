@@ -177,3 +177,56 @@ def test_stage_times_aggregates_manifests(analysis_home: Path):
     monkeypatch.undo()
     projects_mod._STAGE_CACHE["payload"] = None
     projects_mod._STAGE_CACHE["at"] = 0.0
+
+
+def test_manifest_status_field_and_incomplete_exclusion(analysis_home: Path):
+    pytest.importorskip("fastapi")
+    import apps.pipeline_harness.projects as projects_mod
+    import importlib
+    from pipeline_modules.utils.run_manifest import (
+        MANIFEST_STATUS_INCOMPLETE,
+        build_run_manifest,
+        write_run_manifest,
+    )
+
+    # default manifests are "completed"
+    manifest = build_run_manifest(
+        module="m", entrypoint="e", inputs={}, outputs=[], started_at=100.0, ended_at=160.0
+    )
+    assert manifest["status"] == "completed"
+    assert manifest["duration_seconds"] == 60.0
+
+    # an interrupted run writes an incomplete manifest
+    sample = _write_sample(analysis_home, "ot")
+    write_run_manifest(
+        sample, module="main_pipeline", entrypoint="main", inputs={}, outputs=[],
+        started_at=100.0, ended_at=900.0, status=MANIFEST_STATUS_INCOMPLETE,
+    )
+    payload = json.loads((sample / "_run_manifest.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "incomplete"
+
+    # stage-times skips incomplete manifests even with a plausible duration
+    other = _write_sample(analysis_home, "sham")
+    (other / "_run_manifest.json").write_text(
+        json.dumps({"module": "main_pipeline", "duration_seconds": 500.0, "status": "incomplete"}),
+        encoding="utf-8",
+    )
+    good = _write_sample(analysis_home, "tmcao")
+    (good / "_run_manifest.json").write_text(
+        json.dumps({"module": "registration.ANTs_registration", "duration_seconds": 700.0}),
+        encoding="utf-8",
+    )
+
+    projects_mod._STAGE_CACHE["payload"] = None
+    projects_mod._STAGE_CACHE["at"] = 0.0
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(monitor, "store", ActiveStore())
+    result = monitor.api_stage_times()
+    by_module = {s["module"]: s for s in result["stages"]}
+    assert "main_pipeline" not in by_module  # incomplete excluded
+    assert by_module["registration.ANTs_registration"]["median_s"] == 700.0
+    assert result["incomplete_skipped"] == 2
+    monkeypatch.undo()
+    projects_mod._STAGE_CACHE["payload"] = None
+    projects_mod._STAGE_CACHE["at"] = 0.0

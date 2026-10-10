@@ -117,6 +117,7 @@ def latest_run_manifest_summary(sample_dir: Path) -> dict[str, Any] | None:
         "path": str(newest),
         "module": payload.get("module"),
         "entrypoint": payload.get("entrypoint"),
+        "status": payload.get("status") or "completed",
         "ended_at": payload.get("ended_at"),
         "duration_seconds": payload.get("duration_seconds"),
         "git_commit": code.get("git_commit"),
@@ -292,9 +293,15 @@ def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
 
     by_module: dict[str, list[float]] = {}
     skipped_outliers = 0
+    skipped_incomplete = 0
     for manifest in manifests[:_MANIFEST_SCAN_LIMIT]:
         payload = read_json(manifest, default=None)
         if not isinstance(payload, dict):
+            continue
+        # legacy manifests (written only on success) have no status field;
+        # anything explicitly marked incomplete is a failed/interrupted run
+        if str(payload.get("status") or "").lower() == "incomplete":
+            skipped_incomplete += 1
             continue
         duration = payload.get("duration_seconds")
         module = payload.get("module")
@@ -321,6 +328,7 @@ def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
         "stages": stages,
         "manifests_scanned": min(len(manifests), _MANIFEST_SCAN_LIMIT),
         "outliers_skipped": skipped_outliers,
+        "incomplete_skipped": skipped_incomplete,
         "generated_at": utc_now_iso(),
     }
     _STAGE_CACHE["at"] = now

@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Add project root to path
@@ -42,6 +43,7 @@ MAIN_PIPELINE_REGISTRATION_MODE = "atlas2image"
 PIPELINE_STEP_COUNT = 6
 _PROGRESS = None
 _STEP_TOTAL = PIPELINE_STEP_COUNT
+_RUN_STARTED_AT = time.time()
 
 #: Stub-run state: when enabled, every shell command is recorded and skipped
 #: (no algorithm runs) while each step still touches its declared outputs, so
@@ -649,17 +651,17 @@ def ensure_segmentation_outputs(sample_dir, signal_ch, zarr_path, seg_cfg):
         segmentation_ran = True
 
     if post_enabled and (segmentation_ran or not mask_zarr_path.exists()):
-        exclude_edge_px = int(post_cfg.get("exclude_edge_px", 40))
+        edge_shrink = float(post_cfg.get("edge_shrink_factor", 0.99))
         label_zarr_path = sample_dir / "upsampled_atlas_label.zarr"
-        if exclude_edge_px > 0 and not label_zarr_path.exists():
-            print(f"Error: segmentation.postprocess.exclude_edge_px requires {label_zarr_path} (run registration first).")
+        if edge_shrink > 0 and not label_zarr_path.exists():
+            print(f"Error: segmentation.postprocess.edge_shrink_factor requires {label_zarr_path} (run registration first).")
             sys.exit(1)
         post_cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.cfos_mask_postprocess '
             f'--signal_zarr "{zarr_path}" '
             f'--mask_zarr "{seg_target_mask}" '
             f'--output_mask_zarr "{mask_zarr_path}" '
-            f'--exclude_edge_px {exclude_edge_px} '
+            f'--edge_shrink_factor {edge_shrink} '
             f'--max_single_slice_voxels {int(post_cfg.get("max_single_slice_voxels", 200))} '
             f'--max_voxels {int(post_cfg.get("max_voxels", 0))} '
             f'--min_voxels {int(post_cfg.get("min_voxels", 0))} '
@@ -1322,15 +1324,47 @@ def main():
             _PROGRESS.finish(collect_existing_results(sample_dir, cfg))
     except (KeyboardInterrupt, SystemExit) as exc:
         failed = not isinstance(exc, SystemExit) or (exc.code not in (0, None))
+        if failed:
+            _write_incomplete_manifest(cfg, sample_dir, str(exc) or type(exc).__name__)
         if _PROGRESS is not None and failed:
             _PROGRESS.fail(str(exc) or type(exc).__name__)
         raise
     except Exception as exc:
+        _write_incomplete_manifest(cfg, sample_dir, f"{type(exc).__name__}: {exc}")
         if _PROGRESS is not None:
             _PROGRESS.fail(f"{type(exc).__name__}: {exc}")
         raise
     finally:
         _PROGRESS = None
+
+
+def _write_incomplete_manifest(cfg, sample_dir, error: str) -> None:
+    """Mark a failed/interrupted pipeline run in the sample's manifest so the
+    stage-times aggregation (and humans) can tell it never finished."""
+    try:
+        from pipeline_modules.utils.run_manifest import (
+            MANIFEST_STATUS_INCOMPLETE,
+            write_run_manifest,
+        )
+
+        step = {}
+        if _PROGRESS is not None:
+            step = {
+                "step_index": _PROGRESS.state.get("step_index"),
+                "step_name": _PROGRESS.state.get("step_name"),
+            }
+        write_run_manifest(
+            sample_dir,
+            module="main_pipeline",
+            entrypoint="main",
+            inputs={"config": str(cfg.get("project_name") or ""), "sample_dir": str(sample_dir)},
+            outputs=[],
+            started_at=_RUN_STARTED_AT,
+            status=MANIFEST_STATUS_INCOMPLETE,
+            extra={"error": str(error)[:500], **step},
+        )
+    except Exception:
+        print("  NOTE: could not write incomplete run manifest (non-fatal)")
 
 
 def _run_pipeline(args, cfg, config_path, sample_dir):

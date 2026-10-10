@@ -35,6 +35,9 @@ MANIFEST_SCHEMA_VERSION = "2"
 #: ones are silently skipped so manifests never fail because of them.
 TRACKED_PACKAGES = ("numpy", "scipy", "torch", "zarr", "numcodecs", "ants", "cv2", "h5py")
 
+MANIFEST_STATUS_COMPLETED = "completed"
+MANIFEST_STATUS_INCOMPLETE = "incomplete"
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -143,11 +146,14 @@ def build_run_manifest(
     ended_at: float | None = None,
     warnings: Iterable[str] | None = None,
     extra: Mapping[str, Any] | None = None,
+    status: str = MANIFEST_STATUS_COMPLETED,
 ) -> dict[str, Any]:
     """Assemble a manifest dict without writing it to disk.
 
     Useful when the caller wants to embed the manifest in a larger structure
-    or return it alongside the module's primary result.
+    or return it alongside the module's primary result. ``status`` records
+    whether the run finished ("completed") or was interrupted/failed
+    ("incomplete") — the stage-times aggregation only counts completed runs.
     """
     ended_at = ended_at if ended_at is not None else time.time()
     outputs_records = [_describe_output(Path(p)) for p in outputs]
@@ -157,6 +163,7 @@ def build_run_manifest(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "module": module,
         "entrypoint": entrypoint,
+        "status": status,
         "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
         "ended_at": datetime.fromtimestamp(ended_at, tz=timezone.utc).isoformat(),
         "duration_seconds": float(ended_at - started_at),
@@ -191,12 +198,14 @@ def write_run_manifest(
     warnings: Iterable[str] | None = None,
     extra: Mapping[str, Any] | None = None,
     filename: str = MANIFEST_FILENAME,
+    status: str = MANIFEST_STATUS_COMPLETED,
 ) -> Path:
     """Write a ``_run_manifest.json`` under ``output_dir`` and return its path.
 
     ``output_dir`` is created if missing. Existing manifest files are
     overwritten on purpose; callers that care about history should rename the
-    old file before invoking this helper.
+    old file before invoking this helper. Pass ``status="incomplete"`` when
+    the run failed or was interrupted so downstream stats can exclude it.
     """
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -210,6 +219,7 @@ def write_run_manifest(
         ended_at=ended_at,
         warnings=warnings,
         extra=extra,
+        status=status,
     )
 
     manifest_path = output_root / filename
