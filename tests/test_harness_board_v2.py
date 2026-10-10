@@ -31,41 +31,42 @@ def _write_sample(root: Path, name: str) -> Path:
     return sample
 
 
-def test_board_priority_persists_and_sorts(analysis_home: Path):
+def test_board_priority_lives_on_batches_and_sorts(analysis_home: Path):
     pytest.importorskip("fastapi")
     import importlib
 
-    batch = analysis_home / "YF20991001"
-    a = _write_sample(batch, "aaa")
-    b = _write_sample(batch, "bbb")
-    c = _write_sample(batch, "ccc")
+    batchA = analysis_home / "YF20991101"  # will get P1
+    batchB = analysis_home / "YF20991202"  # will get P0
+    batchC = analysis_home / "YF20991303"  # unprioritized
+    for sample_dir in (batchA / "s1", batchB / "s1", batchC / "s1"):
+        _write_sample(sample_dir.parent, sample_dir.name)
 
     store = ActiveStore()
-    for sample in (a, b, c):
-        store.add_job(sample)
+    for batch in (batchA, batchB, batchC):
+        store.add_job(batch / "s1")
 
     monitor = importlib.import_module("apps.pipeline_harness.main")
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(monitor, "store", store)
 
-    # aaa -> P0, bbb -> P2 via the priority endpoint
-    monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(a), level=0))
-    result = monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(b), level=2))
-    assert str(a) in result["priorities"] or str(a).replace("\\", "/") in result["priorities"]
+    # priority is set on the PROJECT (batch dir), not the sample
+    monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(batchA), level=1))
+    monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(batchB), level=0))
 
     payload = monitor.api_projects()
-    projects = payload["batches"][0]["projects"]
-    # P0 first, then P2, then unprioritized
-    assert [p["sample_name"] for p in projects] == ["aaa", "bbb", "ccc"]
-    assert projects[0]["priority"] == 0
-    assert projects[1]["priority"] == 2
-    assert projects[2]["priority"] is None
+    batches = payload["batches"]
+    # P0 batch first, then P1, then unprioritized
+    assert [b["batch"] for b in batches] == ["YF20991202", "YF20991101", "YF20991303"]
+    assert batches[0]["priority"] == 0
+    assert batches[1]["priority"] == 1
+    assert batches[2]["priority"] is None
+    # samples inside a batch carry no priority of their own anymore
+    assert all(p.get("priority") is None for b in batches for p in b["projects"])
 
-    # clearing (level=-1) drops it back among the unprioritized
-    monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(a), level=-1))
+    # clearing (level=-1) drops the batch back among the unprioritized
+    monitor.api_projects_priority(monitor.ProjectPriorityBody(sample_dir=str(batchB), level=-1))
     payload = monitor.api_projects()
-    names = [p["sample_name"] for p in payload["batches"][0]["projects"]]
-    assert names[0] == "bbb" and "aaa" in names[1:]
+    assert [b["batch"] for b in payload["batches"]][0] == "YF20991101"
 
     with pytest.raises(Exception):
         monitor.api_projects_priority(

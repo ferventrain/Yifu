@@ -291,6 +291,27 @@ function batchHeader(batch) {
 
   const right = document.createElement("div");
   right.className = "batch-right";
+
+  // priority selector lives on the PROJECT (batch): P-high moves to the top
+  const prioSeg = document.createElement("span");
+  prioSeg.className = "prio-seg";
+  prioSeg.title = "项目紧急度（P0 最高，自动置顶；再点一次取消）";
+  for (const level of [0, 1, 2, 3]) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    const active = batch.priority === level;
+    btn.className = `prio-btn p${level}${active ? " active" : ""}`;
+    btn.textContent = `P${level}`;
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+    btn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setPriority(batch.batch_dir, batch.priority === level ? -1 : level);
+    });
+    prioSeg.appendChild(btn);
+  }
+  right.appendChild(prioSeg);
+
   if (batch.remaining_s != null) {
     const rem = document.createElement("span");
     rem.className = "batch-remaining";
@@ -315,7 +336,7 @@ function batchHeader(batch) {
 
 function renderBatch(batch) {
   const box = document.createElement("details");
-  box.className = "batch";
+  box.className = "batch" + (batch.priority != null ? ` has-p${batch.priority}` : "");
   const hasActive = batch.projects.some((p) => ["running", "verifying", "queued", "stalled"].includes(p.status));
   box.open = expandedBatches.has(batch.batch) ? true : expandedBatches.size === 0 ? hasActive : expandedBatches.has(batch.batch);
   if (box.open) expandedBatches.add(batch.batch);
@@ -372,8 +393,7 @@ function renderProject(project) {
   }
 
   const card = document.createElement("article");
-  const pcls = project.priority != null ? ` has-p${project.priority}` : "";
-  card.className = `project-card status-${project.status}${project.anomaly ? " anomalous" : ""}${pcls}`;
+  card.className = `project-card status-${project.status}${project.anomaly ? " anomalous" : ""}`;
   card.dataset.sampleKey = key;
 
   // ---- header
@@ -397,29 +417,7 @@ function renderProject(project) {
   lamp.className = `lamp ${project.status}`;
   const label = document.createElement("span");
   label.textContent = STATUS_LABELS[project.status] || project.status;
-
-  // priority selector: small single-choice group on the row's right side
-  const prioSeg = document.createElement("span");
-  prioSeg.className = "prio-seg";
-  prioSeg.title = "紧急度";
-  for (const level of [0, 1, 2, 3]) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    const active = project.priority === level;
-    btn.className = `prio-btn p${level}${active ? " active" : ""}`;
-    btn.textContent = `P${level}`;
-    btn.setAttribute("aria-pressed", active ? "true" : "false");
-    btn.addEventListener("click", () => {
-      if (project.priority === level) {
-        setPriority(project.sample_dir, -1); // clicking the active level clears
-      } else {
-        setPriority(project.sample_dir, level);
-      }
-    });
-    prioSeg.appendChild(btn);
-  }
-
-  statusCluster.append(lamp, label, prioSeg);
+  statusCluster.append(lamp, label);
   head.append(titleWrap, statusCluster);
   card.appendChild(head);
 

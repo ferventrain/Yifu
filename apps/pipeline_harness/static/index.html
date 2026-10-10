@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Yifu 流水线监控台</title>
-  <link rel="stylesheet" href="/styles.css?v=13" />
+  <link rel="stylesheet" href="/styles.css?v=14" />
 </head>
 <body>
   <header class="app-header">
@@ -42,7 +42,7 @@
         </form>
         <button type="button" id="stage-times-btn" class="btn ghost">环节耗时</button>
       </div>
-      <p class="hint">看板按实验批分组；样本行内选 config 开始（断点自动续跑，补跑放 config_1.json）。行右侧 P0–P3 按钮设紧急度（再点一次取消）。刷新页面不会启动任何任务；开始、保存笔记、取消是显式操作。</p>
+      <p class="hint">看板按实验批分组；样本行内选 config 开始（断点自动续跑，补跑放 config_1.json）。项目标题右侧 P0–P3 设紧急度，P 高自动置顶（再点一次取消）。刷新页面不会启动任何任务；开始、保存笔记、取消是显式操作。</p>
       <p id="form-error" class="error-banner hidden"></p>
       <div class="board-layout">
         <div id="job-list" class="job-list board-column"></div>
@@ -67,6 +67,6 @@
     <pre id="log-body" class="log-body"></pre>
   </dialog>
 
-  <script src="/app.js?v=13"></script>
+  <script src="/app.js?v=14"></script>
 </body>
 </html>

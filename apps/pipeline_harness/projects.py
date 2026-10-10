@@ -711,7 +711,6 @@ def group_into_batches(
         project["configs"] = list_sample_configs(sample_path)
         project["last_manifest"] = latest_run_manifest_summary(sample_path)
         project["anomaly"] = _sample_anomaly(sample_path)
-        project["priority"] = priority_map.get(_norm_key(project["sample_dir"]))
 
         batch_dir = sample_path.parent
         batch_key = _norm_key(str(batch_dir))
@@ -721,6 +720,8 @@ def group_into_batches(
                 "batch": batch_dir.name or str(batch_dir),
                 "batch_dir": str(batch_dir),
                 "under_active": bool(active_key) and (batch_key == active_key or batch_key.startswith(active_key.rstrip("/") + "/")),
+                # priority lives on the PROJECT (batch), not the sample
+                "priority": priority_map.get(batch_key),
                 "projects": [],
             },
         )
@@ -736,19 +737,13 @@ def group_into_batches(
             project["runs"], project["sample_dir"], stage_medians or {}, timing_history or {}
         )
 
-    def _batch_sort(batch: dict[str, Any]) -> tuple[int, str]:
-        return (0 if batch.get("under_active") else 1, str(batch["batch"]).lower())
-
-    def _project_rank(project: dict[str, Any]) -> tuple[int, int, int, str]:
-        priority = project.get("priority")
-        anomaly = 1 if project.get("anomaly") else 0
-        newest = project["runs"][0] if project["runs"] else {}
-        stamp = str(newest.get("started_at") or newest.get("created_at") or "")
+    def _batch_sort(batch: dict[str, Any]) -> tuple[int, int, int, str]:
+        priority = batch.get("priority")
         return (
-            anomaly,
+            0 if batch.get("under_active") else 1,
             0 if priority is not None else 1,
             priority if priority is not None else 10**9,
-            stamp,
+            str(batch["batch"]).lower(),
         )
 
     # per-batch sample progress + remaining-time estimate
@@ -785,7 +780,9 @@ def group_into_batches(
 
     batch_list = sorted(batches.values(), key=_batch_sort)
     for batch in batch_list:
-        batch["projects"].sort(key=_project_rank, reverse=False)
+        # newest activity first, anomalous samples pushed last (stable 2-pass)
+        batch["projects"].sort(key=lambda p: str(p["runs"][0].get("started_at") or p["runs"][0].get("created_at") or "") if p["runs"] else "", reverse=True)
+        batch["projects"].sort(key=lambda p: 1 if p.get("anomaly") else 0)
     return batch_list
 
 

@@ -1032,3 +1032,9 @@ dialog::backdrop { background: rgba(16, 24, 34, 0.35); }
 .prio-btn.p1.active { background: var(--warn); color: #fff; }
 .prio-btn.p2.active { background: var(--run); color: #fff; }
 .prio-btn.p3.active { background: #6d7a87; color: #fff; }
+
+/* batch priority accent */
+.batch.has-p0 { border-left: 3px solid var(--bad); }
+.batch.has-p1 { border-left: 3px solid var(--warn); }
+.batch.has-p2 { border-left: 3px solid var(--run); }
+.batch.has-p3 { border-left: 3px solid #6d7a87; }

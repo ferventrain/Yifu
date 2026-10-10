@@ -41,7 +41,7 @@ from pipeline_modules.harness.worker import (
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
 STATIC_DIR = APP_DIR / "static"
-ASSET_VERSION = "13"
+ASSET_VERSION = "14"
 
 def _resolve_pipeline_python() -> str | None:
     for key in ("YIFU_PYTHON", "YIFU_PYTHON_EXE"):
