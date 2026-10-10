@@ -8,27 +8,52 @@
 4. **新代码先确认归属**：任务确实需要新代码时，先问用户——写进现有仓库，还是放到项目/数据文件夹下用完即删？
 5. **少说话**：执行前只回一条将执行的命令，提交后回 run_id，不长篇解释，不逐步请求确认。
 
-## 参数基线（cfos）
+## cfos：config 与参数
 
-**运行模式（2026-10-09 起）**：每开一次任务写一个该 run 专属 config，放样本目录（config.json 为基底，
-补跑依次 config_1.json、config_2.json…，PM 项目卡下拉可选）。run config **只需写要覆盖的字段**——
-缺省键自动继承同目录 config.json，再继承 `config/config_cfos_template.json`（深合并，list/标量整体覆盖）。
-跳过环节用顶层布尔：`"skip_registration": true`（复用已有配准产物）、`"only_tubule": true`、
-`"only_region_analysis": true`（与命令行 extra-arg 等效，PM 一键开始也能用）。
+**总原则：template 已定的参数一律不重复写。** run config 只写覆盖项。
 
-首次为样本建 config 时仍按必查项核对：`project_name`、`input.resolution_xyz`（从 ims 元数据取真实体素
-大小，MegaSpim 恒为 1.8/1.8/2.0）、`input.channels`（cfos 惯例 signal=ch1/registration=ch0，非标准排布
-先核对）。其余参数保持 template 默认，要动阈值、模型、postprocess 等先问用户。全脑 normalization
-（normalize_scope=global）、256³ 推理块、hemisphere 半球统计、postprocess（max_single_slice_voxels=300、
-edge_shrink_factor=0.99 脑表面 mesh 收缩剔除，读注册产物 `<label>_ds_brain_mask.zarr` 缓存）是基线，不调。
-配准基线（2026-10-03 固化）：配准输入先做光晕裁切掩膜（`registration.halo_mask`，默认开，
-由 zarr_to_registration_nii 在建 25µm volume 时执行）；形变 `registration.grad_step=0.15`、
-`registration.syn_iterations=[70,50,30,10]`（比旧标准 0.1/40x20x0 强，用于组织变形大的样本）。
-2026-10-08 追加：`registration.n4_preprocess`（配准前 SimpleITK 带掩码 N4，用 halo 的
-brain_mask）与 `registration.rigid_preflight_qc`（主配准前 ~20s 刚体粗配准 + QC 图）默认开，
-产出 `<sample>/qc/registration_rigid_check.png` 与 `registration_final_check.png`，Pipeline
-Monitor 任务卡片可直接点开查看；关掉用 false。AIND 对照实验结论：CC+大迭代档形变过度不采用。
-血管任务不套 cfos template（等用户的血管 template 固化）。
+1. **run config**：每 run 一个，放样本目录。`config.json` 是基底；补跑依次 `config_1.json`、`config_2.json`…（PM 下拉自动出现）。
+   缺省键自动继承：`config_1 ← 同目录 config.json ← config/config_cfos_template.json`（深合并；list/标量整体覆盖）。
+2. **首次建 config.json 必查三项**：`project_name`；`input.resolution_xyz`（从 ims 元数据取，MegaSpim 恒 1.8/1.8/2.0）；
+   `input.channels`（cfos 惯例 signal=ch1 / registration=ch0，非标准排布先核对）。
+3. **跳过环节**：顶层布尔 `"skip_registration": true`、`"only_tubule": true`、`"only_region_analysis": true`
+   （等效命令行旗标，PM 一键开始可用；断点续跑靠完成标记自动跳过已完成步骤）。
+4. **基线默认值全部定在 template 里，照用不调**；要动先问用户。当前基线要点：
+   - 分割：cfos_unet + 全脑归一化（normalize_scope=global，1–99.5 百分位）+ 256³ 推理块 + rerun_if_model_updated。
+   - 后处理：max_single_slice_voxels=300；edge_shrink_factor=0.99（脑表面收缩剔除，读注册产物 `<label>_ds_brain_mask.zarr` 缓存）。
+   - 半球：save_upsampled_label_hemisphere_zarr=true（统计用 atlas_label_hemisphere.zarr）。
+   - 配准：halo_mask 默认开；grad_step=0.15、syn_iterations=[70,50,30,10]；n4_preprocess 与 rigid_preflight_qc 默认开
+     （产出 `<sample>/qc/registration_rigid_check.png`、`registration_final_check.png`，PM 卡片可点开）。
+   - 已证伪不采用：CC 度量 + 大迭代档（AIND 对照实验，形变过度）。
+5. 血管任务不套 cfos template（等血管 template 固化）。
+
+## PM（Pipeline Monitor）
+
+地址 http://127.0.0.1:8766。提交后在 PM 看板跟踪；拿不准时把结构化错误和日志尾部报告给用户。
+
+**新写的程序必须让 PM 可读（三选一，从简到繁）**：
+1. 用 **wrap** 包装（零改动，默认姿势）：`python -m pipeline_modules.harness wrap --sample-dir <样本> --title <标题> -- <任意命令>`。
+   自动挂任务/日志/心跳/取消；程序 stdout 打 `PROGRESS <done>/<total> [phase]` 行就有进度条。
+2. Python 程序内三行接入：`from pipeline_modules.harness.progress import report, report_done, report_failed`；
+   `report(done=42, total=100, phase="写 ims", sample_dir=...)`。
+3. 已在跑的外部进程用 attach（status 文件首行 `RUNNING/ALL DONE/FAILED/CANCELLED` + 第二行 started_at）。
+   进度文件字段等完整契约见 `pipeline_modules/harness/capability_manifest.json` 的 progress_protocol。
+
+**看板用法**：
+1. 两级结构：项目（批=父目录）→ 样本卡；`_active` 下的批排前面，其余折叠在"其他目录"。
+2. 样本卡：config 下拉 + "开始/继续"（一键断点续跑）；⠿ 拖动调优先级（存 `_active/pm_board.json`）；
+   "需求/复盘"笔记 + 记一笔（存 `<样本>/pm_project.json`）；预计时长 chip；run 历史点击展开详情/QC 图/结果。
+3. 工具栏"环节耗时"：全部 run manifest 聚合的各模块中位/均值耗时（剔除 incomplete 与 >3 天离群）。
+
+**不报错的要点**：
+1. 提交/启动 worker 一律用 **micromamba yifu env 的 python**——worker 解释器跟随提交者，系统 python 会拉起无依赖
+   worker，任务秒退 ModuleNotFoundError。
+2. fresh shell 没设 `YIFU_ANALYSIS_ROOT` 时 harness 默认指向不存在的 `H:\`——命令前带
+   `YIFU_ANALYSIS_ROOT=S:/Arivis_Analysis YIFU_ACTIVE_DIR=S:/Arivis_Analysis/_active`。
+3. PM 启动（重启不杀任务；改后端需重启，改前端刷新 + Ctrl+F5）：
+   `YIFU_ANALYSIS_ROOT=... micromamba run -n yifu python -m apps.pipeline_harness.main --port 8766`。
+4. 刷新/GET 永不启动任务；开始、保存笔记、取消才是显式操作。运行中 external 任务显"失联"= 进程死了或心跳断了。
+5. 失败 run 的 manifest 会写 `status: incomplete`（含出错步骤），环节耗时统计自动排除。
 
 ## 组织选区（tissue ROI）
 
@@ -58,11 +83,3 @@ python -m pipeline_modules.harness run --sample-dir "S:/path/to/sample" \
   --config "S:/path/to/sample/config.json"                                                 # 提交，返回 run_id
 python -m pipeline_modules.harness cancel <run_id>                                          # 取消
 ```
-
-自定义/一次性程序要在 PM 里显示进度，默认用 wrap 包装（零改动）：
-`python -m pipeline_modules.harness wrap --sample-dir <样本目录> --title <标题> -- <任意命令>`；
-要细粒度进度就在程序里调 `progress.report(done, total, phase, sample_dir)`（详见
-`pipeline_modules/harness/capability_manifest.json` 的 progress_protocol）。
-
-提交后在 Pipeline Monitor（http://127.0.0.1:8766，只读）查看。状态语义与错误字段见
-`pipeline_modules/harness/capability_manifest.json`。拿不准时把结构化错误和日志尾部报告给用户，等指示。
