@@ -110,16 +110,48 @@ def test_deleted_input_invalidates(tmp_path: Path):
     assert "input missing" in reason
 
 
-def test_missing_input_recorded_then_invalid(tmp_path: Path):
-    out = tmp_path / "out.bin"
-    _touch(out)
-    gone = tmp_path / "not_there.tif"
+def test_missing_input_stays_missing_verifies(tmp_path: Path):
+    """Folders that keep zarr outputs but deleted the heavy TIFF inputs record
+    those inputs as kind="missing"; while they stay absent, every later check
+    must verify. Regression: the marker used to fail its own verification on
+    the next run, forcing a doomed rebuild (INPUT_NOT_FOUND at step 3)."""
+    out = tmp_path / "ch1.zarr"
+    out.mkdir()
+    gone = tmp_path / "ch1"
     marker = mark_step_complete([out], [gone], {"step": "demo"})
     assert marker.exists()
 
     complete, reason = step_is_complete([out], [gone], {"step": "demo"})
+    assert complete, reason
+
+
+def test_missing_input_reappears_invalidates(tmp_path: Path):
+    out = tmp_path / "out.bin"
+    _touch(out)
+    gone = tmp_path / "ch1"
+    mark_step_complete([out], [gone], {"step": "demo"})
+
+    gone.mkdir()
+    _touch(gone / "a.tif")
+    complete, reason = step_is_complete([out], [gone], {"step": "demo"})
     assert not complete
-    assert "input missing" in reason
+    assert "input changed" in reason
+
+
+def test_legacy_missing_input_cycle_verifies_on_second_run(tmp_path: Path):
+    """Production trap, end to end: run 1 hits the legacy lane (outputs kept,
+    TIFF inputs deleted) and backfills a marker; run 2 must verify the marker,
+    not attempt a rebuild from the missing inputs."""
+    out = tmp_path / "ch1.zarr"
+    out.mkdir()
+    gone = tmp_path / "ch1"
+
+    complete, reason = step_or_legacy_complete([out], [gone], {"step": "demo"}, lambda: out.exists())
+    assert complete and "legacy" in reason
+
+    complete, reason = step_or_legacy_complete([out], [gone], {"step": "demo"}, lambda: out.exists())
+    assert complete, reason
+    assert reason == "completion marker valid"
 
 
 def test_marker_records_code_version(tmp_path: Path):

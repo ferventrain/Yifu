@@ -100,9 +100,15 @@ def step_is_complete(
     recorded_inputs = {str(item.get("path")): item for item in record.get("inputs", []) if isinstance(item, dict)}
     for raw in inputs:
         signature = _input_signature(raw)
-        if signature is None:
-            return False, f"input missing: {raw}"
         previous = recorded_inputs.get(str(Path(raw)))
+        if signature is None:
+            if previous is not None and previous.get("kind") == "missing":
+                # Absent at record time and still absent: nothing changed.
+                # Production folders keep the zarr/label outputs and delete the
+                # heavy TIFF inputs; the legacy lane records those inputs as
+                # kind="missing", and every later run must keep verifying.
+                continue
+            return False, f"input missing: {raw}"
         if previous is None:
             return False, f"input not tracked by marker: {raw}"
         comparable = {key: value for key, value in signature.items() if key != "path"}
@@ -148,9 +154,11 @@ def mark_step_complete(
     """Write the completion marker for the step's primary output.
 
     Call only after the step's producing commands succeeded. Inputs that no
-    longer exist are recorded with a null signature (the next check treats
-    that as incomplete and reruns). The write is atomic so an interrupted
-    write can never leave a half-readable marker.
+    longer exist are recorded with a null signature; as long as they stay
+    absent, later checks verify (absence is unchanged state). If such an input
+    reappears, the check reports "input changed" and the step reruns. The
+    write is atomic so an interrupted write can never leave a half-readable
+    marker.
     """
     output_paths = [Path(p) for p in outputs]
     marker = marker_path_for(output_paths[0])

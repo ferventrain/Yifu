@@ -6,7 +6,7 @@ from typing import Literal
 
 import cc3d
 import numpy as np
-from skimage.measure import block_reduce
+from skimage.measure import block_reduce, marching_cubes
 from tqdm import tqdm
 
 try:
@@ -62,14 +62,10 @@ def downsample_mask_zarr(
     region_id_array: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, list[int]]:
     depth, height, width = (int(mask_in.shape[0]), int(mask_in.shape[1]), int(mask_in.shape[2]))
-    if depth % factor or height % factor or width % factor:
-        raise ValueError(
-            f"Mask shape {(depth, height, width)} must be divisible by downsample factor {factor}"
-        )
     if (label_in is None) ^ (region_id_array is None):
         raise ValueError("label_in and region_id_array must be provided together")
 
-    ds_shape = (depth // factor, height // factor, width // factor)
+    ds_shape = (-(-depth // factor), -(-height // factor), -(-width // factor))
     ds_mask = np.zeros(ds_shape, dtype=np.uint8)
     ds_region = None if region_id_array is None else np.zeros(ds_shape, dtype=np.uint8)
     active_z_indices: list[int] = []
@@ -85,6 +81,9 @@ def downsample_mask_zarr(
     for zb0 in tqdm(range(0, depth, z_block), desc="Downsample mask", unit="block"):
         zb1 = min(zb0 + z_block, depth)
         slab = (np.asarray(mask_in[zb0:zb1], dtype=np.uint8) > 0).astype(np.uint8)
+        pad = [(-s) % factor for s in slab.shape]
+        if any(pad):
+            slab = np.pad(slab, [(0, p) for p in pad])
         ds_mask[zb0 // factor : zb1 // factor] = block_reduce(
             slab,
             block_size=(factor, factor, factor),
@@ -93,6 +92,8 @@ def downsample_mask_zarr(
         if ds_region is not None:
             label_slab = np.asarray(label_in[zb0:zb1])
             region_slab = _build_region_slice(label_slab, region_id_array).astype(np.uint8)
+            if any(pad):
+                region_slab = np.pad(region_slab, [(0, p) for p in pad])
             ds_region[zb0 // factor : zb1 // factor] = block_reduce(
                 region_slab,
                 block_size=(factor, factor, factor),
@@ -116,7 +117,7 @@ def select_keep_labels_3d(
     downsample_factor: int,
     max_single_slice_voxels: int = 0,
     max_slice_counts_ds: np.ndarray | None = None,
-    shell_hits: np.ndarray | None = None,
+    edge_hits: np.ndarray | None = None,
 ) -> tuple[set[int], int, int, int, int]:
     """Decide which 3D components survive the standard filters.
 
@@ -127,8 +128,8 @@ def select_keep_labels_3d(
     - ``max_extent_ratio``: bounding-box max/min axis ratio
     - ``max_single_slice_voxels``: drop objects whose largest single-slice
       footprint (vessels, surface sheets) exceeds this many voxels
-    - ``shell_hits``: per-label voxel counts inside the excluded near-boundary
-      shell; any hit removes the object
+    - ``edge_hits``: per-label flags from the brain-boundary exclusion
+      (edge shrink); any hit removes the object
     """
     keep_labels: set[int] = set()
     removed_volume = 0
@@ -166,7 +167,7 @@ def select_keep_labels_3d(
             if ratio > max_extent_ratio:
                 removed_extent += 1
                 continue
-        if shell_hits is not None and int(shell_hits[label_idx]) > 0:
+        if edge_hits is not None and int(edge_hits[label_idx]) > 0:
             removed_edge += 1
             continue
 
@@ -180,7 +181,7 @@ def upsample_keep_slice(ds_keep: np.ndarray, factor: int, height: int, width: in
     return upsampled[:height, :width]
 
 
-def _downsample_foreground(label_arr, factor: int, ds_shape: tuple[int, int, int]) -> np.ndarray:
+def _stream_pool_label_foreground(label_arr, factor: int, ds_shape: tuple[int, int, int]) -> np.ndarray:
     """Max-pool (label > 0) onto the downsampled grid, streaming z blocks
     aligned to the source chunk depth (factor-slice reads on deep-chunked
     Zarrs re-decompress every chunk once per few slices). Blocks are
@@ -192,9 +193,12 @@ def _downsample_foreground(label_arr, factor: int, ds_shape: tuple[int, int, int
     slice_cap = max(factor, (4 * 1024**3) // max(per_slice, 1))
     slice_cap -= slice_cap % factor
     z_block = max(factor, min(chunk_z, slice_cap))
-    for zb0 in range(0, depth, z_block):
+    for zb0 in tqdm(range(0, depth, z_block), desc="Pool label foreground", unit="block"):
         zb1 = min(zb0 + z_block, depth)
         slab = (np.asarray(label_arr[zb0:zb1]) > 0).astype(np.uint8)
+        pad = [(-s) % factor for s in slab.shape]
+        if any(pad):
+            slab = np.pad(slab, [(0, p) for p in pad])
         ds[zb0 // factor : zb1 // factor] = block_reduce(
             slab,
             block_size=(factor, factor, factor),
@@ -212,35 +216,111 @@ def _per_component_max_slice_counts(labels: np.ndarray, n_labels: int) -> np.nda
     return max_counts
 
 
-def _boundary_shell_hits(
-    label_in,
-    *,
-    factor: int,
-    ds_shape: tuple[int, int, int],
-    labels: np.ndarray,
-    n_labels: int,
-    exclude_edge_px: int,
-) -> tuple[np.ndarray, int]:
-    """Per-label voxel counts inside the near-brain-surface exclusion shell.
-
-    The brain surface comes from the registered atlas label (label > 0); it is
-    downsampled, eroded by ceil(exclude_edge_px / factor) voxels, and the
-    shell between the surface and the eroded core defines the exclusion zone.
-    """
-    from scipy import ndimage as ndi
-
-    ds_brain = _downsample_foreground(label_in, factor, ds_shape)
-    iterations = max(1, -(-int(exclude_edge_px) // int(factor)))
-    core = ndi.binary_erosion(
-        ds_brain.astype(bool),
-        structure=ndi.generate_binary_structure(3, 1),
-        iterations=iterations,
+def _resolve_ds_brain_mask(
+    label_zarr: Path | None,
+    brain_mask_ds: Path | None,
+    downsample_factor: int,
+) -> tuple[np.ndarray, dict, Path]:
+    """Load the factor-4 brain-mask cache, building and persisting it from the
+    label zarr (one full label read) when the cache does not exist yet."""
+    from pipeline_modules.registration.brain_mask_ds import (
+        ATTRS_KEY,
+        DS_FACTOR,
+        brain_mask_ds_path,
+        open_brain_mask_ds,
     )
-    shell = (ds_brain > 0) & ~core
-    if not np.any(shell):
-        return np.zeros(n_labels, dtype=np.int64), iterations
-    shell_hits = np.bincount(labels[shell].astype(np.int64).ravel(), minlength=n_labels)
-    return shell_hits[:n_labels], iterations
+    from pipeline_modules.utils.zarr_io import create_output_zarr
+
+    cache_path = brain_mask_ds or (brain_mask_ds_path(label_zarr) if label_zarr is not None else None)
+    if cache_path is None:
+        raise ValueError("edge_shrink_factor requires a brain-mask cache or --label_zarr")
+    if cache_path.exists():
+        mask, meta = open_brain_mask_ds(cache_path)
+        return mask, meta, cache_path
+
+    if label_zarr is None or not Path(label_zarr).exists():
+        raise FileNotFoundError(
+            f"Brain-mask cache not found at {cache_path} and no label zarr to build it from. "
+            "Rerun registration (it writes the cache as a side product) or pass --label_zarr."
+        )
+    print(f"Building factor-{DS_FACTOR} brain-mask cache from {label_zarr} (one-time full label read)...", flush=True)
+    label_arr = open_zarr_dataset(label_zarr, dataset_name="0")
+    ds_shape = tuple(int(-(-int(s) // DS_FACTOR)) for s in label_arr.shape)
+    mask = _stream_pool_label_foreground(label_arr, DS_FACTOR, ds_shape)
+    _, out_arr = create_output_zarr(cache_path, mask.shape, (min(8, mask.shape[0]), 1024, 1024), "uint8", data=mask)
+    del out_arr
+    root_attrs = {
+        ATTRS_KEY: {
+            "factor": DS_FACTOR,
+            "target_shape": [int(s) for s in label_arr.shape],
+            "ds_shape": [int(s) for s in mask.shape],
+            "spacing_zyx_um": None,
+            "source": "label_zarr_fallback",
+        }
+    }
+    import zarr
+
+    try:
+        grp = zarr.open_group(str(cache_path), mode="r+")
+    except TypeError:  # zarr 2.x has no zarr_format kwarg
+        grp = zarr.open_group(str(cache_path), mode="r+")
+    grp.attrs.update(root_attrs)
+    return mask, dict(root_attrs[ATTRS_KEY]), cache_path
+
+
+def _edge_shrink_hits(
+    ds_brain: np.ndarray,
+    spacing_zyx,
+    centroids: np.ndarray,
+    n_labels: int,
+    shrink: float,
+    cache_factor: int,
+    downsample_factor: int,
+    coarse_factor: int = 4,
+) -> np.ndarray:
+    """AIND-style brain-boundary exclusion (crop_cells).
+
+    Builds a surface mesh from the ds brain mask (max-pooled onto a coarse
+    grid, marching cubes), shrinks it about its center of mass by ``shrink``,
+    and marks every component whose centroid falls outside the shrunken mesh.
+    Points are evaluated in micrometers when the cache carries spacing,
+    otherwise in ds-grid voxel units (the shrink factor is dimensionless).
+
+    Returns a 0/1 hit array indexed like cc3d labels (0 = background).
+    """
+    import vedo
+
+    spacing = tuple(float(v) for v in (spacing_zyx or (1.0, 1.0, 1.0)))
+
+    pad = [(-s) % coarse_factor for s in ds_brain.shape]
+    coarse = ds_brain if not any(pad) else np.pad(ds_brain, [(0, p) for p in pad])
+    coarse = block_reduce(coarse, block_size=(coarse_factor,) * 3, func=np.max)
+    # One empty border guarantees a closed marching-cubes surface.
+    coarse = np.pad(coarse, 1)
+    if not coarse.any():
+        return np.zeros(n_labels, dtype=np.int64)
+    verts, faces, _, _ = marching_cubes(
+        coarse.astype(np.float32),
+        level=0.5,
+        spacing=tuple(s * coarse_factor for s in spacing),
+    )
+
+    mesh = vedo.Mesh([verts, faces])
+    com = mesh.center_of_mass()
+    verts_shrunk = com + float(shrink) * (verts - com)
+    shrunk = vedo.Mesh([verts_shrunk, faces])
+
+    # centroids are in the postprocess ds grid; convert to cache-grid
+    # coordinates, then to mesh coordinates (padded by one coarse voxel).
+    pts = centroids * (float(downsample_factor) / float(cache_factor)) * np.asarray(spacing)
+    pts = pts + np.asarray([s * coarse_factor for s in spacing])
+    inside_ids = shrunk.inside_points(pts=pts, return_ids=True)
+    # inside_ids index the centroid array (component label = index + 1) and are
+    # the components to KEEP; everything else falls outside the shrunken brain.
+    hits = np.ones(n_labels, dtype=np.int64)
+    hits[0] = 0
+    hits[np.asarray(inside_ids, dtype=int) + 1] = 0
+    return hits
 
 
 def postprocess_cfos_mask_3d(
@@ -254,9 +334,10 @@ def postprocess_cfos_mask_3d(
     min_voxels: int,
     max_extent_ratio: float,
     downsample_factor: int,
-    exclude_edge_px: int = 0,
+    edge_shrink_factor: float = 0.0,
     max_single_slice_voxels: int = 0,
     label_zarr: Path | None = None,
+    brain_mask_ds: Path | None = None,
     region_query: str | None = None,
     region_cfg: Path | None = None,
     region_outside: Literal["keep", "zero"] = "keep",
@@ -272,16 +353,15 @@ def postprocess_cfos_mask_3d(
     region_id_array = None
     region_name = None
     region_ids: set[int] = set()
-    if region_query or exclude_edge_px > 0:
+    if region_query:
         if label_zarr is None:
-            raise ValueError("--region and --exclude_edge_px require --label_zarr")
+            raise ValueError("--region requires --label_zarr")
         label_in = open_zarr_dataset(label_zarr, dataset_name=dataset_name)
         if label_in.shape != mask_in.shape:
             raise ValueError(f"Shape mismatch: mask={mask_in.shape}, label={label_in.shape}")
-        if region_query:
-            region_cfg = region_cfg or DEFAULT_REGION_CFG
-            region_ids, region_name = resolve_region_subtree_ids(region_query, cfg_path=region_cfg)
-            region_id_array = np.asarray(sorted(region_ids))
+        region_cfg = region_cfg or DEFAULT_REGION_CFG
+        region_ids, region_name = resolve_region_subtree_ids(region_query, cfg_path=region_cfg)
+        region_id_array = np.asarray(sorted(region_ids))
 
     ds_mask, ds_region, active_z_indices = downsample_mask_zarr(
         mask_in,
@@ -297,17 +377,25 @@ def postprocess_cfos_mask_3d(
     n_labels = int(len(stats["voxel_counts"]))
     print(f"3D connected components: {n_labels - 1} objects in filter scope", flush=True)
 
-    shell_hits = None
-    erosion_iterations = 0
-    if exclude_edge_px > 0:
-        shell_hits, erosion_iterations = _boundary_shell_hits(
-            label_in,
-            factor=downsample_factor,
-            ds_shape=tuple(int(v) for v in ds_mask.shape),
-            labels=labels,
-            n_labels=n_labels,
-            exclude_edge_px=exclude_edge_px,
+    edge_hits = None
+    brain_mask_cache_used = ""
+    if edge_shrink_factor > 0:
+        ds_brain, cache_meta, cache_path = _resolve_ds_brain_mask(label_zarr, brain_mask_ds, downsample_factor)
+        cache_factor = int(cache_meta.get("factor", 4))
+        spacing = cache_meta.get("spacing_zyx_um") or None
+        centroids = np.asarray(stats["centroids"])[1:]
+        coarse_factor = 4 if min(ds_brain.shape) >= 32 else 1
+        edge_hits = _edge_shrink_hits(
+            ds_brain,
+            spacing,
+            centroids,
+            n_labels,
+            shrink=edge_shrink_factor,
+            cache_factor=cache_factor,
+            downsample_factor=downsample_factor,
+            coarse_factor=coarse_factor,
         )
+        brain_mask_cache_used = str(cache_path)
     max_slice_counts_ds = None
     if max_single_slice_voxels > 0:
         max_slice_counts_ds = _per_component_max_slice_counts(labels, n_labels)
@@ -321,7 +409,7 @@ def postprocess_cfos_mask_3d(
         downsample_factor=downsample_factor,
         max_single_slice_voxels=max_single_slice_voxels,
         max_slice_counts_ds=max_slice_counts_ds,
-        shell_hits=shell_hits,
+        edge_hits=edge_hits,
     )
     ds_keep = np.isin(labels, list(keep_labels)).astype(np.uint8)
 
@@ -415,8 +503,8 @@ def postprocess_cfos_mask_3d(
         "max_voxels_full": int(max_voxels),
         "max_voxels_downsampled": int(max(max_voxels // (downsample_factor**3), 1)),
         "max_extent_ratio": float(max_extent_ratio),
-        "exclude_edge_px": int(exclude_edge_px),
-        "edge_shell_erosion_iterations": int(erosion_iterations),
+        "edge_shrink_factor": float(edge_shrink_factor),
+        "brain_mask_ds": brain_mask_cache_used,
         "max_single_slice_voxels": int(max_single_slice_voxels),
         "labels_total_3d": int(n_labels - 1),
         "labels_kept_3d": int(len(keep_labels)),
@@ -460,11 +548,19 @@ def parse_args() -> argparse.Namespace:
         help="Maximum allowed max-axis/min-axis ratio from 3D bounding box (0 disables).",
     )
     parser.add_argument(
-        "--exclude_edge_px",
-        type=int,
-        default=0,
-        help="Drop objects with any voxel within this many pixels inside the brain "
-        "surface (atlas label boundary); requires --label_zarr (0 disables).",
+        "--edge_shrink_factor",
+        type=float,
+        default=0.0,
+        help="AIND-style brain-boundary exclusion: shrink the brain-surface mesh "
+        "about its center of mass by this factor and drop components whose "
+        "centroid falls outside it (e.g. 0.99; 0 disables). Uses the factor-4 "
+        "brain-mask cache written by registration (or built once from --label_zarr).",
+    )
+    parser.add_argument(
+        "--brain_mask_ds",
+        type=Path,
+        default=None,
+        help="Factor-4 brain-mask cache zarr (default: <label_zarr>_ds_brain_mask.zarr).",
     )
     parser.add_argument(
         "--max_single_slice_voxels",
@@ -483,8 +579,8 @@ def parse_args() -> argparse.Namespace:
         "--label_zarr",
         type=Path,
         default=None,
-        help="Registered atlas label Zarr in sample space (required with --region "
-        "or --exclude_edge_px).",
+        help="Registered atlas label Zarr in sample space (required with --region; "
+        "also used to build the brain-mask cache when it does not exist yet).",
     )
     parser.add_argument(
         "--region",
@@ -519,10 +615,11 @@ def main() -> int:
         max_voxels=args.max_voxels,
         min_voxels=args.min_voxels,
         max_extent_ratio=args.max_extent_ratio,
-        exclude_edge_px=args.exclude_edge_px,
+        edge_shrink_factor=args.edge_shrink_factor,
         max_single_slice_voxels=args.max_single_slice_voxels,
         downsample_factor=args.downsample_factor,
         label_zarr=args.label_zarr,
+        brain_mask_ds=args.brain_mask_ds,
         region_query=args.region,
         region_cfg=args.region_cfg,
         region_outside=args.region_outside,

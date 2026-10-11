@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor
+.trae/
+.vscode/
+.idea/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Build artifacts / caches
+*.egg-info/
+.pytest_cache/
+*.docx
+
+# Local agent / IDE state (kept out of the public repo)
+.claude/
+.cursor/
+
+# Project specific
+*.log
+*.tmp
+best_model.pt
+models/
+data/reference/*
+!data/reference/.gitkeep
+results/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask_vis.png
+results/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask.tiff
+results/spotiflow_results/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410.csv
+SOTA_test/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask_vis.png
+yifu_env.tar.gz
+SOTA_test/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask.tiff
+SOTA_test/spotiflow_results/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410.csv
+results/spotiflow_results/output_mask.tiff
+SOTA_test/spotiflow_results/output_mask.tiff
+smoke_test_outputs/*
+# Generated / local-only
+blur_analysis/
+mlruns/
+node_modules/
+package.json
+package-lock.json
+.zcode/
+
+# Local one-off helper/run scripts never belong in the repo
+_*.py
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

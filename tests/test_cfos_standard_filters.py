@@ -58,7 +58,7 @@ def test_select_keep_labels_filters_single_slice_and_edge():
     }
     # factor 4: single-slice threshold 200/16 = 12.5 downsampled voxels.
     max_slice_counts = np.array([0, 4, 20, 4], dtype=np.int64)  # label 2 has a big slice
-    shell_hits = np.array([0, 0, 0, 3], dtype=np.int64)  # label 3 touches the edge shell
+    edge_hits = np.array([0, 0, 0, 1], dtype=np.int64)  # label 3 fails the edge-shrink exclusion
     keep, removed_volume, removed_extent, removed_slice, removed_edge = select_keep_labels_3d(
         None,
         stats,
@@ -68,7 +68,7 @@ def test_select_keep_labels_filters_single_slice_and_edge():
         downsample_factor=4,
         max_single_slice_voxels=200,
         max_slice_counts_ds=max_slice_counts,
-        shell_hits=shell_hits,
+        edge_hits=edge_hits,
     )
     assert keep == {1}
     assert (removed_volume, removed_extent, removed_slice, removed_edge) == (0, 0, 1, 1)
@@ -86,19 +86,22 @@ def test_postprocess_applies_edge_and_single_slice_rules(tmp_path=None):
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        shape = (8, 12, 12)
+        shape = (16, 64, 64)
         signal = np.zeros(shape, dtype=np.uint16)
         mask = np.zeros(shape, dtype=np.uint8)
         label = np.zeros(shape, dtype=np.uint32)
 
-        label[1:8, 1:11, 1:11] = 500  # brain block; erosion k=2 -> core z3..5, y/x 3..8
+        # Brain block: z 4..15, y/x 8..55. On the factor-4 cache grid
+        # (4, 16, 16) this leaves empty z-row 0 and empty y/x border rows,
+        # so the shrunk surface mesh separates inside from outside blobs.
+        label[4:16, 8:56, 8:56] = 500
 
-        mask[5, 3, 3] = 1  # good cell inside the core -> kept
-        signal[5, 3, 3] = 900
-        mask[1, 6, 6] = 1  # inside brain but in the 2px surface shell -> dropped
-        signal[1, 6, 6] = 800
-        mask[3, 5:8, 5:8] = 1  # flat slab: single slice of 9 voxels -> dropped by slice rule
-        signal[3, 5:8, 5:8] = 700
+        mask[8, 32, 32] = 1  # brain-center blob -> kept
+        signal[8, 32, 32] = 900
+        mask[2, 32, 32] = 1  # outside the brain block -> dropped by edge shrink
+        signal[2, 32, 32] = 800
+        mask[8, 20:28, 20:28] = 1  # flat slab: single slice of 64 voxels -> dropped by slice rule
+        signal[8, 20:28, 20:28] = 700
 
         _make_zarr(tmp / "signal.zarr", signal)
         _make_zarr(tmp / "mask_raw.zarr", mask)
@@ -113,17 +116,19 @@ def test_postprocess_applies_edge_and_single_slice_rules(tmp_path=None):
             max_voxels=0,
             min_voxels=0,
             max_extent_ratio=0.0,
-            downsample_factor=1,
-            exclude_edge_px=2,
-            max_single_slice_voxels=8,
+            downsample_factor=4,
+            edge_shrink_factor=0.5,
+            max_single_slice_voxels=32,
             label_zarr=tmp / "label.zarr",
         )
         assert result["labels_kept_3d"] == 1
         assert result["labels_removed_single_slice_3d"] == 1
         assert result["labels_removed_edge_3d"] == 1
+        # fallback path must persist the brain-mask cache for the next run
+        assert (tmp / "label_ds_brain_mask.zarr").exists()
 
         from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
 
         filtered = np.asarray(open_zarr_dataset(tmp / "mask_filtered.zarr"))
         assert int(filtered.sum()) == 1
-        assert filtered[5, 3, 3] == 1
+        assert filtered[8, 32, 32] == 1

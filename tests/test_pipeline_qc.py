@@ -124,9 +124,9 @@ def test_qc_flags_oversampled_grid(tmp_path):
     assert verdict["checks"]["grid_shape"]["status"] == "FAIL"
 
 
-def test_registration_views_five_panel_grid(tmp_path):
-    """The AIND-style grid renders 5 columns (sample/atlas/warped/overlay/
-    difference) x 3 direction rows plus the axial L/R check row."""
+def test_registration_views_grid(tmp_path):
+    """3 direction rows x 3 slice panels each (25/50/75%) plus the axial
+    L/R check row; sheet dimensions follow the widest row (sagittal)."""
     sample = _build_sample(tmp_path)
     config = json.loads((sample / "config.json").read_text(encoding="utf-8"))
 
@@ -146,8 +146,9 @@ def test_registration_views_five_panel_grid(tmp_path):
 
     img = Image.open(png)
     z, y, x = 20, 24, 16  # synthetic full_shape
-    col_gap = 16 * 4      # 5 panels per direction row
-    expected_w = max(x * 5 + col_gap, y * 5 + col_gap)  # sagittal panels are y-wide
+    gutter = 16
+    # 3 slices per direction row; sagittal panels are y-wide -> widest row
+    expected_w = max(x * 3 + gutter * 2, y * 3 + gutter * 2)
     assert img.width == expected_w
     row_heights = [y, z, z, y]  # axial, coronal, sagittal, L/R check
-    assert img.height == sum(row_heights) + 16 * 3
+    assert img.height == sum(row_heights) + gutter * 3

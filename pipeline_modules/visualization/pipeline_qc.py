@@ -2,10 +2,11 @@
 minimal machine verdict.
 
 Outputs under <sample>/qc/:
-  registration_views.png  - three orthogonal mid-planes of the (coarse)
-                            registration NIfTI, per-view normalized, with the
-                            registered label contour (red) and the hemisphere
-                            split line (yellow, axial+coronal views).
+  registration_views.png  - three orthogonal views (axial/coronal/sagittal)
+                            of the (coarse) registration NIfTI at three slice
+                            positions each (25/50/75%), per-view normalized,
+                            with the registered label contour (red) and the
+                            hemisphere split line (yellow, axial+coronal views).
   seg_blocks/block_NN.zarr- N random full-resolution blocks, dataset '0' =
                             raw signal, dataset '1' = segmentation mask.
   verdict.json            - four hard checks only (label magnitude, hemisphere
@@ -212,7 +213,13 @@ def measure_boundary_alignment(nii_path: Path, label_zarr_path: Path) -> dict:
     }
 
 
-def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_path: Path, out_png: Path) -> None:
+def render_registration_views(
+    nii_path: Path,
+    label_zarr_path: Path,
+    hemi_zarr_path: Path,
+    out_png: Path,
+    fractions: tuple[float, ...] = (0.25, 0.5, 0.75),
+) -> None:
     import nibabel as nib
     from PIL import Image, ImageDraw
 
@@ -225,82 +232,92 @@ def render_registration_views(nii_path: Path, label_zarr_path: Path, hemi_zarr_p
 
     # Display convention: rows = first listed axis, cols = second.
     # axial (rows=y, cols=x), coronal (rows=z, cols=x), sagittal (rows=z, cols=y).
-    planes = {
-        "axial": _norm_u8(np.transpose(nii_xyz[:, :, nz // 2])),          # -> (y, x)
-        "coronal": _norm_u8(np.transpose(nii_xyz[:, ny // 2, :])),        # -> (z, x)
-        "sagittal": _norm_u8(np.transpose(nii_xyz[nx // 2, :, :])),       # -> (z, y)
+    # Three slice positions per view direction (25/50/75%) so registration can
+    # be judged at more than just the mid-plane.
+    views = {
+        "axial": lambda f: _norm_u8(np.transpose(nii_xyz[:, :, min(int(f * nz), nz - 1)])),  # (y, x)
+        "coronal": lambda f: _norm_u8(np.transpose(nii_xyz[:, min(int(f * ny), ny - 1), :])),  # (z, x)
+        "sagittal": lambda f: _norm_u8(np.transpose(nii_xyz[min(int(f * nx), nx - 1), :, :])),  # (z, y)
     }
-    label_planes: dict[str, np.ndarray | None] = {"axial": None, "coronal": None, "sagittal": None}
-    hemi_plane: np.ndarray | None = None
-    if label is not None:
-        # Resample onto the exact NIfTI grid per plane (see _resample_plane).
-        axial_target = planes["axial"].shape          # (y, x)
-        coronal_target = planes["coronal"].shape      # (z, x)
-        sagittal_target = planes["sagittal"].shape    # (z, y)
-        label_planes["axial"] = _resample_plane(np.asarray(label[lz // 2]) > 0, axial_target)
-        label_planes["coronal"] = _resample_plane(np.asarray(label[:, ly // 2, :]) > 0, coronal_target)
-        label_planes["sagittal"] = _resample_plane(np.asarray(label[:, :, lx // 2]) > 0, sagittal_target)
+    label_slices = {
+        "axial": lambda f: (np.asarray(label[min(int(f * lz), lz - 1)]) > 0) if label is not None else None,
+        "coronal": lambda f: (np.asarray(label[:, min(int(f * ly), ly - 1), :]) > 0) if label is not None else None,
+        "sagittal": lambda f: (np.asarray(label[:, :, min(int(f * lx), lx - 1)]) > 0) if label is not None else None,
+    }
+
+    split_x = split_per_z = None
     if hemi is not None:
-        hemi_plane = _resample_plane(np.asarray(hemi[lz // 2]), planes["axial"].shape, preserve_values=True)
+        import zarr as _zarr
 
-    import zarr as _zarr
+        try:
+            _attrs = dict(_zarr.open(str(hemi_zarr_path), mode="r").attrs)
+            split_x = _attrs.get("split_x")
+            split_per_z = _attrs.get("split_x_per_z")
+        except Exception:
+            split_x = None
+            split_per_z = None
 
-    try:
-        _attrs = dict(_zarr.open(str(hemi_zarr_path), mode="r").attrs)
-        split_x = _attrs.get("split_x")
-        split_per_z = _attrs.get("split_x_per_z")
-    except Exception:
-        split_x = None
-        split_per_z = None
-
-    images = []
-    for name, plane in planes.items():
-        rgb = np.repeat(plane[..., None], 3, axis=2)
-        presence = label_planes.get(name)
-        if presence is not None:
-            rgb[_label_contour(_match_plane(presence, plane))] = (255, 60, 60)
-        img = Image.fromarray(rgb)
-        draw = ImageDraw.Draw(img)
-        # cols are the x axis on both views; scale full-res split into nii x.
-        if name == "axial" and (split_x or split_per_z):
-            full_x = split_per_z[lz // 2] if split_per_z else split_x
-            col = int(full_x / fx)
-            draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
-        elif name == "coronal" and (split_x or split_per_z):
-            if split_per_z and lz:
-                # per-z midline curve: rows are nii z, cols are nii x
-                fz = lz / max(nz, 1)
-                step = max(1, lz // 64)
-                pts = []
-                for zf in range(0, lz, step):
-                    pts += [int(split_per_z[zf] / fx), int(zf / fz)]
-                pts += [int(split_per_z[-1] / fx), int((lz - 1) / fz)]
-                draw.line(pts, fill=(255, 220, 0), width=2)
-            else:
-                col = int(split_x / fx)
+    rows: list[list[Image.Image]] = []
+    for name in ("axial", "coronal", "sagittal"):
+        row: list[Image.Image] = []
+        for frac in fractions:
+            plane = views[name](frac)
+            rgb = np.repeat(plane[..., None], 3, axis=2)
+            presence = label_slices[name](frac)
+            if presence is not None:
+                presence = _resample_plane(presence, plane.shape)
+                rgb[_label_contour(_match_plane(presence, plane))] = (255, 60, 60)
+            img = Image.fromarray(rgb)
+            draw = ImageDraw.Draw(img)
+            # cols are the x axis on both views; scale full-res split into nii x.
+            if name == "axial" and (split_x or split_per_z):
+                zfull = min(int(frac * lz), lz - 1)
+                full_x = split_per_z[zfull] if split_per_z else split_x
+                col = int(full_x / fx)
                 draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
-        draw.text((6, 4), name, fill=(255, 255, 255))
-        images.append(img)
+            elif name == "coronal" and (split_x or split_per_z):
+                if split_per_z and lz:
+                    # per-z midline curve: rows are nii z, cols are nii x
+                    fz = lz / max(nz, 1)
+                    step = max(1, lz // 64)
+                    pts = []
+                    for zf in range(0, lz, step):
+                        pts += [int(split_per_z[zf] / fx), int(zf / fz)]
+                    pts += [int(split_per_z[-1] / fx), int((lz - 1) / fz)]
+                    draw.line(pts, fill=(255, 220, 0), width=2)
+                elif split_x:
+                    col = int(split_x / fx)
+                    draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
+            draw.text((6, 4), f"{name} {int(frac * 100)}%", fill=(255, 255, 255))
+            row.append(img)
+        rows.append(row)
 
-    # Hemisphere-verification panel: axial plane tinted left=red / right=blue
+    # Hemisphere-verification panel: axial mid plane tinted left=red / right=blue
     # on the autofluorescence background — shows whether the split plane
     # actually separates the two lobes.
-    if hemi_plane is not None:
-        rgb = np.repeat(planes["axial"][..., None], 3, axis=2)
-        matched = _match_plane(hemi_plane, planes["axial"])
+    if hemi is not None:
+        axial_mid = views["axial"](0.5)
+        hemi_plane = _resample_plane(np.asarray(hemi[lz // 2]), axial_mid.shape, preserve_values=True)
+        rgb = np.repeat(axial_mid[..., None], 3, axis=2)
+        matched = _match_plane(hemi_plane, axial_mid)
         rgb[matched == 1] = (255, 90, 90)
         rgb[matched == 2] = (90, 120, 255)
         img = Image.fromarray(rgb)
         draw = ImageDraw.Draw(img)
         draw.text((6, 4), "axial L/R check", fill=(255, 255, 255))
-        images.append(img)
+        rows.append([img])
 
-    height = max(img.height for img in images)
-    sheet = Image.new("RGB", (sum(img.width for img in images) + 16 * (len(images) - 1), height), (20, 20, 20))
-    offset = 0
-    for img in images:
-        sheet.paste(img, (offset, 0))
-        offset += img.width + 16
+    gutter = 16
+    row_heights = [max(img.height for img in row) for row in rows]
+    sheet_w = max(sum(img.width for img in row) + gutter * (len(row) - 1) for row in rows)
+    sheet = Image.new("RGB", (sheet_w, sum(row_heights) + gutter * (len(rows) - 1)), (20, 20, 20))
+    y = 0
+    for row, rh in zip(rows, row_heights):
+        x = 0
+        for img in row:
+            sheet.paste(img, (x, y))
+            x += img.width + gutter
+        y += rh + gutter
     sheet.save(out_png)
 
 
@@ -327,29 +344,45 @@ def save_segmentation_blocks(signal_zarr_path: Path, mask_zarr_path: Path, label
         if not np.any(mask_block > 0):
             continue
         signal_block = np.asarray(signal[z0:z0 + bz, y0:y0 + by, x0:x0 + bx])
-        # One OME-Zarr store per block, single (c, z, y, x) array with channel
-        # 0 = raw signal, channel 1 = mask (0/1). NGFF multiscales + omero
-        # metadata make napari (napari-ome-zarr) open it directly via
-        # drag-and-drop and split the two channels into named layers.
+        # One OME-Zarr store per block with TWO independent layers: an image
+        # layer (raw signal, 3D uint16) and a labels layer (mask, NGFF
+        # image-label). napari-ome-zarr opens both directly; the labels layer
+        # carries image-label metadata pointing back at the raw image.
         block_path = out_dir / f"block_{len(written):02d}.zarr"
-        stacked = np.stack([signal_block, mask_block.astype(signal_block.dtype)])
         group = open_output_group(block_path, overwrite=True)
-        create_array(group, "0", shape=stacked.shape, chunks=(2, min(32, bz), by, bx),
-                     dtype=stacked.dtype, data=stacked)
-        group.attrs["multiscales"] = ome_ngff_multiscales(
-            ["0"], ndim=4, base_scale=(1.0, resolution_xyz[2], resolution_xyz[1], resolution_xyz[0]),
+
+        raw_group = group.require_group("raw")
+        create_array(raw_group, "0", shape=(bz, by, bx), chunks=(min(32, bz), by, bx),
+                     dtype=signal_block.dtype, data=signal_block)
+        raw_group.attrs["multiscales"] = ome_ngff_multiscales(
+            ["0"], ndim=3, base_scale=(resolution_xyz[2], resolution_xyz[1], resolution_xyz[0]),
             name=f"{sample_name} QC block",
         )
-        group.attrs["omero"] = {
+        raw_group.attrs["omero"] = {
             "channels": [
                 {"label": "signal", "color": "FFFF00", "window": {"start": 0, "end": 65535}, "active": True},
-                {"label": "mask", "color": "FF0000", "window": {"start": 0, "end": 1}, "active": True},
             ],
         }
+
+        labels_group = group.require_group("labels")
+        mask_group = labels_group.require_group("mask")
+        create_array(mask_group, "0", shape=(bz, by, bx), chunks=(min(32, bz), by, bx),
+                     dtype=np.uint8, data=(mask_block > 0).astype(np.uint8))
+        mask_group.attrs["multiscales"] = ome_ngff_multiscales(
+            ["0"], ndim=3, base_scale=(resolution_xyz[2], resolution_xyz[1], resolution_xyz[0]),
+            name="mask",
+        )
+        mask_group.attrs["image-label"] = {
+            "version": "0.4",
+            "source": {"image": "../../raw"},
+            "colors": [
+                {"label-value": 1, "rgba": [255, 0, 0, 255]},
+            ],
+        }
+
         group.attrs["block_offset_zyx"] = [z0, y0, x0]
         group.attrs["block_shape_zyx"] = [bz, by, bx]
         group.attrs["sample"] = sample_name
-        group.attrs["channels"] = {"0": "raw signal", "1": "segmentation mask"}
         written.append(block_path)
         logger.info("saved QC block %s at zyx=%s", block_path.name, (z0, y0, x0))
     if len(written) < N_SEG_BLOCKS:
