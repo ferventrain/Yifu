@@ -430,6 +430,10 @@ class ActiveStore:
                 "unit_total": unit_total,
                 "unit_phase": phase,
                 "heartbeat_at": job.get("heartbeat_at"),
+                # coarse stepper fields written by `harness wrap --steps`
+                "steps": (module_prog or {}).get("steps"),
+                "current_step": (module_prog or {}).get("current_step"),
+                "step_states": (module_prog or {}).get("step_states"),
             }
             if job.get("status") == "running" and unit_total > 0:
                 eta = estimate_unit_eta(
@@ -536,6 +540,15 @@ def _read_module_progress(path_value: str | None) -> dict[str, Any] | None:
         return None
     if normalized["unit_total"] <= 0 and not normalized["phase"]:
         return None
+    # pass through the coarse stepper fields when present (harness wrap
+    # --steps writes steps/current_step/step_states)
+    steps = payload.get("steps")
+    if isinstance(steps, list) and steps and all(isinstance(s, str) for s in steps):
+        states = payload.get("step_states")
+        normalized["steps"] = [str(s) for s in steps]
+        normalized["current_step"] = payload.get("current_step")
+        if isinstance(states, list) and len(states) == len(steps):
+            normalized["step_states"] = [str(s) for s in states]
     return normalized
 
 

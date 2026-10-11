@@ -84,7 +84,7 @@
     },
     "postprocess": {
       "enabled": true,
-      "exclude_edge_px": 40,
+      "edge_shrink_factor": 0.99,
       "max_single_slice_voxels": 200,
       "max_voxels": 0,
       "min_voxels": 0,

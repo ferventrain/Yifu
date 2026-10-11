@@ -41,7 +41,7 @@ from pipeline_modules.harness.worker import (
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
 STATIC_DIR = APP_DIR / "static"
-ASSET_VERSION = "14"
+ASSET_VERSION = "17"
 
 def _resolve_pipeline_python() -> str | None:
     for key in ("YIFU_PYTHON", "YIFU_PYTHON_EXE"):
@@ -217,6 +217,11 @@ class ProjectPriorityBody(BaseModel):
     level: int = Field(..., ge=-1, le=3)  # -1 clears the priority
 
 
+class ProjectArchiveBody(BaseModel):
+    sample_dir: str = Field(..., min_length=1)
+    dry_run: bool = False  # preview only: list what would be deleted, touch nothing
+
+
 @app.post("/api/projects/priority")
 def api_projects_priority(body: ProjectPriorityBody) -> dict[str, Any]:
     """Set one sample's priority level P0-P3 (or -1 to clear)."""
@@ -239,6 +244,67 @@ def api_projects_priority(body: ProjectPriorityBody) -> dict[str, Any]:
     return {"priorities": state.get("priorities", {})}
 
 
+@app.post("/api/projects/archive")
+def api_project_archive(body: ProjectArchiveBody) -> dict[str, Any]:
+    """Archive a finished sample (explicit POST, like submitting a job).
+
+    Deletes zarr stores / raw ims / transforms inside the sample dir, keeps
+    result*, visualization*, qc and small files, then moves the folder under
+    <root>/_archived and drops the sample's job records + board priority so
+    its card leaves the board. Refused while a queued/running/verifying job
+    exists. ``dry_run=true`` returns the deletion list without touching
+    anything (the confirm dialog's file list).
+    """
+    from apps.pipeline_harness.projects import archive_sample, write_board_priority
+
+    target = Path(body.sample_dir).expanduser()
+    try:
+        target = target.resolve()
+    except OSError as exc:
+        raise PipelineError(ErrorCode.ARGUMENT_INVALID, str(exc)) from exc
+    if not is_under(target, store.root):
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            f"路径不在分析根目录内: {body.sample_dir}",
+            context={"path": body.sample_dir, "root": str(store.root)},
+        )
+    if target in {store.root.resolve(), store.active.resolve()} or target.name.startswith("_"):
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            f"不能归档根目录或内部目录: {target}",
+            context={"path": str(target)},
+        )
+    if not target.is_dir():
+        raise PipelineError(
+            ErrorCode.INPUT_NOT_FOUND,
+            f"样本目录不存在: {target}",
+            context={"path": str(target)},
+        )
+
+    def _norm(value: Any) -> str:
+        return str(value or "").replace("\\", "/").rstrip("/").lower()
+
+    wanted = _norm(target)
+    for job in store.list_jobs():
+        if _norm(job.get("sample_dir")) != wanted:
+            continue
+        if str(job.get("status")) in {"queued", "running", "verifying"}:
+            raise PipelineError(
+                ErrorCode.ARGUMENT_INVALID,
+                f"样本还有未结束的任务（{job.get('id')} {job.get('status')}），先取消或等完成再归档",
+                context={"job_id": str(job.get("id"))},
+            )
+
+    summary = archive_sample(target, store.root / "_archived", dry_run=body.dry_run)
+    if body.dry_run:
+        return summary
+    for job in store.list_jobs():
+        if _norm(job.get("sample_dir")) == wanted:
+            store.remove_job(str(job["id"]))
+    write_board_priority(store.active, str(target), None)
+    return summary
+
+
 @app.get("/api/stage-times")
 def api_stage_times() -> dict[str, Any]:
     """Per-module duration stats aggregated from run manifests (read-only,
@@ -250,8 +316,12 @@ def api_stage_times() -> dict[str, Any]:
 
 @app.post("/api/projects/notes")
 def api_project_notes(body: ProjectNotesBody) -> dict[str, Any]:
-    """Write project notes (<sample>/pm_project.json) — an explicit POST,
-    like submitting a job; GET refreshes stay side-effect free."""
+    """Write project notes (<batch>/pm_project.json) — an explicit POST,
+    like submitting a job; GET refreshes stay side-effect free.
+
+    ``sample_dir`` may be a sample dir (notes go to its parent batch) or a
+    batch dir directly: a dir holding config*.json is a SAMPLE -> its parent.
+    """
     from apps.pipeline_harness.projects import write_project_notes
 
     target = Path(body.sample_dir).expanduser()
@@ -268,9 +338,11 @@ def api_project_notes(body: ProjectNotesBody) -> dict[str, Any]:
     if not target.is_dir():
         raise PipelineError(
             ErrorCode.INPUT_NOT_FOUND,
-            f"样本目录不存在: {target}",
+            f"目录不存在: {target}",
             context={"path": str(target)},
         )
+    if any(target.glob("config*.json")):
+        target = target.parent
     if body.requirements is None and body.retro is None and not body.append_note:
         raise PipelineError(
             ErrorCode.ARGUMENT_INVALID,

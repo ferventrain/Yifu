@@ -35,6 +35,9 @@ let openLogJobId = null;
 const batchOpenState = new Map(); // batch name -> user-pinned open/closed
 const runOpenState = new Map(); // "<scope>::<id>" -> pinned open/closed
 const nodeCache = new Map(); // sample key -> live card element (focus protection)
+const batchNodes = new Map(); // batch key -> {node, fingerprint} (DOM reconciliation)
+const dirtyNotes = new Set(); // sample keys with unsaved note edits
+const batchNotesCache = new Map(); // batch name -> live notes node (edit pinning)
 let currentSampleOrder = []; // flat display order of sample_dirs
 let errorHoldUntil = 0;
 
@@ -155,24 +158,125 @@ function renderBoard(data) {
   const activeBatches = batches.filter((b) => b.under_active);
   const otherBatches = batches.filter((b) => !b.under_active);
 
-  els.board.replaceChildren();
   if (!batches.length) {
+    els.board.replaceChildren();
+    batchNodes.clear();
     const empty = document.createElement("p");
     empty.className = "empty";
     empty.textContent = "还没有项目。提交任务或用 wrap 挂载程序后，样本目录会自动出现在这里。";
     els.board.appendChild(empty);
     return;
   }
+
+  // DOM reconciliation: an unchanged batch keeps its node untouched; a changed
+  // batch swaps only its non-interacted project cards. The node a user is
+  // typing notes in (or has unsaved note edits in) is never detached —
+  // detaching resets focus, IME composition, and <details> open state.
+  // Only TEXT-INPUT widgets pin their card: a button click (run row, config
+  // select's row...) must NOT pin, or the very click that toggles a row open
+  // would freeze the card and the toggle would never render.
+  const focusedKey = isTextInput(document.activeElement)
+    ? sampleKeyOfNode(document.activeElement)
+    : null;
   const order = [];
-  for (const batch of activeBatches) {
-    els.board.appendChild(renderBatch(batch));
+  const wantKeys = [];
+  const applyBatch = (batch, dim) => {
     for (const project of batch.projects) order.push(project.sample_dir);
+    const key = sampleKey(batch.batch_dir);
+    wantKeys.push(key);
+    reconcileBatch(batch, dim, focusedKey);
+  };
+  for (const batch of activeBatches) applyBatch(batch, false);
+  for (const batch of otherBatches) applyBatch(batch, true); // 展开显示，仅样式略暗
+
+  for (const [key, entry] of [...batchNodes]) {
+    if (!wantKeys.includes(key)) {
+      entry.node.remove();
+      batchNodes.delete(key);
+    }
   }
-  if (otherBatches.length) {
-    els.board.appendChild(renderOtherSection(otherBatches, order));
+  // fix display order only when it actually changed (moving a node blurs focus)
+  const domKeys = [...els.board.children]
+    .map((n) => n.dataset.batchKey)
+    .join("\u0001");
+  if (domKeys !== wantKeys.join("\u0001")) {
+    for (const key of wantKeys) {
+      const entry = batchNodes.get(key);
+      if (entry) els.board.appendChild(entry.node);
+    }
   }
   currentSampleOrder = order;
   renderResourcePanel(data.resources || null, batches);
+}
+
+function sampleKeyOfNode(node) {
+  while (node && node !== document.body) {
+    if (node.dataset && node.dataset.sampleKey) return node.dataset.sampleKey;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+// text-input widgets pin their card; buttons/details do not (their clicks
+// change UI state that the next render must show)
+function isTextInput(node) {
+  if (!node || !node.tagName) return false;
+  const tag = node.tagName.toUpperCase();
+  return tag === "TEXTAREA" || tag === "INPUT" || tag === "SELECT";
+}
+
+function batchFingerprint(batch, dim) {
+  // Everything the batch DOM renders, minus the heavy embedded full views.
+  return (
+    JSON.stringify(batch, (key, value) =>
+      key === "full_view" || key === "latest_full_view" ? undefined : value
+    ) + (dim ? "|dim" : "")
+  );
+}
+
+function reconcileBatch(batch, dim, focusedKey) {
+  const key = sampleKey(batch.batch_dir);
+  const fingerprint = batchFingerprint(batch, dim);
+  const entry = batchNodes.get(key);
+  if (entry && entry.fingerprint === fingerprint && entry.node.isConnected) return;
+
+  const holdsUserState = batch.projects.some(
+    (p) => sampleKey(p.sample_dir) === focusedKey || dirtyNotes.has(sampleKey(p.sample_dir))
+  );
+  if (entry && entry.node.isConnected && holdsUserState) {
+    updateBatchInPlace(entry.node, batch, dim, focusedKey);
+    entry.fingerprint = fingerprint;
+    return;
+  }
+  const node = renderBatch(batch);
+  if (dim) node.classList.add("other-root");
+  node.dataset.batchKey = key;
+  if (entry && entry.node.isConnected) entry.node.replaceWith(node);
+  batchNodes.set(key, { node, fingerprint });
+}
+
+function updateBatchInPlace(node, batch, dim, focusedKey) {
+  node.className = `batch${batch.priority != null ? ` has-p${batch.priority}` : ""}${dim ? " other-root" : ""}`;
+  const oldSummary = node.querySelector("summary");
+  if (oldSummary) oldSummary.replaceWith(batchHeader(batch));
+  const list = node.querySelector(".batch-projects");
+  if (!list) return;
+  const oldCards = new Map();
+  for (const card of [...list.querySelectorAll(".project-card")]) {
+    oldCards.set(card.dataset.sampleKey, card);
+  }
+  const kept = new Set();
+  for (const project of batch.projects) {
+    const key = sampleKey(project.sample_dir);
+    kept.add(key);
+    const old = oldCards.get(key);
+    // the card being typed in (or holding unsaved notes) stays untouched
+    if (old && (key === focusedKey || dirtyNotes.has(key))) continue;
+    const fresh = renderProject(project);
+    if (old) old.replaceWith(fresh);
+    else list.appendChild(fresh);
+  }
+  for (const [key, card] of oldCards) if (!kept.has(key)) card.remove();
 }
 
 async function setPriority(sampleDir, level) {
@@ -292,7 +396,27 @@ function batchHeader(batch) {
   const right = document.createElement("div");
   right.className = "batch-right";
 
-  // priority selector lives on the PROJECT (batch): P-high moves to the top
+  if (batch.remaining_s != null) {
+    const rem = document.createElement("span");
+    rem.className = "batch-remaining";
+    rem.textContent = `还需 ≈ ${formatEta(batch.remaining_s)}`;
+    right.appendChild(rem);
+  }
+  if (progress.total) {
+    const bar = document.createElement("div");
+    bar.className = "batch-progress";
+    for (const [kind, cls] of [["done", "ok"], ["running", "run"], ["failed", "bad"], ["waiting", "idle"]]) {
+      if (!progress[kind]) continue;
+      const seg = document.createElement("i");
+      seg.className = `bp-seg ${cls}`;
+      seg.style.width = `${(progress[kind] / progress.total) * 100}%`;
+      bar.appendChild(seg);
+    }
+    right.appendChild(bar);
+  }
+
+  // priority selector lives on the PROJECT (batch): P-high moves to the top;
+  // rendered last so it sits at the far right of the batch header
   const prioSeg = document.createElement("span");
   prioSeg.className = "prio-seg";
   prioSeg.title = "项目紧急度（P0 最高，自动置顶；再点一次取消）";
@@ -312,26 +436,115 @@ function batchHeader(batch) {
   }
   right.appendChild(prioSeg);
 
-  if (batch.remaining_s != null) {
-    const rem = document.createElement("span");
-    rem.className = "batch-remaining";
-    rem.textContent = `还需 ≈ ${formatEta(batch.remaining_s)}`;
-    right.appendChild(rem);
-  }
-  if (progress.total) {
-    const bar = document.createElement("div");
-    bar.className = "batch-progress";
-    for (const [kind, cls] of [["done", "ok"], ["running", "run"], ["failed", "bad"], ["waiting", "idle"]]) {
-      if (!progress[kind]) continue;
-      const seg = document.createElement("i");
-      seg.className = `bp-seg ${cls}`;
-      seg.style.width = `${(progress[kind] / progress.total) * 100}%`;
-      bar.appendChild(seg);
-    }
-    right.appendChild(bar);
-  }
   heading.append(wrap, right);
   return heading;
+}
+
+function renderBatchNotes(batch) {
+  // Project-level notes: 需求 / 复盘 as two separate entries + 记一笔
+  const notes = batch.notes || {};
+  const key = `batch::${batch.batch}`;
+  const holder = document.createElement("div");
+  holder.className = "batch-notes";
+  holder.dataset.batchKey = key;
+
+  const dirty = new Set(); // scopes with unsaved edits -> pin this node
+
+  const makeEntry = (scope, label, placeholder, rows, value) => {
+    const entryKey = `notes::${key}::${scope}`;
+    const box = document.createElement("details");
+    box.className = "notes";
+    box.open = runOpenState.get(entryKey) === true;
+    box.addEventListener("toggle", () => runOpenState.set(entryKey, box.open));
+    const summary = document.createElement("summary");
+    const renderPreview = () => {
+      const preview = (area.value || "").trim().split("\n")[0] || "点击填写";
+      summary.textContent = `${label}：${preview.slice(0, 80)}`;
+    };
+    const area = document.createElement("textarea");
+    area.rows = rows;
+    area.placeholder = placeholder;
+    area.value = value || "";
+    renderPreview();
+    area.addEventListener("input", () => dirty.add(scope));
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "btn";
+    saveBtn.textContent = "保存";
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.disabled = true;
+      saveBtn.textContent = "保存中…";
+      try {
+        const body = { sample_dir: batch.batch_dir };
+        body[scope === "requirements" ? "requirements" : "retro"] = area.value;
+        await api("/api/projects/notes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        dirty.delete(scope);
+        renderPreview();
+        showError(`${label}已保存`, 3000, "info");
+      } catch (error) {
+        showError(error.message, 6000);
+      }
+      saveBtn.disabled = false;
+      saveBtn.textContent = "保存";
+    });
+    box.append(summary, area, saveBtn);
+    return box;
+  };
+
+  holder.appendChild(
+    makeEntry("requirements", "需求", "分析需求（这个项目要做什么、对照组、交付物…）", 2, notes.requirements)
+  );
+  holder.appendChild(
+    makeEntry("retro", "复盘", "复盘（踩过的坑、失误、下次注意…）", 3, notes.retro)
+  );
+
+  const quickRow = document.createElement("div");
+  quickRow.className = "quick-note";
+  const quickInput = document.createElement("input");
+  quickInput.type = "text";
+  quickInput.placeholder = "记一笔（时间戳笔记），回车提交";
+  const quickBtn = document.createElement("button");
+  quickBtn.type = "button";
+  quickBtn.className = "btn";
+  quickBtn.textContent = "记一笔";
+  const submitQuick = async () => {
+    const text = quickInput.value.trim();
+    if (!text) return;
+    try {
+      await api("/api/projects/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sample_dir: batch.batch_dir, append_note: text }),
+      });
+      quickInput.value = "";
+      await refresh();
+    } catch (error) {
+      showError(error.message, 6000);
+    }
+  };
+  quickBtn.addEventListener("click", submitQuick);
+  quickInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submitQuick();
+  });
+  quickRow.append(quickInput, quickBtn);
+  holder.appendChild(quickRow);
+
+  const noteLog = document.createElement("div");
+  noteLog.className = "note-log";
+  for (const entry of (notes.log || []).slice(-3)) {
+    const line = document.createElement("p");
+    line.textContent = `${(entry.at || "").replace("T", " ").slice(0, 16)}  ${entry.text}`;
+    noteLog.appendChild(line);
+  }
+  holder.appendChild(noteLog);
+
+  // pin while editing: never rebuild a notes node with unsaved input
+  holder._isPinned = () => dirty.size > 0 || (isTextInput(document.activeElement) && holder.contains(document.activeElement));
+  return holder;
 }
 
 function renderBatch(batch) {
@@ -344,36 +557,21 @@ function renderBatch(batch) {
   box.open = userChoice != null ? userChoice : hasActive;
   box.addEventListener("toggle", () => batchOpenState.set(batch.batch, box.open));
   box.appendChild(batchHeader(batch));
+
+  // project-level notes (需求/复盘) sit above the sample list
+  const cachedNotes = batchNotesCache.get(batch.batch);
+  if (cachedNotes && cachedNotes._isPinned && cachedNotes._isPinned() && cachedNotes.isConnected) {
+    box.appendChild(cachedNotes);
+  } else {
+    const node = renderBatchNotes(batch);
+    batchNotesCache.set(batch.batch, node);
+    box.appendChild(node);
+  }
+
   const list = document.createElement("div");
   list.className = "batch-projects";
   for (const project of batch.projects) list.appendChild(renderProject(project));
   box.appendChild(list);
-  return box;
-}
-
-function renderOtherSection(batches, orderSink) {
-  const box = document.createElement("details");
-  box.className = "batch other-root";
-  box.open = batchOpenState.get("__other_root__") === true;
-  box.addEventListener("toggle", () => batchOpenState.set("__other_root__", box.open));
-  const heading = document.createElement("summary");
-  const name = document.createElement("strong");
-  name.className = "batch-name";
-  name.textContent = "其他目录";
-  const meta = document.createElement("span");
-  meta.className = "batch-meta";
-  meta.textContent = `${batches.length} 个批次（分析根目录下、非 _active）`;
-  heading.append(name, meta);
-  box.appendChild(heading);
-  const wrap = document.createElement("div");
-  wrap.className = "batch-projects";
-  for (const batch of batches) {
-    const inner = renderBatch(batch);
-    inner.classList.add("nested");
-    wrap.appendChild(inner);
-    for (const project of batch.projects) orderSink.push(project.sample_dir);
-  }
-  box.appendChild(wrap);
   return box;
 }
 
@@ -382,9 +580,12 @@ function renderOtherSection(batches, orderSink) {
 function renderProject(project) {
   const key = sampleKey(project.sample_dir);
   const cached = nodeCache.get(key);
-  // Never swap a card the user is interacting with (typing notes, open
-  // select...) — that is what made the notes box collapse every 1.5s.
-  if (cached && cached.isConnected && cached.contains(document.activeElement)) {
+  // Never swap a card holding TEXT-INPUT focus or unsaved note edits —
+  // that is what made notes lose focus/text every 1.5s poll. Button clicks
+  // (run rows, toggles) must NOT pin: the state they change needs re-render.
+  const inputFocused = cached && cached.isConnected && isTextInput(document.activeElement) &&
+    cached.contains(document.activeElement);
+  if (inputFocused || (cached && cached.isConnected && dirtyNotes.has(key))) {
     return cached;
   }
 
@@ -417,7 +618,7 @@ function renderProject(project) {
   head.append(titleWrap, statusCluster);
   card.appendChild(head);
 
-  // ---- chips: anomaly / profile / estimate
+  // ---- chips: anomaly / profile / estimate (short — details on hover)
   const chips = document.createElement("div");
   chips.className = "chip-row";
   if (project.anomaly) {
@@ -435,26 +636,17 @@ function renderProject(project) {
   if (project.estimate && project.estimate.seconds) {
     const chip = document.createElement("span");
     chip.className = "chip estimate";
-    chip.textContent = `预计 ${formatEta(project.estimate.seconds)}（${project.estimate.basis}）`;
+    chip.textContent = `≈ ${formatEta(project.estimate.seconds)}`;
+    chip.title = project.estimate.basis || "";
     chips.appendChild(chip);
   }
   if (chips.childNodes.length) card.appendChild(chips);
 
-  // ---- meta: sample dir + manifest summary
+  // ---- meta: sample dir only (manifest summary dropped: info overload)
   const meta = document.createElement("p");
   meta.className = "card-meta";
   meta.textContent = project.sample_dir;
   card.appendChild(meta);
-  const manifest = project.last_manifest;
-  if (manifest && manifest.module) {
-    const manLine = document.createElement("p");
-    manLine.className = "card-meta manifest";
-    const commit = manifest.git_commit ? ` @ ${manifest.git_commit}` : "";
-    const dur = manifest.duration_seconds != null ? ` · ${formatDuration(manifest.duration_seconds) || "?"}` : "";
-    const incomplete = manifest.status === "incomplete" ? " · ⚠️ 未跑完" : "";
-    manLine.textContent = `最近产物：${manifest.module}${commit}${dur} · 输出 ${manifest.outputs.length} 项${incomplete}`;
-    card.appendChild(manLine);
-  }
 
   // ---- start row (one-click start / resume)
   const startRow = document.createElement("div");
@@ -502,92 +694,15 @@ function renderProject(project) {
   openBtn.className = "btn";
   openBtn.textContent = "打开目录";
   openBtn.addEventListener("click", () => openPath(project.sample_dir, openBtn));
-  startRow.append(select, startBtn, openBtn);
+  const archiveBtn = document.createElement("button");
+  archiveBtn.type = "button";
+  archiveBtn.className = "btn danger";
+  archiveBtn.textContent = "归档";
+  archiveBtn.addEventListener("click", () => archiveSample(project, archiveBtn));
+  startRow.append(select, startBtn, openBtn, archiveBtn);
   card.appendChild(startRow);
 
-  // ---- notes (requirements / retro), state survives polling
-  const notes = project.notes || {};
-  const notesKey = `notes::${key}`;
-  const notesBox = document.createElement("details");
-  notesBox.className = "notes";
-  notesBox.open = runOpenState.get(notesKey) === true;
-  notesBox.addEventListener("toggle", () => runOpenState.set(notesKey, notesBox.open));
-  const notesSummary = document.createElement("summary");
-  const reqPreview = (notes.requirements || "").trim().split("\n")[0] || "点击填写分析需求";
-  notesSummary.textContent = `需求：${reqPreview.slice(0, 80)}`;
-  notesBox.appendChild(notesSummary);
-
-  const reqArea = document.createElement("textarea");
-  reqArea.rows = 2;
-  reqArea.placeholder = "分析需求（这个项目要做什么、对照组、交付物…）";
-  reqArea.value = notes.requirements || "";
-  const retroArea = document.createElement("textarea");
-  retroArea.rows = 3;
-  retroArea.placeholder = "复盘（踩过的坑、失误、下次注意…）";
-  retroArea.value = notes.retro || "";
-  const saveBtn = document.createElement("button");
-  saveBtn.type = "button";
-  saveBtn.className = "btn";
-  saveBtn.textContent = "保存笔记";
-  saveBtn.addEventListener("click", async () => {
-    saveBtn.disabled = true;
-    saveBtn.textContent = "保存中…";
-    try {
-      await api("/api/projects/notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sample_dir: project.sample_dir,
-          requirements: reqArea.value,
-          retro: retroArea.value,
-        }),
-      });
-      showError("笔记已保存", 3000, "info");
-    } catch (error) {
-      showError(error.message, 6000);
-    }
-    saveBtn.disabled = false;
-    saveBtn.textContent = "保存笔记";
-  });
-  const noteLog = document.createElement("div");
-  noteLog.className = "note-log";
-  for (const entry of notes.log || []) {
-    const line = document.createElement("p");
-    line.textContent = `${(entry.at || "").replace("T", " ").slice(0, 16)}  ${entry.text}`;
-    noteLog.appendChild(line);
-  }
-  const quickRow = document.createElement("div");
-  quickRow.className = "quick-note";
-  const quickInput = document.createElement("input");
-  quickInput.type = "text";
-  quickInput.placeholder = "记一笔（时间戳笔记），回车提交";
-  const quickBtn = document.createElement("button");
-  quickBtn.type = "button";
-  quickBtn.className = "btn";
-  quickBtn.textContent = "记一笔";
-  const submitQuick = async () => {
-    const text = quickInput.value.trim();
-    if (!text) return;
-    try {
-      await api("/api/projects/notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sample_dir: project.sample_dir, append_note: text }),
-      });
-      quickInput.value = "";
-      nodeCache.delete(key); // allow re-render with the new log line
-      await refresh();
-    } catch (error) {
-      showError(error.message, 6000);
-    }
-  };
-  quickBtn.addEventListener("click", submitQuick);
-  quickInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") submitQuick();
-  });
-  quickRow.append(quickInput, quickBtn);
-  notesBox.append(reqArea, retroArea, saveBtn, quickRow, noteLog);
-  card.appendChild(notesBox);
+  // ---- notes moved UP to the project (batch) level; sample rows carry no notes
 
   // ---- error history (auto)
   if (project.error_history && project.error_history.length) {
@@ -659,6 +774,67 @@ function renderRunRow(project, run) {
 
 // ------------------------------------------------------ rich run card
 
+const STEP_STATE_LABELS = { done: "完成", active: "进行中", pending: "未开始", failed: "失败" };
+
+function renderStepper(job, status) {
+  // Coarse step dots: from wrap --steps (steps/step_states) or, for main
+  // pipeline runs, the canonical steps[] in progress.json (list of dicts).
+  // Falls back to the plain bar when no step list is known.
+  const progress = job.progress || {};
+
+  let names = null;
+  let states = null;
+  if (Array.isArray(progress.steps) && progress.steps.length) {
+    if (typeof progress.steps[0] === "object" && progress.steps[0] !== null) {
+      // main pipeline: steps[] is [{name, ended_at, skipped}]
+      names = progress.steps.map((s) => s.name || "步骤");
+      states = progress.steps.map((s) => (s.ended_at ? "done" : "pending"));
+      const cur = Number(progress.step_index || 0);
+      if (cur > 0 && (status === "failed" || status === "running" || status === "stalled")) {
+        const activeState = status === "failed" ? "failed" : "active";
+        states = progress.steps.map((s, i) =>
+          i + 1 < cur ? "done" : i + 1 === cur ? activeState : "pending"
+        );
+      }
+    } else {
+      // wrap --steps: steps[] is a list of names + step_states
+      names = progress.steps;
+      states = Array.isArray(progress.step_states) && progress.step_states.length === names.length
+        ? progress.step_states
+        : names.map((_, i) => {
+            const cur = progress.current_step;
+            if (status === "succeeded" || status === "done") return "done";
+            if (status === "failed") return i + 1 === cur ? "failed" : i + 1 < cur ? "done" : "pending";
+            if (cur == null) return "pending";
+            return i + 1 < cur ? "done" : i + 1 === cur ? "active" : "pending";
+          });
+    }
+  }
+
+  if (!names) {
+    // fallback: the plain percentage bar
+    const track = document.createElement("div");
+    track.className = "progress-track";
+    const fill = document.createElement("div");
+    fill.className = `progress-fill status-${status}`;
+    fill.style.width = `${progressPercent(job)}%`;
+    track.appendChild(fill);
+    return track;
+  }
+
+  const stepper = document.createElement("div");
+  stepper.className = "stepper";
+  names.forEach((name, i) => {
+    const state = states[i] || "pending";
+    const dot = document.createElement("span");
+    dot.className = `step-dot ${state}`;
+    dot.title = `${i + 1}. ${name} — ${STEP_STATE_LABELS[state] || state}`;
+    if (i > 0) stepper.appendChild(document.createElement("i")).className = "step-link " + state;
+    stepper.appendChild(dot);
+  });
+  return stepper;
+}
+
 function renderRunCard(job) {
   const rawStatus = job.status || "queued";
   const status = job.display_status || rawStatus;
@@ -703,13 +879,8 @@ function renderRunCard(job) {
   }
   if (etaLine.textContent) card.appendChild(etaLine);
 
-  const track = document.createElement("div");
-  track.className = "progress-track";
-  const fill = document.createElement("div");
-  fill.className = `progress-fill status-${status}`;
-  fill.style.width = `${progressPercent(job)}%`;
-  track.appendChild(fill);
-  card.appendChild(track);
+  const track = renderStepper(job, status);
+  if (track) card.appendChild(track);
 
   const error = job.error;
   if (error) {
@@ -915,6 +1086,49 @@ async function cancelJob(jobId) {
   } catch (error) {
     showError(error.message);
   }
+}
+
+async function archiveSample(project, button) {
+  // Dry-run first: the confirm dialog lists exactly what will be deleted,
+  // so the plan is reviewed against real names, not a generic description.
+  let preview;
+  try {
+    preview = await api("/api/projects/archive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sample_dir: project.sample_dir, dry_run: true }),
+    });
+  } catch (error) {
+    showError(error.message, 8000);
+    return;
+  }
+  const names = preview.would_delete || [];
+  const shown = names.slice(0, 30).join("\n");
+  const more = names.length > 30 ? `\n… 共 ${names.length} 项` : "";
+  const message =
+    `归档 ${project.sample_name}，将删除以下 ${names.length} 项（zarr / 原始 ims / transforms / 完成标记）：\n` +
+    `${shown || "（无）"}${more}\n` +
+    `保留 result*、visualization*、qc 及小文件（config、笔记、manifest、日志），目录移入 _archived。\n` +
+    `此操作不可撤销，确定继续？`;
+  if (!window.confirm(message)) return;
+  button.disabled = true;
+  button.textContent = "归档中…";
+  try {
+    const result = await api("/api/projects/archive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sample_dir: project.sample_dir }),
+    });
+    const key = sampleKey(project.sample_dir);
+    nodeCache.delete(key);
+    dirtyNotes.delete(key);
+    showError(`已归档：清理 ${result.deleted_count} 项 → ${result.archived_to}`, 10000, "info");
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "归档";
+    showError(error.message, 8000);
+  }
+  await refresh();
 }
 
 async function loadLog(jobId, resetScroll) {

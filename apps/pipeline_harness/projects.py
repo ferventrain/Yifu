@@ -13,13 +13,94 @@ records/views plus a few small files in the sample dir:
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 from pipeline_modules.harness.jsonio import read_json, utc_now_iso, write_json_atomic
+from pipeline_modules.harness.progress import planned_step_names
 
 NOTES_FILENAME = "pm_project.json"
 NOTES_SCHEMA_VERSION = "1"
+
+# ------------------------------------------------------------- archive (归档)
+#
+# Archive = strip the heavy intermediates from a finished sample, then move
+# the folder under <root>/_archived. Deleted: zarr stores (v2 group .zgroup /
+# v2 array .zarray / v3 zarr.json markers at the store root), completion
+# markers (*.done.json), raw ims/tiff, and the transforms folder. Kept:
+# result*/visualization* (deliverables), qc (复盘 evidence, tiny), and every
+# small file (config, notes, manifests, logs).
+
+ARCHIVE_DIRNAME = "_archived"
+ARCHIVE_KEEP_DIR_PREFIXES = ("result", "visualization")
+ARCHIVE_TRANSFORMS_DIRNAME = "transforms"
+_ARCHIVE_ZARR_MARKERS = (".zarray", ".zgroup", "zarr.json")
+_ARCHIVE_DELETE_FILE_SUFFIXES = (".ims", ".tiff", ".tif")
+_ARCHIVE_DELETE_MARKER_SUFFIXES = (".done.json",)
+
+
+def _is_zarr_store(path: Path) -> bool:
+    return path.is_dir() and any((path / marker).exists() for marker in _ARCHIVE_ZARR_MARKERS)
+
+
+def _plan_archive_deletions(sample_dir: Path) -> list[str]:
+    """Relative names (dirs with a trailing /) that archive would delete."""
+    planned: list[str] = []
+    for entry in sorted(sample_dir.iterdir()):
+        name = entry.name
+        if entry.is_dir():
+            if any(name.startswith(prefix) for prefix in ARCHIVE_KEEP_DIR_PREFIXES):
+                continue
+            if _is_zarr_store(entry) or name == ARCHIVE_TRANSFORMS_DIRNAME:
+                planned.append(f"{name}/")
+            continue
+        low = name.lower()
+        if low.endswith(_ARCHIVE_DELETE_MARKER_SUFFIXES) or low.endswith(_ARCHIVE_DELETE_FILE_SUFFIXES):
+            planned.append(name)
+    return planned
+
+
+def archive_sample(sample_dir: Path, archive_root: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
+    """Delete heavy intermediates in-place, then move the sample to _archived.
+
+    ``dry_run=True`` only reports what would be deleted; nothing is removed
+    and the folder stays put (used for the confirm dialog's file list).
+    """
+    planned = _plan_archive_deletions(sample_dir)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "would_delete": planned,
+            "deleted_count": len(planned),
+        }
+    dest_root = (
+        Path(archive_root) if archive_root is not None else sample_dir.parents[1] / ARCHIVE_DIRNAME
+    )
+    deleted: list[str] = []
+    for entry in sorted(sample_dir.iterdir()):
+        name = entry.name
+        if entry.is_dir():
+            if any(name.startswith(prefix) for prefix in ARCHIVE_KEEP_DIR_PREFIXES):
+                continue
+            if _is_zarr_store(entry) or name == ARCHIVE_TRANSFORMS_DIRNAME:
+                shutil.rmtree(entry)
+                deleted.append(f"{name}/")
+            continue
+        low = name.lower()
+        if low.endswith(_ARCHIVE_DELETE_MARKER_SUFFIXES) or low.endswith(_ARCHIVE_DELETE_FILE_SUFFIXES):
+            entry.unlink()
+            deleted.append(name)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    dest = dest_root / sample_dir.name
+    if dest.exists():
+        dest = dest_root / f"{sample_dir.name}_arch_{utc_now_iso().replace('-', '').replace(':', '').replace('T', '_')[:15]}"
+    shutil.move(str(sample_dir), str(dest))
+    return {
+        "archived_to": str(dest),
+        "deleted": deleted,
+        "deleted_count": len(deleted),
+    }
 
 _AGGREGATE_RANK = {
     "running": 0,
@@ -52,20 +133,21 @@ def _norm_key(path_value: str) -> str:
     return str(path_value).replace("\\", "/").rstrip("/").lower()
 
 
-def read_project_notes(sample_dir: Path) -> dict[str, Any] | None:
-    payload = read_json(sample_dir / NOTES_FILENAME, default=None)
+def read_project_notes(project_dir: Path) -> dict[str, Any] | None:
+    """Project-level notes live at the batch dir: <batch>/pm_project.json."""
+    payload = read_json(Path(project_dir) / NOTES_FILENAME, default=None)
     return payload if isinstance(payload, dict) else None
 
 
 def write_project_notes(
-    sample_dir: Path,
+    project_dir: Path,
     *,
     requirements: str | None = None,
     retro: str | None = None,
     append_note: str | None = None,
 ) -> dict[str, Any]:
-    """Create/update ``<sample>/pm_project.json`` (the notes writer)."""
-    path = sample_dir / NOTES_FILENAME
+    """Create/update ``<batch>/pm_project.json`` (the notes writer)."""
+    path = Path(project_dir) / NOTES_FILENAME
     state = read_json(path, default=None) or {}
     if not isinstance(state, dict):
         state = {}
@@ -707,7 +789,6 @@ def group_into_batches(
         ][:20]
 
         sample_path = Path(project["sample_dir"])
-        project["notes"] = read_project_notes(sample_path)
         project["configs"] = list_sample_configs(sample_path)
         project["last_manifest"] = latest_run_manifest_summary(sample_path)
         project["anomaly"] = _sample_anomaly(sample_path)
@@ -722,6 +803,7 @@ def group_into_batches(
                 "under_active": bool(active_key) and (batch_key == active_key or batch_key.startswith(active_key.rstrip("/") + "/")),
                 # priority lives on the PROJECT (batch), not the sample
                 "priority": priority_map.get(batch_key),
+                "notes": read_project_notes(batch_dir),
                 "projects": [],
             },
         )
@@ -757,20 +839,51 @@ def group_into_batches(
             return "failed"
         return "waiting"  # idle / cancelled / never run
 
+    def _remaining_for_running(project: dict[str, Any]) -> float | None:
+        """Remaining time for a running sample = sum of the HISTORICAL step
+        medians for every pipeline step it has NOT finished yet (steps from
+        its current one onward). Deliberately ignores the dynamic ETA — that
+        reflects one inner sub-step (downsample/upsample inside a module) and
+        swings wildly. Returns None when the step history can't say."""
+        view = project.get("latest_full_view") or {}
+        progress = view.get("progress") or {}
+        step_index = int(progress.get("step_index") or 0)
+        steps = progress.get("steps")
+        if step_index <= 0 or not isinstance(steps, list) or not steps:
+            return None
+        cfg = None
+        for run in project["runs"]:
+            cfg = _read_config_cached(run.get("config_path"))
+            if cfg:
+                break
+        planned = planned_step_names(cfg)
+        names = [str(s.get("name") or "") for s in steps if isinstance(s, dict)]
+        remaining = 0.0
+        known = 0
+        for idx in range(step_index, len(planned) + 1):
+            name = planned[idx - 1] if idx - 1 < len(planned) else (names[idx - 1] if idx - 1 < len(names) else "")
+            median = _median(timing_history.get(name) or [])
+            if median:
+                remaining += median
+                known += 1
+        if known == 0:
+            return None
+        return remaining
+
     for batch in batches.values():
         counts = {"done": 0, "running": 0, "failed": 0, "waiting": 0}
         remaining = 0.0
         has_remaining = False
         for project in batch["projects"]:
-            counts[_sample_outcome(project)] += 1
-            if project.get("active_run_id"):
-                eta = ((project.get("latest_full_view") or {}).get("eta")) or {}
-                eta_seconds = eta.get("total_remaining_s") or eta.get("current_step_remaining_s")
-                if eta_seconds:
-                    remaining += float(eta_seconds)
+            outcome = _sample_outcome(project)
+            counts[outcome] += 1
+            if outcome == "running":
+                step_remaining = _remaining_for_running(project)
+                if step_remaining is not None:
+                    remaining += step_remaining
                     has_remaining = True
                     continue
-            if _sample_outcome(project) != "done":
+            if outcome != "done":
                 estimate = project.get("estimate") or {}
                 if estimate.get("seconds"):
                     remaining += float(estimate["seconds"])

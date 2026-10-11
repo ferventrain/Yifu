@@ -80,11 +80,12 @@ def test_projects_notes_post_and_roundtrip(analysis_home: Path, monkeypatch: pyt
     assert result["notes"]["requirements"] == "OT 组 cfos 定量"
     assert result["notes"]["log"][0]["text"] == "首次提交"
 
-    # notes surface in the projects payload
+    # notes surface in the projects payload — at the BATCH (project) level
     payload = monitor.api_projects()
-    project = payload["batches"][0]["projects"][0]
-    assert project["notes"]["requirements"] == "OT 组 cfos 定量"
-    assert project["notes"]["log"][0]["text"] == "首次提交"
+    batch = payload["batches"][0]
+    assert batch["notes"]["requirements"] == "OT 组 cfos 定量"
+    assert batch["notes"]["log"][0]["text"] == "首次提交"
+    assert "notes" not in batch["projects"][0] or batch["projects"][0].get("notes") is None
 
     # paths outside the analysis root are rejected
     with pytest.raises(Exception):
@@ -135,3 +136,107 @@ def test_projects_includes_manifest_summary(analysis_home: Path, monkeypatch: py
     project = payload["batches"][0]["projects"][0]
     assert project["last_manifest"]["module"] == "registration.ANTs_registration"
     assert project["last_manifest"]["git_commit"].startswith("abcdef")
+
+
+# ---------------------------------------------------------------- archive (归档)
+
+
+def _make_archivable_sample(root: Path, name: str = "sample") -> Path:
+    """A finished sample shaped like real production folders: v2 GROUP zarr
+    stores (root .zgroup + 0/.zarray, the layout archive must detect), a
+    completion marker, raw ims, transforms, and kept deliverables."""
+    sample = root / name
+    (sample / "ch1.zarr" / "0").mkdir(parents=True)
+    (sample / "ch1.zarr" / ".zgroup").write_text("{}", encoding="utf-8")
+    (sample / "ch1.zarr" / "0" / ".zarray").write_text("{}", encoding="utf-8")
+    (sample / "atlas_label_hemisphere.zarr").mkdir()
+    (sample / "atlas_label_hemisphere.zarr" / ".zgroup").write_text("{}", encoding="utf-8")
+    (sample / "transforms").mkdir()
+    (sample / "raw.ims").write_text("x", encoding="utf-8")
+    (sample / "ch1.zarr.done.json").write_text("{}", encoding="utf-8")
+    (sample / "config.json").write_text(
+        json.dumps({"input": {"channels": {"signal": "1", "registration": "0"}}}), encoding="utf-8"
+    )
+    (sample / "results").mkdir()
+    (sample / "results" / "stats.xlsx").write_text("x", encoding="utf-8")
+    (sample / "qc").mkdir()
+    (sample / "qc" / "check.png").write_text("x", encoding="utf-8")
+    return sample
+
+
+def test_archive_deletes_v2_group_zarr_stores(tmp_path: Path):
+    from apps.pipeline_harness.projects import archive_sample
+
+    sample = _make_archivable_sample(tmp_path)
+    summary = archive_sample(sample, tmp_path / "_archived")
+
+    # the production layout (group store) IS detected and deleted
+    assert "ch1.zarr/" in summary["deleted"]
+    assert "atlas_label_hemisphere.zarr/" in summary["deleted"]
+    assert "transforms/" in summary["deleted"]
+    assert "raw.ims" in summary["deleted"]
+    assert "ch1.zarr.done.json" in summary["deleted"]  # .done.json suffix matches
+    # deliverables kept and the folder moved
+    dest = tmp_path / "_archived" / "sample"
+    assert (dest / "results" / "stats.xlsx").exists()
+    assert (dest / "qc" / "check.png").exists()
+    assert (dest / "config.json").exists()
+    assert not sample.exists()
+
+
+def test_archive_dry_run_touches_nothing(tmp_path: Path):
+    from apps.pipeline_harness.projects import archive_sample
+
+    sample = _make_archivable_sample(tmp_path)
+    summary = archive_sample(sample, tmp_path / "_archived", dry_run=True)
+
+    assert summary["dry_run"] is True
+    assert summary["deleted_count"] == len(summary["would_delete"]) == 5
+    # nothing was deleted and the folder did not move
+    assert (sample / "ch1.zarr" / ".zgroup").exists()
+    assert (sample / "transforms").exists()
+    assert not (tmp_path / "_archived").exists()
+
+
+def test_archive_endpoint_refuses_unfinished_jobs(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("fastapi")
+    sample = _make_archivable_sample(analysis_home)
+    store = ActiveStore()
+    job = store.add_job(sample)
+    job["status"] = "running"
+    store.save_job(job)
+
+    import importlib
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    monkeypatch.setattr(monitor, "store", store)
+
+    with pytest.raises(Exception):
+        monitor.api_project_archive(monitor.ProjectArchiveBody(sample_dir=str(sample)))
+
+
+def test_archive_endpoint_dry_run_and_full_roundtrip(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("fastapi")
+    sample = _make_archivable_sample(analysis_home)
+    store = ActiveStore()
+    job = store.add_job(sample)
+    job["status"] = "done"
+    store.save_job(job)
+
+    import importlib
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    monkeypatch.setattr(monitor, "store", store)
+
+    preview = monitor.api_project_archive(
+        monitor.ProjectArchiveBody(sample_dir=str(sample), dry_run=True)
+    )
+    assert preview["dry_run"] is True
+    assert "ch1.zarr/" in preview["would_delete"]
+    assert (sample / "ch1.zarr").exists()  # preview deleted nothing
+
+    result = monitor.api_project_archive(monitor.ProjectArchiveBody(sample_dir=str(sample)))
+    assert "ch1.zarr/" in result["deleted"]
+    assert (analysis_home / "_archived" / "sample" / "config.json").exists()
+    # job records for the archived sample are gone
+    assert all(str(j.get("sample_dir")) != str(sample) for j in store.list_jobs())

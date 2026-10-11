@@ -66,6 +66,38 @@ class _WrapFiles:
         if phase:
             payload["phase"] = str(phase)
             payload.setdefault("phase_started_at", utc_now_iso())
+        self._merge_write(payload)
+
+    def write_steps(self, steps: list[str], current_index: int | None, failed: bool = False) -> None:
+        """Write the coarse-step checklist for the stepper UI.
+
+        ``current_index`` is 1-based and marks the step the child is IN
+        (i < current are done, == current is active/failed, > pending).
+        ``current_index=None`` + ``failed`` marks the whole task failed;
+        without ``failed`` it marks all done.
+        """
+        if failed and current_index is None:
+            states = ["failed"] * len(steps)
+        elif current_index is None:
+            states = ["done"] * len(steps)
+        else:
+            states = []
+            for i in range(1, len(steps) + 1):
+                if i < current_index:
+                    states.append("done")
+                elif i == current_index:
+                    states.append("failed" if failed else "active")
+                else:
+                    states.append("pending")
+        self._merge_write(
+            {
+                "steps": list(steps),
+                "current_step": current_index,
+                "step_states": states,
+            }
+        )
+
+    def _merge_write(self, payload: dict[str, Any]) -> None:
         try:
             # merge: keep a previously stamped phase_started_at so the unit
             # ETA does not restart on every line
@@ -80,14 +112,30 @@ class _WrapFiles:
             pass
 
 
-def _tail_stream(stream, log_handle, files: _WrapFiles) -> None:
-    """Tee child output into the log file and harvest PROGRESS lines."""
+STEP_LINE_RE = re.compile(r"^\s*STEP\s+(\d+)(?:/(\d+))?(?:\s+(.+?))?\s*$", re.IGNORECASE)
+
+
+def _tail_stream(stream, log_handle, files: _WrapFiles, steps: list[str] | None = None) -> None:
+    """Tee child output into the log file; harvest PROGRESS and STEP lines."""
+    current_step = 1 if steps else None
     for raw in iter(stream.readline, ""):
         log_handle.write(raw)
         log_handle.flush()
         match = PROGRESS_LINE_RE.match(raw)
         if match:
             files.write_progress(int(match.group(1)), int(match.group(2)), (match.group(3) or "").strip())
+        elif steps:
+            step_match = STEP_LINE_RE.match(raw)
+            if step_match:
+                try:
+                    current_step = max(1, min(len(steps), int(step_match.group(1))))
+                except ValueError:
+                    continue
+                phase = (step_match.group(3) or steps[current_step - 1]).strip()
+                files.write_steps(steps, current_step)
+                files.write_progress(None, None, phase)
+    # NOTE: the terminal stamp (all-done / current-failed) is written by
+    # run_wrap after the exit code is known — nothing to do here.
     stream.close()
 
 
@@ -103,9 +151,13 @@ def run_wrap(args: argparse.Namespace) -> int:
     store.ensure_layout()
     sample = store.validate_sample_dir(args.sample_dir)
 
+    steps = [s.strip() for s in (args.steps or "").split(",") if s.strip()] or None
+
     files = _WrapFiles(store.active)
     files.write_status(f"RUNNING {args.title or 'wrapped command'}")
     files.write_progress(0, 0, args.title or "starting")
+    if steps:
+        files.write_steps(steps, 1)
 
     env = os.environ.copy()
     # Children that use progress.report()/report_child_units write unit
@@ -148,7 +200,7 @@ def run_wrap(args: argparse.Namespace) -> int:
     job_id = str(record["id"])
     print(json.dumps({"wrap": {"job_id": job_id, "log": str(files.log)}}, ensure_ascii=False), flush=True)
 
-    reader = threading.Thread(target=_tail_stream, args=(proc.stdout, log_handle, files), daemon=True)
+    reader = threading.Thread(target=_tail_stream, args=(proc.stdout, log_handle, files, steps), daemon=True)
     reader.start()
 
     def _kill_tree() -> None:
@@ -185,15 +237,27 @@ def run_wrap(args: argparse.Namespace) -> int:
 
     if cancelled:
         files.write_status("CANCELLED by user")
+        if steps:
+            files.write_steps(steps, None, failed=True)
         cancel_flag_path(job_id, store.active).unlink(missing_ok=True)
         _sync_terminal_record()
         print(json.dumps({"wrap": {"job_id": job_id, "status": "cancelled"}}), flush=True)
         return 130
     if returncode == 0:
         files.write_status("ALL DONE")
+        if steps:
+            files.write_steps(steps, None, failed=False)
         _sync_terminal_record()
         print(json.dumps({"wrap": {"job_id": job_id, "status": "done"}}), flush=True)
         return 0
+    # failure: mark the step the child last reported as failed. A `STEP n`
+    # line means step n STARTED; the failed one is n, and n-1..1 are done.
+    if steps:
+        from pipeline_modules.harness.jsonio import read_json
+
+        state = read_json(files.progress, default={}) or {}
+        last_step = state.get("current_step")
+        files.write_steps(steps, int(last_step) if last_step else 1, failed=True)
     files.write_status(f"FAILED exit code {returncode}")
     _sync_terminal_record()
     print(json.dumps({"wrap": {"job_id": job_id, "status": "failed", "exit_code": int(returncode or 1)}}), flush=True)
@@ -203,6 +267,12 @@ def run_wrap(args: argparse.Namespace) -> int:
 def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--sample-dir", required=True, help="Sample directory the command belongs to")
     parser.add_argument("--title", default="", help="Job title shown in the monitor")
+    parser.add_argument(
+        "--steps",
+        default="",
+        help="Comma-separated coarse step names (e.g. '下载,配准,写ims'); the child "
+        "prints 'STEP <n>' lines to advance the stepper in the monitor",
+    )
     parser.add_argument("--step-total", type=int, default=0, help="Optional step count for the progress bar denominator")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command after '--'")
     return parser

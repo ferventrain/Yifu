@@ -355,12 +355,7 @@ main {
   border-style: dashed;
 }
 
-.batch.nested {
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  margin: 0.4rem 0.9rem 0.9rem;
-}
+.batch.other-root .batch-name { color: #5b6673; }
 
 /* 样本行：清单而非卡片 */
 
@@ -542,35 +537,6 @@ main {
 }
 
 .notes textarea:focus {
-  outline: none;
-  border-color: var(--run);
-  box-shadow: 0 0 0 3px rgba(43, 127, 212, 0.15);
-}
-
-.note-log p {
-  margin: 0.25rem 0 0;
-  font-size: 0.76rem;
-  color: var(--muted);
-}
-
-.quick-note {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 0.45rem;
-}
-
-.quick-note input {
-  flex: 1;
-  padding: 0.32rem 0.55rem;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  font: inherit;
-  font-size: 0.84rem;
-  background: #fff;
-  color: var(--text);
-}
-
-.quick-note input:focus {
   outline: none;
   border-color: var(--run);
   box-shadow: 0 0 0 3px rgba(43, 127, 212, 0.15);
@@ -1038,3 +1004,21 @@ dialog::backdrop { background: rgba(16, 24, 34, 0.35); }
 .batch.has-p1 { border-left: 3px solid var(--warn); }
 .batch.has-p2 { border-left: 3px solid var(--run); }
 .batch.has-p3 { border-left: 3px solid #6d7a87; }
+
+/* stepper: coarse step dots */
+.stepper { display: flex; align-items: center; gap: 0; margin-top: 0.6rem; padding: 0.15rem 0; }
+.step-dot { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--line); background: var(--panel); cursor: default; flex-shrink: 0; }
+.step-dot.done { background: var(--ok); border-color: var(--ok); }
+.step-dot.active { background: #fff; border-color: var(--run); box-shadow: 0 0 0 3px rgba(43, 127, 212, 0.2); animation: led 1.8s ease-in-out infinite; }
+.step-dot.pending { background: var(--panel-3); border-color: var(--line); }
+.step-dot.failed { background: var(--bad); border-color: var(--bad); }
+.step-link { flex: 1 1 auto; height: 2px; background: var(--line); min-width: 10px; margin: 0 4px; }
+.step-link.done { background: var(--ok); }
+.step-link.active { background: var(--run); }
+.step-link.failed { background: var(--bad); }
+
+/* batch notes block */
+.batch-notes { padding: 0.6rem 1.1rem 0.2rem; border-bottom: 1px solid var(--line-soft); background: rgba(246, 248, 250, 0.5); display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; align-items: flex-start; }
+.batch-notes .notes { border-top: none; margin-top: 0; padding-top: 0; flex: 1 1 320px; min-width: 260px; }
+.batch-notes .quick-note { flex: 1 1 100%; margin-top: 0.1rem; }
+.batch-notes .note-log { flex: 1 1 100%; }
