@@ -427,54 +427,59 @@ def label_boundary_mask(label_slice: np.ndarray) -> np.ndarray:
     return mask
 
 
-def _skeleton_paths(skel: np.ndarray) -> list[np.ndarray]:
-    """Split a 1-px boolean skeleton into (N, 2) row/col polylines.
+def _label_border_chains(labels: np.ndarray) -> list[np.ndarray]:
+    """Chain inter-pixel border edges of a label slice into polylines.
 
-    Junction pixels (3+ neighbors) are removed first so every remaining
-    connected component is a simple path or loop; each is walked end to end.
+    Every unit edge between two differing neighboring labels belongs to exactly
+    one physical border, so chaining the edges yields exactly one line per
+    shared border (no per-region double draw). Chains break only at junction
+    corners (where 3+ regions meet on one pixel corner) or at the slice edge,
+    and every junction corner is one exact coordinate shared by all incident
+    chains -- pinning chain endpoints there makes the network meet in a point.
+    Coordinates are (row, col) on the pixel-corner lattice.
     """
-    from scipy import ndimage as ndi
+    adjacency: dict[tuple[int, int], set[tuple[int, int]]] = {}
 
-    s = np.asarray(skel, dtype=bool)
-    if not s.any():
-        return []
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    kernel[1, 1] = 0
-    neighbor_count = ndi.convolve(s.astype(np.uint8), kernel, mode="constant")
-    junction = s & (neighbor_count >= 3)
-    comp_labels, n_comp = ndi.label(s & ~junction, structure=np.ones((3, 3), dtype=bool))
+    def add_edge(a: tuple[int, int], b: tuple[int, int]) -> None:
+        adjacency.setdefault(a, set()).add(b)
+        adjacency.setdefault(b, set()).add(a)
 
-    def neighbors8(pt: tuple[int, int]) -> list[tuple[int, int]]:
-        y, x = pt
-        out = []
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                q = (y + dy, x + dx)
-                if 0 <= q[0] < s.shape[0] and 0 <= q[1] < s.shape[1] and s[q]:
-                    out.append(q)
-        return out
+    for r, c in np.argwhere(labels[:, :-1] != labels[:, 1:]):
+        add_edge((int(r), int(c) + 1), (int(r) + 1, int(c) + 1))
+    for r, c in np.argwhere(labels[:-1, :] != labels[1:, :]):
+        add_edge((int(r) + 1, int(c)), (int(r) + 1, int(c) + 1))
 
-    paths: list[np.ndarray] = []
-    for ci in range(1, n_comp + 1):
-        pts = set(map(tuple, np.argwhere(comp_labels == ci)))
-        if not pts:
-            continue
-        ends = [p for p in pts if sum(1 for q in neighbors8(p) if q in pts) == 1]
-        cur = ends[0] if ends else next(iter(pts))
-        path = [cur]
-        pts.discard(cur)
-        while pts:
-            nxt = [q for q in neighbors8(cur) if q in pts]
-            if not nxt:
+    used: set[frozenset] = set()
+
+    def walk(start: tuple[int, int], first: tuple[int, int]) -> list[tuple[int, int]]:
+        chain = [start, first]
+        used.add(frozenset((start, first)))
+        prev, cur = start, first
+        while True:
+            candidates = [q for q in adjacency[cur] if frozenset((cur, q)) not in used]
+            if not candidates or cur == start:
                 break
-            cur = nxt[0]
-            pts.discard(cur)
-            path.append(cur)
-        if len(path) >= 2:
-            paths.append(np.asarray(path, dtype=np.float64))
-    return paths
+            nxt = candidates[0]
+            used.add(frozenset((cur, nxt)))
+            prev, cur = cur, nxt
+            chain.append(cur)
+            if len(adjacency[cur]) != 2:
+                break
+        return chain
+
+    chains: list[list[tuple[int, int]]] = []
+    for corner in sorted(c for c, nb in adjacency.items() if len(nb) != 2):
+        for nxt in sorted(adjacency[corner]):
+            if frozenset((corner, nxt)) not in used:
+                chains.append(walk(corner, nxt))
+    all_edges = {
+        frozenset((a, b)) for a, neighbors in adjacency.items() for b in neighbors
+    }
+    while all_edges - used:  # pure cycles: island regions with no junction
+        edge = next(iter(all_edges - used))
+        a, b = tuple(edge)
+        chains.append(walk(a, b))
+    return [np.asarray(chain, dtype=np.float64) for chain in chains if len(chain) >= 2]
 
 
 def label_boundary_lines_mm(
@@ -483,54 +488,153 @@ def label_boundary_lines_mm(
     row_vox_um: float,
     col_vox_um: float,
     upsample: int = 5,
-    smoothing: float = 1.2,
+    smoothing: float = 1.6,
+    min_area_mm2: float = 0.5,
 ) -> list[np.ndarray]:
-    """Single smooth centerline per region boundary of a coronal label slice, in mm.
+    """Smooth region-boundary polylines of a coronal label slice, in display mm.
 
     Rows are DV and cols are ML on the slice; the returned (N, 2) arrays hold
     (x=ML mm, y=DV mm) with the origin at the slice corner, ready to draw on an
     imshow with extent (0, W, H, 0).
 
-    Per-region contour extraction draws every shared border twice (once per
-    adjoining region). Instead the boundary band -- voxels where the label
-    changes between neighbors -- is upsampled with linear interpolation,
-    gaussian-blurred (rounding the 25 um label staircase, the heatmap slice
-    renderer recipe) and skeletonized, so each border yields exactly one
-    centerline. ``smoothing`` adds a gaussian along each line in label voxels
-    (heatmap default 1.2; 0 disables).
+    One clean solid line per border: the label slice is decluttered
+    (:func:`coarsen_label_slice`), upsampled linearly onto the fine grid, and
+    its inter-pixel borders chained (:func:`_label_border_chains`) -- each
+    shared border exists exactly once and junction corners are exact shared
+    endpoints. A gaussian (``smoothing``, in label voxels; 0 disables) then
+    rounds the fine-grid staircase, with open-chain endpoints pinned so every
+    junction still meets in one point.
     """
     from scipy import ndimage as ndi
-    from skimage.morphology import skeletonize
 
     from pipeline_modules.visualization.atlas_slice import _smooth_contour
 
-    labels = np.asarray(label_slice)
-    band = label_boundary_mask(labels).astype(np.float32)
-    if not band.any():
-        return []
-    fine = ndi.zoom(band, float(upsample), order=1)
-    fine = ndi.gaussian_filter(fine, sigma=max(1.0, upsample / 4.0))
-    skel = skeletonize(fine >= 0.5)
+    labels = coarsen_label_slice(
+        np.asarray(label_slice),
+        row_vox_um=row_vox_um,
+        col_vox_um=col_vox_um,
+        min_area_mm2=min_area_mm2,
+    )
+    if upsample > 1:
+        # Nearest-neighbor: linear interpolation would fabricate intermediate
+        # label values along every border, which the crack chains would then
+        # treat as real nested regions.
+        fine = ndi.zoom(labels, float(upsample), order=0)
+        labels = fine.astype(labels.dtype, copy=False)
+
     sigma_fine = float(smoothing) * float(upsample)
     min_pts = max(8, 2 * upsample)
-    lines = []
-    for path in _skeleton_paths(skel):
-        if len(path) < min_pts:
-            continue
-        if sigma_fine > 0:
-            path = _smooth_contour(path, sigma_fine)
-        lines.append(np.column_stack([path[:, 1], path[:, 0]]))  # (row, col) -> (x, y)
     x_mm = col_vox_um / (1000.0 * upsample)
     y_mm = row_vox_um / (1000.0 * upsample)
-    max_x = (labels.shape[1] - 1) * col_vox_um / 1000.0
-    max_y = (labels.shape[0] - 1) * row_vox_um / 1000.0
-    scaled = [np.asarray(ln, dtype=np.float64) * (x_mm, y_mm) for ln in lines]
-    # Smoothing can push edge-running lines a fraction of a fine voxel outside
+    lines = []
+    for chain in _label_border_chains(labels):
+        if len(chain) < min_pts:
+            continue
+        closed = float(np.linalg.norm(chain[0] - chain[-1])) < 1.5
+        if sigma_fine > 0:
+            smoothed = _smooth_contour(chain, sigma_fine)
+            if not closed:
+                # Pin the shared junction/slice-edge endpoints.
+                smoothed[0], smoothed[-1] = chain[0], chain[-1]
+            chain = smoothed
+        lines.append(np.column_stack([chain[:, 1], chain[:, 0]]) * (x_mm, y_mm))
+    max_x = labels.shape[1] * col_vox_um / 1000.0
+    max_y = labels.shape[0] * row_vox_um / 1000.0
+    # Smoothing can push edge-running chains a fraction of a fine voxel outside
     # the slice; clamp so every line stays drawable in-extent.
-    return [np.clip(ln, (0.0, 0.0), (max_x, max_y)) for ln in scaled]
+    return [np.clip(ln, (0.0, 0.0), (max_x, max_y)) for ln in lines]
 
 
 MULTI_CHANNEL_PALETTE = ("green", "magenta", "cyan", "yellow", "red", "blue", "orange")
+
+
+@dataclass(frozen=True)
+class _StructureTree:
+    parents: dict[int, int]
+    known_ids: frozenset[int]
+
+
+_STRUCTURE_TREE_CACHE: _StructureTree | None = None
+
+
+def _structure_tree() -> _StructureTree:
+    """Allen structure parent map from the repo's structures csv (cached)."""
+    global _STRUCTURE_TREE_CACHE
+    if _STRUCTURE_TREE_CACHE is None:
+        import csv
+
+        parents: dict[int, int] = {}
+        known: set[int] = set()
+        csv_path = Path(__file__).resolve().parents[2] / "allen_mouse_25um_structures.csv"
+        if csv_path.exists():
+            with open(csv_path, encoding="utf-8-sig") as handle:
+                for row in csv.DictReader(handle):
+                    sid = int(row["id"])
+                    known.add(sid)
+                    raw = row.get("parent_structure_id") or ""
+                    if raw:
+                        parents[sid] = int(float(raw))
+        known.discard(997)  # root node is not a drawable region
+        _STRUCTURE_TREE_CACHE = _StructureTree(parents=parents, known_ids=frozenset(known))
+    return _STRUCTURE_TREE_CACHE
+
+
+def coarsen_label_slice(
+    label_slice: np.ndarray,
+    *,
+    row_vox_um: float,
+    col_vox_um: float,
+    min_area_mm2: float = 0.5,
+) -> np.ndarray:
+    """Declutter a label slice before boundary extraction.
+
+    Two cleanups, both needed for a readable atlas cross-section:
+
+    * The Allen annotation carries scattered "unassigned"/root labels (thin
+      slivers fragmenting e.g. the corpus callosum). Every id outside the
+      structure csv is replaced by the nearest structured label.
+    * Regions smaller than ``min_area_mm2`` merge into their parent structure
+      (iteratively up the tree), so tiny parcels stop slicing large tracts into
+      ribbons; 0 disables the merge.
+    """
+    from collections import Counter
+
+    from scipy import ndimage as ndi
+
+    labels = np.asarray(label_slice)
+    tree = _structure_tree()
+    if tree.known_ids:
+        valid = np.isin(labels, sorted(tree.known_ids))
+        unassigned = (labels != 0) & ~valid
+        if unassigned.any() and valid.any():
+            # EDT indices of the nearest valid (zero-valued) pixel fill each sliver.
+            _, (ri, ci) = ndi.distance_transform_edt(~valid, return_indices=True)
+            labels = np.where(unassigned, labels[ri, ci], labels)
+    if min_area_mm2 <= 0:
+        return labels
+
+    vox_mm2 = row_vox_um * col_vox_um / 1.0e6
+    min_vox = min_area_mm2 / max(vox_mm2, 1e-12)
+    uniq = [int(v) for v in np.unique(labels) if v != 0]
+    base_area = {v: int(np.count_nonzero(labels == v)) for v in uniq}
+    mapping = {v: v for v in uniq}
+    while True:
+        areas: Counter[int] = Counter()
+        for v, area in base_area.items():
+            areas[mapping[v]] += area
+        changed = False
+        for v in list(mapping):
+            merged = mapping[v]
+            if areas.get(merged, 0) < min_vox:
+                parent = tree.parents.get(merged, 0)
+                if parent and parent != 997:  # never merge up into the root node
+                    mapping[v] = parent
+                    changed = True
+        if not changed:
+            break
+    uniq2, inverse = np.unique(labels, return_inverse=True)
+    remap = np.array([mapping.get(int(v), int(v)) for v in uniq2], dtype=labels.dtype)
+    return remap[inverse].reshape(labels.shape)
 
 
 def resolve_channel_cmaps(n_channels: int, cmaps: list[str] | str | None) -> list[str]:
@@ -571,15 +675,29 @@ def _channel_colormap(name: str):
         return LinearSegmentedColormap.from_list(name, [(0.0, 0.0, 0.0), tuple(rgb)])
 
 
-def _compose_rgb(mips: list[np.ndarray], cmaps: list[str], vmaxs: list[float]) -> np.ndarray:
-    """Additive false-color composite of per-channel MIPs, clipped to [0, 1]."""
+def _compose_rgb(
+    mips: list[np.ndarray],
+    cmaps: list[str],
+    vmaxs: list[float],
+    zero_color: tuple[float, float, float] | None = None,
+) -> np.ndarray:
+    """Additive false-color composite of per-channel MIPs, clipped to [0, 1].
+
+    With ``zero_color``, pixels where every channel is exactly zero (outside
+    the specimen) paint in that color instead of the colormaps' zero entry.
+    """
     rgb = None
+    zero_mask = np.ones(mips[0].shape, dtype=bool)
     for mip, cmap_name, vmax in zip(mips, cmaps, vmaxs):
         cmap = _channel_colormap(cmap_name)
         normed = np.clip(mip.astype(np.float32) / max(float(vmax), 1e-6), 0.0, 1.0)
         layer = np.asarray(cmap(normed), dtype=np.float32)[..., :3]
         rgb = layer if rgb is None else rgb + layer
-    return np.clip(rgb, 0.0, 1.0)
+        zero_mask &= mip == 0
+    rgb = np.clip(rgb, 0.0, 1.0)
+    if zero_color is not None:
+        rgb[zero_mask] = np.asarray(zero_color, dtype=np.float32)
+    return rgb
 
 
 def _draw_boundary_lines(
@@ -611,6 +729,33 @@ def _draw_boundary_lines(
         antialiaseds=True,
     )
     ax.add_collection(collection)
+
+
+def _clip_polylines_x(lines: list[np.ndarray], x_max: float) -> list[np.ndarray]:
+    """Keep the x <= x_max part of each polyline, splitting segments at the cut."""
+    result: list[np.ndarray] = []
+    for line in lines:
+        pts: list[tuple[float, float]] = []
+
+        def flush() -> None:
+            if len(pts) >= 2:
+                result.append(np.asarray(pts, dtype=np.float64))
+            pts.clear()
+
+        prev = None
+        for p in line:
+            if p[0] <= x_max:
+                if prev is not None and prev[0] > x_max:
+                    t = (x_max - prev[0]) / (p[0] - prev[0])
+                    pts.append((x_max, prev[1] + t * (p[1] - prev[1])))
+                pts.append((float(p[0]), float(p[1])))
+            elif prev is not None and prev[0] <= x_max:
+                t = (x_max - prev[0]) / (p[0] - prev[0])
+                pts.append((x_max, prev[1] + t * (p[1] - prev[1])))
+                flush()
+            prev = p
+        flush()
+    return result
 
 
 def resolve_display_vmax(mip: np.ndarray, *, percentile: float, explicit: float | None) -> float:
@@ -980,7 +1125,7 @@ def render_bregma_png(
     cmap: str = "gray",
     boundary_lines: list[np.ndarray] | None = None,
     boundary_color: str = "white",
-    boundary_linewidth: float = 0.35,
+    boundary_linewidth: float = 0.8,
     boundary_style: str = "dashed",
     atlas_slice_image: np.ndarray | None = None,
     pool_factor: int = 1,
@@ -1064,13 +1209,13 @@ def render_bregma_png(
     return output_path
 
 
-def _draw_scale_bar(ax, extent_ml_mm: float, extent_dv_mm: float) -> None:
+def _draw_scale_bar(ax, extent_ml_mm: float, extent_dv_mm: float, color: str = "white") -> None:
     bar_mm = 1.0 if extent_ml_mm >= 2.0 else 0.5
     x1 = extent_ml_mm * 0.96
     x0 = x1 - bar_mm
     y = extent_dv_mm * 0.95
-    ax.plot([x0, x1], [y, y], color="white", linewidth=2.5)
-    ax.text((x0 + x1) / 2.0, y - extent_dv_mm * 0.02, f"{bar_mm:g} mm", color="white",
+    ax.plot([x0, x1], [y, y], color=color, linewidth=2.5)
+    ax.text((x0 + x1) / 2.0, y - extent_dv_mm * 0.02, f"{bar_mm:g} mm", color=color,
             ha="center", va="bottom", fontsize=8)
 
 
@@ -1089,8 +1234,9 @@ def render_atlas_slab_png(
     mapper_info: str,
     boundary_lines: list[np.ndarray] | None = None,
     boundary_color: str = "white",
-    boundary_linewidth: float = 0.35,
+    boundary_linewidth: float = 0.8,
     boundary_style: str = "dashed",
+    bilateral: bool = False,
     flip_dv: bool = False,
     flip_ml: bool = False,
     pool_factor: int = 1,
@@ -1101,7 +1247,13 @@ def render_atlas_slab_png(
     image = _compose_rgb(mips, cmaps, vmaxs)
     image = np.flipud(image) if flip_dv else image
     image = np.fliplr(image) if flip_ml else image
+    if bilateral:
+        # Left half is a pure atlas-division schematic: blank the signal so only
+        # the white boundary lines remain; the right half keeps the raw MIP.
+        image[:, : image.shape[1] // 2] = 0.0
 
+    bg = "black"
+    fg = "white"
     n_dv, n_ap, n_ml = atlas_shape_dv_ap_ml
     extent_ml_mm = n_ml * atlas_res_um / 1000.0
     extent_dv_mm = n_dv * atlas_res_um / 1000.0
@@ -1109,14 +1261,25 @@ def render_atlas_slab_png(
     panel_h = 8.0
     fig_w = panel_h * aspect + max(panel_h * aspect * 0.35, 2.5)
     fig, ax = plt.subplots(1, 1, figsize=(fig_w, panel_h), dpi=dpi)
-    ax.set_facecolor("black")
+    ax.set_facecolor(bg)
 
     ax.imshow(
         image, extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
     )
+    half_lines = boundary_lines
+    if bilateral and boundary_lines:
+        # Annotate the display-left hemisphere only; the other half stays raw.
+        if flip_ml:
+            mirrored = [np.column_stack([extent_ml_mm - ln[:, 0], ln[:, 1]]) for ln in boundary_lines]
+            half_lines = [
+                np.column_stack([extent_ml_mm - ln[:, 0], ln[:, 1]])
+                for ln in _clip_polylines_x(mirrored, extent_ml_mm / 2.0)
+            ]
+        else:
+            half_lines = _clip_polylines_x(boundary_lines, extent_ml_mm / 2.0)
     _draw_boundary_lines(
         ax,
-        boundary_lines,
+        half_lines,
         extent_ml_mm=extent_ml_mm,
         extent_dv_mm=extent_dv_mm,
         color=boundary_color,
@@ -1125,15 +1288,16 @@ def render_atlas_slab_png(
         flip_dv=flip_dv,
         flip_ml=flip_ml,
     )
-    _draw_scale_bar(ax, extent_ml_mm, extent_dv_mm)
+    _draw_scale_bar(ax, extent_ml_mm, extent_dv_mm, color=fg)
 
     channel_summary = " + ".join(
         f"{p.stem}[{cmap}] vmax {vmax:.0f}"
         for p, cmap, vmax in zip(zarr_paths, cmaps, vmaxs)
     )
+    mode_note = "  |  bilateral: left atlas divisions, right raw MIP" if bilateral else ""
     ax.set_title(
-        f"Atlas-space slab MIP  |  bregma AP {bregma_mm:+.2f} mm  |  slab {thickness_mm:.2f} mm",
-        color="white", fontsize=11,
+        f"Atlas-space slab MIP  |  bregma AP {bregma_mm:+.2f} mm  |  slab {thickness_mm:.2f} mm{mode_note}",
+        color=fg, fontsize=11,
     )
     ax.text(
         0.5, -0.04,
@@ -1142,15 +1306,16 @@ def render_atlas_slab_png(
             f"atlas {n_dv}x{n_ap}x{n_ml} @ {atlas_res_um:g} um\n"
             f"{mapper_info}\n{channel_summary}"
         ),
-        transform=ax.transAxes, ha="center", va="top", color="0.75", fontsize=7,
+        transform=ax.transAxes, ha="center", va="top", color="0.75",
+        fontsize=7,
     )
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_color("0.4")
-    fig.patch.set_facecolor("black")
+    fig.patch.set_facecolor(bg)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=dpi, facecolor="black", bbox_inches="tight", pad_inches=0.15)
+    fig.savefig(output_path, dpi=dpi, facecolor=bg, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     return output_path
 
@@ -1169,9 +1334,11 @@ def render_bregma_mips(
     pitch_um: float = 5.0,
     cmaps: list[str] | str | None = None,
     boundary_color: str = "white",
-    boundary_linewidth: float = 0.35,
+    boundary_linewidth: float = 0.8,
     boundary_style: str = "dashed",
-    boundary_smooth: float = 1.2,
+    boundary_smooth: float = 1.6,
+    boundary_min_area_mm2: float = 0.5,
+    bilateral: bool = False,
     fixed_nii: str | Path | None = None,
     chunk_points: int = 250_000,
     bregma_index: float | None = None,
@@ -1216,6 +1383,8 @@ def render_bregma_mips(
             boundary_linewidth=boundary_linewidth,
             boundary_style=boundary_style,
             boundary_smooth=boundary_smooth,
+            boundary_min_area_mm2=boundary_min_area_mm2,
+            bilateral=bilateral,
             percentile=percentile,
             vmax=vmax,
             flip_dv=flip_dv,
@@ -1352,6 +1521,7 @@ def render_bregma_mips(
                 row_vox_um=vox_dv,
                 col_vox_um=vox_ml,
                 smoothing=boundary_smooth,
+                min_area_mm2=boundary_min_area_mm2,
             )
 
         atlas_image = None
@@ -1437,9 +1607,11 @@ def render_atlas_space_mips(
     chunk_points: int = 250_000,
     overlay_labels: bool = True,
     boundary_color: str = "white",
-    boundary_linewidth: float = 0.35,
+    boundary_linewidth: float = 0.8,
     boundary_style: str = "dashed",
-    boundary_smooth: float = 1.2,
+    boundary_smooth: float = 1.6,
+    boundary_min_area_mm2: float = 0.5,
+    bilateral: bool = False,
     percentile: float = 99.5,
     vmax: float | None = None,
     flip_dv: bool = False,
@@ -1566,6 +1738,7 @@ def render_atlas_space_mips(
                 col_vox_um=atlas_res_um,
                 upsample=boundary_upsample,
                 smoothing=boundary_smooth,
+                min_area_mm2=boundary_min_area_mm2,
             )
 
         pool_factor = 1
@@ -1574,7 +1747,8 @@ def render_atlas_space_mips(
         stem = "+".join(p.stem for p in zarr_paths)
         out_path = out_dir / (
             f"{sample_dir.name}_{stem}_atlas_bregma{bregma:+.2f}mm_"
-            f"thick{thickness_mm:.2f}mm_pitch{pitch_um:g}um_{boundary_style}.png"
+            f"thick{thickness_mm:.2f}mm_pitch{pitch_um:g}um_{boundary_style}"
+            f"{'_bilateral' if bilateral else ''}.png"
         )
         render_atlas_slab_png(
             mips,
@@ -1592,6 +1766,7 @@ def render_atlas_space_mips(
             boundary_color=boundary_color,
             boundary_linewidth=boundary_linewidth,
             boundary_style=boundary_style,
+            bilateral=bilateral,
             flip_dv=flip_dv,
             flip_ml=flip_ml,
             pool_factor=pool_factor,
@@ -1608,6 +1783,7 @@ def render_atlas_space_mips(
                 "channels": channel_infos,
                 "pool_factor": pool_factor,
                 "boundary_overlay": bool(boundary),
+                "bilateral": bilateral,
                 "output": str(out_path),
             }
         )
@@ -1679,17 +1855,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Color of the atlas region boundary overlay (default white)",
     )
     parser.add_argument(
-        "--boundary-linewidth", type=float, default=0.35,
-        help="Boundary line width in points (default 0.35)",
+        "--boundary-linewidth", type=float, default=0.8,
+        help="Boundary line width in points (default 0.8)",
     )
     parser.add_argument(
-        "--boundary-style", choices=("dashed", "solid"), default="dashed",
-        help="Boundary line style (default dashed)",
+        "--boundary-style", choices=("dashed", "solid"), default=None,
+        help="Boundary line style (default dashed; solid when --bilateral)",
     )
     parser.add_argument(
-        "--boundary-smooth", type=float, default=1.2,
+        "--boundary-smooth", type=float, default=1.6,
         help="Boundary smoothing gaussian in atlas label voxels, heatmap-style "
              "(default 1.2; 0 disables)",
+    )
+    parser.add_argument(
+        "--boundary-min-area-mm2", type=float, default=0.5,
+        help="Regions smaller than this atlas area merge into their parent structure "
+             "before boundary extraction, keeping tracts like the corpus callosum whole "
+             "(default 0.5; 0 disables)",
+    )
+    parser.add_argument(
+        "--bilateral", action="store_true",
+        help="Split at the atlas midline: display-left hemisphere shows only the atlas "
+             "boundary divisions (solid white on black), the right half is the raw MIP",
     )
     parser.add_argument(
         "--bregma-mm", required=True, type=parse_bregma_list,
@@ -1769,6 +1956,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = build_parser().parse_args(argv)
+    boundary_style = args.boundary_style or ("solid" if args.bilateral else "dashed")
     try:
         payload = render_bregma_mips(
             zarr_path=args.zarr,
@@ -1779,8 +1967,10 @@ def main(argv: list[str] | None = None) -> int:
             cmaps=args.cmap or None,
             boundary_color=args.boundary_color,
             boundary_linewidth=args.boundary_linewidth,
-            boundary_style=args.boundary_style,
+            boundary_style=boundary_style,
             boundary_smooth=args.boundary_smooth,
+            boundary_min_area_mm2=args.boundary_min_area_mm2,
+            bilateral=args.bilateral,
             fixed_nii=args.fixed_nii,
             chunk_points=args.chunk_points,
             bregma_index=args.bregma_index,
