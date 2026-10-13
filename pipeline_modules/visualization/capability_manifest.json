@@ -193,10 +193,11 @@
       "id": "plot_top_level7_density_ratio",
       "function": "pipeline_modules.visualization.top_level7_density_ratio.generate_top_level_ratio_plot",
       "cli": "python pipeline_modules/visualization/top_level7_density_ratio.py",
-      "description": "Find density Excel workbooks in exactly two child sample folders, compare Level_6 count metrics, and plot the top absolute log(A/B) region differences.",
+      "description": "Find density Excel workbooks in exactly two child sample folders, compare count metrics over the default parcellation (level auto: Allen tree divided until children would be layers; cortical subareas split, nuclei stay whole, remainder rows keep parent-labelled voxels) or a fixed Level_N sheet, and plot the top absolute log(A/B) region differences.",
       "prerequisites": [
         "root_dir must contain exactly two child sample_dir folders with density Excel workbooks",
-        "Density workbooks must contain a Level_6 sheet with Name and selected metric columns"
+        "Density workbooks must contain Level_* sheets with Name and selected metric columns",
+        "level auto additionally reads pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
       ],
       "inputs": {
         "root_dir": {
@@ -214,8 +215,9 @@
           ]
         },
         "level": {
-          "type": "int",
-          "default": 6
+          "type": "int|string",
+          "default": "auto",
+          "description": "Level sheet number, or 'auto' for the default parcellation"
         },
         "top_n": {
           "type": "int",
@@ -261,21 +263,58 @@
       "outputs": {
         "ratio_csv": {
           "type": "path",
-          "description": "<output_prefix>_level6_ratio_top.csv"
+          "description": "<output_prefix>_auto_ratio_top.csv (level auto) or <output_prefix>_level6_ratio_top.csv (numeric level)"
         },
         "ratio_xlsx": {
           "type": "path",
-          "description": "<output_prefix>_level6_ratio_top.xlsx"
+          "description": "<output_prefix>_auto_ratio_top.xlsx or <output_prefix>_level6_ratio_top.xlsx"
         },
         "ratio_plot": {
           "type": "path",
-          "description": "<output_prefix>_level6_ratio_top10.png"
+          "description": "<output_prefix>_auto_ratio_top10.png or <output_prefix>_level6_ratio_top10.png"
         }
       },
       "common_commands": [
         {
-          "description": "Compare top Level_6 signal-count differences between two sample folders",
+          "description": "Compare top default-parcellation signal-count differences between two sample folders",
           "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\top_level7_density_ratio.py --root_dir \"S:\\Arivis_Analysis\\two_samples\""
+        },
+        {
+          "description": "Compare a fixed Level_6 sheet instead of the default parcellation",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\top_level7_density_ratio.py --root_dir \"S:\\Arivis_Analysis\\two_samples\" --level 6"
+        }
+      ]
+    },
+    {
+      "id": "generate_cfos_standard_report",
+      "function": "pipeline_modules.visualization.cfos_standard_report.generate_report",
+      "cli": "python -m pipeline_modules.visualization.cfos_standard_report",
+      "description": "Standard two-sample c-Fos descriptive report per spec v1.0: 6-page A4-landscape HTML+PDF (overview / QC / spatial density / Top-N density difference / ROI granularity / methods), Excel tables, figure files, params+provenance. Default region set = the fixed exclusive parcellation from top_level7_density_ratio; ranking by |Δdensity| (B−A) with direction and raw counts kept; 3D isosurfaces at fixed absolute thresholds with shared camera.",
+      "prerequisites": [
+        "Both samples have region workbooks (results/*_brain_distribution_stats.xlsx or *_result.xlsx with Level_* sheets)",
+        "Recommended: visualization/<sample>_ch1_count_volume.tif per sample (warp_mask_zarr_to_atlas_points --volume_mode count); without it spatial pages degrade with an explicit missing-inputs note",
+        "Microsoft Edge for HTML->PDF (default path C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe)"
+      ],
+      "inputs": {
+        "root_dir": {"type": "dir", "required": true, "description": "Batch root containing the two sample dirs"},
+        "sample_a/sample_b": {"type": "string", "default": "auto-detect"},
+        "top_n": {"type": "int", "default": 10},
+        "bin_um": {"type": "float", "default": 100.0},
+        "sigma_um": {"type": "float", "default": 150.0},
+        "min_volume_mm3": {"type": "float", "default": 0.005},
+        "low_count_warning": {"type": "float", "default": 20.0}
+      },
+      "outputs": {
+        "report_html": "report_{a}_vs_{b}/report.html",
+        "report_pdf": "report_{a}_vs_{b}/report.pdf",
+        "excel": "report_{a}_vs_{b}/cfos_report_tables.xlsx",
+        "figures": "report_{a}_vs_{b}/figures/*",
+        "reproducibility": "report_{a}_vs_{b}/params.json + provenance.json"
+      },
+      "common_commands": [
+        {
+          "description": "Generate the ot vs sham standard report",
+          "powershell": "python -m pipeline_modules.visualization.cfos_standard_report --root_dir \"S:\\Arivis_Analysis\\_active\\YF2026071002\" --sample_a ot --sample_b sham"
         }
       ]
     },
@@ -493,7 +532,9 @@
         "Atlas-space points CSV must exist or be generatable via --sample_dir",
         "BrainGlobe atlas allen_mouse_25um must be downloaded in the napari/brainrender environment",
         "On Windows, set PYTHONPATH to the repo root before running",
-        "Default region groups: config/region_groups.json"
+        "Default region groups: config/region_groups.json",
+        "--resolution_xyz must match the mask Zarr's true spacing (read the signal zarr multiscale scale; 1.8/1.8/2.0 for YF2026071002-style samples, 7.2/7.2/8.0 where the zarr is an ims L2). The repo default atlas_image path may not exist; pass --atlas_image <YIFU_DATA_DIR>/reference/atlas.tiff when forcing a warp",
+        "--filter_to_brain drops the few percent of warped points that fall outside the Allen annotation (mask rim artifacts + transform far-field extrapolation)"
       ],
       "inputs": {
         "sample_dir": {

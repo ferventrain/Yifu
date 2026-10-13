@@ -275,8 +275,15 @@ class HarnessWorker:
         self._finalize(job_id, returncode)
 
     def _supervise(self, proc: subprocess.Popen[str], job_id: str, progress_file: Path) -> int:
-        """Wait for the pipeline while stamping heartbeats and honouring cancel."""
+        """Wait for the pipeline while stamping heartbeats and honouring cancel.
+
+        Each heartbeat also samples the pipeline process-tree private-commit
+        memory; the running max is stamped into progress.json (peak_mem_mb)
+        and persisted on the job record so planning can rely on it."""
+        from pipeline_modules.harness.proc import tree_memory_mb
+
         last_heartbeat = 0.0
+        peak_mb = 0.0
         while proc.poll() is None:
             if cancel_flag_path(job_id, self.store.active).exists():
                 _terminate(proc)
@@ -287,10 +294,20 @@ class HarnessWorker:
                 return proc.wait()
             now = time.monotonic()
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-                touch_heartbeat(progress_file)
+                mem = tree_memory_mb(proc.pid)
+                if mem is not None and mem > peak_mb:
+                    peak_mb = mem
+                touch_heartbeat(progress_file, peak_mem_mb=round(peak_mb, 1) if peak_mb > 0 else None)
                 self._write_state(job_id)
                 last_heartbeat = now
             time.sleep(CANCEL_POLL_S)
+        if peak_mb > 0:
+            try:
+                job = self.store.load_job(job_id)
+                job["peak_mem_mb"] = round(peak_mb, 1)
+                self.store.save_job(job)
+            except PipelineError:
+                logger.debug("Could not persist peak memory on job", exc_info=True)
         return proc.wait()
 
     # --------------------------------------------------------------- finalize

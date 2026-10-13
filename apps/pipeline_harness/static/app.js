@@ -1023,6 +1023,11 @@ async function openStageTimes() {
   }
 }
 
+function formatMemMB(mb) {
+  if (mb == null) return "?";
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
 function renderStageTimes(data) {
   const stages = data.stages || [];
   els.stageBody.replaceChildren();
@@ -1044,7 +1049,10 @@ function renderStageTimes(data) {
     name.textContent = stage.module;
     const stat = document.createElement("span");
     stat.className = "stage-stat";
-    stat.textContent = `中位 ${formatDuration(stage.median_s) || "?"} · 均值 ${formatDuration(stage.mean_s) || "?"} · ${stage.count} 次`;
+    const mem = stage.peak_mem_mb_median
+      ? ` · 峰值内存 ${formatMemMB(stage.peak_mem_mb_median)}${stage.peak_mem_count ? ` (${stage.peak_mem_count} 次)` : ""}`
+      : " · 峰值内存 无记录";
+    stat.textContent = `中位 ${formatDuration(stage.median_s) || "?"} · 均值 ${formatDuration(stage.mean_s) || "?"} · ${stage.count} 次${mem}`;
     head.append(name, stat);
     const track = document.createElement("div");
     track.className = "stage-track";

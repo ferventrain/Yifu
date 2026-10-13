@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -80,8 +81,15 @@ def print_note(message):
         _PROGRESS.note(message)
 
 
+def module_id_from_command(cmd: str):
+    """pipeline_modules.<a>.<b>... inside a command -> '<a>.<b>...' (None if absent)."""
+    match = re.search(r"pipeline_modules\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)", str(cmd))
+    return match.group(1) if match else None
+
+
 def run_command(cmd, desc, *, show_command=True):
-    """Run a shell command and print output."""
+    """Run a shell command, sampling the child process-tree memory so every
+    step records its peak (progress step + job record + PM 资源面板)."""
     if _STUB["enabled"]:
         _STUB["commands"].append({"desc": desc, "cmd": cmd})
         print(f"  STUB: {desc}")
@@ -93,10 +101,24 @@ def run_command(cmd, desc, *, show_command=True):
     if show_command:
         print(f"     Command: {cmd}")
 
-    try:
-        subprocess.run(cmd, shell=True, check=True)
-    except subprocess.CalledProcessError as exc:
-        print(f"  ERROR: command failed ({exc})")
+    from pipeline_modules.harness.proc import tree_memory_mb
+
+    proc = subprocess.Popen(cmd, shell=True)
+    peak_mb = 0.0
+    while True:
+        mem = tree_memory_mb(proc.pid)
+        if mem is not None and mem > peak_mb:
+            peak_mb = mem
+        if proc.poll() is not None:
+            break
+        time.sleep(5.0)
+    if peak_mb > 0 and _PROGRESS is not None:
+        _PROGRESS.record_step_peak(peak_mb)
+        module_id = module_id_from_command(cmd)
+        if module_id:
+            _PROGRESS.annotate_current_module(module_id)
+    if proc.returncode != 0:
+        print(f"  ERROR: command failed (exit {proc.returncode})")
         sys.exit(1)
 
 

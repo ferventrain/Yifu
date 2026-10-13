@@ -62,6 +62,36 @@ def test_projects_groups_by_batch_and_sample(analysis_home: Path, monkeypatch: p
     assert batch_projects["ot"]["status"] == "queued"
 
 
+def test_project_status_follows_newest_run_not_history(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):
+    """A sample whose latest rerun succeeded must show succeeded, not stay
+    red forever because older runs failed; history stays countable."""
+    pytest.importorskip("fastapi")
+    sample = _write_sample(analysis_home, "ot")
+
+    store = ActiveStore()
+    old = store.add_job(sample)
+    old["status"] = "failed"
+    old["error"] = {"code": "INTERNAL_ERROR", "message": "older failure"}
+    old["started_at"] = "2026-10-01T00:00:00+00:00"
+    old["ended_at"] = "2026-10-01T00:00:00+00:00"
+    store.save_job(old)
+    new = store.add_job(sample, sample / "config.json")
+    new["status"] = "succeeded"
+    new["started_at"] = "2026-10-02T00:00:00+00:00"
+    new["ended_at"] = "2026-10-02T00:00:00+00:00"
+    store.save_job(new)
+
+    import importlib
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    monkeypatch.setattr(monitor, "store", store)
+    payload = monitor.api_projects()
+    project = payload["batches"][0]["projects"][0]
+    assert project["status"] == "succeeded"
+    assert project["failed_count"] == 1
+    assert len(project["error_history"]) == 1
+
+
 def test_projects_notes_post_and_roundtrip(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("fastapi")
     sample = _write_sample(analysis_home, "ot")

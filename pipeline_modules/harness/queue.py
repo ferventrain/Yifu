@@ -307,6 +307,13 @@ class ActiveStore:
             job["heartbeat_at"] = utc_now_iso()
             if parsed.get("started_at"):
                 job["started_at"] = parsed["started_at"]
+            # Peak-memory tracking for attached drivers (manual chains): same
+            # planning metric as worker-run jobs.
+            from pipeline_modules.harness.proc import tree_memory_mb
+
+            mem = tree_memory_mb(job.get("pid"))
+            if mem is not None and float(mem) > float(job.get("peak_mem_mb") or 0.0):
+                job["peak_mem_mb"] = round(float(mem), 1)
         elif first.startswith("RUNNING"):
             job["status"] = "failed"
             job["error"] = "process exited while still marked RUNNING"

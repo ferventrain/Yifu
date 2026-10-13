@@ -227,9 +227,10 @@
       "run_started_at",
       "step_started_at",
       "phase_started_at",
-      "heartbeat_at"
+      "heartbeat_at",
+      "peak_mem_mb"
     ],
-    "field_note": "时间戳字段为 run_started_at（不是 started_at）",
+    "field_note": "时间戳字段为 run_started_at（不是 started_at）；peak_mem_mb 为 worker 采样的进程树私有提交内存峰值（MB，规划并发用），steps[] 每步另有 peak_mem_mb/module 字段",
     "unknown_units": "unit_total 为 null 表示进度未知；UI 显示『进度未知』，禁止伪造百分比或 ETA",
     "module_api": "细粒度进度：pipeline_modules.harness.progress.report(done, total, phase, sample_dir) / report_done / report_failed——环境变量 YIFU_PROGRESS_FILE 存在时并入 run 进度，否则写 <sample_dir>/pm_progress.json（schema 2：done/total/phase/status）。PM 对 external 任务自动回退读 pm_progress.json，读取端宽容（unit_done/done、percent 别名都认）。",
     "env_chain": "main.py 收到 --progress_file 时会导出 YIFU_PROGRESS_FILE，手动跑 main.py 子模块单位进度不丢",
