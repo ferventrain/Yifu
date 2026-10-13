@@ -31,7 +31,7 @@ from pipeline_modules.visualization.atlas_slice import (
 
 DEFAULT_PIXEL_SCALE = 4
 DEFAULT_SUPERSAMPLE = 2
-DEFAULT_CONTOUR_SMOOTH = 1.2
+DEFAULT_CONTOUR_SMOOTH = 2.0
 DEFAULT_REGION_LINE_WIDTH = 0.7
 DEFAULT_BRAIN_OUTLINE_WIDTH = 0.0  # off: outer outline is often broken
 

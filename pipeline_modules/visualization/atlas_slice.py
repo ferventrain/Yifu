@@ -1563,7 +1563,7 @@ def render_atlas_slice(
     dpi: int = 300,
     line_width: float = 0.3,
     brain_outline_width: float = 0.0,
-    contour_smoothing: float = 1.8,
+    contour_smoothing: float = 2.0,
     show_regions: bool = True,
 ) -> Path:
     """Render a white-background, black-outline atlas slice."""

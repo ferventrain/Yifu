@@ -2001,7 +2001,7 @@ def _render_region_metric_slice_array(
             ax.set_xlim(-0.5, width - 0.5)
             ax.set_ylim(height - 0.5, -0.5)
             ax.set_axis_off()
-            focus_lines = _mask_contour_lines(focus_mask, smoothing=1.2)
+            focus_lines = _mask_contour_lines(focus_mask, smoothing=2.0)
             if focus_lines:
                 ax.add_collection(
                     LineCollection(
