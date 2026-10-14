@@ -353,7 +353,10 @@ def attach_colorbar_to_slice_rgb(
         for spine in cax.spines.values():
             spine.set_color(theme["cbar_edge"])
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=100, facecolor=bg_rgb)
+        # bbox_inches="tight": the right-side ylabel falls outside the fixed
+        # cbar figure width (72 px) and is silently clipped without it
+        fig.savefig(buf, format="png", dpi=100, facecolor=bg_rgb,
+                    bbox_inches="tight", pad_inches=0.02)
         buf.seek(0)
         cbar_img = Image.open(buf).convert("RGB")
     finally:

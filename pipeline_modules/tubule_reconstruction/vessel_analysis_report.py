@@ -589,6 +589,10 @@ def build_diameter_rows(branch_table):
     valid_dia = np.isfinite(diameter) & (diameter > 0)
     total_valid_count = int(valid_dia.sum())
     length = np.where(np.isfinite(length), length, 0.0)
+    if "is_branch_to_branch" in branch_table.columns:
+        b2b = branch_table["is_branch_to_branch"].fillna(False).astype(bool).to_numpy()
+    else:
+        b2b = np.ones(len(branch_table), dtype=bool)
     rows = []
     for index, lower in enumerate(DEFAULT_DIAM_BIN_EDGES):
         upper = list(DEFAULT_DIAM_BIN_EDGES) + [np.inf]
@@ -596,6 +600,7 @@ def build_diameter_rows(branch_table):
         mask = valid_dia & (diameter >= lower) & (diameter < upper)
         counts, _ = bin_stats(diameter[mask], (lower,))
         branch_count = int(counts[0])
+        branch_point_segments = int((mask & b2b).sum())
         length_sum = float(length[mask].sum())
         tort_min, tort_max, tort_mean = tortuosity_range(tortuosity, mask)
         radii = diameter[mask] / 2.0
@@ -609,6 +614,7 @@ def build_diameter_rows(branch_table):
                 "upper_um": upper if np.isfinite(upper) else np.nan,
                 "branch_count": branch_count,
                 "branch_percent": float(branch_count / max(total_valid_count, 1) * 100.0),
+                "branch_point_segments": branch_point_segments,
                 "length_um": length_sum,
                 "length_percent": float(length_sum / max(float(length[valid_dia].sum()), 1e-12) * 100.0),
                 "tortuosity_min": tort_min,
@@ -619,6 +625,64 @@ def build_diameter_rows(branch_table):
             }
         )
     return pd.DataFrame(rows)
+
+
+def build_tortuosity_length_rows(branch_table):
+    """Segment count and total length (with share of total length) per tortuosity bin."""
+    tortuosity = pd.to_numeric(branch_table["tortuosity"], errors="coerce").to_numpy(dtype=np.float64)
+    length = pd.to_numeric(branch_table["branch_length_um"], errors="coerce").to_numpy(dtype=np.float64)
+    valid = np.isfinite(tortuosity) & (tortuosity >= 1.0) & np.isfinite(length)
+    length = np.where(np.isfinite(length), length, 0.0)
+    total_length = float(length[valid].sum())
+    rows = []
+    for index, lower in enumerate(DEFAULT_TORT_BIN_EDGES):
+        upper = list(DEFAULT_TORT_BIN_EDGES) + [np.inf]
+        upper = upper[index + 1]
+        mask = valid & (tortuosity >= lower) & (tortuosity < upper)
+        count = int(mask.sum())
+        length_sum = float(length[mask].sum())
+        rows.append(
+            {
+                "tortuosity_bin": fmt_interval(lower, upper),
+                "lower": lower,
+                "upper": upper if np.isfinite(upper) else np.nan,
+                "segment_count": count,
+                "segment_percent": float(count / max(int(valid.sum()), 1) * 100.0),
+                "length_um": length_sum,
+                "length_percent": float(length_sum / max(total_length, 1e-12) * 100.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def normalize_branch_table(table):
+    """Ensure kimimaro-style derived columns exist on any branch table.
+
+    Full-schema ``vessel_branch_metrics.csv`` (with ``start_node``/``start_degree``
+    etc.) already carries ``branch_length_um``/``tortuosity``; only the flag
+    columns are derived here so downstream builders see one consistent schema.
+    """
+    if "branch_length_um" not in table.columns and "length_um" in table.columns:
+        table = table.assign(
+            branch_length_um=pd.to_numeric(table["length_um"], errors="coerce").to_numpy(dtype=np.float64)
+        )
+    if "tortuosity" not in table.columns:
+        table = table.assign(tortuosity=np.full(len(table), np.nan))
+    if {"start_degree", "end_degree"}.issubset(table.columns):
+        start_degree = pd.to_numeric(table["start_degree"], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+        end_degree = pd.to_numeric(table["end_degree"], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+        if "is_branch_to_branch" not in table.columns:
+            table = table.assign(is_branch_to_branch=(start_degree >= 3) & (end_degree >= 3))
+        if "is_terminal_branch" not in table.columns:
+            table = table.assign(is_terminal_branch=(start_degree == 1) | (end_degree == 1))
+        if "is_loop" not in table.columns and {"start_node", "end_node"}.issubset(table.columns):
+            start_node = pd.to_numeric(table["start_node"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+            end_node = pd.to_numeric(table["end_node"], errors="coerce").fillna(-2).to_numpy(dtype=np.int64)
+            table = table.assign(is_loop=(start_node == end_node) & (start_node >= 0))
+    for flag in ("is_branch_to_branch", "is_terminal_branch", "is_loop"):
+        if flag not in table.columns:
+            table = table.assign(**{flag: np.zeros(len(table), dtype=bool)})
+    return table
 
 
 def build_length_rows(branch_table, branch_to_branch_only=True):
@@ -686,40 +750,105 @@ def save_figure(fig, path):
 def plot_length_distribution(length_df, output_path):
     fig, ax = plt.subplots(figsize=(9, 5))
     labels = [row["length_bin_um"] for _, row in length_df.iterrows()]
-    counts = length_df["segment_count"].to_numpy(dtype=np.float64)
-    ax.bar(range(len(labels)), counts, color="#4C72B0")
+    lengths = length_df["length_um"].to_numpy(dtype=np.float64)
+    ax.bar(range(len(labels)), lengths, color="#4C72B0")
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_xlabel("Segment length (um)")
-    ax.set_ylabel("Segment count")
-    ax.set_title("Vessel segment length distribution (branch-point to branch-point)")
-    ax.set_yscale("log")
+    ax.set_ylabel("Total vessel length (um)")
+    ax.set_title("Total vessel length per segment-length bin (branch-point to branch-point)")
+    for index, value in enumerate(lengths):
+        if value > 0:
+            ax.text(index, value, f"{value/1e3:.0f}k", ha="center", va="bottom", fontsize=8)
+    save_figure(fig, output_path)
+
+
+def plot_length_fraction_distribution(length_df, output_path):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    labels = [row["length_bin_um"] for _, row in length_df.iterrows()]
+    fractions = length_df["length_percent"].to_numpy(dtype=np.float64)
+    ax.bar(range(len(labels)), fractions, color="#55A868")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_xlabel("Segment length (um)")
+    ax.set_ylabel("Share of total length (%)")
+    ax.set_title("Share of total vessel length per length bin")
+    for index, value in enumerate(fractions):
+        if value > 0:
+            ax.text(index, value, f"{value:.1f}", ha="center", va="bottom", fontsize=8)
+    save_figure(fig, output_path)
+
+
+def plot_tortuosity_length_fraction(tort_len_df, output_path):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    labels = [row["tortuosity_bin"] for _, row in tort_len_df.iterrows()]
+    fractions = tort_len_df["length_percent"].to_numpy(dtype=np.float64)
+    ax.bar(range(len(labels)), fractions, color="#C44E52")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_xlabel("Tortuosity bin")
+    ax.set_ylabel("Share of total length (%)")
+    ax.set_title("Share of total vessel length per tortuosity bin")
+    for index, value in enumerate(fractions):
+        if value > 0:
+            ax.text(index, value, f"{value:.1f}", ha="center", va="bottom", fontsize=8)
     save_figure(fig, output_path)
 
 
 def plot_diameter_distribution(diam_df, output_path):
-    fig, ax = plt.subplots(figsize=(9, 5))
+    """Six-panel diameter distribution: length, length share, branch-point
+    segments, volume, surface area, and segment count per diameter bin."""
+    panels = [
+        ("length_um", "Total length (um)", "Length"),
+        ("length_percent", "Length share (%)", "Length share"),
+        ("branch_point_segments", "Branch-point segments", "Branch points"),
+        ("vessel_volume_um3", "Volume (um3)", "Volume"),
+        ("surface_area_um2", "Surface area (um2)", "Surface area"),
+        ("branch_count", "Segment count", "Count"),
+    ]
     labels = [row["diameter_bin_um"] for _, row in diam_df.iterrows()]
     x = np.arange(len(labels))
-    length_pct = diam_df["length_percent"].to_numpy(dtype=np.float64)
-    ax.bar(x, length_pct, color="#55A868")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_xlabel("Vessel diameter (um)")
-    ax.set_ylabel("Length percent (%)")
-    ax.set_title("Vessel length by diameter bin")
-    save_figure(fig, output_path)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    for ax, (column, ylabel, title) in zip(axes.ravel(), panels):
+        values = diam_df[column].to_numpy(dtype=np.float64)
+        ax.bar(x, values, color="#4C72B0")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax.set_xlabel("Vessel diameter (um)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+    fig.suptitle("Vessel metrics by diameter bin")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def bin_degree_histogram(hist, max_individual: int = 10) -> list[tuple[str, int]]:
+    """Degrees up to ``max_individual`` as own bins; everything above lumped as '>N'."""
+    rows = []
+    for degree in sorted(hist):
+        if degree <= max_individual:
+            rows.append((str(degree), int(hist[degree])))
+    tail = int(sum(count for degree, count in hist.items() if degree > max_individual))
+    if tail:
+        rows.append((f">{max_individual}", tail))
+    return rows
 
 
 def plot_branch_degree_distribution(hist, output_path):
+    rows = bin_degree_histogram(hist)
+    labels = [label for label, _ in rows]
+    counts = [count for _, count in rows]
     fig, ax = plt.subplots(figsize=(9, 5))
-    degrees = sorted(hist)
-    counts = [hist[d] for d in degrees]
-    ax.bar([str(d) for d in degrees], counts, color="#C44E52")
+    ax.bar(range(len(labels)), counts, color="#C44E52")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels)
     ax.set_xlabel("Number of connected vessel segments at branch point")
     ax.set_ylabel("Branch point count")
     ax.set_title("Branch point degree distribution")
     ax.set_yscale("log")
+    for index, value in enumerate(counts):
+        ax.text(index, value, f"{value:,}", ha="center", va="bottom", fontsize=8)
     save_figure(fig, output_path)
 
 
@@ -923,6 +1052,14 @@ def main() -> int:
     )
     parser.add_argument("--mask_dataset", default="0", help="Dataset name inside --mask_zarr")
     parser.add_argument(
+        "--metrics",
+        default="all",
+        help=(
+            "Comma-separated report sections to emit: length, length_fraction, diameter, "
+            "degree, tortuosity, tort_diam, angles, fractal; or 'all' (default)"
+        ),
+    )
+    parser.add_argument(
         "--fd_box_sizes_um",
         default=",".join(str(int(size)) for size in DEFAULT_FD_BOX_SIZES_UM),
         help="Comma-separated physical box sizes in um for fractal dimension",
@@ -966,7 +1103,7 @@ def main() -> int:
             branch_table = load_express_branch_table(branch_csv)
         else:
             print("Loading branch table ...")
-            branch_table = pd.read_csv(branch_csv, low_memory=False)
+            branch_table = normalize_branch_table(pd.read_csv(branch_csv, low_memory=False))
         print("Streaming vertices ...")
         vertex_stats = stream_vertices(vertex_csv)
         if vertex_stats is None:
@@ -1042,34 +1179,53 @@ def main() -> int:
     if args.hpf_volume_um3:
         summary["vessel_volume_hpf_um3"] = float(args.hpf_volume_um3)
 
-    length_df = build_length_rows(branch_table, branch_to_branch_only=True)
-    diam_df = build_diameter_rows(branch_table)
-    tort_diam_df = build_tortuosity_diameter_rows(branch_table)
-    branch_degree_hist = vertex_stats["branch_point_degree_histogram"]
+    metrics = set(args.metrics.split(","))
+    want_all = "all" in metrics or not metrics
+    want = lambda name: want_all or name in metrics  # noqa: E731
+
+    length_df = build_length_rows(branch_table, branch_to_branch_only=True) if want("length") or want("length_fraction") else None
+    diam_df = build_diameter_rows(branch_table) if want("diameter") else None
+    tort_len_df = build_tortuosity_length_rows(branch_table) if want("tortuosity") else None
+    tort_diam_df = build_tortuosity_diameter_rows(branch_table) if want("tort_diam") else None
+    branch_degree_hist = vertex_stats["branch_point_degree_histogram"] if want("degree") else None
 
     print("Writing tables and figures ...")
-    length_df.to_csv(output_dir / "length_distribution.csv", index=False)
-    diam_df.to_csv(output_dir / "diameter_distribution.csv", index=False)
-    tort_diam_df.to_csv(output_dir / "tortuosity_diameter_length_percent.csv", index=False)
-    pd.DataFrame(
-        [
-            {"branch_point_degree": int(k), "count": int(v)}
-            for k, v in sorted(branch_degree_hist.items())
-        ]
-    ).to_csv(output_dir / "branch_point_degree_distribution.csv", index=False)
+    if length_df is not None:
+        length_df.to_csv(output_dir / "length_distribution.csv", index=False)
+    if diam_df is not None:
+        diam_df.to_csv(output_dir / "diameter_distribution.csv", index=False)
+    if tort_len_df is not None:
+        tort_len_df.to_csv(output_dir / "tortuosity_length_share.csv", index=False)
+    if tort_diam_df is not None:
+        tort_diam_df.to_csv(output_dir / "tortuosity_diameter_length_percent.csv", index=False)
+    if branch_degree_hist is not None:
+        pd.DataFrame(
+            [
+                {"branch_point_degree": int(k), "count": int(v)}
+                for k, v in sorted(branch_degree_hist.items())
+            ]
+        ).to_csv(output_dir / "branch_point_degree_distribution.csv", index=False)
 
-    plot_length_distribution(length_df, figures_dir / "length_distribution.png")
-    plot_diameter_distribution(diam_df, figures_dir / "diameter_distribution.png")
-    plot_branch_degree_distribution(branch_degree_hist, figures_dir / "branch_point_degree_distribution.png")
-    plot_tortuosity_diameter_heatmap(tort_diam_df, figures_dir / "tortuosity_diameter_length_percent.png")
-    plot_tortuosity_histogram(tortuosity, figures_dir / "tortuosity_distribution.png")
+    if want("length") and length_df is not None:
+        plot_length_distribution(length_df, figures_dir / "length_distribution.png")
+    if want("length_fraction") and length_df is not None:
+        plot_length_fraction_distribution(length_df, figures_dir / "length_fraction_distribution.png")
+    if want("diameter") and diam_df is not None:
+        plot_diameter_distribution(diam_df, figures_dir / "diameter_distribution.png")
+    if want("degree") and branch_degree_hist is not None:
+        plot_branch_degree_distribution(branch_degree_hist, figures_dir / "branch_point_degree_distribution.png")
+    if want("tortuosity") and tort_len_df is not None:
+        plot_tortuosity_length_fraction(tort_len_df, figures_dir / "tortuosity_length_share.png")
+        plot_tortuosity_histogram(tortuosity, figures_dir / "tortuosity_distribution.png")
+    if want("tort_diam") and tort_diam_df is not None:
+        plot_tortuosity_diameter_heatmap(tort_diam_df, figures_dir / "tortuosity_diameter_length_percent.png")
 
     angle_df = None
-    if angle_result is not None and angle_result["angles_deg"].size:
+    if (want_all or "angles" in metrics) and angle_result is not None and angle_result["angles_deg"].size:
         angle_df = build_branch_angle_rows(angle_result["angles_deg"])
         angle_df.to_csv(output_dir / "branch_angle_distribution.csv", index=False)
         plot_branch_angle_distribution(angle_df, figures_dir / "branch_angle_distribution.png")
-    if fd_points is not None:
+    if (want_all or "fractal" in metrics) and fd_points is not None:
         fd_points.to_csv(output_dir / "fractal_dimension_points.csv", index=False)
         plot_fractal_dimension(fd_points, fractal_dimension, figures_dir / "fractal_dimension_fit.png")
 
@@ -1080,15 +1236,21 @@ def main() -> int:
     xlsx_path = output_dir / "vessel_analysis_table.xlsx"
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         pd.DataFrame([summary]).to_excel(writer, sheet_name="mouse_summary", index=False)
-        length_df.to_excel(writer, sheet_name="length_distribution", index=False)
-        diam_df.to_excel(writer, sheet_name="diameter_distribution", index=False)
-        tort_diam_df.to_excel(writer, sheet_name="tortuosity_x_diameter", index=False)
-        pd.DataFrame(
-            [
-                {"branch_point_degree": int(k), "count": int(v)}
-                for k, v in sorted(branch_degree_hist.items())
-            ]
-        ).to_excel(writer, sheet_name="branch_point_degree", index=False)
+        if length_df is not None:
+            length_df.to_excel(writer, sheet_name="length_distribution", index=False)
+        if diam_df is not None:
+            diam_df.to_excel(writer, sheet_name="diameter_distribution", index=False)
+        if tort_len_df is not None:
+            tort_len_df.to_excel(writer, sheet_name="tortuosity_length_share", index=False)
+        if tort_diam_df is not None:
+            tort_diam_df.to_excel(writer, sheet_name="tortuosity_x_diameter", index=False)
+        if branch_degree_hist is not None:
+            pd.DataFrame(
+                [
+                    {"branch_point_degree": int(k), "count": int(v)}
+                    for k, v in sorted(branch_degree_hist.items())
+                ]
+            ).to_excel(writer, sheet_name="branch_point_degree", index=False)
         if angle_df is not None:
             angle_df.to_excel(writer, sheet_name="branch_angles", index=False)
         if fd_points is not None:
