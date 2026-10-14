@@ -286,6 +286,66 @@
       ]
     },
     {
+      "id": "plot_region_grid_heatmap",
+      "function": "pipeline_modules.visualization.region_grid_heatmap.main",
+      "cli": "python -m pipeline_modules.visualization.region_grid_heatmap --root_dir <batch_dir>",
+      "description": "Region-GRID heatmap (region x sample matrix; 2026-10-14 fixed layout): rows are the top_level7 default-parcellation regions grouped by major division, columns are samples, each cell = per-region cFos density (Signal Voxels / Total Voxels, %). Grey matter only; groups stack naturally into <= max_panels equal-width columns of square cells (top-aligned, ragged bottoms); each group's full name (Isocortex / Cortical subplate / Striatum / Pallidum / Thalamus / Hypothalamus / Midbrain / Pons / Medulla / Cerebellum) is an inline centered band above its rows; vertical sample labels under each panel; white->orange colormap, thick colorbar hugging the last panel. NOT the spatial heatmap: for anatomical atlas-space 2D/3D signal maps use render_signal_heatmap (heatmap.py) instead.",
+      "prerequisites": [
+        "Each sample child dir has results/*_brain_distribution_stats.xlsx with Level_* sheets (Name + Signal Voxels + Total Voxels columns) — i.e. a finished cfos run",
+        "level auto parcellation reads pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+      ],
+      "inputs": {
+        "root_dir": {
+          "type": "dir",
+          "required": true,
+          "description": "Batch folder containing sample child dirs (like H:/arivis-analysis/_active/<batch>)"
+        },
+        "samples": {
+          "type": "string",
+          "default": "",
+          "description": "Comma-separated sample dir names; default: all children with a stats workbook. Column labels = dir names with their common prefix stripped (YF..._AYD_nao_SY1 -> SY1)"
+        },
+        "parcellation_csv": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        },
+        "output_prefix": {
+          "type": "path|null",
+          "default": null,
+          "description": "Default <root_dir>/<root_name>_region_grid"
+        },
+        "max_panels": {
+          "type": "int",
+          "default": 5,
+          "description": "Upper bound on stacked group columns"
+        },
+        "dpi": {
+          "type": "int",
+          "default": 300
+        }
+      },
+      "outputs": {
+        "grid_png": {
+          "type": "path",
+          "description": "<output_prefix>_heatmap.png — the region-grid heatmap figure"
+        },
+        "grid_csv": {
+          "type": "path",
+          "description": "<output_prefix>_density.csv — acronym/region/group + density_pct_<sample> columns"
+        }
+      },
+      "common_commands": [
+        {
+          "description": "All samples of a batch (labels auto-shortened)",
+          "powershell": "python -m pipeline_modules.visualization.region_grid_heatmap --root_dir \"H:\\arivis-analysis\\_active\\YF2026082501\""
+        },
+        {
+          "description": "Explicit sample subset and custom output name",
+          "powershell": "python -m pipeline_modules.visualization.region_grid_heatmap --root_dir \"H:\\arivis-analysis\\_active\\YF2026082501\" --samples \"YF2026082501_AYD_nao_SY1,YF2026082501_AYD_nao_SY2\" --output_prefix \"H:\\arivis-analysis\\_active\\YF2026082501\\SY_pair\""
+        }
+      ]
+    },
+    {
       "id": "generate_cfos_standard_report",
       "function": "pipeline_modules.visualization.cfos_standard_report.generate_report",
       "cli": "python -m pipeline_modules.visualization.cfos_standard_report",
