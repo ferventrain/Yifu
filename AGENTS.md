@@ -18,13 +18,9 @@
    `input.channels`（cfos 惯例 signal=ch1 / registration=ch0，非标准排布先核对）。
 3. **跳过环节**：顶层布尔 `"skip_registration": true`、`"only_tubule": true`、`"only_region_analysis": true`
    （等效命令行旗标，PM 一键开始可用；断点续跑靠完成标记自动跳过已完成步骤）。
-4. **基线默认值全部定在 template 里，照用不调**；要动先问用户。当前基线要点：
-   - 分割：cfos_unet + 全脑归一化（normalize_scope=global，1–99.5 百分位）+ 256³ 推理块 + rerun_if_model_updated。
-   - 后处理：max_single_slice_voxels=300；edge_shrink_factor=0.99（脑表面收缩剔除，读注册产物 `<label>_ds_brain_mask.zarr` 缓存）。
-   - 半球：save_upsampled_label_hemisphere_zarr=true（统计用 atlas_label_hemisphere.zarr）。
-   - 配准：halo_mask 默认开；grad_step=0.15、syn_iterations=[70,50,30,10]；n4_preprocess 与 rigid_preflight_qc 默认开
-     （产出 `<sample>/qc/registration_rigid_check.png`、`registration_final_check.png`，PM 卡片可点开）。
-   - 已证伪不采用：CC 度量 + 大迭代档（AIND 对照实验，形变过度）。
+4. **基线默认值全部定在 `config/config_cfos_template.json` 里，照用不调**；要动先问用户。
+   具体参数值需要时再读 template，不在本文重复维护（改参数只改 template 一处）。
+   已证伪不采用：CC 度量 + 大迭代档（AIND 对照实验，形变过度）。
 5. 血管任务不套 cfos template（等血管 template 固化）。
 
 ## PM（Pipeline Monitor）
@@ -57,17 +53,26 @@
 4. 刷新/GET 永不启动任务；开始、保存笔记、归档、取消才是显式操作。运行中 external 任务显"失联"= 进程死了或心跳断了。
 5. 失败 run 的 manifest 会写 `status: incomplete`（含出错步骤），环节耗时统计自动排除。
 
-## 组织选区（tissue ROI）
-
-术语"组织选区"= 每个样本的组织包络 mask，固定存 `<sample>/tissue_roi.zarr`（样本级唯一名，不随通道变）。
-一句话打开样本标注（自动找 QC 卷，画框→Segment All Slices→可选插值→Save）：
 
 ```bash
 python -m pipeline_modules.visualization.annotate_tissue_sam_napari --sample-dir <sample_dir>
 ```
 
-QC 卷不存在时错误里会给出 `surface_brightness_homogenize --qc_only` 的生成命令；消费用
-`--tissue_mask <sample>/tissue_roi.zarr`。入口详情见 `pipeline_modules/visualization/capability_manifest.json`。
+输入输出、QC 卷不存在时的错误指引等完整契约见 `pipeline_modules/visualization/capability_manifest.json`
+的 `annotate_tissue_roi` 条目（本文不重复维护）。
+
+## 项目分析工作模式
+
+1. **开工先读 manifest**：第一次接手一个项目（或动工具箱）前，先读仓库根的 `capabilities.json`，
+   再按需读涉及模块的 `capability_manifest.json`——可用程序、CLI 契约、输入输出都在那里，不凭记忆猜。
+2. **repo 只调用、不改动**：跑项目分析时不修改 `pipeline_modules/` 里的程序。唯一例外是发现明确 bug：
+   先向用户报告，做最小修复，并跑相关测试（例：slice_heatmap_render 的 colorbar 标签被画布裁掉）。
+3. **组合分析程序放项目文件夹**：为特定分析组合新写的程序（多次调用 repo 程序、拼不同指标）写到
+   `<analysis_root>/_active/<项目>/` 下，不进 repo；repo 程序按 CLI / capability_manifest 契约调用。
+4. **结果归一**：每个项目跑完，所有分析结果（Excel/图表/热图等）集合到该项目的单一结果文件夹
+   （如 `<项目>/_reports/`），不散落在各样本目录。
+5. **说明文档（PDF）**：结果文件夹必须附一份面向用户的 PDF 说明，逐项解释图表和表格——每个指标的
+   含义、口径（如圆柱法表面积、血管环数定义）与使用注意；交付前用视觉验收过一遍。
 
 ## 开发约定
 

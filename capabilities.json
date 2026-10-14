@@ -35,7 +35,6 @@
         "pipeline_modules/registration/ANTs_registration.py",
         "pipeline_modules/registration/atlas_label_to_hemisphere.py",
         "pipeline_modules/registration/region_signal_analysis_zarr_graph.py",
-        "pipeline_modules/registration/check_region_coverage_zarr.py",
         "pipeline_modules/registration/merge_atlas_regions.py"
       ],
       "python_package": "pipeline_modules.registration",
@@ -136,7 +135,8 @@
       "usage_doc": "README.md section 4.0",
       "primary_scripts": [
         "pipeline_modules/harness/queue.py",
-        "pipeline_modules/harness/runner.py",
+        "pipeline_modules/harness/runspec.py",
+        "pipeline_modules/harness/runcontext.py",
         "apps/pipeline_harness/main.py"
       ],
       "python_package": "pipeline_modules.harness",

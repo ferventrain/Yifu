@@ -1,8 +1,9 @@
 """Render coronal atlas-slice heatmaps of per-region vessel volume density.
 
-Reads the region vessel density CSV produced by vessel_region_density_scan.py,
-maps each top-level region's density fraction onto every atlas label id in that
-region's subtree, then renders coronal slices with render_region_metric_atlas_slice.
+Reads a region density CSV with ``query`` (region id / acronym / name) and
+``density_vessel_fraction`` columns, maps each region's density fraction onto
+every atlas label id in that region's subtree, then renders coronal slices
+with render_region_metric_atlas_slice.
 """
 from __future__ import annotations
 
