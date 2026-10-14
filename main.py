@@ -466,6 +466,13 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
             cmd += f' --normalize_percentiles "{format_csv(model_cfg["normalize_percentiles"])}"'
         if model_cfg.get("skip_below_threshold") is not None:
             cmd += f' --skip_below_threshold {model_cfg.get("skip_below_threshold")}'
+        if model_cfg.get("restrict_to_label", False):
+            label_zarr_path = Path(zarr_path).parent / "upsampled_atlas_label.zarr"
+            if not label_zarr_path.exists():
+                print(f"Error: restrict_to_label=true but atlas label zarr not found: {label_zarr_path}")
+                sys.exit(1)
+            cmd += f' --label_zarr "{label_zarr_path}"'
+            cmd += f' --label_stride {int(model_cfg.get("label_stride", 8))}'
         if model_cfg.get("process_existing_only", False):
             cmd += ' --process_existing_only'
         return cmd

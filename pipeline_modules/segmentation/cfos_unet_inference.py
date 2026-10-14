@@ -105,6 +105,17 @@ def _percentile_bounds_from_histogram(
     return float(min(low_index, max_index)), float(min(high_index, max_index))
 
 
+def chunk_has_label(label_data, slices: tuple[slice, slice, slice], stride: int = 8) -> bool:
+    """Cheap label coverage test: strided read, True if any labeled voxel is hit.
+
+    Paired with chunk-local normalization this keeps background blocks (where
+    local percentile stretching would turn noise into cells) out of the
+    inference entirely.
+    """
+    stepped = tuple(slice(s.start, s.stop, max(int(stride), 1)) for s in slices)
+    return bool(np.asarray(label_data[stepped]).any())
+
+
 def _global_normalize_bounds(
     data_in,
     chunk_slices: list[tuple[slice, slice, slice]],
@@ -219,6 +230,8 @@ def run_cfos_unet_inference(
     probability_threshold: float = 0.5,
     process_existing_only: bool = False,
     skip_below_threshold: float | None = 100.0,
+    label_zarr: str | Path | None = None,
+    label_stride: int = 8,
     output_mode: str = "binary",
     output_dtype: str = "uint8",
     probability_dtype: str = "float16",
@@ -244,6 +257,28 @@ def run_cfos_unet_inference(
         )
 
     data_in = open_zarr_dataset(input_path, dataset_name=dataset_name)
+    label_data = None
+    if label_zarr:
+        label_path = Path(label_zarr)
+        if not label_path.exists():
+            raise PipelineError(
+                ErrorCode.INPUT_NOT_FOUND,
+                "label_zarr not found",
+                {"label_zarr": str(label_path)},
+            )
+        label_data = open_zarr_dataset(label_path, dataset_name=dataset_name)
+        if tuple(int(v) for v in label_data.shape) != tuple(int(v) for v in data_in.shape):
+            raise PipelineError(
+                ErrorCode.ARGUMENT_INVALID,
+                "label_zarr shape must match the input signal zarr",
+                {"label_shape": list(label_data.shape), "input_shape": list(data_in.shape)},
+            )
+        if int(label_stride) < 1:
+            raise PipelineError(
+                ErrorCode.ARGUMENT_INVALID,
+                "label_stride must be >= 1",
+                {"label_stride": label_stride},
+            )
     model_bundle = load_cfos_unet_checkpoint(checkpoint, device="cpu")
     torch_mod = model_bundle["torch"]
     resolved_device = _resolve_device(torch_mod, device)
@@ -274,6 +309,7 @@ def run_cfos_unet_inference(
 
     processed_regions = 0
     skipped_regions = 0
+    skipped_no_label = 0
     if process_existing_only:
         existing_indices = list_existing_chunk_indices(data_in)
         if not existing_indices:
@@ -315,6 +351,10 @@ def run_cfos_unet_inference(
 
     with torch_mod.inference_mode():
         for slices in tqdm(chunk_slices_iter, total=len(chunk_slices_iter), desc="cFos inference", unit="chunk"):
+            if label_data is not None and not chunk_has_label(label_data, slices, label_stride):
+                skipped_regions += 1
+                skipped_no_label += 1
+                continue
             volume_np = np.asarray(data_in[slices])
             if skip_below_threshold is not None and float(volume_np.max()) < float(skip_below_threshold):
                 skipped_regions += 1
@@ -358,7 +398,10 @@ def run_cfos_unet_inference(
         "patch_size": list(inferred_patch_size),
         "processed_regions": processed_regions,
         "skipped_regions": skipped_regions,
+        "skipped_no_label": skipped_no_label,
         "skip_below_threshold": skip_below_threshold,
+        "label_zarr": str(label_zarr) if label_zarr else "",
+        "label_stride": int(label_stride) if label_data is not None else None,
         "resolved_device": resolved_device,
         "num_classes": int(model_bundle["num_classes"]),
         "base_channels": int(model_bundle["base_channels"]),
@@ -387,6 +430,8 @@ def run_cfos_unet_inference(
             "probability_threshold": probability_threshold,
             "process_existing_only": process_existing_only,
             "skip_below_threshold": skip_below_threshold,
+            "label_zarr": str(label_zarr) if label_zarr else "",
+            "label_stride": int(label_stride) if label_data is not None else None,
             "output_mode": output_mode,
             "output_dtype": output_dtype,
             "probability_dtype": probability_dtype,
@@ -433,6 +478,14 @@ def parse_args() -> argparse.Namespace:
         help="global (default): compute percentiles over the whole volume first, then "
         "normalize every chunk with the same bounds; chunk: per-chunk percentiles (legacy)",
     )
+    parser.add_argument(
+        "--label_zarr",
+        default="",
+        help="Optional atlas label Zarr (same grid as input). Chunks with no labeled voxels "
+        "(strided test, --label_stride) are skipped entirely — keeps background blocks out of "
+        "chunk-local normalization. Empty: off.",
+    )
+    parser.add_argument("--label_stride", type=int, default=8, help="Sampling stride for the label coverage test (default 8)")
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()
 
@@ -479,6 +532,8 @@ def main() -> int:
             probability_threshold=args.probability_threshold,
             process_existing_only=args.process_existing_only,
             skip_below_threshold=None if args.skip_below_threshold < 0 else args.skip_below_threshold,
+            label_zarr=args.label_zarr or None,
+            label_stride=args.label_stride,
             output_mode=args.output_mode,
             output_dtype=args.output_dtype,
             probability_dtype=args.probability_dtype,

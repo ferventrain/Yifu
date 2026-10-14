@@ -45,6 +45,8 @@
         "probability_dtype": {"type": "string", "default": "float16"},
         "process_existing_only": {"type": "bool", "default": false},
         "skip_below_threshold": {"type": "float|null", "default": 100.0},
+        "label_zarr": {"type": "path|null", "default": null, "description": "Atlas label Zarr on the same grid; chunks whose strided label test finds no labeled voxel are skipped entirely (guards chunk-local normalization against background false positives). main.py wires <sample>/upsampled_atlas_label.zarr when segmentation.cfos_unet.restrict_to_label=true."},
+        "label_stride": {"type": "int", "default": 8, "description": "Sampling stride of the per-chunk label coverage test"},
         "chunk_size": {"type": "triplet_int|null", "default": null},
         "normalize_percentiles": {"type": "pair_float", "default": [1.0, 99.5]}
       },
