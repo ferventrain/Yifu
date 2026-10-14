@@ -55,6 +55,39 @@ def pid_matches(pid: int | None, created_at: float | None) -> bool:
     return abs(actual - float(created_at)) <= 5.0
 
 
+def tree_memory_mb(pid: int | None) -> float | None:
+    """Sum of private commit bytes (vms) over ``pid`` and its descendants, MB.
+
+    vms/PagefileUsage is the committed amount — the resource that actually
+    runs out when parallel big-array steps OOM — so this is the planning
+    metric. Returns None when the process is gone or psutil is unavailable.
+    """
+    if pid is None:
+        return None
+    try:
+        number = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil ships with the runtime env
+        return None
+    try:
+        root = psutil.Process(number)
+        procs = [root, *root.children(recursive=True)]
+    except Exception:
+        return None
+    total = 0
+    for proc in procs:
+        try:
+            total += int(proc.memory_info().vms)
+        except Exception:
+            continue
+    return total / (1024 * 1024)
+
+
 def _pid_is_alive_windows(pid: int) -> bool:
     import ctypes
     from ctypes import wintypes

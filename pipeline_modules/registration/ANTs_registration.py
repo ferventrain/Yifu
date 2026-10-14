@@ -314,10 +314,17 @@ class BidirectionalRegistration:
         # catches catastrophic misalignment ~20s into the run.
         self.n4_preprocess = bool(registration_config.get("n4_preprocess", True))
         self.rigid_preflight_qc = bool(registration_config.get("rigid_preflight_qc", True))
+        # 2026-10-12 additions (edge-focused variant): SyN similarity metric
+        # override (e.g. "CC" — RA stages stay Mattes MI) and histogram
+        # matching toggle; defaults keep the production behavior.
+        self.syn_metric = str(registration_config.get("syn_metric", "mattes"))
+        self.histogram_matching = bool(registration_config.get("histogram_matching", True))
         logger.info(
-            "SyN deformation params: grad_step=%s, syn_iterations=%s",
+            "SyN deformation params: grad_step=%s, syn_iterations=%s, syn_metric=%s, histogram_matching=%s",
             self.grad_step,
             self.syn_iterations,
+            self.syn_metric,
+            self.histogram_matching,
         )
 
         # Flip atlas if configured
@@ -502,6 +509,7 @@ class BidirectionalRegistration:
             reg_iterations=self.syn_iterations,
             aff_random_sampling_rate=0.5,
             aff_do_reflection=False,
+            syn_metric=self.syn_metric,
             **kwargs
         )
 
@@ -561,9 +569,14 @@ class BidirectionalRegistration:
         if self.n4_preprocess:
             fixed = self._apply_n4_preprocess(fixed)
 
-        # Histogram matching (Sample matches Atlas)
-        logger.info("Performing histogram matching (Sample -> Atlas)...")
-        self.register_image = ants.histogram_match_image(fixed, self.atlas_image)
+        # Histogram matching (Sample matches Atlas); optional for
+        # edge-focused variants (CC metric works on raw intensities).
+        if self.histogram_matching:
+            logger.info("Performing histogram matching (Sample -> Atlas)...")
+            self.register_image = ants.histogram_match_image(fixed, self.atlas_image)
+        else:
+            logger.info("Histogram matching disabled by config; registering raw N4 output.")
+            self.register_image = fixed
 
         if mode == 'atlas2image':
             if self.rigid_preflight_qc:

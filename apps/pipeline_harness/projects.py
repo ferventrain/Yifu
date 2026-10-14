@@ -685,8 +685,27 @@ def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
             continue
         by_module.setdefault(str(module), []).append(float(duration))
 
+    # Peak memory per module: run manifests don't carry it; harness progress
+    # files record it per step (worker samples the pipeline process tree).
+    peaks_by_module: dict[str, list[float]] = {}
+    runs_root = active_dir / "runs" if active_dir is not None else None
+    if runs_root is not None and runs_root.is_dir():
+        for progress_file in sorted(runs_root.glob("*/progress.json")):
+            prog = read_json(progress_file, default=None)
+            if not isinstance(prog, dict):
+                continue
+            for step in prog.get("steps") or []:
+                if not isinstance(step, dict) or step.get("skipped"):
+                    continue
+                module = step.get("module")
+                peak = step.get("peak_mem_mb")
+                if not module or not isinstance(peak, (int, float)) or float(peak) <= 0:
+                    continue
+                peaks_by_module.setdefault(str(module), []).append(float(peak))
+
     stages = []
     for module, durations in by_module.items():
+        peaks = peaks_by_module.get(module) or []
         stages.append(
             {
                 "module": module,
@@ -694,6 +713,8 @@ def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
                 "median_s": round(_median(durations) or 0.0, 1),
                 "mean_s": round(sum(durations) / len(durations), 1),
                 "total_s": round(sum(durations), 1),
+                "peak_mem_mb_median": round(_median(peaks), 0) or None if peaks else None,
+                "peak_mem_count": len(peaks),
             }
         )
     stages.sort(key=lambda item: item["median_s"], reverse=True)
@@ -777,11 +798,16 @@ def group_into_batches(
 
         active = [r for r in project["runs"] if str(r["status"]) in {"queued", "running", "verifying"}]
         project["active_run_id"] = active[0]["id"] if active else None
-        statuses = [str(r["display_status"] or r["status"]) for r in project["runs"]]
+        all_statuses = [str(r["display_status"] or r["status"]) for r in project["runs"]]
+        # Status reflects what is live right now: any active run, else the
+        # NEWEST run only. Ranking the whole history kept a sample "failed"
+        # forever after one failed attempt even when a later rerun succeeded;
+        # past failures stay visible via failed_count / error_history.
+        live_statuses = [str(r["display_status"] or r["status"]) for r in (active or project["runs"][:1])]
         project["status"] = (
-            min(statuses, key=lambda s: _AGGREGATE_RANK.get(s, 9)) if statuses else "idle"
+            min(live_statuses, key=lambda s: _AGGREGATE_RANK.get(s, 9)) if live_statuses else "idle"
         )
-        project["failed_count"] = sum(1 for s in statuses if s in {"failed", "stalled"})
+        project["failed_count"] = sum(1 for s in all_statuses if s in {"failed", "stalled"})
         project["error_history"] = [
             {"run_id": r["id"], "error": r["error"], "ended_at": r["ended_at"]}
             for r in project["runs"]

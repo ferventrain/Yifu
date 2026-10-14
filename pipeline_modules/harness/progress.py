@@ -171,9 +171,34 @@ class ProgressWriter:
                 "ended_at": None,
                 "seconds": None,
                 "skipped": False,
+                "peak_mem_mb": None,
+                "module": None,
             }
         )
         self._flush()
+
+    def record_step_peak(self, peak_mb: float | None) -> None:
+        """Track the running max process-tree memory of the current step."""
+        if peak_mb is None or float(peak_mb) <= 0:
+            return
+        steps = self.state["steps"]
+        if not steps:
+            return
+        current = steps[-1]
+        if float(peak_mb) > float(current.get("peak_mem_mb") or 0.0):
+            current["peak_mem_mb"] = round(float(peak_mb), 1)
+            self._flush()
+
+    def annotate_current_module(self, module_id: str) -> None:
+        """Attach the module id (e.g. segmentation.cfos_mask_postprocess) the
+        current step executed, so memory stats can aggregate per module."""
+        steps = self.state["steps"]
+        if not steps or not module_id:
+            return
+        current = steps[-1]
+        if not current.get("module"):
+            current["module"] = str(module_id)
+            self._flush()
 
     def note(self, message: str) -> None:
         self.state["message"] = str(message)
@@ -266,8 +291,9 @@ def report_child_units(
             logger.warning("Could not update harness progress file (warned once)", exc_info=True)
 
 
-def touch_heartbeat(path: Path) -> str | None:
-    """Worker-side heartbeat: read-modify-write ONLY ``heartbeat_at``.
+def touch_heartbeat(path: Path, *, peak_mem_mb: float | None = None) -> str | None:
+    """Worker-side heartbeat: read-modify-write ONLY ``heartbeat_at`` (and the
+    worker-owned ``peak_mem_mb`` maximum when provided).
 
     The pipeline subprocess owns the rest of the file; the worker stamps
     liveness so the monitor can distinguish "running" from "stalled" without
@@ -276,6 +302,10 @@ def touch_heartbeat(path: Path) -> str | None:
     state = read_progress(path)
     now = utc_now_iso()
     state["heartbeat_at"] = now
+    if peak_mem_mb is not None:
+        prev = state.get("peak_mem_mb") or 0.0
+        if float(peak_mem_mb) > float(prev):
+            state["peak_mem_mb"] = float(peak_mem_mb)
     try:
         write_json_atomic(path, state)
     except OSError:

@@ -18,6 +18,13 @@ The tool intentionally avoids re-running registration. Two spaces:
   with a manual bregma anchor (``--bregma-index`` or ``--bregma-offset-mm`` +
   ``--anterior``) and optional ``--tilt-deg`` angle correction; transforms
   only serve as an anchor. Works on any Zarr without registration outputs.
+* **atlas-band (``--space atlas-band``)**: the same atlas-space slab as
+  ``atlas`` (bregma-anchored, boundaries warped into native space), but the
+  MIP maxes native voxels inside each pixel's own curved AP window instead of
+  resampling a fine atlas grid -- full native resolution (e.g. 1.8/1.8/2.0 um)
+  at a fraction of the memory and time. The projection direction is the
+  native AP axis within the band, a first-order approximation of the
+  atlas-orthogonal camera.
 
 Sample Zarr convention (same as the rest of the repo): arrays are ``(z, y, x)``
 with z = DV (the TIFF stack axis), y = AP, x = ML. A coronal MIP therefore has
@@ -675,6 +682,112 @@ def _channel_colormap(name: str):
         return LinearSegmentedColormap.from_list(name, [(0.0, 0.0, 0.0), tuple(rgb)])
 
 
+def _nucleus_group_map() -> dict[int, int]:
+    """Label id -> nucleus-level group id, the cfos standard report parcellation.
+
+    Mirrors ``build_default_parcellation``'s tree walk: descend until children
+    would be cortical layers or nucleus parts (those fold into their parent),
+    keep cortical areas and _PART_SPLIT_ACRO parts divided. Above the ``grey``
+    node everything divides by child. Cached after the first call.
+    """
+    import functools
+
+    from pipeline_modules.visualization.top_level7_density_ratio import (
+        _GREY_ACRONYM,
+        _ISOCORTEX_ACRONYM,
+        _PART_SPLIT_ACRO,
+        DEFAULT_PARCELLATION_CSV,
+        is_layer_child_name,
+        is_part_of_parent,
+        load_structure_tree,
+    )
+
+    @functools.lru_cache(maxsize=1)
+    def build() -> dict[int, int]:
+        nodes, root_id = load_structure_tree(DEFAULT_PARCELLATION_CSV)
+        mapping: dict[int, int] = {}
+
+        def subtree_ids(node: dict) -> list[int]:
+            out = [node["id"]]
+            for child in node["children"]:
+                out.extend(subtree_ids(child))
+            return out
+
+        def walk(node: dict, under_grey: bool, under_isocortex: bool) -> None:
+            children = node["children"]
+            if not children:
+                mapping[node["id"]] = node["id"]
+                return
+            next_iso = under_isocortex or node["acronym"] == _ISOCORTEX_ACRONYM
+            if not under_grey:
+                for child in children:
+                    walk(child, under_grey or node["acronym"] == _GREY_ACRONYM, next_iso)
+                mapping[node["id"]] = node["id"]
+                return
+            layer_flags = [is_layer_child_name(child["name"]) for child in children]
+            if all(layer_flags):
+                for sid in subtree_ids(node):
+                    mapping[sid] = node["id"]
+                return
+            non_layer = [c for c, f in zip(children, layer_flags) if not f]
+            part_allowed = under_isocortex or node["acronym"] in _PART_SPLIT_ACRO
+            if non_layer and not part_allowed and all(
+                is_part_of_parent(node["name"], child["name"]) for child in non_layer
+            ):
+                for sid in subtree_ids(node):
+                    mapping[sid] = node["id"]
+                return
+            for child in non_layer:
+                walk(child, under_grey, next_iso)
+            mapping[node["id"]] = node["id"]
+            for child, flag in zip(children, layer_flags):
+                if flag:
+                    for sid in subtree_ids(child):
+                        mapping[sid] = node["id"]
+
+        walk(nodes[root_id], False, False)
+        return mapping
+
+    return build()
+
+
+def nucleus_contour_lines_mm(
+    label_slice: np.ndarray,
+    *,
+    vox_um: float = 25.0,
+    smoothing: float = 1.2,
+) -> list[np.ndarray]:
+    """Per-region smooth contour outlines of a label slice, in mm.
+
+    Companion to the nucleus-level parcellation: every distinct label is
+    outlined by marching-squares contours and gaussian-smoothed in voxel
+    units. Shared borders of adjacent regions coincide (both traces sit on
+    the interface midline), so overlapping draws are harmless in a raster.
+    Returns (N, 2) arrays of (x=ML mm, y=DV mm) from the slice corner -- the
+    ``label_boundary_lines_mm`` convention.
+    """
+    from skimage import measure
+
+    from pipeline_modules.visualization.atlas_slice import _smooth_contour
+
+    sigma_vox = max(0.0, smoothing)
+    lines: list[np.ndarray] = []
+    labels = np.asarray(label_slice)
+    for val in np.unique(labels):
+        if val == 0:
+            continue
+        for contour in measure.find_contours(labels == val, 0.5):
+            if len(contour) < 8:
+                continue
+            path = (
+                np.asarray(contour, dtype=np.float64)
+                if sigma_vox <= 0
+                else _smooth_contour(np.asarray(contour, dtype=np.float64), sigma_vox)
+            )
+            lines.append(path[:, ::-1] * (vox_um / 1000.0))
+    return lines
+
+
 def _compose_rgb(
     mips: list[np.ndarray],
     cmaps: list[str],
@@ -1095,6 +1208,205 @@ def resolve_atlas_native_mapper(
 
 
 # ---------------------------------------------------------------------------
+# Atlas-space thin-slab band MIP (native-resolution curved windows)
+# ---------------------------------------------------------------------------
+
+
+def _atlas_surface_grid(
+    mapper: AtlasNativeMapper,
+    *,
+    atlas_shape_dv_ap_ml: tuple[int, int, int],
+    ap_index: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Native (z, y, x) coordinates of one atlas coronal surface's (DV, ML) grid."""
+    n_dv_a, _n_ap_a, n_ml_a = atlas_shape_dv_ap_ml
+    dv_g, ml_g = np.meshgrid(
+        np.arange(n_dv_a, dtype=np.float64),
+        np.arange(n_ml_a, dtype=np.float64),
+        indexing="ij",
+    )
+    ap_g = np.full(dv_g.shape, float(ap_index))
+    return mapper.map(dv_g, ap_g, ml_g)
+
+
+def _atlas_surface_y_field(
+    mapper: AtlasNativeMapper,
+    *,
+    atlas_shape_dv_ap_ml: tuple[int, int, int],
+    ap_index: float,
+    native_shape_zyx: tuple[int, int, int],
+    subsample: int = 8,
+) -> np.ndarray:
+    """Native y (AP) height field of one warped atlas coronal surface.
+
+    Maps the full atlas (DV, ML) grid at ``ap_index`` through the transforms
+    and interpolates the resulting native y coordinates onto the native
+    (z=DV, x=ML) pixel grid: scattered linear interpolation on a decimated
+    grid (the deformation is smooth far below ``subsample`` voxels), refined
+    bilinearly to full resolution. NaN marks pixels outside the mapped atlas
+    footprint.
+    """
+    from scipy.interpolate import griddata
+    from scipy import ndimage as ndi
+
+    z_s, y_s, x_s = _atlas_surface_grid(
+        mapper, atlas_shape_dv_ap_ml=atlas_shape_dv_ap_ml, ap_index=ap_index
+    )
+    points = np.column_stack([z_s.ravel(), x_s.ravel()])
+    values = y_s.ravel()
+
+    n_z, _n_y, n_x = native_shape_zyx
+    tz = (np.arange(int(np.ceil(n_z / subsample)), dtype=np.float64) + 0.5) * subsample - 0.5
+    tx = (np.arange(int(np.ceil(n_x / subsample)), dtype=np.float64) + 0.5) * subsample - 0.5
+    tz_g, tx_g = np.meshgrid(tz, tx, indexing="ij")
+    coarse = griddata(points, values, (tz_g, tx_g), method="linear")
+    if coarse is None or np.isnan(coarse).all():
+        raise AnchorError(
+            f"Atlas surface at AP index {ap_index:.1f} maps entirely outside the zarr grid"
+        )
+    valid_c = ~np.isnan(coarse)
+    filled = np.where(valid_c, coarse, griddata(points, values, (tz_g, tx_g), method="nearest"))
+
+    fine_z = ((np.arange(n_z, dtype=np.float32) + 0.5) / subsample - 0.5).astype(np.float32)
+    fine_x = ((np.arange(n_x, dtype=np.float32) + 0.5) / subsample - 0.5).astype(np.float32)
+    fz_g, fx_g = np.meshgrid(fine_z, fine_x, indexing="ij")
+    coords = np.stack([fz_g, fx_g])
+    field = ndi.map_coordinates(filled.astype(np.float32), coords, order=1, mode="nearest")
+    inside = ndi.map_coordinates(
+        valid_c.astype(np.float32), coords, order=1, mode="constant", cval=0.0
+    ) > 0.999
+    field[~inside] = np.nan
+    return field
+
+
+def band_mip_per_pixel(
+    arrays,
+    *,
+    y_win_lo: np.ndarray,
+    y_win_hi: np.ndarray,
+    dv_block: int = 256,
+    ml_block: int = 1536,
+) -> list[np.ndarray]:
+    """Coronal MIP over per-pixel curved AP windows; rows = DV, cols = ML.
+
+    ``y_win_lo``/``y_win_hi`` bound each (DV, ML) pixel's own AP window (NaN =
+    no window). The image is processed in (DV, ML) tiles aligned to the zarr
+    chunk grid; each tile reads the one AP band covering all its windows,
+    zeroes outside-window voxels in place and maxes every pixel over its own
+    window -- native voxels throughout, no resampling. Tiles run serially:
+    zarr's sync API funnels concurrent getitems through one global loop, so a
+    thread pool only serializes (and defeats zarr's internal chunk
+    parallelism).
+    """
+    import time
+
+    shape0 = tuple(int(v) for v in arrays[0].shape)
+    n_z, n_y, n_x = shape0
+    outs = [np.zeros((n_z, n_x), dtype=np.result_type(a.dtype, np.uint16)) for a in arrays]
+    tiles = [
+        (r0, min(r0 + int(dv_block), n_z), c0, min(c0 + int(ml_block), n_x))
+        for r0 in range(0, n_z, int(dv_block))
+        for c0 in range(0, n_x, int(ml_block))
+    ]
+    t_start = time.perf_counter()
+    for n_done, (r0, r1, c0, c1) in enumerate(tiles):
+        lo_f = y_win_lo[r0:r1, c0:c1]
+        hi_f = y_win_hi[r0:r1, c0:c1]
+        if np.isfinite(lo_f).any():
+            blo = max(0, int(np.floor(np.nanmin(lo_f))) - 1)
+            bhi = min(n_y, int(np.ceil(np.nanmax(hi_f))) + 2)
+            if bhi > blo:
+                yy = np.arange(blo, bhi, dtype=np.float32)[None, :, None]
+                with np.errstate(invalid="ignore"):
+                    mask = (yy >= lo_f[:, None, :]) & (yy <= hi_f[:, None, :])
+                off = ~mask
+                for out, arr in zip(outs, arrays):
+                    block = np.asarray(arr[r0:r1, blo:bhi, c0:c1])
+                    block[off] = 0
+                    out[r0:r1, c0:c1] = block.max(axis=1)
+        if n_done % 10 == 9 or n_done == len(tiles) - 1:
+            logger.info(
+                "band MIP tile %d/%d (z %d, ml %d) after %.1fs",
+                n_done + 1, len(tiles), r0, c0, time.perf_counter() - t_start,
+            )
+    return outs
+
+
+def _atlas_lines_to_native_mm(
+    lines: list[np.ndarray],
+    z_surface: np.ndarray,
+    x_surface: np.ndarray,
+    *,
+    atlas_res_um: float,
+    vox_ml_um: float,
+    vox_dv_um: float,
+) -> list[np.ndarray]:
+    """Map atlas-space boundary lines (mm) onto the native grid via the surface map.
+
+    ``z_surface``/``x_surface`` are the native coordinates of the atlas (DV,
+    ML) grid on the same coronal surface; line points are converted back to
+    atlas voxel coordinates, bilinearly resampled onto the native grid, and
+    expressed in mm from the native slice corner -- the same convention as
+    ``label_boundary_lines_mm`` output, ready for ``render_bregma_png``.
+    """
+    from scipy import ndimage as ndi
+
+    vox_mm = atlas_res_um / 1000.0
+    n_dv_a, n_ml_a = z_surface.shape
+    out: list[np.ndarray] = []
+    for ln in lines:
+        dv_vox = np.clip(ln[:, 1] / vox_mm, 0.0, n_dv_a - 1.0)
+        ml_vox = np.clip(ln[:, 0] / vox_mm, 0.0, n_ml_a - 1.0)
+        z_i = ndi.map_coordinates(z_surface, [dv_vox, ml_vox], order=1, mode="nearest")
+        x_i = ndi.map_coordinates(x_surface, [dv_vox, ml_vox], order=1, mode="nearest")
+        out.append(np.column_stack([x_i * vox_ml_um / 1000.0, z_i * vox_dv_um / 1000.0]))
+    return out
+
+
+def regrid_band_mip_to_atlas(
+    mip: np.ndarray,
+    z_surface: np.ndarray,
+    x_surface: np.ndarray,
+    *,
+    atlas_shape_dv_ap_ml: tuple[int, int, int],
+    atlas_res_um: float,
+    pitch_um: float,
+) -> np.ndarray:
+    """Regrid a native-grid band MIP onto the standard atlas coronal grid.
+
+    Project first, regrid after: the band MIP already holds native-resolution
+    detail, so moving it into upright atlas space is a single 2D bilinear
+    resampling -- every atlas-grid pixel looks up its native (z, x) position on
+    the warped mid-surface (``z_surface``/``x_surface`` on the atlas (DV, ML)
+    grid) and samples the MIP there. Isotropic ``pitch_um`` output; pixels
+    mapping outside the native grid are zero.
+    """
+    from scipy import ndimage as ndi
+
+    n_dv_a, _n_ap_a, n_ml_a = atlas_shape_dv_ap_ml
+    n_rows = int(np.floor((n_dv_a - 1) * atlas_res_um / pitch_um)) + 1
+    n_cols = int(np.floor((n_ml_a - 1) * atlas_res_um / pitch_um)) + 1
+    dv_f = np.arange(n_rows, dtype=np.float32) * (pitch_um / atlas_res_um)
+    ml_f = np.arange(n_cols, dtype=np.float32) * (pitch_um / atlas_res_um)
+    dv_g, ml_g = np.meshgrid(dv_f, ml_f, indexing="ij")
+    z_i = ndi.map_coordinates(
+        np.asarray(z_surface, dtype=np.float32), [dv_g, ml_g], order=1, mode="nearest"
+    )
+    x_i = ndi.map_coordinates(
+        np.asarray(x_surface, dtype=np.float32), [dv_g, ml_g], order=1, mode="nearest"
+    )
+    n_z, n_x = mip.shape
+    valid = (z_i >= 0) & (z_i <= n_z - 1) & (x_i >= 0) & (x_i <= n_x - 1)
+    zc = np.clip(z_i, 0, n_z - 1)
+    xc = np.clip(x_i, 0, n_x - 1)
+    out = ndi.map_coordinates(
+        np.asarray(mip, dtype=np.float32), [zc, xc], order=1, mode="constant", cval=0.0
+    )
+    out[~valid] = 0.0
+    return out.astype(np.result_type(mip.dtype, np.uint16))
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1130,6 +1442,7 @@ def render_bregma_png(
     atlas_slice_image: np.ndarray | None = None,
     pool_factor: int = 1,
     dpi: int = 200,
+    full_scale: bool = False,
 ) -> Path:
     if pool_factor > 1:
         mip = _max_pool(mip, pool_factor)
@@ -1142,18 +1455,41 @@ def render_bregma_png(
 
     n_panels = 2 if atlas_slice_image is not None else 1
     aspect = extent_ml_mm / max(extent_dv_mm, 1e-6)
-    panel_h = 8.0
-    fig_w = panel_h * aspect * n_panels + max(panel_h * aspect * 0.35, 2.5)
-    fig, axes = plt.subplots(1, n_panels, figsize=(fig_w, panel_h), dpi=dpi)
-    axes = np.atleast_1d(axes)
+    if full_scale and n_panels == 1:
+        # Canvas = the image: one display pixel per data pixel, no downsampling.
+        # A margin around the full-bleed axes keeps titles drawable; tight bbox
+        # crops it back so the saved axes span exactly image.shape pixels.
+        panel_w = image.shape[1] / float(dpi)
+        panel_h = image.shape[0] / float(dpi)
+        margin_in = 1.0
+        fig_w = panel_w + 2.0 * margin_in
+        fig_h = panel_h + 2.0 * margin_in
+        fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+        ax = fig.add_axes([margin_in / fig_w, margin_in / fig_h, panel_w / fig_w, panel_h / fig_h])
+        axes = np.atleast_1d(ax)
+        font_scale = max(1.0, panel_h / 8.0)
+    else:
+        panel_h = 8.0
+        panel_w = panel_h * aspect
+        fig_w = panel_w * n_panels + max(panel_w * 0.35, 2.5)
+        fig, axes = plt.subplots(1, n_panels, figsize=(fig_w, panel_h), dpi=dpi)
+        axes = np.atleast_1d(axes)
+        font_scale = 1.0
     for ax in axes:
         ax.set_facecolor("black")
 
     ax = axes[0]
-    ax.imshow(
-        image, cmap=cmap, vmin=0.0, vmax=meta.vmax,
-        extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
-    )
+    if image.ndim == 3:
+        ax.imshow(
+            image, extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
+            aspect="auto" if full_scale else "equal",
+        )
+    else:
+        ax.imshow(
+            image, cmap=cmap, vmin=0.0, vmax=meta.vmax,
+            extent=(0, extent_ml_mm, extent_dv_mm, 0), interpolation="nearest",
+            aspect="auto" if full_scale else "equal",
+        )
     _draw_boundary_lines(
         ax,
         boundary_lines,
@@ -1169,7 +1505,7 @@ def render_bregma_png(
 
     ax.set_title(
         f"Bregma AP {meta.bregma_mm:+.2f} mm  |  slab {meta.thickness_mm:.2f} mm",
-        color="white", fontsize=11,
+        color="white", fontsize=11 * font_scale,
     )
     ax.text(
         0.5, -0.04,
@@ -1180,7 +1516,7 @@ def render_bregma_png(
             f"voxel {meta.voxel_xyz_um} um ({meta.voxel_source})  level {meta.level}  "
             f"vmax={meta.vmax:.0f}  {meta.zarr_path.name}"
         ),
-        transform=ax.transAxes, ha="center", va="top", color="0.75", fontsize=7,
+        transform=ax.transAxes, ha="center", va="top", color="0.75", fontsize=7 * font_scale,
     )
 
     if atlas_slice_image is not None:
@@ -1330,13 +1666,13 @@ def render_bregma_mips(
     zarr_path: str | Path,
     bregma_mm: list[float],
     thickness_mm: float,
-    space: str = "native",
+    space: str = "atlas-band",
     pitch_um: float = 5.0,
     cmaps: list[str] | str | None = None,
     boundary_color: str = "white",
     boundary_linewidth: float = 0.8,
     boundary_style: str = "dashed",
-    boundary_smooth: float = 1.6,
+    boundary_smooth: float = 2.0,
     boundary_min_area_mm2: float = 0.5,
     bilateral: bool = False,
     fixed_nii: str | Path | None = None,
@@ -1364,7 +1700,40 @@ def render_bregma_mips(
     output_dir: str | Path | None = None,
     max_pixels: int = 3000,
     dv_block: int = 128,
+    atlas_grid: bool = True,
+    atlas_grid_pitch_um: float | None = None,
+    split_atlas: bool = False,
+    split_nucleus_merge: bool = False,
 ) -> dict[str, object]:
+    if space == "atlas-band":
+        return render_atlas_band_mips(
+            zarr_path=zarr_path,
+            bregma_mm=bregma_mm,
+            thickness_mm=thickness_mm,
+            cmaps=cmaps,
+            transforms_dir=transforms_dir,
+            atlas_image_path=atlas_image_path,
+            atlas_label_path=atlas_label_path,
+            label_zarr_path=label_zarr_path,
+            fixed_nii=fixed_nii,
+            chunk_points=chunk_points,
+            overlay_labels=overlay_labels,
+            boundary_color=boundary_color,
+            boundary_linewidth=boundary_linewidth,
+            boundary_style=boundary_style,
+            boundary_smooth=boundary_smooth,
+            percentile=percentile,
+            vmax=vmax,
+            flip_dv=flip_dv,
+            flip_ml=flip_ml,
+            output_dir=output_dir,
+            max_pixels=max_pixels,
+            dv_block=dv_block,
+            atlas_grid=atlas_grid,
+            atlas_grid_pitch_um=atlas_grid_pitch_um,
+            split_atlas=split_atlas,
+            split_nucleus_merge=split_nucleus_merge,
+        )
     if space == "atlas":
         return render_atlas_space_mips(
             zarr_path=zarr_path,
@@ -1609,7 +1978,7 @@ def render_atlas_space_mips(
     boundary_color: str = "white",
     boundary_linewidth: float = 0.8,
     boundary_style: str = "dashed",
-    boundary_smooth: float = 1.6,
+    boundary_smooth: float = 2.0,
     boundary_min_area_mm2: float = 0.5,
     bilateral: bool = False,
     percentile: float = 99.5,
@@ -1818,6 +2187,290 @@ def _atlas_coronal_image(bregma_mm: float, atlas_label_path: str | Path | None) 
         return None
 
 
+def render_atlas_band_mips(
+    *,
+    zarr_path: str | Path,
+    bregma_mm: list[float],
+    thickness_mm: float,
+    cmaps: list[str] | str | None = None,
+    transforms_dir: str | Path | None = None,
+    atlas_image_path: str | Path | None = None,
+    atlas_label_path: str | Path | None = None,
+    label_zarr_path: str | Path | None = None,
+    fixed_nii: str | Path | None = None,
+    chunk_points: int = 250_000,
+    overlay_labels: bool = True,
+    boundary_color: str = "white",
+    boundary_linewidth: float = 0.35,
+    boundary_style: str = "dashed",
+    boundary_smooth: float = 2.0,
+    percentile: float = 99.5,
+    vmax: float | None = None,
+    flip_dv: bool = False,
+    flip_ml: bool = False,
+    output_dir: str | Path | None = None,
+    max_pixels: int = 3000,
+    dv_block: int = 256,
+    height_subsample: int = 8,
+    atlas_grid: bool = True,
+    atlas_grid_pitch_um: float | None = None,
+    split_atlas: bool = False,
+    split_min_line_px: int = 100,
+    split_nucleus_merge: bool = False,
+) -> dict[str, object]:
+    """Atlas-space slab with per-pixel curved windows, native-voxel band MIP.
+
+    Same slab definition as ``--space atlas`` (bregma-anchored in atlas space,
+    boundary surfaces warped into native space), but the MIP maxes the native
+    voxels inside each pixel's own curved AP window: the output is exactly the
+    native voxel grid (no resampling) and only the slab's boundary surfaces go
+    through the transforms (~0.5M points instead of a fine-grid point cloud).
+    The projection direction is the native AP axis within the band -- a
+    first-order approximation of the atlas-orthogonal camera.
+    """
+    if isinstance(zarr_path, str) and "," in zarr_path:
+        raise ValueError("--space atlas-band renders one signal zarr per image")
+    if split_atlas:
+        atlas_grid = True  # the split composite is defined on the atlas grid
+    zarr_path = Path(zarr_path)
+    sample_dir = zarr_path.parent
+    arr = open_zarr_dataset(zarr_path)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {arr.shape} for {zarr_path}")
+    native_shape = tuple(int(v) for v in arr.shape)
+    voxel, voxel_source = resolve_voxel_xyz_um(
+        zarr_path, config_path=sample_dir / "config.json", sample_dir=sample_dir
+    )
+    vox_ml, _vox_ap, vox_dv = voxel
+
+    transforms_dir = Path(transforms_dir) if transforms_dir else sample_dir / "transforms"
+    label_zarr = Path(label_zarr_path) if label_zarr_path else sample_dir / "upsampled_atlas_label.zarr"
+
+    if atlas_image_path is None or atlas_label_path is None:
+        from pipeline_modules.utils.data_paths import reference_dir
+
+        ref_dir = reference_dir()
+        atlas_image_path = atlas_image_path or ref_dir / "atlas.tiff"
+        atlas_label_path = atlas_label_path or ref_dir / "atlas_label.tiff"
+    atlas_image_path, atlas_label_path = Path(atlas_image_path), Path(atlas_label_path)
+
+    atlas_shape = _atlas_label_shape_dv_ap_ml(atlas_label_path)
+    atlas_res_um = 25.0
+    mapper = resolve_atlas_native_mapper(
+        sample_dir=sample_dir,
+        transforms_dir=transforms_dir,
+        atlas_image_path=atlas_image_path,
+        atlas_label_path=atlas_label_path,
+        label_zarr_path=label_zarr,
+        native_shape_zyx=native_shape,
+        fixed_nii=fixed_nii,
+        chunk_points=chunk_points,
+    )
+    logger.info("Atlas->native mapper ready (%s)", mapper.label_check)
+
+    atlas_label_volume = None
+    if overlay_labels or split_atlas:
+        import tifffile
+
+        atlas_label_volume = tifffile.imread(str(atlas_label_path))
+
+    out_dir = Path(output_dir) if output_dir else sample_dir / "visualization" / "bregma_mip"
+    n_dv_a, n_ap_a, _n_ml_a = atlas_shape
+    outputs: list[dict[str, object]] = []
+    for bregma in bregma_mm:
+        ap_center = DEFAULT_BREGMA_DV_AP_ML[1] - bregma * 1000.0 / atlas_res_um
+        half_vox = thickness_mm * 1000.0 / 2.0 / atlas_res_um
+        if ap_center + half_vox < 0 or ap_center - half_vox > n_ap_a - 1:
+            raise AnchorError(
+                f"Bregma {bregma:+.2f} mm maps to atlas AP index {ap_center:.1f}, "
+                f"outside 0..{n_ap_a - 1}"
+            )
+        import time
+
+        t0 = time.perf_counter()
+        logger.info(
+            "Bregma %+.2f mm: warping boundary surfaces at atlas AP %.1f / %.1f",
+            bregma, ap_center - half_vox, ap_center + half_vox,
+        )
+        y_a = _atlas_surface_y_field(
+            mapper, atlas_shape_dv_ap_ml=atlas_shape, ap_index=ap_center - half_vox,
+            native_shape_zyx=native_shape, subsample=height_subsample,
+        )
+        y_b = _atlas_surface_y_field(
+            mapper, atlas_shape_dv_ap_ml=atlas_shape, ap_index=ap_center + half_vox,
+            native_shape_zyx=native_shape, subsample=height_subsample,
+        )
+        logger.info("boundary surfaces ready after %.1fs", time.perf_counter() - t0)
+        y_win_lo = np.fmin(y_a, y_b)
+        y_win_hi = np.fmax(y_a, y_b)
+        mips = band_mip_per_pixel(
+            [arr], y_win_lo=y_win_lo, y_win_hi=y_win_hi, dv_block=dv_block
+        )
+
+        boundary = None
+        atlas_lines = None
+        z_mid = x_mid = None
+        if atlas_label_volume is not None or atlas_grid:
+            t1 = time.perf_counter()
+            center_ap = int(np.clip(round(ap_center), 0, n_ap_a - 1))
+            if atlas_label_volume is not None:
+                atlas_lines = label_boundary_lines_mm(
+                    np.asarray(atlas_label_volume[:, center_ap, :]),
+                    row_vox_um=atlas_res_um,
+                    col_vox_um=atlas_res_um,
+                    smoothing=boundary_smooth,
+                )
+            z_mid, _y_mid, x_mid = _atlas_surface_grid(
+                mapper, atlas_shape_dv_ap_ml=atlas_shape, ap_index=float(center_ap)
+            )
+            logger.info(
+                "mid-surface grid + atlas lines (%s) after %.1fs",
+                f"{len(atlas_lines)} paths" if atlas_lines else "none",
+                time.perf_counter() - t1,
+            )
+
+        mip = mips[0]
+        finite = np.isfinite(y_win_lo)
+        if not finite.any():
+            raise AnchorError(
+                f"Bregma {bregma:+.2f} mm: warped slab does not intersect the zarr grid"
+            )
+        grid_pitch_um = None
+        if atlas_grid:
+            grid_pitch_um = float(atlas_grid_pitch_um) if atlas_grid_pitch_um else float(vox_ml)
+            t1 = time.perf_counter()
+            mip = regrid_band_mip_to_atlas(
+                mip, z_mid, x_mid,
+                atlas_shape_dv_ap_ml=atlas_shape, atlas_res_um=atlas_res_um,
+                pitch_um=grid_pitch_um,
+            )
+            logger.info(
+                "regridded band MIP onto atlas grid at %.1f um after %.1fs",
+                grid_pitch_um, time.perf_counter() - t1,
+            )
+            boundary = atlas_lines  # already standard atlas-space mm
+        elif atlas_lines is not None:
+            boundary = _atlas_lines_to_native_mm(
+                atlas_lines, z_mid, x_mid,
+                atlas_res_um=atlas_res_um, vox_ml_um=vox_ml, vox_dv_um=vox_dv,
+            )
+        vmax_eff = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
+        if split_atlas:
+            # Left half: atlas boundary lines on black (no fill). Right half:
+            # the raw signal, nothing overlaid. The label slice is merged to
+            # the report's nucleus-level parcellation (no layers, no parts)
+            # and outlined per region by contour tracing -- no skeletonization,
+            # so thin sheets like the corpus callosum stay whole.
+            from PIL import Image as _PilImage
+            from PIL import ImageDraw as _PilDraw
+            from matplotlib import colors as _mcolors
+            from scipy import ndimage as _ndi
+
+            lab_plane = np.asarray(
+                atlas_label_volume[:, int(np.clip(round(ap_center), 0, n_ap_a - 1)), :]
+            )
+            if split_nucleus_merge:
+                id2group = _nucleus_group_map()
+                lut = np.arange(int(lab_plane.max()) + 1, dtype=np.int64)
+                for i in range(len(lut)):
+                    lut[i] = id2group.get(int(i), int(i))
+                lab_plane = lut[lab_plane]
+            merged_lines = nucleus_contour_lines_mm(
+                lab_plane, vox_um=atlas_res_um, smoothing=boundary_smooth
+            )
+            logger.info("split contours (%s): %d paths from %d groups",
+                        "nucleus-merged" if split_nucleus_merge else "raw parcellation",
+                        len(merged_lines), int(np.unique(lab_plane[lab_plane > 0]).size))
+
+            n_rows, n_cols = mip.shape
+            pitch_mm = grid_pitch_um / 1000.0
+            lines_img = _PilImage.new("L", (n_cols, n_rows), 0)
+            draw = _PilDraw.Draw(lines_img)
+            for ln in merged_lines:
+                pts = [(x / pitch_mm, y / pitch_mm) for x, y in ln]
+                draw.line(pts, fill=255, width=2, joint="curve")
+            line_mask = np.asarray(lines_img) > 0
+            # contours are continuous; only drop degenerate tiny loops
+            comps, n_comp = _ndi.label(line_mask, structure=np.ones((3, 3), bool))
+            if n_comp:
+                sizes = np.bincount(comps.ravel())
+                sizes[0] = 0
+                line_mask = sizes[comps] >= split_min_line_px
+            normed = np.clip(mip.astype(np.float32) / max(vmax_eff, 1e-6), 0.0, 1.0)
+            rgb = np.repeat(normed[..., None], 3, axis=2)
+            mid_col = int(round(DEFAULT_BREGMA_DV_AP_ML[2] * atlas_res_um / grid_pitch_um))
+            line_rgb = np.asarray(_mcolors.to_rgb(boundary_color), dtype=np.float32)
+            rgb[:, :mid_col] = np.where(line_mask[:, :mid_col, None], line_rgb, 0.0)
+            mip = rgb
+            boundary = None  # the atlas half carries the lines; signal half stays clean
+        anchor = ApAnchor(
+            index=float(np.nanmean(0.5 * (y_win_lo + y_win_hi))),
+            anterior="low",
+            source="atlas-band",
+            label_check=mapper.label_check,
+        )
+        meta = RenderMeta(
+            bregma_mm=bregma,
+            thickness_mm=thickness_mm,
+            tilt_deg=0.0,
+            anchor=anchor,
+            voxel_xyz_um=(grid_pitch_um, grid_pitch_um, grid_pitch_um) if grid_pitch_um else voxel,
+            voxel_source=("atlas-grid %.1f um" % grid_pitch_um) if grid_pitch_um else voxel_source,
+            ap_lo=int(np.nanmin(y_win_lo)),
+            ap_hi=int(np.nanmax(y_win_hi)),
+            vmax=vmax_eff,
+            zarr_path=zarr_path,
+            level=0,
+        )
+        # Full-scale render: canvas = image, one display pixel per native voxel
+        # (max_pixels/pooling deliberately ignored in this mode).
+        stem = "atlasband_atlasgrid_split" if split_atlas else (
+            "atlasband_atlasgrid" if atlas_grid else "atlasband"
+        )
+        out_path = out_dir / (
+            f"{sample_dir.name}_{zarr_path.stem}_{stem}_bregma{bregma:+.2f}mm_"
+            f"thick{thickness_mm:.2f}mm_{boundary_style}.png"
+        )
+        render_bregma_png(
+            mip,
+            output_path=out_path,
+            meta=meta,
+            flip_dv=flip_dv,
+            flip_ml=flip_ml,
+            cmap=resolve_channel_cmaps(1, cmaps)[0] if cmaps else "gray",
+            boundary_lines=boundary,
+            boundary_color=boundary_color,
+            boundary_linewidth=boundary_linewidth,
+            boundary_style=boundary_style,
+            full_scale=True,
+        )
+        outputs.append(
+            {
+                "bregma_mm": bregma,
+                "atlas_ap_center_index": round(ap_center, 1),
+                "native_ap_window": [int(np.nanmin(y_win_lo)), int(np.nanmax(y_win_hi))],
+                "valid_fraction": round(float(finite.mean()), 4),
+                "vmax": round(vmax_eff, 1),
+                "full_scale": True,
+                "atlas_grid_pitch_um": grid_pitch_um,
+                "boundary_overlay": bool(boundary),
+                "output": str(out_path),
+            }
+        )
+        logger.info("Rendered %s", out_path)
+
+    return {
+        "zarr": str(zarr_path),
+        "space": "atlas-band",
+        "shape_zyx": list(native_shape),
+        "atlas_shape_dv_ap_ml": list(atlas_shape),
+        "thickness_mm": thickness_mm,
+        "transform_convention": mapper.convention,
+        "label_check": mapper.label_check,
+        "outputs": outputs,
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1863,9 +2516,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Boundary line style (default dashed; solid when --bilateral)",
     )
     parser.add_argument(
-        "--boundary-smooth", type=float, default=1.6,
-        help="Boundary smoothing gaussian in atlas label voxels, heatmap-style "
-             "(default 1.2; 0 disables)",
+        "--boundary-smooth", type=float, default=2.0,
+        help="Boundary smoothing gaussian in atlas label voxels "
+             "(default 2; 0 disables)",
     )
     parser.add_argument(
         "--boundary-min-area-mm2", type=float, default=0.5,
@@ -1885,10 +2538,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--thickness-mm", required=True, type=float,
                         help="Slab thickness along AP that the MIP covers")
     parser.add_argument(
-        "--space", choices=("atlas", "native"), default="atlas",
-        help="atlas: slab cut in atlas space, warped back to native space, orthogonal "
-             "AP MIP (requires pipeline transforms + upsampled_atlas_label.zarr). "
-             "native: slab on the sample AP axis with a manual anchor (default: atlas)",
+        "--space", choices=("atlas", "atlas-band", "native"), default="atlas-band",
+        help="atlas-band: atlas-defined slab, native-voxel band MIP, optionally regridded "
+             "onto the atlas grid (--atlas-grid, default on) for upright standard atlas "
+             "output. atlas: per-point pull sampling on a fine atlas grid (pitch-um; "
+             "strictly orthogonal camera, heavy at fine pitch). native: slab on the "
+             "sample AP axis with a manual anchor (default: atlas-band)",
     )
     parser.add_argument(
         "--pitch-um", type=float, default=5.0,
@@ -1949,7 +2604,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--max-pixels", type=int, default=3000,
                         help="Cap long image side via max-pooling (0 disables; default 3000)")
-    parser.add_argument("--dv-block", type=int, default=128)
+    parser.add_argument("--atlas-grid", action=argparse.BooleanOptionalAction, default=True,
+                        help="atlas-band only: regrid the band MIP onto the standard atlas "
+                             "coronal grid -- upright atlas-space output with native band "
+                             "detail (2D bilinear regrid) and standard atlas boundary lines "
+                             "(default on; --no-atlas-grid keeps the native-grid output)")
+    parser.add_argument("--atlas-grid-pitch-um", type=float, default=None,
+                        help="Atlas-grid sampling pitch for --atlas-grid "
+                             "(default: native ML voxel size, e.g. 1.8)")
+    parser.add_argument("--split-atlas", action=argparse.BooleanOptionalAction, default=False,
+                        help="atlas-band only: half-and-half composite -- left half native "
+                             "signal, right half colored atlas annotation, split at the ML "
+                             "midline (implies --atlas-grid; default off)")
+    parser.add_argument("--split-nucleus-merge", action=argparse.BooleanOptionalAction, default=False,
+                        help="--split-atlas only: merge the label slice to the cfos report's "
+                             "nucleus-level parcellation before contour tracing "
+                             "(default off -- raw parcellation contours; "
+                             "--split-nucleus-merge enables the merged view)")
+    parser.add_argument("--dv-block", type=int, default=256,
+                        help="DV rows per band tile; match the zarr chunk depth (default 256)")
     return parser
 
 
@@ -1996,6 +2669,10 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             max_pixels=args.max_pixels,
             dv_block=args.dv_block,
+            atlas_grid=args.atlas_grid,
+            atlas_grid_pitch_um=args.atlas_grid_pitch_um,
+            split_atlas=args.split_atlas,
+            split_nucleus_merge=args.split_nucleus_merge,
         )
     except (AnchorError, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
