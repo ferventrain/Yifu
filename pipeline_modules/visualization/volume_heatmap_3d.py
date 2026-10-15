@@ -303,7 +303,7 @@ def main() -> int:
                     region_mesh.alpha(1.0)  # opaque: always visible through the shell
                     include_volume = False
                 else:  # zoom: translucent region shell around its own heatmap, no brain shell
-                    region_mesh.alpha(0.15)  # colored but clearly readable outer shell
+                    region_mesh.alpha(0.30)  # darker, more opaque outer shell
         camera = None
         if args.camera:
             cam_parts = [p.strip() for p in args.camera.split(",") if p.strip()]
@@ -315,7 +315,8 @@ def main() -> int:
                 float(cam_parts[0]),
                 float(cam_parts[1]),
                 radius_factor,
-                center=region_centroid,
+                # only the zoom view orbits the region; location/heat frame the whole brain
+                center=region_centroid if args.region_view == "zoom" else None,
             )
         brain_alpha = args.brain_alpha if args.brain_alpha >= 0 else (
             0.06 if args.region_view == "location" else (0.15 if args.regions else 0.05)
