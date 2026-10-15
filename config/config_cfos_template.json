@@ -120,7 +120,7 @@
       "max_single_slice_voxels": 300,
       "max_voxels": 0,
       "min_voxels": 0,
-      "max_extent_ratio": 0.0,
+      "max_extent_ratio": 3.0,
       "downsample_factor": 4
     }
   },

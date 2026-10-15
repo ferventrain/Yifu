@@ -39,7 +39,13 @@ def normalize_channel_label(value: Any) -> str:
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
     path = Path(config_path)
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))  # raises on bad JSON as before
+    if path.name == "config.json":
+        return payload
+    from pipeline_modules.utils.config_layering import resolve_partial_config
+
+    _path, merged = resolve_partial_config(path)
+    return merged if isinstance(merged, dict) and merged else payload
 
 
 def layout_from_config(sample_dir: str | Path, config: dict[str, Any]) -> SampleLayout:
