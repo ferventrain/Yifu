@@ -60,15 +60,24 @@ def region_mask_from_acronyms(acronyms: list[str], annotation: np.ndarray, csv_p
     return mask_flat.reshape(annotation.shape)
 
 
-def camera_position(shape_zyx: tuple[int, int, int], azimuth_deg: float, elevation_deg: float, radius_factor: float = 1.7):
-    """Spherical camera around the volume center in the (AP, SI, LR) frame.
+def camera_position(shape_zyx: tuple[int, int, int], azimuth_deg: float, elevation_deg: float, radius_factor: float = 1.7, center=None):
+    """Spherical camera around a focal center in the (AP, SI, LR) frame.
 
     az=0/el=0 looks from anterior (+AP); az=90 from the left (+LR); el=90
-    looks straight down from the top. Returns (pos, focal, viewup).
+    looks straight down from the top. ``center`` defaults to the volume
+    center (pass a region centroid to focus a sub-volume). Returns
+    (pos, focal, viewup).
     """
 
     spacing = ATLAS_VOXEL_UM
-    center = ((shape_zyx[0] - 1) / 2.0 * spacing, (shape_zyx[1] - 1) / 2.0 * spacing, (shape_zyx[2] - 1) / 2.0 * spacing)
+    if center is None:
+        center = (
+            (shape_zyx[0] - 1) / 2.0 * spacing,
+            (shape_zyx[1] - 1) / 2.0 * spacing,
+            (shape_zyx[2] - 1) / 2.0 * spacing,
+        )
+    else:
+        center = tuple(float(c) for c in center)
     radius = radius_factor * float(np.max(shape_zyx)) * spacing
     az, el = np.radians(azimuth_deg), np.radians(elevation_deg)
     # spherical direction in (AP, SI, LR): el in the AP-SI plane, LR via az
@@ -78,6 +87,22 @@ def camera_position(shape_zyx: tuple[int, int, int], azimuth_deg: float, elevati
     pos = (center[0] + radius * dir_ap, center[1] + radius * dir_si, center[2] + radius * dir_lr)
     viewup = (0.0, 1.0, 0.0) if abs(np.sin(el)) < 0.99 else (0.0, 0.0, 1.0)
     return pos, center, viewup
+
+
+def mask_surface_mesh(mask: np.ndarray, color: str = "crimson", alpha: float = 0.9):
+    """Marching-cubes surface of a boolean (AP, SI, LR) mask, in um coordinates."""
+
+    import vedo
+    from skimage import measure
+
+    pad = np.pad(np.asarray(mask, dtype=np.float32), 1)
+    verts, faces, _normals, _values = measure.marching_cubes(pad, level=0.5, spacing=(ATLAS_VOXEL_UM,) * 3)
+    verts -= ATLAS_VOXEL_UM  # undo the padding offset
+    mesh = vedo.Mesh([verts, faces.astype(np.int64)])
+    mesh.color(color)
+    mesh.alpha(alpha)
+    centroid = verts.mean(axis=0)
+    return mesh, centroid
 
 
 def prepare_heatmap_grid(
@@ -151,31 +176,39 @@ def render_heatmap(
     atlas_name: str = "allen_mouse_25um",
     camera: tuple | None = None,
     brain_alpha: float = 0.05,
+    extra_actors: tuple = (),
+    include_volume: bool = True,
     title: str = "c-Fos 3D heatmap - L-drag rotate / wheel zoom / q close",
 ) -> Path | None:
     """Render the prepared (AP, SI, LR) grid; interactive window unless output is given.
 
     ``camera`` = (pos, focal, viewup) as produced by :func:`camera_position`
     pins the offscreen view (ignored in the interactive window).
+    ``include_volume=False`` renders only the meshes (location views).
     """
 
     if mode not in MODE_CHOICES:
         raise ValueError(f"mode must be one of {MODE_CHOICES}, got: {mode}")
     import vedo
 
-    positive = grid[grid > 0]
-    if positive.size == 0:
-        raise ValueError("Heatmap grid is empty; nothing to render.")
-    vmax = float(np.percentile(positive, percentile))
-    normalized = np.clip(grid / vmax, 0.0, 1.0) ** power
+    actors = []
+    if include_volume:
+        positive = grid[grid > 0]
+        if positive.size == 0:
+            raise ValueError("Heatmap grid is empty; nothing to render.")
+        vmax = float(np.percentile(positive, percentile))
+        normalized = np.clip(grid / vmax, 0.0, 1.0) ** power
 
-    volume = vedo.Volume(np.ascontiguousarray(normalized, dtype=np.float32), spacing=(ATLAS_VOXEL_UM,) * 3)
-    volume.color(_cmap_anchor_list(cmap))
-    volume.alpha([tuple(stop) for stop in sigma_alpha_stops])
-    volume.mode(1 if mode == "mip" else 0)
+        volume = vedo.Volume(np.ascontiguousarray(normalized, dtype=np.float32), spacing=(ATLAS_VOXEL_UM,) * 3)
+        volume.color(_cmap_anchor_list(cmap))
+        volume.alpha([tuple(stop) for stop in sigma_alpha_stops])
+        volume.mode(1 if mode == "mip" else 0)
+        actors.append(volume)
+    actors.extend(extra_actors)
 
     brain_mesh = _root_brain_mesh(atlas_name)
     brain_mesh.alpha(brain_alpha)
+    actors.append(brain_mesh)
     offscreen = output is not None
     plt = vedo.Plotter(offscreen=offscreen, size=window_size, bg="white")
     if camera is not None:
@@ -183,7 +216,7 @@ def render_heatmap(
         cam_kw = dict(camera=dict(pos=pos, focalPoint=focal, viewup=viewup))
     else:
         cam_kw = {}
-    plt.show(volume, brain_mesh, title, interactive=not offscreen, axes=0, **cam_kw)
+    plt.show(*actors, title, interactive=not offscreen, axes=0, **cam_kw)
     if offscreen:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -228,6 +261,12 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--brain_alpha", type=float, default=-1.0,
                         help="Root brain mesh alpha (0-1). Default: 0.05, or 0.15 when --regions is given.")
+    parser.add_argument(
+        "--region_view", choices=("heat", "location", "zoom"), default="heat",
+        help="With --regions: heat (default) = region heatmap inside the translucent brain; "
+        "location = brain outline + solid colored region surface (where is it); "
+        "zoom = translucent region surface + its internal heatmap, camera pulled close.",
+    )
     return parser
 
 
@@ -246,22 +285,38 @@ def main() -> int:
         window_size = (int(parts[0]), int(parts[1]))
         annotation = load_annotation_ap_si_lr()
         grid = prepare_heatmap_grid(count_volume, annotation=annotation, sigma_um=args.sigma_um)
+        region_centroid = None
+        extra_actors: tuple = ()
+        include_volume = True
         if args.regions:
             acronyms = [a.strip() for a in args.regions.split(",") if a.strip()]
             region_mask = region_mask_from_acronyms(acronyms, annotation)
             grid = grid * region_mask
+            if args.region_view in ("location", "zoom"):
+                region_mesh, region_centroid = mask_surface_mesh(region_mask)
+                if args.region_view == "location":
+                    region_mesh.color("crimson")
+                    region_mesh.alpha(0.95)
+                    include_volume = False
+                else:  # zoom: translucent shell around its own heatmap
+                    region_mesh.color("grey")
+                    region_mesh.alpha(0.07)
         camera = None
         if args.camera:
             cam_parts = [p.strip() for p in args.camera.split(",") if p.strip()]
             if len(cam_parts) not in (2, 3):
                 raise ValueError(f"--camera must be az_deg,el_deg[,radius_factor], got: {args.camera}")
+            radius_factor = float(cam_parts[2]) if len(cam_parts) == 3 else (0.55 if args.region_view == "zoom" else 1.7)
             camera = camera_position(
                 grid.shape,
                 float(cam_parts[0]),
                 float(cam_parts[1]),
-                float(cam_parts[2]) if len(cam_parts) == 3 else 1.7,
+                radius_factor,
+                center=region_centroid,
             )
-        brain_alpha = args.brain_alpha if args.brain_alpha >= 0 else (0.15 if args.regions else 0.05)
+        brain_alpha = args.brain_alpha if args.brain_alpha >= 0 else (
+            0.18 if args.region_view == "location" else (0.15 if args.regions else 0.05)
+        )
         result = render_heatmap(
             grid,
             cmap=args.cmap,
@@ -272,6 +327,8 @@ def main() -> int:
             window_size=window_size,
             camera=camera,
             brain_alpha=brain_alpha,
+            extra_actors=extra_actors,
+            include_volume=include_volume,
             title="c-Fos 3D heatmap" + (f" - {args.regions}" if args.regions else ""),
         )
     except Exception as exc:
