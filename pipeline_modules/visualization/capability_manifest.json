@@ -379,6 +379,35 @@
       ]
     },
     {
+      "id": "volume_heatmap_3d",
+      "function": "pipeline_modules.visualization.volume_heatmap_3d.main",
+      "cli": "python -m pipeline_modules.visualization.volume_heatmap_3d",
+      "description": "Interactive see-through 3D heatmap of an atlas-space c-Fos count volume: annotation-masked, 150um-smoothed, maximum-intensity projection with magma colormap (default). Rotate/zoom in the window, or pass --output for an offscreen screenshot.",
+      "prerequisites": [
+        "visualization/<sample>_ch1_count_volume.tif must exist (warp_mask_zarr_to_atlas_points --volume_mode count --skip_points)",
+        "BrainGlobe atlas allen_mouse_25um cached"
+      ],
+      "inputs": {
+        "sample_dir": {"type": "dir", "description": "Sample root; resolves visualization/*count_volume.tif"},
+        "count_volume": {"type": "path", "description": "Explicit count volume TIFF (axes SI, AP, LR at 25um)"},
+        "cmap": {"type": "string", "default": "magma"},
+        "percentile": {"type": "float", "default": 99.5, "description": "Normalization percentile of nonzero voxels; higher shrinks the peak region"},
+        "power": {"type": "float", "default": 1.2, "description": "Gamma on normalized values; higher dims the background"},
+        "mode": {"type": "string", "choices": ["mip", "composite"], "default": "mip"},
+        "sigma_um": {"type": "float", "default": 150.0},
+        "output": {"type": "path|null", "default": null, "description": "Screenshot path; omit for an interactive window"}
+      },
+      "outputs": {
+        "screenshot": "PNG when --output is given, else on-screen window"
+      },
+      "common_commands": [
+        {
+          "description": "Open the interactive 3D heatmap for a sample",
+          "powershell": "python -m pipeline_modules.visualization.volume_heatmap_3d --sample_dir \"S:\\Arivis_Analysis\\_active\\YF2026071002\\ot\""
+        }
+      ]
+    },
+    {
       "id": "render_signal_heatmap",
       "function": "pipeline_modules.visualization.heatmap.generate_sample_stack_heatmap",
       "cli": "python pipeline_modules/visualization/heatmap.py",
