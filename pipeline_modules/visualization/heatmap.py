@@ -92,6 +92,7 @@ def load_json(path: str | Path) -> dict:
 def resolve_sample_config(sample_dir: str | Path) -> Path:
     sample_dir = Path(sample_dir)
     candidates = [
+        sample_dir / "config.json",
         sample_dir.parent / "config.json",
         sample_dir.parent / "config" / "config.json",
         project_root() / "config" / "config.json",

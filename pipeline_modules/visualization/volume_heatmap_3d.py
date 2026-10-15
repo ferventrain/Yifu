@@ -178,6 +178,7 @@ def render_heatmap(
     brain_alpha: float = 0.05,
     extra_actors: tuple = (),
     include_volume: bool = True,
+    show_brain: bool = True,
     title: str = "c-Fos 3D heatmap - L-drag rotate / wheel zoom / q close",
 ) -> Path | None:
     """Render the prepared (AP, SI, LR) grid; interactive window unless output is given.
@@ -206,9 +207,10 @@ def render_heatmap(
         actors.append(volume)
     actors.extend(extra_actors)
 
-    brain_mesh = _root_brain_mesh(atlas_name)
-    brain_mesh.alpha(brain_alpha)
-    actors.append(brain_mesh)
+    if show_brain:
+        brain_mesh = _root_brain_mesh(atlas_name)
+        brain_mesh.alpha(brain_alpha)
+        actors.append(brain_mesh)
     offscreen = output is not None
     plt = vedo.Plotter(offscreen=offscreen, size=window_size, bg="white")
     if camera is not None:
@@ -296,9 +298,9 @@ def main() -> int:
                 region_mesh, region_centroid = mask_surface_mesh(region_mask)
                 if args.region_view == "location":
                     region_mesh.color("crimson")
-                    region_mesh.alpha(0.95)
+                    region_mesh.alpha(1.0)  # opaque: always visible through the shell
                     include_volume = False
-                else:  # zoom: translucent shell around its own heatmap
+                else:  # zoom: translucent region shell around its own heatmap, no brain shell
                     region_mesh.color("grey")
                     region_mesh.alpha(0.07)
         camera = None
@@ -315,7 +317,7 @@ def main() -> int:
                 center=region_centroid,
             )
         brain_alpha = args.brain_alpha if args.brain_alpha >= 0 else (
-            0.18 if args.region_view == "location" else (0.15 if args.regions else 0.05)
+            0.06 if args.region_view == "location" else (0.15 if args.regions else 0.05)
         )
         result = render_heatmap(
             grid,
@@ -329,6 +331,7 @@ def main() -> int:
             brain_alpha=brain_alpha,
             extra_actors=extra_actors,
             include_volume=include_volume,
+            show_brain=args.region_view != "zoom",
             title="c-Fos 3D heatmap" + (f" - {args.regions}" if args.regions else ""),
         )
     except Exception as exc:
