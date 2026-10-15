@@ -356,13 +356,35 @@
         "Microsoft Edge for HTML->PDF (default path C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe)"
       ],
       "inputs": {
-        "root_dir": {"type": "dir", "required": true, "description": "Batch root containing the two sample dirs"},
-        "sample_a/sample_b": {"type": "string", "default": "auto-detect"},
-        "top_n": {"type": "int", "default": 10},
-        "bin_um": {"type": "float", "default": 100.0},
-        "sigma_um": {"type": "float", "default": 150.0},
-        "min_volume_mm3": {"type": "float", "default": 0.005},
-        "low_count_warning": {"type": "float", "default": 20.0}
+        "root_dir": {
+          "type": "dir",
+          "required": true,
+          "description": "Batch root containing the two sample dirs"
+        },
+        "sample_a/sample_b": {
+          "type": "string",
+          "default": "auto-detect"
+        },
+        "top_n": {
+          "type": "int",
+          "default": 10
+        },
+        "bin_um": {
+          "type": "float",
+          "default": 100.0
+        },
+        "sigma_um": {
+          "type": "float",
+          "default": 150.0
+        },
+        "min_volume_mm3": {
+          "type": "float",
+          "default": 0.005
+        },
+        "low_count_warning": {
+          "type": "float",
+          "default": 20.0
+        }
       },
       "outputs": {
         "report_html": "report_{a}_vs_{b}/report.html",
@@ -388,14 +410,60 @@
         "BrainGlobe atlas allen_mouse_25um cached"
       ],
       "inputs": {
-        "sample_dir": {"type": "dir", "description": "Sample root; resolves visualization/*count_volume.tif"},
-        "count_volume": {"type": "path", "description": "Explicit count volume TIFF (axes SI, AP, LR at 25um)"},
-        "cmap": {"type": "string", "default": "magma"},
-        "percentile": {"type": "float", "default": 99.5, "description": "Normalization percentile of nonzero voxels; higher shrinks the peak region"},
-        "power": {"type": "float", "default": 1.2, "description": "Gamma on normalized values; higher dims the background"},
-        "mode": {"type": "string", "choices": ["mip", "composite"], "default": "mip"},
-        "sigma_um": {"type": "float", "default": 150.0},
-        "output": {"type": "path|null", "default": null, "description": "Screenshot path; omit for an interactive window"}
+        "sample_dir": {
+          "type": "dir",
+          "description": "Sample root; resolves visualization/*count_volume.tif"
+        },
+        "count_volume": {
+          "type": "path",
+          "description": "Explicit count volume TIFF (axes SI, AP, LR at 25um)"
+        },
+        "cmap": {
+          "type": "string",
+          "default": "magma"
+        },
+        "percentile": {
+          "type": "float",
+          "default": 99.5,
+          "description": "Normalization percentile of nonzero voxels; higher shrinks the peak region"
+        },
+        "power": {
+          "type": "float",
+          "default": 1.2,
+          "description": "Gamma on normalized values; higher dims the background"
+        },
+        "mode": {
+          "type": "string",
+          "choices": [
+            "mip",
+            "composite"
+          ],
+          "default": "mip"
+        },
+        "sigma_um": {
+          "type": "float",
+          "default": 150.0
+        },
+        "output": {
+          "type": "path|null",
+          "default": null,
+          "description": "Screenshot path; omit for an interactive window"
+        },
+        "camera": {
+          "type": "string",
+          "default": "",
+          "description": "az_deg,el_deg[,radius_factor] for offscreen views (az=0 anterior, 90 left, el=90 top-down)"
+        },
+        "regions": {
+          "type": "string",
+          "default": "",
+          "description": "Comma-separated repo-CSV acronyms; restricts the heatmap to those structures incl. descendants"
+        },
+        "brain_alpha": {
+          "type": "float",
+          "default": "0.05 (0.15 with --regions)",
+          "description": "Root brain mesh opacity for location context"
+        }
       },
       "outputs": {
         "screenshot": "PNG when --output is given, else on-screen window"
