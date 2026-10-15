@@ -66,6 +66,7 @@ def render_labeled_value_slice_rgb(
     show_region_contours: bool = True,
     background: str = "white",
     contour_color: str | None = None,
+    brain_outline_color: str | None = None,
 ) -> np.ndarray:
     """Return RGB uint8 image of the slice panel (no colorbar)."""
     labels = np.asarray(label_slice)
@@ -79,11 +80,14 @@ def render_labeled_value_slice_rgb(
 
     if background == "white":
         bg_rgb = (1.0, 1.0, 1.0)
-        default_contour = "#334155"
+        default_contour = "white"  # region dividers over the light heatmap
+        default_outline = "#334155"  # brain outer edge stays visible on white
     else:
         bg_rgb = (0.0, 0.0, 0.0)
         default_contour = "white"
+        default_outline = "white"
     stroke_color = contour_color or default_contour
+    outline_color = brain_outline_color or default_outline
 
     cmap = _resolve_cmap(cmap_name)
     norm = _resolve_norm(vmin, vmax, vcenter)
@@ -160,7 +164,7 @@ def render_labeled_value_slice_rgb(
             ax.add_collection(
                 LineCollection(
                     brain_paths,
-                    colors=stroke_color,
+                    colors=outline_color,
                     linewidths=float(brain_outline_width) * (render_scale / 4.0),
                     antialiased=True,
                     zorder=3,
@@ -204,6 +208,7 @@ def render_continuous_signal_slice_rgb(
     show_region_contours: bool = True,
     background: str = "white",
     contour_color: str | None = None,
+    brain_outline_color: str | None = None,
 ) -> np.ndarray:
     """High-res continuous signal slice: supersampled nearest + LANCZOS, vector contours."""
     from pipeline_modules.visualization.atlas_slice import _label_contour_lines
@@ -218,11 +223,14 @@ def render_continuous_signal_slice_rgb(
     height, width = labels.shape
     if background == "white":
         bg_rgb = (1.0, 1.0, 1.0)
-        default_contour = "#334155"
+        default_contour = "white"  # region dividers over the light heatmap
+        default_outline = "#334155"  # brain outer edge stays visible on white
     else:
         bg_rgb = (0.0, 0.0, 0.0)
         default_contour = "white"
+        default_outline = "white"
     stroke_color = contour_color or default_contour
+    outline_color = brain_outline_color or default_outline
 
     cmap = _resolve_cmap(cmap_name)
     norm = mcolors.Normalize(vmin=float(vmin), vmax=float(vmax), clip=True)
@@ -267,7 +275,7 @@ def render_continuous_signal_slice_rgb(
                     ax.add_collection(
                         LineCollection(
                             brain_lines,
-                            colors=stroke_color,
+                            colors=outline_color,
                             linewidths=float(brain_outline_width) * (scale / 4.0),
                             antialiased=True,
                         )

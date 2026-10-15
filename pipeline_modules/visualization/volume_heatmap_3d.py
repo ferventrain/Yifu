@@ -267,8 +267,10 @@ def build_argparser() -> argparse.ArgumentParser:
         "--region_view", choices=("heat", "location", "zoom"), default="heat",
         help="With --regions: heat (default) = region heatmap inside the translucent brain; "
         "location = brain outline + solid colored region surface (where is it); "
-        "zoom = translucent region surface + its internal heatmap, camera pulled close.",
+        "zoom = translucent region shell + its internal heatmap, camera pulled close.",
     )
+    parser.add_argument("--region_color", default="#4cc9f0",
+                        help="Region surface color for location/zoom views (name or #hex). Default #4cc9f0.")
     return parser
 
 
@@ -296,13 +298,12 @@ def main() -> int:
             grid = grid * region_mask
             if args.region_view in ("location", "zoom"):
                 region_mesh, region_centroid = mask_surface_mesh(region_mask)
+                region_mesh.color(args.region_color)
                 if args.region_view == "location":
-                    region_mesh.color("crimson")
                     region_mesh.alpha(1.0)  # opaque: always visible through the shell
                     include_volume = False
                 else:  # zoom: translucent region shell around its own heatmap, no brain shell
-                    region_mesh.color("grey")
-                    region_mesh.alpha(0.07)
+                    region_mesh.alpha(0.15)  # colored but clearly readable outer shell
         camera = None
         if args.camera:
             cam_parts = [p.strip() for p in args.camera.split(",") if p.strip()]
