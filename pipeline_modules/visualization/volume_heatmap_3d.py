@@ -304,6 +304,7 @@ def main() -> int:
                     include_volume = False
                 else:  # zoom: translucent region shell around its own heatmap, no brain shell
                     region_mesh.alpha(0.30)  # darker, more opaque outer shell
+                extra_actors = (region_mesh,)
         camera = None
         if args.camera:
             cam_parts = [p.strip() for p in args.camera.split(",") if p.strip()]
