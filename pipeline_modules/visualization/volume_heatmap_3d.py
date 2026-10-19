@@ -269,8 +269,8 @@ def build_argparser() -> argparse.ArgumentParser:
         "location = brain outline + solid colored region surface (where is it); "
         "zoom = translucent region shell + its internal heatmap, camera pulled close.",
     )
-    parser.add_argument("--region_color", default="#4cc9f0",
-                        help="Region surface color for location/zoom views (name or #hex). Default #4cc9f0.")
+    parser.add_argument("--region_color", default="#D55E00",
+                        help="Region surface color for location/zoom views (name or #hex). Default vermillion #D55E00.")
     return parser
 
 
@@ -303,7 +303,7 @@ def main() -> int:
                     region_mesh.alpha(1.0)  # opaque: always visible through the shell
                     include_volume = False
                 else:  # zoom: translucent region shell around its own heatmap, no brain shell
-                    region_mesh.alpha(0.30)  # darker, more opaque outer shell
+                    region_mesh.alpha(0.18)  # translucent vermillion outer shell
                 extra_actors = (region_mesh,)
         camera = None
         if args.camera:
