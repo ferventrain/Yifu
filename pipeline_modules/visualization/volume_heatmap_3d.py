@@ -218,6 +218,31 @@ def render_heatmap(
         cam_kw = dict(camera=dict(pos=pos, focalPoint=focal, viewup=viewup))
     else:
         cam_kw = {}
+    if not offscreen:
+        state = {"n": 0}
+
+        def _save_viewpoint(evt) -> None:
+            key = evt.get("keypress") if isinstance(evt, dict) else getattr(evt, "keypress", "")
+            if str(key).lower() != "s":
+                return
+            pos = np.array(plt.camera.GetPosition(), dtype=float)
+            focal = np.array(plt.camera.GetFocalPoint(), dtype=float)
+            d = pos - focal
+            r = float(np.linalg.norm(d))
+            if r < 1e-6:
+                return
+            el = float(np.degrees(np.arcsin(np.clip(d[1] / r, -1.0, 1.0))))
+            horizontal = float(np.hypot(d[0], d[2]))
+            az = float(np.degrees(np.arctan2(d[2], d[0]))) if horizontal > 1e-6 else 0.0
+            state["n"] += 1
+            path = Path(f"viewpoint_{state['n']:02d}.png")
+            plt.screenshot(str(path))
+            print(
+                f"[viewpoint {state['n']:02d}] saved {path}  ->  --camera {az:.1f},{el:.1f}",
+                flush=True,
+            )
+
+        plt.add_callback("key press", _save_viewpoint)
     plt.show(*actors, title, interactive=not offscreen, axes=0, **cam_kw)
     if offscreen:
         output = Path(output)
