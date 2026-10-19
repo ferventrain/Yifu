@@ -58,11 +58,13 @@ def test_camera_position_geometry():
     from pipeline_modules.visualization.volume_heatmap_3d import camera_position
 
     pos, focal, viewup = camera_position((528, 320, 456), 0.0, 0.0)
-    # az=0/el=0: camera sits anterior of center, SI is up
+    # az=0/el=0: camera sits anterior of center; screen-up is -SI (+SI is inferior)
     assert pos[0] > focal[0]
     assert pos[1] == pytest.approx(focal[1])
     assert pos[2] == pytest.approx(focal[2])
-    assert viewup == (0.0, 1.0, 0.0)
+    assert viewup == (0.0, -1.0, 0.0)
+    pos_top, _ft, _upt = camera_position((528, 320, 456), 0.0, 20.0)
+    assert pos_top[1] < _ft[1]  # positive elevation = camera dorsal (above, -SI)
     pos90, _f, up90 = camera_position((528, 320, 456), 90.0, 0.0)
     assert pos90[2] > 0 and pos90[0] == pytest.approx(_f[0])  # from the left
     _ptop, _ftop, uptop = camera_position((528, 320, 456), 0.0, 90.0)

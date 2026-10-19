@@ -80,12 +80,13 @@ def camera_position(shape_zyx: tuple[int, int, int], azimuth_deg: float, elevati
         center = tuple(float(c) for c in center)
     radius = radius_factor * float(np.max(shape_zyx)) * spacing
     az, el = np.radians(azimuth_deg), np.radians(elevation_deg)
-    # spherical direction in (AP, SI, LR): el in the AP-SI plane, LR via az
+    # In this (AP, SI, LR) grid +SI points INFERIOR (BrainGlobe convention), so
+    # screen-up is -SI and a positive elevation (俯角, camera above) sits at -SI.
     dir_ap = np.cos(el) * np.cos(az)
-    dir_si = np.sin(el)
+    dir_si = -np.sin(el)
     dir_lr = np.cos(el) * np.sin(az)
     pos = (center[0] + radius * dir_ap, center[1] + radius * dir_si, center[2] + radius * dir_lr)
-    viewup = (0.0, 1.0, 0.0) if abs(np.sin(el)) < 0.99 else (0.0, 0.0, 1.0)
+    viewup = (0.0, -1.0, 0.0) if abs(np.cos(el)) > 0.05 else (0.0, 0.0, 1.0)
     return pos, center, viewup
 
 
