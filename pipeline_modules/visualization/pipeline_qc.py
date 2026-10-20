@@ -269,23 +269,28 @@ def render_registration_views(
                 rgb[_label_contour(_match_plane(presence, plane))] = (255, 60, 60)
             img = Image.fromarray(rgb)
             draw = ImageDraw.Draw(img)
-            # cols are the x axis on both views; scale full-res split into nii x.
-            if name == "axial" and (split_x or split_per_z):
+            # The REAL left/right boundary is the warped midline surface; in
+            # the axial (dorsal) plane it is generally a tilted/curved line,
+            # not the per-z split summary. Extract the actual 1/2 boundary
+            # from the hemi plane whenever available; fall back to the
+            # straight summary line only without hemi data.
+            if name == "axial" and hemi is not None:
+                zfull = min(int(frac * lz), lz - 1)
+                hemi_small = np.asarray(hemi[zfull, ::8, ::8])
+                hemi_plane = _resample_plane(hemi_small, plane.shape, preserve_values=True)
+                left = hemi_plane == 1
+                right = hemi_plane == 2
+                # true midline: pixels where left and right are adjacent
+                edge = (left[:, 1:] & right[:, :-1]) | (left[:, :-1] & right[:, 1:])
+                ys, xs = np.nonzero(edge)
+                if ys.size:
+                    pts = list(zip((xs + 1).tolist(), ys.tolist()))
+                    draw.line(pts, fill=(255, 220, 0), width=2, joint="curve")
+            elif name == "axial" and (split_x or split_per_z):
                 zfull = min(int(frac * lz), lz - 1)
                 full_x = split_per_z[zfull] if split_per_z else split_x
                 col = int(full_x / fx)
                 draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
-                # thin markers of the OTHER displayed z levels: the midline
-                # shifts with z, so seeing all three positions in one axial
-                # panel previews the per-z curve (the full polyline gets its
-                # own panel at the bottom of the sheet).
-                if split_per_z:
-                    for other_frac in fractions:
-                        if other_frac == frac:
-                            continue
-                        oz = min(int(other_frac * lz), lz - 1)
-                        ocol = int(split_per_z[oz] / fx)
-                        draw.line([(ocol, 0), (ocol, img.height)], fill=(255, 220, 0), width=1)
             elif name == "coronal" and (split_x or split_per_z):
                 if split_per_z and lz:
                     # per-z midline curve: rows are nii z, cols are nii x
