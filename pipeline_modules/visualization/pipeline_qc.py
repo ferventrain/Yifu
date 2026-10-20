@@ -275,6 +275,17 @@ def render_registration_views(
                 full_x = split_per_z[zfull] if split_per_z else split_x
                 col = int(full_x / fx)
                 draw.line([(col, 0), (col, img.height)], fill=(255, 220, 0), width=2)
+                # thin markers of the OTHER displayed z levels: the midline
+                # shifts with z, so seeing all three positions in one axial
+                # panel previews the per-z curve (the full polyline gets its
+                # own panel at the bottom of the sheet).
+                if split_per_z:
+                    for other_frac in fractions:
+                        if other_frac == frac:
+                            continue
+                        oz = min(int(other_frac * lz), lz - 1)
+                        ocol = int(split_per_z[oz] / fx)
+                        draw.line([(ocol, 0), (ocol, img.height)], fill=(255, 220, 0), width=1)
             elif name == "coronal" and (split_x or split_per_z):
                 if split_per_z and lz:
                     # per-z midline curve: rows are nii z, cols are nii x
@@ -306,6 +317,39 @@ def render_registration_views(
         draw = ImageDraw.Draw(img)
         draw.text((6, 4), "axial L/R check", fill=(255, 255, 255))
         rows.append([img])
+
+        # Full midline trajectory panel: split_x as a polyline over z, with
+        # markers at the three displayed axial levels. This is where the
+        # warped-midline curve is actually visible as a curve.
+        if split_per_z and lz:
+            curve = np.asarray(split_per_z, dtype=float)
+            w = max(axial_mid.shape[1], 600)
+            h = 200
+            panel = Image.new("RGB", (w + 20, h + 20), (20, 20, 20))
+            d = ImageDraw.Draw(panel)
+            lo, hi = float(np.nanmin(curve)), float(np.nanmax(curve))
+            span = max(hi - lo, 1.0)
+            pts = []
+            step = max(1, len(curve) // 400)
+            for zi in range(0, len(curve), step):
+                v = curve[zi]
+                if not np.isfinite(v):
+                    continue
+                px = int(10 + zi / max(len(curve) - 1, 1) * w)
+                py = int(10 + h - (v - lo) / span * h)
+                pts += [px, py]
+            if len(pts) >= 4:
+                d.line(pts, fill=(255, 220, 0), width=2)
+            for frac in fractions:
+                zi = min(int(frac * len(curve)), len(curve) - 1)
+                v = curve[zi]
+                if not np.isfinite(v):
+                    continue
+                px = int(10 + zi / max(len(curve) - 1, 1) * w)
+                py = int(10 + h - (v - lo) / span * h)
+                d.ellipse([px - 4, py - 4, px + 4, py + 4], outline=(255, 90, 90), width=2)
+            d.text((12, 4), f"midline trajectory: split_x vs z (range {lo:.0f}..{hi:.0f})", fill=(255, 255, 255))
+            rows.append([panel])
 
     gutter = 16
     row_heights = [max(img.height for img in row) for row in rows]
