@@ -91,22 +91,21 @@
     },
     {
       "id": "convert_atlas_label_to_hemisphere",
-      "function": "pipeline_modules.registration.atlas_label_to_hemisphere.convert_atlas_label_to_hemisphere",
-      "cli": "python pipeline_modules/registration/atlas_label_to_hemisphere.py",
-      "description": "Convert a sample-space atlas label Zarr or TIFF stack into a hemisphere label Zarr (0=background, 1=left, 2=right). Called automatically during registration when save_upsampled_label_hemisphere_zarr=true.",
+      "function": "pipeline_modules.registration.atlas_label_to_hemisphere.convert_hemisphere_from_transform",
+      "cli": "python -m pipeline_modules.registration.atlas_label_to_hemisphere --sample_dir <sample> --output <sample>/atlas_label_hemisphere.zarr",
+      "description": "Hemisphere label Zarr (0=background, 1=left, 2=right) from the WARPED STANDARD-SPACE MIDLINE: the atlas midline plane is pushed through the sample's registration transforms, giving a curved per-slice split that follows the registered midline. Called automatically during registration when save_upsampled_label_hemisphere_zarr=true. The old single-flat-plane label-input method was removed (it produced misleading straight splits).",
       "prerequisites": [
-        "Input must be sample_dir/upsampled_atlas_label.zarr or sample_dir/upsampled_atlas_label/ TIFF stack"
+        "sample_dir/transforms/ with fwd_* transforms",
+        "sample_dir/ch0_downsample/volume.nii.gz",
+        "Standard-space atlas label tiff (default resolved from YIFU_DATA_DIR/reference)"
       ],
       "inputs": {
-        "input":         {"type": "path", "required": true, "description": "Input atlas label .zarr or TIFF folder"},
-        "output":        {"type": "path", "required": true, "description": "Output hemisphere .zarr path, commonly sample_dir/atlas_label_hemisphere.zarr"},
-        "chunk_size":    {"type": "triplet_int", "default": [256, 256, 256]},
-        "compressor":    {"type": "string", "default": "default", "choices": ["default", "none"]},
-        "dataset_name":  {"type": "string", "default": "0"}
+        "sample_dir":     {"type": "dir", "required": true, "description": "Sample dir with transforms/ + ch0_downsample/volume.nii.gz"},
+        "output":         {"type": "path", "required": true, "description": "Output hemisphere .zarr path, commonly sample_dir/atlas_label_hemisphere.zarr"},
+        "atlas_label":    {"type": "path|null", "default": null, "description": "Standard-space annotation tiff override"}
       },
       "outputs": {
-        "hemisphere_zarr": {"type": "path", "description": "sample_dir/atlas_label_hemisphere.zarr"},
-        "manifest_path":   {"type": "path", "description": "_run_manifest.json"}
+        "hemisphere_zarr": {"type": "path", "description": "sample_dir/atlas_label_hemisphere.zarr with split_x/split_x_per_z attrs"}
       }
     },
     {

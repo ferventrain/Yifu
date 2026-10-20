@@ -808,22 +808,18 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
     save_hemisphere_zarr = bool(reg_cfg.get("save_upsampled_label_hemisphere_zarr", False))
     hemisphere_zarr_path = sample_dir / "atlas_label_hemisphere.zarr"
     if save_hemisphere_zarr:
-        if transforms_dir.is_dir() and any(transforms_dir.glob("fwd_*")):
-            # Preferred: warp the standard-space midline plane with the saved
-            # registration transform (split follows the registered midline).
-            hemi_payload = {"step": "hemisphere_from_transform"}
-            hemi_inputs = [transforms_dir]
-        else:
-            hemisphere_input = warped_label_zarr_path if warped_label_zarr_path.exists() else warped_label_dir
-            if not Path(hemisphere_input).exists():
-                print(f"Error: Hemisphere Zarr requested, but atlas label input is unavailable at {hemisphere_input}.")
+        # The hemisphere split always warps the standard-space midline with the
+        # saved registration transform (curved per-slice midline). The old
+        # single-flat-plane label fallback was removed: without transforms the
+        # split cannot be trusted, so fail loudly instead.
+        if not (transforms_dir.is_dir() and any(transforms_dir.glob("fwd_*"))):
+            if _STUB["enabled"]:
+                print("  STUB: Hemisphere Zarr from registration transform (no transforms in stub fixture)")
+            else:
+                print(f"Error: Hemisphere Zarr requires registration transforms under {transforms_dir} (rerun registration).")
                 sys.exit(1)
-            hemi_payload = {
-                "step": "hemisphere_from_label",
-                "chunk_size": list(zarr_cfg["chunk_size"]),
-                "dataset_name": "0",
-            }
-            hemi_inputs = [hemisphere_input]
+        hemi_payload = {"step": "hemisphere_from_transform"}
+        hemi_inputs = [transforms_dir]
         hemi_complete, hemi_reason = _marker_check(
             [hemisphere_zarr_path], hemi_inputs, hemi_payload, lambda: hemisphere_zarr_path.exists()
         )
@@ -832,23 +828,12 @@ def ensure_registration_outputs(sample_dir, signal_ch, reg_ch, reg_cfg, zarr_cfg
         else:
             if hemisphere_zarr_path.exists():
                 print_note(f"Hemisphere Zarr exists but {hemi_reason}; rebuilding.")
-            if hemi_payload["step"] == "hemisphere_from_transform":
-                cmd = (
-                    f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
-                    f'--sample_dir "{sample_dir}" '
-                    f'--output "{hemisphere_zarr_path}"'
-                )
-                run_command(cmd, "2.3 Hemisphere Zarr from registration transform")
-            else:
-                chunk_str = format_csv(zarr_cfg["chunk_size"])
-                cmd = (
-                    f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
-                    f'--input "{hemisphere_input}" '
-                    f'--output "{hemisphere_zarr_path}" '
-                    f'--chunk_size "{chunk_str}" '
-                    f'--dataset_name "0"'
-                )
-                run_command(cmd, "2.3 Convert atlas label to hemisphere Zarr (single-plane fallback)")
+            cmd = (
+                f'"{PYTHON_EXE}" -m pipeline_modules.registration.atlas_label_to_hemisphere '
+                f'--sample_dir "{sample_dir}" '
+                f'--output "{hemisphere_zarr_path}"'
+            )
+            run_command(cmd, "2.3 Hemisphere Zarr from registration transform")
             _mark_done([hemisphere_zarr_path], hemi_inputs, hemi_payload)
 
     if not save_label_tiff and directory_has_files(warped_label_dir):

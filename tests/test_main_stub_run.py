@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_COMMANDS = [
     "1.1 Downsample registration channel",
     "2.1 ANTs registration (atlas -> image)",
-    "2.3 Convert atlas label to hemisphere Zarr (single-plane fallback)",
+    "2.3 Hemisphere Zarr from registration transform",
     "3.3 Convert signal TIFF to Zarr",
     "4.1 Segmentation (cfos_unet)",
     "4.2 Standard mask postprocess (edge/single-slice filters)",
@@ -39,6 +39,10 @@ def _build_stub_config(tmp_path: Path) -> Path:
 
     sample_dir = tmp_path / "SAMPLE_STUB"
     sample_dir.mkdir(parents=True)
+    # Hemisphere step 2.3 requires saved fwd transforms on disk (the flat-plane
+    # label fallback was removed); a dummy marker file is enough for --stub.
+    (sample_dir / "transforms").mkdir()
+    (sample_dir / "transforms" / "fwd_0_0GenericAffine.mat").write_bytes(b"stub")
     config_path = sample_dir / "config.json"
     config_path.write_text(json.dumps(template, indent=1), encoding="utf-8")
     return config_path
