@@ -67,18 +67,21 @@ GROUP_RULES = [
 
 
 def find_stats_workbook(sample_dir: str | Path) -> Path:
-    """Newest results/<sample>_*_brain_distribution_stats.xlsx of a cfos run."""
+    """Newest stats workbook of a cfos run: prefers the atlas-v2 (*_v2.xlsx),
+    falls back to the legacy name."""
     sample_dir = Path(sample_dir)
-    matches = sorted(
-        (sample_dir / "results").glob("*_brain_distribution_stats.xlsx"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not matches:
-        raise FileNotFoundError(
-            f"No results/*_brain_distribution_stats.xlsx under sample dir: {sample_dir}"
+    results = sample_dir / "results"
+    for pattern in ("*_brain_distribution_stats_v2.xlsx", "*_brain_distribution_stats.xlsx"):
+        matches = sorted(
+            (p for p in results.glob(pattern) if not p.name.startswith("~$")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
         )
-    return matches[0]
+        if matches:
+            return matches[0]
+    raise FileNotFoundError(
+        f"No results/*_brain_distribution_stats*.xlsx under sample dir: {sample_dir}"
+    )
 
 
 def grey_group_of(node_id: int, nodes: dict) -> str | None:
