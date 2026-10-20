@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Find density Excel files in sample subfolders and draw grouped coarse-region bar plots."
     )
     parser.add_argument("--root_dir", required=True, help="Folder whose direct child folders are sample_dir folders")
-    parser.add_argument("--cfg", default=str(DEFAULT_CFG), help="Path to Region_Csv_Rev1_updated.CSV")
+    parser.add_argument("--cfg", default=str(DEFAULT_CFG), help="Path to Region_Csv_Rev2_updated.CSV")
     parser.add_argument("--metric", default="Voxel Density", help="Metric column to compare")
     parser.add_argument("--title", default=None, help="Figure title")
     parser.add_argument("--ylabel", default=None, help="Y-axis label. Defaults to --metric.")

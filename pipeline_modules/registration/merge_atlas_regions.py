@@ -155,7 +155,7 @@ PRESET_TARGETS = {
 
 
 def parse_args():
-    default_cfg = Path(__file__).with_name("Region_Csv_Rev1_updated.CSV")
+    default_cfg = Path(__file__).with_name("Region_Csv_Rev2_updated.CSV")
     parser = argparse.ArgumentParser(
         description="Merge fine-grained atlas labels into a coarser target-region atlas."
     )
@@ -168,7 +168,7 @@ def parse_args():
     parser.add_argument(
         "--cfg",
         default=str(default_cfg),
-        help="Path to Allen region CSV. Default uses Region_Csv_Rev1_updated.CSV next to this script.",
+        help="Path to Allen region CSV. Default uses Region_Csv_Rev2_updated.CSV next to this script.",
     )
     parser.add_argument(
         "--preset",

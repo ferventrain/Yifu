@@ -109,7 +109,7 @@ class SpotiflowInferenceCfg(_ModelMixin):
     region_counts_csv: str = ""
     summary_json: str = ""
     label_zarr: str = ""
-    cfg: str = "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+    cfg: str = "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
     dataset_name: str = "0"
     which: str = "best"
     prob_thresh: float | None = 0.35

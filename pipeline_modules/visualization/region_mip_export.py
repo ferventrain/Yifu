@@ -23,7 +23,7 @@ from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import iter_b
 
 PLANES = ("horizontal", "coronal", "sagittal")
 DEFAULT_REGION_CFG = (
-    Path(__file__).resolve().parents[2] / "pipeline_modules" / "registration" / "Region_Csv_Rev1_updated.CSV"
+    Path(__file__).resolve().parents[2] / "pipeline_modules" / "registration" / "Region_Csv_Rev2_updated.CSV"
 )
 
 

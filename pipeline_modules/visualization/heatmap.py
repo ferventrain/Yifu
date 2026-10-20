@@ -262,7 +262,7 @@ def default_sample_density_excel(sample_dir: str | Path, signal_ch: str = "ch1")
 
 
 def default_region_cfg_path() -> Path:
-    return project_root() / "pipeline_modules" / "registration" / "Region_Csv_Rev1_updated.CSV"
+    return project_root() / "pipeline_modules" / "registration" / "Region_Csv_Rev2_updated.CSV"
 
 
 def resolve_density_excel_path(
@@ -2566,7 +2566,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signal-ch", default="ch1", help="Signal channel label for --mode sample-stack")
     parser.add_argument("--register-ch", default="ch0", help="Registration channel label for --mode sample-stack")
     parser.add_argument("--sample-reference-nii", default="", help="Downsampled sample NIfTI used for registration")
-    parser.add_argument("--atlas-image", default="", help="Atlas fixed image; defaults to data/reference/atlas_label.tiff")
+    parser.add_argument("--atlas-image", default="", help="Atlas fixed image; defaults to data/reference/atlas_label_v2_uint16.tiff")
     parser.add_argument("--transforms-dir", default="", help="Directory containing inverse transforms")
     parser.add_argument("--resolution-xyz", default="", help="Input mask voxel size in microns as x,y,z")
     parser.add_argument("--target-resolution-xyz", default="", help="Sample grid voxel size in microns as x,y,z")

@@ -181,7 +181,7 @@ copy config_template.json config.json
     }
   },
   "analysis": {
-    "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+    "density_config": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
   }
 }
 ```

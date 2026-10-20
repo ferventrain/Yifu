@@ -41,7 +41,7 @@
       "prerequisites": [
         "Input Excel must be produced by region_signal_analysis_zarr_graph.py or have compatible Level_* sheets",
         "Level_* sheets must include a Name column and the selected metric column",
-        "Allen region CSV must be available; defaults to pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        "Allen region CSV must be available; defaults to pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
       ],
       "inputs": {
         "input_excel": {
@@ -51,7 +51,7 @@
         },
         "cfg": {
           "type": "path",
-          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
           "description": "Allen region CSV containing id, name, and structure_id_path"
         },
         "metric": {
@@ -135,7 +135,7 @@
         },
         "cfg": {
           "type": "path",
-          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
         },
         "metric": {
           "type": "string",
@@ -197,7 +197,7 @@
       "prerequisites": [
         "root_dir must contain exactly two child sample_dir folders with density Excel workbooks",
         "Density workbooks must contain Level_* sheets with Name and selected metric columns",
-        "level auto additionally reads pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        "level auto additionally reads pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
       ],
       "inputs": {
         "root_dir": {
@@ -292,7 +292,7 @@
       "description": "Region-GRID heatmap (region x sample matrix; 2026-10-14 fixed layout): rows are the top_level7 default-parcellation regions grouped by major division, columns are samples, each cell = per-region cFos density (Signal Voxels / Total Voxels, %). Grey matter only; groups stack naturally into <= max_panels equal-width columns of square cells (top-aligned, ragged bottoms); each group's full name (Isocortex / Cortical subplate / Striatum / Pallidum / Thalamus / Hypothalamus / Midbrain / Pons / Medulla / Cerebellum) is an inline centered band above its rows; vertical sample labels under each panel; white->orange colormap, thick colorbar hugging the last panel. NOT the spatial heatmap: for anatomical atlas-space 2D/3D signal maps use render_signal_heatmap (heatmap.py) instead.",
       "prerequisites": [
         "Each sample child dir has results/*_brain_distribution_stats.xlsx with Level_* sheets (Name + Signal Voxels + Total Voxels columns) — i.e. a finished cfos run",
-        "level auto parcellation reads pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+        "level auto parcellation reads pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
       ],
       "inputs": {
         "root_dir": {
@@ -307,7 +307,7 @@
         },
         "parcellation_csv": {
           "type": "path",
-          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
         },
         "output_prefix": {
           "type": "path|null",
@@ -1103,7 +1103,7 @@
         },
         "cfg": {
           "type": "path",
-          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
         },
         "metric": {
           "type": "string",
@@ -1337,7 +1337,7 @@
       "description": "Mask one Allen brain region in sample space using upsampled_atlas_label.zarr, then export horizontal/coronal/sagittal maximum-intensity projection TIFFs from the signal Zarr.",
       "prerequisites": [
         "sample_dir must contain signal Zarr (e.g. ch1.zarr) and upsampled_atlas_label.zarr with identical shapes",
-        "Region query resolves against pipeline_modules/registration/Region_Csv_Rev1_updated.CSV by acronym, full name, or numeric id",
+        "Region query resolves against pipeline_modules/registration/Region_Csv_Rev2_updated.CSV by acronym, full name, or numeric id",
         "Optional mask Zarr can gate foreground voxels before projection"
       ],
       "inputs": {
@@ -1357,7 +1357,7 @@
         },
         "cfg": {
           "type": "path",
-          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
         },
         "config": {
           "type": "path|null",
@@ -1422,7 +1422,7 @@
       "prerequisites": [
         "sample_dir must contain upsampled_atlas_label/ TIFF stack",
         "For export-mode signal, each channel needs a matching chX/ TIFF folder with the same slice count as the label stack",
-        "Region query resolves against pipeline_modules/registration/Region_Csv_Rev1_updated.CSV by acronym, full name, or numeric id"
+        "Region query resolves against pipeline_modules/registration/Region_Csv_Rev2_updated.CSV by acronym, full name, or numeric id"
       ],
       "inputs": {
         "sample_dir": {
@@ -1471,7 +1471,7 @@
         },
         "cfg": {
           "type": "path",
-          "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
         },
         "config": {
           "type": "path|null",

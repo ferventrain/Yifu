@@ -1675,7 +1675,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-excel", default=None, help="Excel workbook with Level_* sheets for region metrics")
     parser.add_argument(
         "--region-cfg",
-        default=str(Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"),
+        default=str(Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"),
         help="Path to region CSV used to map Excel region names to atlas ids",
     )
     parser.add_argument("--metric", default="Voxel Density", help="Metric column to render when --input-excel is set")

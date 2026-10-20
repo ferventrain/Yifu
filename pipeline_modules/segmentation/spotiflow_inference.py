@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[2] / "model" / "spotiflow"
-DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 DEFAULT_CHECKPOINT_TILES = 32
 DEFAULT_BATCH_SIZE = 1
 

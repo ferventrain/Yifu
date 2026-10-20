@@ -77,9 +77,9 @@ def resolve_atlas_label_path() -> Path:
         except Exception:
             pass
 
-    candidates.append(project_root() / "data" / "reference" / "atlas_label.tiff")
+    candidates.append(project_root() / "data" / "reference" / "atlas_label_v2_uint16.tiff")
     if data_dir is not None:
-        candidates.append(data_dir / "reference" / "atlas_label.tiff")
+        candidates.append(data_dir / "reference" / "atlas_label_v2_uint16.tiff")
 
     seen: set[Path] = set()
     for path in candidates:
@@ -94,6 +94,6 @@ def resolve_atlas_label_path() -> Path:
     raise FileNotFoundError(
         "Allen atlas label TIFF not found. Tried:\n  "
         f"{tried}\n"
-        f"Set {YIFU_DATA_DIR_ENV} to your data root (with reference/atlas_label.tiff) "
+        f"Set {YIFU_DATA_DIR_ENV} to your data root (with reference/atlas_label_v2_uint16.tiff) "
         "or update config/registration annotation_path."
     )

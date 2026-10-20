@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 DEFAULT_GROUPS = Path(__file__).resolve().parents[2] / "config" / "region_groups.json"
 
 
@@ -240,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sample_dir", required=True, help="Sample directory containing a density *.xlsx workbook")
     parser.add_argument("--groups_json", default=str(DEFAULT_GROUPS), help="Path to region_groups.json")
-    parser.add_argument("--cfg", default=str(DEFAULT_CFG), help="Path to Region_Csv_Rev1_updated.CSV")
+    parser.add_argument("--cfg", default=str(DEFAULT_CFG), help="Path to Region_Csv_Rev2_updated.CSV")
     parser.add_argument("--metric", default="Signal Count", help="Metric column to sum. Default: Signal Count")
     parser.add_argument("--input_excel", default=None, help="Optional explicit density workbook path")
     parser.add_argument("--output_prefix", default=None, help="Output prefix. Defaults to sample_dir/sample_dir_name")

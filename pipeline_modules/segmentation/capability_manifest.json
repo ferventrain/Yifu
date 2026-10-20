@@ -111,7 +111,7 @@
         "label_zarr": {"type": "path|null", "default": null},
         "region_counts_csv": {"type": "path|null", "default": null},
         "summary_json": {"type": "path|null", "default": null},
-        "cfg": {"type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"},
+        "cfg": {"type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"},
         "dataset_name": {"type": "string", "default": "0"},
         "which": {"type": "string", "default": "best", "choices": ["best", "last"]},
         "prob_thresh": {"type": "float|null", "default": 0.35},

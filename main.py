@@ -249,7 +249,7 @@ def run_tiff_to_zarr(input_path, output_path, chunk_size, desc):
 def resolve_density_cfg_path(analysis_cfg):
     density_cfg_raw = analysis_cfg.get(
         "density_config",
-        "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+        "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
     )
     density_cfg_path = Path(density_cfg_raw)
     if not density_cfg_path.is_absolute():
@@ -259,7 +259,7 @@ def resolve_density_cfg_path(analysis_cfg):
         return density_cfg_path
 
     fallback_density_cfg = (
-        project_root / "pipeline_modules" / "registration" / "Region_Csv_Rev1_updated.CSV"
+        project_root / "pipeline_modules" / "registration" / "Region_Csv_Rev2_updated.CSV"
     )
     if fallback_density_cfg.exists():
         return fallback_density_cfg

@@ -51,7 +51,7 @@
     "method": "ants",
     "mode": "atlas2image",
     "atlas_path": "${YIFU_DATA_DIR}/reference/atlas.tiff",
-    "annotation_path": "${YIFU_DATA_DIR}/reference/atlas_label.tiff",
+    "annotation_path": "${YIFU_DATA_DIR}/reference/atlas_label_v2_uint16.tiff",
     "transform_type": "SyNRA",
     "allow_reflection": false,
     "flip_atlas": [false, false, false],
@@ -93,7 +93,7 @@
     }
   },
   "analysis": {
-    "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+    "density_config": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
     "output_format": "xlsx",
     "use_hemisphere_label": false
   },
