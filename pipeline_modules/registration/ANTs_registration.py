@@ -811,7 +811,16 @@ class BidirectionalRegistration:
         if save_transforms and 'transforms' in results:
             transforms_dir = self.sample_dir / "transforms"
             transforms_dir.mkdir(exist_ok=True)
-            
+            # Remove previous-generation transforms first: reruns used to APPEND
+            # new fwd_*/inv_* files next to the old ones, and every consumer
+            # globs fwd_*/inv_* sorted by index -- a mixed old+new chain silently
+            # corrupts all downstream warps (hit 2026-10-20: d21/d22 flip rerun
+            # left two generations and the v2 label came out misaligned).
+            for stale in transforms_dir.glob("fwd_*"):
+                stale.unlink()
+            for stale in transforms_dir.glob("inv_*"):
+                stale.unlink()
+
             # Save Forward Transforms
             if 'fwdtransforms' in results['transforms']:
                 for i, transform in enumerate(results['transforms']['fwdtransforms']):
