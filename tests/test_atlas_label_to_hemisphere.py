@@ -5,9 +5,33 @@ from __future__ import annotations
 import numpy as np
 
 from pipeline_modules.registration.atlas_label_to_hemisphere import (
+    _load_standard_label,
     _standard_space_hemi,
     convert_hemisphere_from_transform,
 )
+
+
+def test_load_standard_label_applies_axis_flips(tmp_path):
+    import tifffile
+
+    labels_zyx = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
+    path = tmp_path / "atlas_label.tiff"
+    tifffile.imwrite(path, labels_zyx)
+
+    base = _load_standard_label(path)
+    np.testing.assert_array_equal(base, np.transpose(labels_zyx, (2, 1, 0)))
+    np.testing.assert_array_equal(_load_standard_label(path, (1,)), base[:, ::-1, :])
+    np.testing.assert_array_equal(_load_standard_label(path, (0,)), base[::-1, :, :])
+
+
+def test_load_standard_label_rejects_bad_flip_axis(tmp_path):
+    import pytest
+    import tifffile
+
+    path = tmp_path / "atlas_label.tiff"
+    tifffile.imwrite(path, np.zeros((2, 3, 4), dtype=np.uint16))
+    with pytest.raises(ValueError, match="flip_axes"):
+        _load_standard_label(path, (3,))
 
 
 def test_standard_space_hemi_midline():

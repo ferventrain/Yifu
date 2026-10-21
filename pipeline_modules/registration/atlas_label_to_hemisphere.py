@@ -6,7 +6,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from tqdm import tqdm
@@ -85,8 +85,26 @@ def _standard_space_hemi(label_arr_xyz: np.ndarray) -> tuple[np.ndarray, float]:
     return hemi, mid
 
 
+def _load_standard_label(
+    atlas_label_tiff: str | Path, flip_axes: Sequence[int] = ()
+) -> np.ndarray:
+    """Load the atlas annotation in ANTs (X,Y,Z) order and apply the same
+    axis flips registration used. Without this, an ML flip would make the
+    hemisphere labels report the mirrored side as left."""
+    from pipeline_modules.registration.label_codec import load_label_array_preserving_ids
+
+    axes = tuple(int(axis) for axis in flip_axes)
+    if any(axis < 0 or axis > 2 for axis in axes):
+        raise ValueError(f"flip_axes must be axis indices 0..2 (ML, AP, DV), got {axes}")
+    label_arr_xyz = load_label_array_preserving_ids(atlas_label_tiff)
+    if axes:
+        label_arr_xyz = np.flip(label_arr_xyz, axis=axes)
+        logger.info("Applied atlas flip axes %s before painting hemisphere labels", axes)
+    return label_arr_xyz
+
+
 def _upsample_hemi_and_write(warped_zyx: np.ndarray, target_shape, output_zarr: Path,
-                             chunk=(256, 256, 256)) -> np.ndarray:
+                             chunk=(256, 256, 256), flip_axes: Sequence[int] = ()) -> np.ndarray:
     """Nearest-neighbour upsample to the sample grid (z: round-linspace index,
     xy: cv2 nearest) and write in z-batches so each zarr chunk compresses once.
     Returns the per-z left/right boundary curve."""
@@ -120,6 +138,7 @@ def _upsample_hemi_and_write(warped_zyx: np.ndarray, target_shape, output_zarr: 
     root.attrs["split_x"] = int(np.ceil(np.nanmedian(boundary))) if good.any() else 0
     root.attrs["split_x_per_z"] = [round(float(v), 2) for v in boundary]
     root.attrs["source"] = "hemisphere_from_transform"
+    root.attrs["atlas_flip_axes"] = [int(axis) for axis in flip_axes]
     return boundary
 
 
@@ -132,6 +151,7 @@ def convert_hemisphere_from_transform(
     fixed_image=None,
     atlas_image=None,
     target_shape=None,
+    flip_axes: Sequence[int] = (),
 ) -> dict[str, Any]:
     """Preferred hemisphere method: paint the STANDARD-SPACE midline plane on
     the annotation and warp it with the exact transform that produced
@@ -142,11 +162,9 @@ def convert_hemisphere_from_transform(
     ch0_downsample/volume.nii.gz). Inside the registration flow the in-memory
     objects can be passed instead: transformlist=reg_result['fwdtransforms'],
     fixed_image=register_image, atlas_image=atlas_image,
-    target_shape=original_shape.
+    target_shape=original_shape, flip_axes=axes_from_flip(effective_flip_atlas).
     """
     import ants
-
-    from pipeline_modules.registration.label_codec import load_label_array_preserving_ids
 
     started_at = time.time()
     sample_dir = Path(sample_dir)
@@ -181,7 +199,7 @@ def convert_hemisphere_from_transform(
             raise FileNotFoundError(str(label_meta))
         target_shape = tuple(json.loads(label_meta.read_text(encoding="utf-8"))["shape"])
 
-    label_arr_xyz = load_label_array_preserving_ids(atlas_label_tiff)  # (X, Y, Z)
+    label_arr_xyz = _load_standard_label(atlas_label_tiff, flip_axes)  # (X, Y, Z)
     hemi_xyz, mid = _standard_space_hemi(label_arr_xyz)
     if atlas_image is None:
         if not atlas_tiff.exists():
@@ -204,7 +222,9 @@ def convert_hemisphere_from_transform(
     if not np.any(warped_zyx > 0):
         raise RuntimeError("warped hemisphere volume is empty - transform/grid mismatch")
 
-    boundary = _upsample_hemi_and_write(warped_zyx, target_shape, output_zarr)
+    boundary = _upsample_hemi_and_write(
+        warped_zyx, target_shape, output_zarr, flip_axes=flip_axes
+    )
     logger.info(
         "hemisphere zarr written: %s (boundary median %d, curve %.0f..%.0f, %.0fs)",
         output_zarr,
@@ -219,8 +239,21 @@ def convert_hemisphere_from_transform(
         "target_shape": list(target_shape),
         "standard_midline_x": round(mid, 2),
         "split_x": int(np.ceil(np.nanmedian(boundary))),
+        "atlas_flip_axes": [int(axis) for axis in flip_axes],
         "elapsed_s": round(time.time() - started_at, 1),
     }
+
+
+def _parse_flip_axes(value: str) -> tuple[int, ...]:
+    if not value.strip():
+        return ()
+    try:
+        axes = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("flip axes must be comma-separated integers") from exc
+    if any(axis < 0 or axis > 2 for axis in axes):
+        raise argparse.ArgumentTypeError("flip axes must be 0 (ML), 1 (AP) or 2 (DV)")
+    return axes
 
 
 def parse_args() -> argparse.Namespace:
@@ -230,6 +263,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_dir", required=True, help="Sample dir with transforms/ + ch0_downsample/volume.nii.gz")
     parser.add_argument("--output", required=True, help="Output hemisphere .zarr path")
     parser.add_argument("--atlas_label", default="", help="Standard-space annotation tiff override")
+    parser.add_argument(
+        "--flip_axes",
+        type=_parse_flip_axes,
+        default=(),
+        help="Atlas axis indices flipped before registration (0=ML, 1=AP, 2=DV)",
+    )
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser.parse_args()
 
@@ -242,6 +281,7 @@ def main() -> int:
             args.sample_dir,
             args.output,
             args.atlas_label or None,
+            flip_axes=args.flip_axes,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0

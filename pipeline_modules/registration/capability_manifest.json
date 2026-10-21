@@ -37,6 +37,8 @@
         "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack. Production default false: transient intermediate, removed after zarr conversion"},
         "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr (the label deliverable)"},
         "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr (0=background, 1=left, 2=right). Required when analysis.use_hemisphere_label=true in main.py config for bilateral L/R statistics"},
+        "auto_orient": {"type": "bool", "default": true, "description": "Before SyN, compare the sample brain mask with the atlas label mask over the 8 axis flips and auto-apply the detected AP/DV flip when the Dice gap is confident. ML is never auto-flipped (near-symmetric brain). An explicit non-default flip_atlas takes precedence. Writes qc/orientation_check.json."},
+        "orientation_confidence_min": {"type": "float", "default": 0.02, "description": "Minimum best-vs-runner-up Dice gap required to apply an auto-detected flip; below it the atlas stays unflipped and the orientation report is flagged unreliable"},
         "config":              {"type": "path|null", "default": null, "description": "Path to main config.json for resolution info"},
         "density_cfg":         {"type": "path|null", "default": null}
       },
@@ -47,6 +49,7 @@
         "warped_mask_dir":       {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_mask (image2atlas mode)"},
         "warped_image_dir":      {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_image (if save_registered_image)"},
         "transforms_dir":        {"type": "dir", "optional": true, "description": "sample_dir/transforms (if save_transforms)"},
+        "orientation_check":     {"type": "path", "optional": true, "description": "sample_dir/qc/orientation_check.json with all 8 flip Dice scores, detected/applied flip, confidence and ML ambiguity"},
         "manifest_path":         {"type": "path", "description": "_run_manifest.json"}
       }
     },
@@ -102,7 +105,8 @@
       "inputs": {
         "sample_dir":     {"type": "dir", "required": true, "description": "Sample dir with transforms/ + ch0_downsample/volume.nii.gz"},
         "output":         {"type": "path", "required": true, "description": "Output hemisphere .zarr path, commonly sample_dir/atlas_label_hemisphere.zarr"},
-        "atlas_label":    {"type": "path|null", "default": null, "description": "Standard-space annotation tiff override"}
+        "atlas_label":    {"type": "path|null", "default": null, "description": "Standard-space annotation tiff override"},
+        "flip_axes":      {"type": "list[int]", "default": [], "description": "Atlas axis indices flipped before registration (0=ML, 1=AP, 2=DV). Must match registration.flip_atlas or the auto_orient result so hemisphere labels follow the same atlas orientation."}
       },
       "outputs": {
         "hemisphere_zarr": {"type": "path", "description": "sample_dir/atlas_label_hemisphere.zarr with split_x/split_x_per_z attrs"}

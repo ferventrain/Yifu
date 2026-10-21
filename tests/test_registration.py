@@ -34,6 +34,9 @@ class TestRegistrationCfg:
         assert cfg.save_upsampled_label is True
         assert cfg.save_upsampled_label_zarr is True
         assert cfg.save_upsampled_label_hemisphere_zarr is False
+        assert cfg.flip_atlas == [False, False, False]
+        assert cfg.auto_orient is True
+        assert cfg.orientation_confidence_min == 0.02
         assert cfg.upsample_method == "nearest"
         assert cfg.chunk_size == 50
 
@@ -72,6 +75,12 @@ class TestRegistrationCfg:
 
         with pytest.raises(ValueError, match="transform_type must be"):
             RegistrationCfg(transform_type="BSpline")
+
+    def test_invalid_flip_atlas_length(self):
+        from pipeline_modules.registration.config import RegistrationCfg
+
+        with pytest.raises(ValueError, match="flip_atlas must have 3 entries"):
+            RegistrationCfg(flip_atlas=[False, True])
 
     def test_frozen(self):
         from pipeline_modules.registration.config import RegistrationCfg
@@ -314,3 +323,107 @@ class TestN4AndAlignmentCheck:
         )
         registrator._run_rigid_preflight_qc(fixed, moved)
         assert (tmp_path / "qc" / "registration_rigid_check.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Orientation preflight
+# ---------------------------------------------------------------------------
+
+
+def _orientation_brain(shape=(40, 72, 40)):
+    """AP/DV-asymmetric, ML-symmetric mask (x=ML, y=AP, z=DV)."""
+    import numpy as np
+
+    xx, yy, zz = np.mgrid[0 : shape[0], 0 : shape[1], 0 : shape[2]]
+    x = xx - (shape[0] - 1) / 2
+    y = yy - (shape[1] - 1) / 2
+    z = zz - (shape[2] - 1) / 2
+    mask = (x / 14) ** 2 + (y / 26) ** 2 + (z / 11) ** 2 <= 1
+    mask |= (x / 7) ** 2 + ((y - 21) / 7) ** 2 + ((z + 1) / 6) ** 2 <= 1
+    mask |= (x / 8) ** 2 + ((y + 27) / 7) ** 2 + ((z - 6) / 6) ** 2 <= 1
+    mask |= (x / 6) ** 2 + ((y + 3) / 14) ** 2 + ((z - 12) / 4) ** 2 <= 1
+    mask |= (x / 4) ** 2 + ((y - 5) / 7) ** 2 + ((z + 12) / 3) ** 2 <= 1
+    return mask
+
+
+def _orientation_registrator(tmp_path, atlas_mask, sample_mask):
+    import ants
+
+    from pipeline_modules.registration.ANTs_registration import (
+        BidirectionalRegistration,
+    )
+
+    registrator = BidirectionalRegistration.__new__(BidirectionalRegistration)
+    registrator.sample_dir = tmp_path
+    registrator.register_image = ants.from_numpy(sample_mask.astype("float32"))
+    registrator.atlas_image = ants.from_numpy(atlas_mask.astype("float32"))
+    registrator.atlas_label = ants.from_numpy(atlas_mask.astype("float32"))
+    registrator.auto_orient = True
+    registrator.orientation_confidence_min = 0.02
+    registrator.config_flip_atlas = [False, False, False]
+    registrator.effective_flip_atlas = [False, False, False]
+    registrator._orientation_checked = False
+    return registrator
+
+
+class TestOrientationPreflight:
+    def test_auto_orient_flips_atlas_and_writes_report(self, tmp_path: Path):
+        pytest.importorskip("ants")
+        import numpy as np
+
+        atlas = _orientation_brain()
+        registrator = _orientation_registrator(tmp_path, atlas, np.flip(atlas, axis=1))
+
+        registrator._maybe_auto_orient()
+
+        assert registrator.effective_flip_atlas == [False, True, False]
+        np.testing.assert_array_equal(
+            registrator.atlas_label.numpy(), np.flip(atlas, axis=1).astype(np.float32)
+        )
+        report = json.loads(
+            (tmp_path / "qc" / "orientation_check.json").read_text(encoding="utf-8")
+        )
+        assert report["source"] == "auto"
+        assert report["applied_flip"] == [False, True, False]
+        assert report["reliable"] is True
+
+    def test_low_confidence_keeps_atlas_unflipped(self, tmp_path: Path):
+        pytest.importorskip("ants")
+        import numpy as np
+
+        atlas = _orientation_brain()
+        registrator = _orientation_registrator(tmp_path, atlas, np.flip(atlas, axis=1))
+        registrator.orientation_confidence_min = 1.0
+
+        registrator._maybe_auto_orient()
+
+        assert registrator.effective_flip_atlas == [False, False, False]
+        np.testing.assert_array_equal(
+            registrator.atlas_label.numpy(), atlas.astype(np.float32)
+        )
+        report = json.loads(
+            (tmp_path / "qc" / "orientation_check.json").read_text(encoding="utf-8")
+        )
+        assert report["reliable"] is False
+        assert report["applied_flip"] == [False, False, False]
+
+    def test_explicit_flip_skips_auto_detection(self, tmp_path: Path):
+        pytest.importorskip("ants")
+        import numpy as np
+
+        atlas = _orientation_brain()
+        flipped = np.flip(atlas, axis=1)
+        registrator = _orientation_registrator(tmp_path, flipped, atlas)
+        registrator.config_flip_atlas = [False, True, False]
+        registrator.effective_flip_atlas = [False, True, False]
+
+        registrator._maybe_auto_orient()
+
+        assert registrator.effective_flip_atlas == [False, True, False]
+        np.testing.assert_array_equal(
+            registrator.atlas_label.numpy(), flipped.astype(np.float32)
+        )
+        report = json.loads(
+            (tmp_path / "qc" / "orientation_check.json").read_text(encoding="utf-8")
+        )
+        assert report["source"] == "config"

@@ -23,6 +23,11 @@ try:
         brain_mask_ds_path,
         write_brain_mask_ds_from_source,
     )
+    from pipeline_modules.registration.orientation import (
+        axes_from_flip,
+        detect_axis_flips,
+        write_orientation_report,
+    )
     from pipeline_modules.utils.tiff_stack_io import (
         iter_batch_ranges,
         normalize_tiff_compression,
@@ -43,6 +48,11 @@ except ImportError:
         DS_FACTOR,
         brain_mask_ds_path,
         write_brain_mask_ds_from_source,
+    )
+    from .orientation import (  # type: ignore[no-redef]
+        axes_from_flip,
+        detect_axis_flips,
+        write_orientation_report,
     )
 
     convert_tiff_to_zarr = None  # type: ignore[assignment]
@@ -314,6 +324,11 @@ class BidirectionalRegistration:
         # catches catastrophic misalignment ~20s into the run.
         self.n4_preprocess = bool(registration_config.get("n4_preprocess", True))
         self.rigid_preflight_qc = bool(registration_config.get("rigid_preflight_qc", True))
+        self.auto_orient = bool(registration_config.get("auto_orient", True))
+        self.orientation_confidence_min = float(
+            registration_config.get("orientation_confidence_min", 0.02)
+        )
+        self._orientation_checked = False
         # 2026-10-12 additions (edge-focused variant): SyN similarity metric
         # override (e.g. "CC" — RA stages stay Mattes MI) and histogram
         # matching toggle; defaults keep the production behavior.
@@ -327,24 +342,23 @@ class BidirectionalRegistration:
             self.histogram_matching,
         )
 
-        # Flip atlas if configured
-        flip_atlas = registration_config.get("flip_atlas", [False, False, False])
+        # Flip atlas if configured; automatic orientation detection runs later,
+        # once the registration image is loaded (see _maybe_auto_orient).
+        flip_atlas = [
+            bool(v) for v in registration_config.get("flip_atlas", [False, False, False])
+        ]
+        if len(flip_atlas) != 3:
+            raise ValueError(f"registration.flip_atlas must have 3 entries, got {flip_atlas}")
+        self.config_flip_atlas = flip_atlas
+        self.effective_flip_atlas = list(flip_atlas)
         if any(flip_atlas):
-            flip_axes = tuple(i for i, flip in enumerate(flip_atlas) if flip)
-            logger.info("Flipping atlas along axis indices %s (x=%s, y=%s, z=%s)",
-                        flip_axes, flip_atlas[0], flip_atlas[1], flip_atlas[2])
-            self.atlas_image = ants.from_numpy(
-                np.flip(self.atlas_image.numpy(), axis=flip_axes).copy(),
-                spacing=self.atlas_image.spacing,
-                origin=self.atlas_image.origin,
-                direction=self.atlas_image.direction,
-            )
-            self.atlas_label = ants.from_numpy(
-                np.flip(self.atlas_label.numpy(), axis=flip_axes).copy(),
-                spacing=self.atlas_label.spacing,
-                origin=self.atlas_label.origin,
-                direction=self.atlas_label.direction,
-            )
+            self._apply_atlas_flip(flip_atlas, source="config")
+        logger.info(
+            "Orientation preflight: auto_orient=%s, confidence_min=%.3f, configured flip_atlas=%s",
+            self.auto_orient,
+            self.orientation_confidence_min,
+            self.config_flip_atlas,
+        )
 
         self.save_upsampled_label = bool(registration_config.get("save_upsampled_label", True))
         self.save_upsampled_label_zarr = bool(registration_config.get("save_upsampled_label_zarr", True))
@@ -372,6 +386,120 @@ class BidirectionalRegistration:
         
         # Density Config
         self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Region_Csv_Rev2_updated.CSV')
+
+    def _apply_atlas_flip(self, flip, *, source: str) -> None:
+        axes = axes_from_flip(flip)
+        if not axes:
+            return
+        logger.info(
+            "Flipping atlas along axis indices %s (x=%s, y=%s, z=%s; source=%s)",
+            axes, flip[0], flip[1], flip[2], source,
+        )
+        self.atlas_image = ants.from_numpy(
+            np.flip(self.atlas_image.numpy(), axis=axes).copy(),
+            spacing=self.atlas_image.spacing,
+            origin=self.atlas_image.origin,
+            direction=self.atlas_image.direction,
+        )
+        self.atlas_label = ants.from_numpy(
+            np.flip(self.atlas_label.numpy(), axis=axes).copy(),
+            spacing=self.atlas_label.spacing,
+            origin=self.atlas_label.origin,
+            direction=self.atlas_label.direction,
+        )
+        self.effective_flip_atlas = [bool(v) for v in flip]
+
+    def _maybe_auto_orient(self) -> None:
+        """Detect the sample's AP/DV orientation before SyN and flip the atlas.
+
+        The mask comparison takes a few seconds and runs before N4/histogram
+        matching. An explicit flip_atlas wins; otherwise the detected AP/DV
+        flip is applied only when the Dice gap clears the confidence floor.
+        ML is never auto-flipped because a mouse brain is near left-right
+        symmetric.
+        """
+        if self._orientation_checked:
+            return
+        self._orientation_checked = True
+
+        report_path = self.sample_dir / "qc" / "orientation_check.json"
+        if not self.auto_orient:
+            logger.info("Orientation preflight disabled (registration.auto_orient=false)")
+            return
+        if any(self.config_flip_atlas):
+            write_orientation_report(
+                report_path,
+                {
+                    "source": "config",
+                    "axis_order": ["ML", "AP", "DV"],
+                    "applied_flip": list(self.effective_flip_atlas),
+                    "auto_orient": False,
+                    "note": "registration.flip_atlas was set explicitly; automatic detection skipped.",
+                },
+            )
+            logger.info(
+                "Orientation preflight skipped: flip_atlas explicitly configured as %s",
+                self.effective_flip_atlas,
+            )
+            return
+
+        sample_mask = np.asarray(self.register_image.numpy()) > 0
+        atlas_mask = np.asarray(self.atlas_label.numpy()) > 0
+        try:
+            result = detect_axis_flips(
+                sample_mask,
+                atlas_mask,
+                min_confidence=self.orientation_confidence_min,
+            )
+        except Exception as exc:
+            logger.exception("Orientation preflight failed; keeping the unflipped atlas")
+            write_orientation_report(
+                report_path,
+                {
+                    "source": "auto",
+                    "axis_order": ["ML", "AP", "DV"],
+                    "error": str(exc),
+                    "applied_flip": [False, False, False],
+                    "reliable": False,
+                },
+            )
+            return
+
+        applied = (
+            list(result["detected_flip"]) if result["reliable"] else [False, False, False]
+        )
+        if any(applied):
+            self._apply_atlas_flip(applied, source="auto")
+        result["source"] = "auto"
+        result["applied_flip"] = applied
+        write_orientation_report(report_path, result)
+
+        if result["reliable"]:
+            logger.info(
+                "Orientation preflight: detected %s (Dice %.4f vs %.4f, confidence %.4f) "
+                "-> applied %s; ML ambiguous=%s",
+                result["detected_flip"],
+                result["best_score"],
+                result["runner_up_score"],
+                result["confidence"],
+                applied,
+                result["ml_ambiguous"],
+            )
+        else:
+            logger.warning(
+                "Orientation preflight inconclusive: best %s (Dice %.4f), runner-up %.4f, "
+                "confidence %.4f < %.4f; keeping atlas unflipped (see %s)",
+                result["detected_flip"],
+                result["best_score"],
+                result["runner_up_score"],
+                result["confidence"],
+                result["threshold"],
+                report_path,
+            )
+        if result["ml_ambiguous"]:
+            logger.info(
+                "Orientation preflight: left/right (ML) is near-symmetric and was not auto-flipped."
+            )
 
     def _load_encoded_atlas_label(self, atlas_label_path: str) -> ants.ANTsImage:
         label_array = load_label_array_preserving_ids(atlas_label_path)
@@ -565,6 +693,7 @@ class BidirectionalRegistration:
         if mode not in ['atlas2image', 'image2atlas']:
             raise ValueError(f"Invalid mode: {mode}")
 
+        self._maybe_auto_orient()
         fixed = self.register_image
         if self.n4_preprocess:
             fixed = self._apply_n4_preprocess(fixed)
@@ -775,6 +904,10 @@ class BidirectionalRegistration:
                                 transformlist=results["transforms"]["fwdtransforms"],
                                 fixed_image=self.register_image,
                                 target_shape=self.original_shape,
+                                # Hemisphere painting must see the same atlas
+                                # orientation as registration; otherwise an ML
+                                # flip swaps left/right in the output labels.
+                                flip_axes=axes_from_flip(self.effective_flip_atlas),
                                 # NOTE: do NOT pass self.atlas_image here — its
                                 # direction was forced to identity AFTER the label
                                 # image was created; the label warp used the

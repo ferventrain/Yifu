@@ -76,6 +76,8 @@
     "transform_type": "SyNRA",
     "allow_reflection": false,
     "flip_atlas": [false, false, false],
+    "auto_orient": true,
+    "orientation_confidence_min": 0.02,
         "save_upsampled_label": false,
         "save_upsampled_label_zarr": true,
         "save_upsampled_label_hemisphere_zarr": true,

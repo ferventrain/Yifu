@@ -120,10 +120,38 @@ class RegistrationCfg(BaseModel):
     )
     flip_atlas: List[bool] = Field(
         [False, False, False],
-        description="Flip atlas before registration: [flip_x, flip_y, flip_z]",
+        description=(
+            "Manual atlas flip before registration: [flip_x, flip_y, flip_z] "
+            "where x=ML, y=AP, z=DV. A non-default value disables auto_orient."
+        ),
+    )
+    auto_orient: bool = Field(
+        True,
+        description=(
+            "Before SyN, compare the sample brain mask with the atlas label mask over "
+            "the 8 axis flips and apply the detected AP/DV flip when the Dice gap is "
+            "confident. ML is never auto-flipped (near-symmetric brain). Writes "
+            "qc/orientation_check.json."
+        ),
+    )
+    orientation_confidence_min: float = Field(
+        0.02,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum best-vs-runner-up Dice gap required to apply an auto-detected flip. "
+            "Below this the atlas stays unflipped and the QC report is flagged unreliable."
+        ),
     )
     upsample_method: str = Field("nearest", description="Interpolation for upsampling: nearest, linear, cubic, quintic")
     chunk_size: int = Field(50, ge=1, description="Chunk size (slices) for chunked label upsampling")
+
+    @field_validator("flip_atlas")
+    @classmethod
+    def _validate_flip_atlas(cls, v: List[bool]) -> List[bool]:
+        if len(v) != 3:
+            raise ValueError(f"flip_atlas must have 3 entries [x, y, z], got {v!r}")
+        return v
 
     @field_validator("mode")
     @classmethod
