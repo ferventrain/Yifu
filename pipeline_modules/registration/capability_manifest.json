@@ -25,30 +25,121 @@
         "For label upsampling without TIFF folders: sample_dir/original_shape.json with the full-res signal (z,y,x) shape"
       ],
       "inputs": {
-        "sample_dir":          {"type": "path", "required": true, "description": "Sample root directory"},
-        "signal_channel":      {"type": "string", "required": true, "description": "Signal channel label (e.g. '0')"},
-        "atlas_image":         {"type": "path", "required": true, "description": "Allen atlas template image (.tiff / .nii.gz)"},
-        "atlas_label":         {"type": "path", "required": true, "description": "Allen atlas annotation label image"},
-        "register_channel":    {"type": "string", "required": true, "description": "Registration channel label (e.g. '1')"},
-        "mode":                {"type": "string", "default": "atlas2image", "choices": ["atlas2image", "image2atlas"]},
-        "registration_type":   {"type": "string", "default": "SyN", "choices": ["Rigid", "Affine", "SyN", "SyNRA"]},
-        "save_registered_image": {"type": "bool", "default": false},
-        "save_transforms":     {"type": "bool", "default": false},
-        "save_upsampled_label": {"type": "bool", "default": true, "description": "Save sample-space atlas label TIFF stack. Production default false: transient intermediate, removed after zarr conversion"},
-        "save_upsampled_label_zarr": {"type": "bool", "default": true, "description": "Convert sample-space atlas label to Zarr (the label deliverable)"},
-        "save_upsampled_label_hemisphere_zarr": {"type": "bool", "default": false, "description": "Convert sample-space atlas label to hemisphere Zarr (0=background, 1=left, 2=right). Required when analysis.use_hemisphere_label=true in main.py config for bilateral L/R statistics"},
-        "config":              {"type": "path|null", "default": null, "description": "Path to main config.json for resolution info"},
-        "density_cfg":         {"type": "path|null", "default": null}
+        "sample_dir": {
+          "type": "path",
+          "required": true,
+          "description": "Sample root directory"
+        },
+        "signal_channel": {
+          "type": "string",
+          "required": true,
+          "description": "Signal channel label (e.g. '0')"
+        },
+        "atlas_image": {
+          "type": "path",
+          "required": true,
+          "description": "Allen atlas template image (.tiff / .nii.gz)"
+        },
+        "atlas_label": {
+          "type": "path",
+          "required": true,
+          "description": "Allen atlas annotation label image"
+        },
+        "register_channel": {
+          "type": "string",
+          "required": true,
+          "description": "Registration channel label (e.g. '1')"
+        },
+        "mode": {
+          "type": "string",
+          "default": "atlas2image",
+          "choices": [
+            "atlas2image",
+            "image2atlas"
+          ]
+        },
+        "registration_type": {
+          "type": "string",
+          "default": "SyN",
+          "choices": [
+            "Rigid",
+            "Affine",
+            "SyN",
+            "SyNRA"
+          ]
+        },
+        "save_registered_image": {
+          "type": "bool",
+          "default": false
+        },
+        "save_transforms": {
+          "type": "bool",
+          "default": false
+        },
+        "save_upsampled_label": {
+          "type": "bool",
+          "default": true,
+          "description": "Save sample-space atlas label TIFF stack. Production default false: transient intermediate, removed after zarr conversion"
+        },
+        "save_upsampled_label_zarr": {
+          "type": "bool",
+          "default": true,
+          "description": "Convert sample-space atlas label to Zarr (the label deliverable)"
+        },
+        "save_upsampled_label_hemisphere_zarr": {
+          "type": "bool",
+          "default": false,
+          "description": "Convert sample-space atlas label to hemisphere Zarr (0=background, 1=left, 2=right). Required when analysis.use_hemisphere_label=true in main.py config for bilateral L/R statistics"
+        },
+        "config": {
+          "type": "path|null",
+          "default": null,
+          "description": "Path to main config.json for resolution info"
+        },
+        "density_cfg": {
+          "type": "path|null",
+          "default": null
+        }
       },
       "outputs": {
-        "upsampled_atlas_label": {"type": "dir", "description": "sample_dir/upsampled_atlas_label (TIFF stack)"},
-        "upsampled_atlas_label_zarr": {"type": "path", "optional": true, "description": "sample_dir/upsampled_atlas_label.zarr"},
-        "upsampled_label_ngff_zarr": {"type": "path", "optional": true, "description": "sample_dir/upsampled_label_ngff.zarr — NGFF copy of the label zarr with root .zattrs multiscales + image-label; opens in napari (napari env, napari-ome-zarr plugin) as a Labels layer. Plain copy: regenerate after any registration rerun"},
-        "atlas_label_hemisphere_zarr": {"type": "path", "optional": true, "description": "sample_dir/atlas_label_hemisphere.zarr"},
-        "warped_mask_dir":       {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_mask (image2atlas mode)"},
-        "warped_image_dir":      {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_image (if save_registered_image)"},
-        "transforms_dir":        {"type": "dir", "optional": true, "description": "sample_dir/transforms (if save_transforms)"},
-        "manifest_path":         {"type": "path", "description": "_run_manifest.json"}
+        "upsampled_atlas_label": {
+          "type": "dir",
+          "description": "sample_dir/upsampled_atlas_label (TIFF stack)"
+        },
+        "upsampled_atlas_label_zarr": {
+          "type": "path",
+          "optional": true,
+          "description": "sample_dir/upsampled_atlas_label.zarr"
+        },
+        "upsampled_label_ngff_zarr": {
+          "type": "path",
+          "optional": true,
+          "description": "LEGACY sibling (pre-2026-10-22); no longer written. upsampled_atlas_label.zarr itself now carries root .zattrs multiscales + image-label (marked in place) and opens in napari (napari env, napari-ome-zarr plugin) as a Labels layer; analysis readers only open array 0 and ignore the attrs"
+        },
+        "atlas_label_hemisphere_zarr": {
+          "type": "path",
+          "optional": true,
+          "description": "sample_dir/atlas_label_hemisphere.zarr"
+        },
+        "warped_mask_dir": {
+          "type": "dir",
+          "optional": true,
+          "description": "sample_dir/chX_warped_mask (image2atlas mode)"
+        },
+        "warped_image_dir": {
+          "type": "dir",
+          "optional": true,
+          "description": "sample_dir/chX_warped_image (if save_registered_image)"
+        },
+        "transforms_dir": {
+          "type": "dir",
+          "optional": true,
+          "description": "sample_dir/transforms (if save_transforms)"
+        },
+        "manifest_path": {
+          "type": "path",
+          "description": "_run_manifest.json"
+        }
       }
     },
     {
@@ -67,27 +158,97 @@
         "Signal Count is connected-object based under both modes: meaningful for punctate/cell signals, meaningless for vessel networks that form one brain-spanning object. For vessels, report density columns only."
       ],
       "inputs": {
-        "mask_zarr_path":       {"type": "path", "required": true},
-        "label_zarr_path":      {"type": "path", "required": true},
-        "signal_zarr_path":     {"type": "path", "required": true},
-        "cfg_path":             {"type": "path", "required": true, "description": "Allen region CSV"},
-        "output_path":          {"type": "path", "required": true, "description": "Output Excel file path"},
-        "dataset_name":         {"type": "string", "default": "0"},
-        "block_size":           {"type": "triplet_int|null", "default": null, "description": "Override block size as z,y,x"},
-        "foreground_mode":      {"type": "string", "default": "equal", "choices": ["equal", "nonzero"]},
-        "foreground_label":     {"type": "int", "default": 1},
-        "min_voxels":           {"type": "int", "default": 10},
-        "flush_every":          {"type": "int", "default": 25},
-        "resolution_xyz":       {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
-        "tmp_dir":              {"type": "path|null", "default": null},
-        "keep_tmp":             {"type": "bool", "default": false},
-        "pass1_workers":        {"type": "int", "default": 1},
-        "hemisphere_zarr_path":  {"type": "path|null", "default": null, "description": "Optional hemisphere Zarr for left/right stats"},
-        "hemisphere_only":       {"type": "bool", "default": false, "description": "With hemisphere stats: export Left/Right columns only, suppress whole-brain columns (production default for bilateral studies)"}
+        "mask_zarr_path": {
+          "type": "path",
+          "required": true
+        },
+        "label_zarr_path": {
+          "type": "path",
+          "required": true
+        },
+        "signal_zarr_path": {
+          "type": "path",
+          "required": true
+        },
+        "cfg_path": {
+          "type": "path",
+          "required": true,
+          "description": "Allen region CSV"
+        },
+        "output_path": {
+          "type": "path",
+          "required": true,
+          "description": "Output Excel file path"
+        },
+        "dataset_name": {
+          "type": "string",
+          "default": "0"
+        },
+        "block_size": {
+          "type": "triplet_int|null",
+          "default": null,
+          "description": "Override block size as z,y,x"
+        },
+        "foreground_mode": {
+          "type": "string",
+          "default": "equal",
+          "choices": [
+            "equal",
+            "nonzero"
+          ]
+        },
+        "foreground_label": {
+          "type": "int",
+          "default": 1
+        },
+        "min_voxels": {
+          "type": "int",
+          "default": 10
+        },
+        "flush_every": {
+          "type": "int",
+          "default": 25
+        },
+        "resolution_xyz": {
+          "type": "triplet_float_um",
+          "default": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        "tmp_dir": {
+          "type": "path|null",
+          "default": null
+        },
+        "keep_tmp": {
+          "type": "bool",
+          "default": false
+        },
+        "pass1_workers": {
+          "type": "int",
+          "default": 1
+        },
+        "hemisphere_zarr_path": {
+          "type": "path|null",
+          "default": null,
+          "description": "Optional hemisphere Zarr for left/right stats"
+        },
+        "hemisphere_only": {
+          "type": "bool",
+          "default": false,
+          "description": "With hemisphere stats: export Left/Right columns only, suppress whole-brain columns (production default for bilateral studies)"
+        }
       },
       "outputs": {
-        "excel_path":    {"type": "path", "description": "Per-region signal statistics Excel workbook; may include Left/Right Total Voxels, Left/Right Signal Voxels, Left/Right Voxel Density, Left/Right Signal Count, Left/Right Sum Intensity when hemisphere_zarr is used"},
-        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
+        "excel_path": {
+          "type": "path",
+          "description": "Per-region signal statistics Excel workbook; may include Left/Right Total Voxels, Left/Right Signal Voxels, Left/Right Voxel Density, Left/Right Signal Count, Left/Right Sum Intensity when hemisphere_zarr is used"
+        },
+        "manifest_path": {
+          "type": "path",
+          "description": "_run_manifest.json"
+        }
       }
     },
     {
@@ -101,12 +262,27 @@
         "Standard-space atlas label tiff (default resolved from YIFU_DATA_DIR/reference)"
       ],
       "inputs": {
-        "sample_dir":     {"type": "dir", "required": true, "description": "Sample dir with transforms/ + ch0_downsample/volume.nii.gz"},
-        "output":         {"type": "path", "required": true, "description": "Output hemisphere .zarr path, commonly sample_dir/atlas_label_hemisphere.zarr"},
-        "atlas_label":    {"type": "path|null", "default": null, "description": "Standard-space annotation tiff override"}
+        "sample_dir": {
+          "type": "dir",
+          "required": true,
+          "description": "Sample dir with transforms/ + ch0_downsample/volume.nii.gz"
+        },
+        "output": {
+          "type": "path",
+          "required": true,
+          "description": "Output hemisphere .zarr path, commonly sample_dir/atlas_label_hemisphere.zarr"
+        },
+        "atlas_label": {
+          "type": "path|null",
+          "default": null,
+          "description": "Standard-space annotation tiff override"
+        }
       },
       "outputs": {
-        "hemisphere_zarr": {"type": "path", "description": "sample_dir/atlas_label_hemisphere.zarr with split_x/split_x_per_z attrs"}
+        "hemisphere_zarr": {
+          "type": "path",
+          "description": "sample_dir/atlas_label_hemisphere.zarr with split_x/split_x_per_z attrs"
+        }
       }
     },
     {
@@ -119,17 +295,45 @@
         "Allen region CSV must be available"
       ],
       "inputs": {
-        "label_zarr":           {"type": "path", "required": true},
-        "reference_label_zarr": {"type": "path|null", "default": null},
-        "cfg":                  {"type": "path", "required": true, "description": "Allen region CSV"},
-        "dataset_name":         {"type": "string", "default": "0"},
-        "region_id":            {"type": "int|null", "default": null},
-        "acronym":              {"type": "string|null", "default": null},
-        "block_size":           {"type": "triplet_int|null", "default": null},
-        "top_zero":             {"type": "int", "default": 20}
+        "label_zarr": {
+          "type": "path",
+          "required": true
+        },
+        "reference_label_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "cfg": {
+          "type": "path",
+          "required": true,
+          "description": "Allen region CSV"
+        },
+        "dataset_name": {
+          "type": "string",
+          "default": "0"
+        },
+        "region_id": {
+          "type": "int|null",
+          "default": null
+        },
+        "acronym": {
+          "type": "string|null",
+          "default": null
+        },
+        "block_size": {
+          "type": "triplet_int|null",
+          "default": null
+        },
+        "top_zero": {
+          "type": "int",
+          "default": 20
+        }
       },
       "outputs": {
-        "report": {"type": "log", "description": "Coverage report emitted as structured log messages"}
+        "report": {
+          "type": "log",
+          "description": "Coverage report emitted as structured log messages"
+        }
       }
     },
     {
@@ -142,18 +346,53 @@
         "Allen region CSV must be available"
       ],
       "inputs": {
-        "input":             {"type": "path+", "required": true, "description": "One or more atlas label volumes"},
-        "cfg":               {"type": "path", "required": true, "description": "Allen region CSV"},
-        "preset":            {"type": "string", "default": "wb20", "description": "Built-in coarse-region preset"},
-        "output_dir":        {"type": "path|null", "default": null},
-        "output_suffix":     {"type": "string", "default": ""},
-        "target_ids":        {"type": "string|null", "default": null, "description": "Comma-separated parent IDs to override preset"},
-        "preserve_unmapped": {"type": "bool", "default": false}
+        "input": {
+          "type": "path+",
+          "required": true,
+          "description": "One or more atlas label volumes"
+        },
+        "cfg": {
+          "type": "path",
+          "required": true,
+          "description": "Allen region CSV"
+        },
+        "preset": {
+          "type": "string",
+          "default": "wb20",
+          "description": "Built-in coarse-region preset"
+        },
+        "output_dir": {
+          "type": "path|null",
+          "default": null
+        },
+        "output_suffix": {
+          "type": "string",
+          "default": ""
+        },
+        "target_ids": {
+          "type": "string|null",
+          "default": null,
+          "description": "Comma-separated parent IDs to override preset"
+        },
+        "preserve_unmapped": {
+          "type": "bool",
+          "default": false
+        }
       },
       "outputs": {
-        "output_volume": {"type": "path", "description": "Remapped label volume"},
-        "summary_csv":   {"type": "path", "description": "Per-target region voxel counts CSV"},
-        "manifest_path": {"type": "path", "optional": true, "description": "_run_manifest.json (when output_dir set)"}
+        "output_volume": {
+          "type": "path",
+          "description": "Remapped label volume"
+        },
+        "summary_csv": {
+          "type": "path",
+          "description": "Per-target region voxel counts CSV"
+        },
+        "manifest_path": {
+          "type": "path",
+          "optional": true,
+          "description": "_run_manifest.json (when output_dir set)"
+        }
       }
     },
     {
@@ -167,20 +406,65 @@
         "Segment legend CSV (segment_id_legend.csv) reachable via label Zarr attrs or sample_dir"
       ],
       "inputs": {
-        "sample_dir":       {"type": "path", "required": true, "description": "Sample root directory"},
-        "signal_ch":        {"type": "string", "required": true, "description": "Signal channel label (e.g. '0')"},
-        "signal_zarr_path": {"type": "path", "required": true, "description": "Signal Zarr (dataset '0')"},
-        "mask_zarr_path":   {"type": "path", "required": true, "description": "Binary threshold mask Zarr (foreground=1)"},
-        "segments_zarr":    {"type": "path", "default": "spinalj_segments", "description": "Vertebral segment label Zarr under sample_dir"},
-        "legend_csv":       {"type": "path|null", "default": null, "description": "Segment legend CSV; defaults to zarr attrs / segment_id_legend.csv"},
-        "min_voxels":       {"type": "int", "default": 300, "description": "Minimum merged object size in voxels"},
-        "max_voxels":       {"type": "int", "default": 5000, "description": "Maximum merged object size in voxels; 0 disables"},
-        "resolution_xyz":   {"type": "string", "default": "1,1,1", "description": "Voxel size in microns as x,y,z (config input.resolution_xyz)"}
+        "sample_dir": {
+          "type": "path",
+          "required": true,
+          "description": "Sample root directory"
+        },
+        "signal_ch": {
+          "type": "string",
+          "required": true,
+          "description": "Signal channel label (e.g. '0')"
+        },
+        "signal_zarr_path": {
+          "type": "path",
+          "required": true,
+          "description": "Signal Zarr (dataset '0')"
+        },
+        "mask_zarr_path": {
+          "type": "path",
+          "required": true,
+          "description": "Binary threshold mask Zarr (foreground=1)"
+        },
+        "segments_zarr": {
+          "type": "path",
+          "default": "spinalj_segments",
+          "description": "Vertebral segment label Zarr under sample_dir"
+        },
+        "legend_csv": {
+          "type": "path|null",
+          "default": null,
+          "description": "Segment legend CSV; defaults to zarr attrs / segment_id_legend.csv"
+        },
+        "min_voxels": {
+          "type": "int",
+          "default": 300,
+          "description": "Minimum merged object size in voxels"
+        },
+        "max_voxels": {
+          "type": "int",
+          "default": 5000,
+          "description": "Maximum merged object size in voxels; 0 disables"
+        },
+        "resolution_xyz": {
+          "type": "string",
+          "default": "1,1,1",
+          "description": "Voxel size in microns as x,y,z (config input.resolution_xyz)"
+        }
       },
       "outputs": {
-        "excel":      {"type": "path", "description": "results/<sample>_ch<ch>_spinal_segment_stats.xlsx (Level_0 summary + Level_1 per vertebra)"},
-        "csv":        {"type": "path", "description": "Flat CSV copy of the Excel"},
-        "region_csv": {"type": "path", "description": "results/<sample>_spinal_segment_regions.csv legend-derived region CSV"}
+        "excel": {
+          "type": "path",
+          "description": "results/<sample>_ch<ch>_spinal_segment_stats.xlsx (Level_0 summary + Level_1 per vertebra)"
+        },
+        "csv": {
+          "type": "path",
+          "description": "Flat CSV copy of the Excel"
+        },
+        "region_csv": {
+          "type": "path",
+          "description": "results/<sample>_spinal_segment_regions.csv legend-derived region CSV"
+        }
       }
     }
   ],
@@ -191,14 +475,14 @@
   "sample_layout": {
     "class": "pipeline_modules.utils.sample_layout.SampleLayout",
     "relevant_paths": {
-      "reg_downsample_dir":    "SampleLayout.reg_downsample_dir",
-      "reg_downsample_nii":    "SampleLayout.reg_downsample_nii",
-      "atlas_label_zarr":      "SampleLayout.atlas_label_zarr",
-      "atlas_label_tiff_dir":  "SampleLayout.atlas_label_tiff_dir",
+      "reg_downsample_dir": "SampleLayout.reg_downsample_dir",
+      "reg_downsample_nii": "SampleLayout.reg_downsample_nii",
+      "atlas_label_zarr": "SampleLayout.atlas_label_zarr",
+      "atlas_label_tiff_dir": "SampleLayout.atlas_label_tiff_dir",
       "atlas_label_hemisphere_zarr": "sample_dir/atlas_label_hemisphere.zarr",
-      "mask_zarr":             "SampleLayout.mask_zarr",
-      "signal_zarr":           "SampleLayout.signal_zarr",
-      "density_results_xlsx":  "SampleLayout.density_results_xlsx"
+      "mask_zarr": "SampleLayout.mask_zarr",
+      "signal_zarr": "SampleLayout.signal_zarr",
+      "density_results_xlsx": "SampleLayout.density_results_xlsx"
     }
   }
 }

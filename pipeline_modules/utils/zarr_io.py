@@ -310,13 +310,36 @@ def ome_ngff_multiscales(
     ]
 
 
+def mark_ngff_label(label_zarr: str | Path) -> Path:
+    """Make an existing label zarr open in napari as a Labels layer, in place.
+
+    napari-ome-zarr classifies a store as Labels only when its root .zattrs
+    carries multiscales plus the "image-label" key; the NGFF "labels" group
+    convention is not honored by the plugin. Downstream readers only open
+    array "0" and ignore these attrs, so marking is safe for analysis zarrs.
+    """
+    path = Path(label_zarr)
+    attrs = read_zarr_attrs(path)
+    changed = False
+    if "multiscales" not in attrs:
+        attrs["multiscales"] = ome_ngff_multiscales(["0"], ndim=len(read_zarr_shape(path)))
+        changed = True
+    if attrs.get("image-label") != {"version": "0.4"}:
+        attrs["image-label"] = {"version": "0.4"}
+        changed = True
+    if changed:
+        (path / ".zattrs").write_text(json.dumps(attrs, indent=1), encoding="utf-8")
+    return path
+
+
 def write_ngff_label_sibling(label_zarr: str | Path, ngff_zarr: str | Path) -> Path:
     """Copy a label zarr into an NGFF store that napari opens as a Labels layer.
 
     napari-ome-zarr classifies a store as Labels only when its root .zattrs
     carries multiscales plus the "image-label" key; the NGFF "labels" group
-    convention is not honored by the plugin. Plain file copy — regenerate the
-    sibling whenever the source label zarr is rewritten.
+    convention is not honored by the plugin. Plain file copy — prefer marking
+    the store itself with mark_ngff_label; this sibling path is kept for
+    stores that must stay untouched.
     """
     src = Path(label_zarr)
     dst = Path(ngff_zarr)

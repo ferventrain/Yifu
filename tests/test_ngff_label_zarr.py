@@ -58,3 +58,27 @@ def test_ngff_sibling_replaces_existing_destination(tmp_path):
     write_ngff_label_sibling(src, dst)
     assert not (dst / "stale.txt").exists()
     assert (dst / "0" / "0.0.0").exists()
+
+
+def test_mark_ngff_label_adds_keys_in_place(tmp_path):
+    from pipeline_modules.utils.zarr_io import mark_ngff_label
+
+    src = _make_label_zarr(tmp_path / "upsampled_atlas_label.zarr")
+    original_chunk = (src / "0" / "0.0.0").read_bytes()
+
+    mark_ngff_label(src)
+
+    attrs = json.loads((src / ".zattrs").read_text(encoding="utf-8"))
+    assert attrs["image-label"] == {"version": "0.4"}
+    assert attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"][0]["scale"] == [2.0, 1.8, 1.8]
+    assert (src / "0" / "0.0.0").read_bytes() == original_chunk
+
+
+def test_mark_ngff_label_is_idempotent(tmp_path):
+    from pipeline_modules.utils.zarr_io import mark_ngff_label
+
+    src = _make_label_zarr(tmp_path / "lab.zarr", with_multiscales=False)
+    mark_ngff_label(src)
+    first = (src / ".zattrs").read_text(encoding="utf-8")
+    mark_ngff_label(src)
+    assert (src / ".zattrs").read_text(encoding="utf-8") == first

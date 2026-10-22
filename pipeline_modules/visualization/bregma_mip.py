@@ -1851,6 +1851,8 @@ def render_bregma_mips(
             split_atlas=split_atlas,
             overlay_atlas=overlay_atlas,
             split_nucleus_merge=split_nucleus_merge,
+            boundary_region=boundary_region,
+            boundary_region_colors=boundary_region_colors,
         )
     if space == "atlas":
         return render_atlas_space_mips(
@@ -2415,6 +2417,8 @@ def render_atlas_band_mips(
     overlay_atlas: bool = False,
     split_min_line_px: int = 100,
     split_nucleus_merge: bool = False,
+    boundary_region: list[str] | None = None,
+    boundary_region_colors: list[str] | None = None,
 ) -> dict[str, object]:
     """Atlas-space slab with per-pixel curved windows, native-voxel band MIP.
 
@@ -2425,17 +2429,45 @@ def render_atlas_band_mips(
     through the transforms (~0.5M points instead of a fine-grid point cloud).
     The projection direction is the native AP axis within the band -- a
     first-order approximation of the atlas-orthogonal camera.
+
+    ``zarr_path`` accepts one signal zarr or several (comma-separated string or
+    list) for a false-color multi-channel composite; all channels must be zarrs
+    of the same sample (same registration outputs and shape), each drawn with
+    its own colormap from ``cmaps``.
+
+    ``boundary_region`` (acronyms) draws ONLY those regions' outlines (subtree =
+    region + children), traced from the atlas-space label slice at the slab
+    center so they stay upright on the atlas grid.
     """
-    if isinstance(zarr_path, str) and "," in zarr_path:
-        raise ValueError("--space atlas-band renders one signal zarr per image")
-    if split_atlas:
-        atlas_grid = True  # the split composite is defined on the atlas grid
-    zarr_path = Path(zarr_path)
-    sample_dir = zarr_path.parent
-    arr = open_zarr_dataset(zarr_path)
-    if arr.ndim != 3:
-        raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {arr.shape} for {zarr_path}")
-    native_shape = tuple(int(v) for v in arr.shape)
+    zarr_paths = (
+        [Path(p.strip()) for p in str(zarr_path).split(",") if p.strip()]
+        if isinstance(zarr_path, str)
+        else [Path(zarr_path)]
+    )
+    if not zarr_paths:
+        raise ValueError("At least one signal zarr is required")
+    if split_atlas and len(zarr_paths) > 1:
+        raise ValueError("--split-atlas renders one signal zarr per image")
+    if overlay_atlas and len(zarr_paths) > 1:
+        raise ValueError("--overlay-atlas renders one signal zarr per image")
+    sample_dir = zarr_paths[0].parent
+    if any(p.parent != sample_dir for p in zarr_paths):
+        raise ValueError(
+            "Multi-channel rendering needs zarrs of the same sample directory "
+            f"(got parents: {sorted({str(p.parent) for p in zarr_paths})})"
+        )
+    arrays = [open_zarr_dataset(p) for p in zarr_paths]
+    for p, arr in zip(zarr_paths, arrays):
+        if arr.ndim != 3:
+            raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {arr.shape} for {p}")
+    if len(arrays) > 1 and any(
+        tuple(int(v) for v in a.shape) != tuple(int(v) for v in arrays[0].shape) for a in arrays
+    ):
+        raise ValueError("Multi-channel zarrs must share one shape")
+    zarr_path = zarr_paths[0]
+    arr = arrays[0]
+    native_shape = tuple(int(v) for v in arrays[0].shape)
+    cmaps = resolve_channel_cmaps(len(zarr_paths), cmaps)
     voxel, voxel_source = resolve_voxel_xyz_um(
         zarr_path, config_path=sample_dir / "config.json", sample_dir=sample_dir
     )
@@ -2467,7 +2499,7 @@ def render_atlas_band_mips(
     logger.info("Atlas->native mapper ready (%s)", mapper.label_check)
 
     atlas_label_volume = None
-    if overlay_labels or split_atlas or overlay_atlas:
+    if overlay_labels or split_atlas or overlay_atlas or boundary_region:
         import tifffile
 
         atlas_label_volume = tifffile.imread(str(atlas_label_path))
@@ -2502,7 +2534,7 @@ def render_atlas_band_mips(
         y_win_lo = np.fmin(y_a, y_b)
         y_win_hi = np.fmax(y_a, y_b)
         mips = band_mip_per_pixel(
-            [arr], y_win_lo=y_win_lo, y_win_hi=y_win_hi, dv_block=dv_block
+            arrays, y_win_lo=y_win_lo, y_win_hi=y_win_hi, dv_block=dv_block
         )
 
         boundary = None
@@ -2537,11 +2569,14 @@ def render_atlas_band_mips(
         if atlas_grid:
             grid_pitch_um = float(atlas_grid_pitch_um) if atlas_grid_pitch_um else float(vox_ml)
             t1 = time.perf_counter()
-            mip = regrid_band_mip_to_atlas(
-                mip, z_mid, x_mid,
-                atlas_shape_dv_ap_ml=atlas_shape, atlas_res_um=atlas_res_um,
-                pitch_um=grid_pitch_um,
-            )
+            mips = [
+                regrid_band_mip_to_atlas(
+                    m, z_mid, x_mid,
+                    atlas_shape_dv_ap_ml=atlas_shape, atlas_res_um=atlas_res_um,
+                    pitch_um=grid_pitch_um,
+                )
+                for m in mips
+            ]
             logger.info(
                 "regridded band MIP onto atlas grid at %.1f um after %.1fs",
                 grid_pitch_um, time.perf_counter() - t1,
@@ -2552,7 +2587,42 @@ def render_atlas_band_mips(
                 atlas_lines, z_mid, x_mid,
                 atlas_res_um=atlas_res_um, vox_ml_um=vox_ml, vox_dv_um=vox_dv,
             )
-        vmax_eff = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
+        boundary_groups = None
+        group_colors = None
+        if boundary_region:
+            # Per-region outlines traced straight on the atlas label slice:
+            # upright on the atlas grid, replaces the stock all-boundary overlay.
+            if atlas_label_volume is None:
+                raise ValueError("--boundary-region needs the atlas label volume")
+            ids_map = region_subtree_ids(
+                boundary_region, region_csv=region_csv or DEFAULT_REGION_CSV
+            )
+            lab_plane = np.asarray(
+                atlas_label_volume[:, int(np.clip(round(ap_center), 0, n_ap_a - 1)), :]
+            )
+            lines_by: dict[str, list[np.ndarray]] = {}
+            for r in boundary_region:
+                ids_r = np.fromiter(ids_map[r], dtype=np.int64)
+                m_ = np.isin(lab_plane, ids_r).astype(np.uint8)
+                lines_by[r] = (
+                    _region_contour_lines_mm(
+                        m_, row_vox_um=atlas_res_um, col_vox_um=atlas_res_um,
+                        downsample=2, smoothing=boundary_smooth,
+                    )
+                    if m_.any()
+                    else []
+                )
+            boundary_groups = [(r, lines_by[r]) for r in boundary_region]
+            group_colors = boundary_region_colors or ["white", "yellow", "cyan", "orange"][
+                : len(boundary_region)
+            ]
+            boundary = None  # region outlines replace the stock all-boundary lines
+        if len(mips) > 1:
+            vmaxs = [resolve_display_vmax(m, percentile=percentile, explicit=vmax) for m in mips]
+            vmax_eff = vmaxs[-1]
+            mip = _compose_rgb(mips, cmaps, vmaxs)
+        else:
+            vmax_eff = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
         if split_atlas or overlay_atlas:
             # Atlas boundary lines from contour tracing (no skeletonization, so
             # thin sheets like the corpus callosum stay whole), rasterized onto
@@ -2625,13 +2695,16 @@ def render_atlas_band_mips(
         # Full-scale render: canvas = image, one display pixel per native voxel
         # (max_pixels/pooling deliberately ignored in this mode).
         stem = (
-            "atlasband_atlasgrid_ovl" if overlay_atlas
-            else "atlasband_atlasgrid_split" if split_atlas
-            else "atlasband_atlasgrid" if atlas_grid
-            else "atlasband"
+            "+".join(p.stem for p in zarr_paths) + "_"
+            + (
+                "atlasband_atlasgrid_ovl" if overlay_atlas
+                else "atlasband_atlasgrid_split" if split_atlas
+                else "atlasband_atlasgrid" if atlas_grid
+                else "atlasband"
+            )
         )
         out_path = out_dir / (
-            f"{sample_dir.name}_{zarr_path.stem}_{stem}_bregma{bregma:+.2f}mm_"
+            f"{sample_dir.name}_{stem}_bregma{bregma:+.2f}mm_"
             f"thick{thickness_mm:.2f}mm_{boundary_style}.png"
         )
         render_bregma_png(
@@ -2646,6 +2719,10 @@ def render_atlas_band_mips(
             boundary_linewidth=boundary_linewidth,
             boundary_style=boundary_style,
             full_scale=True,
+            boundary_groups=boundary_groups,
+            boundary_group_colors=group_colors if boundary_groups else None,
+            boundary_group_linewidth=boundary_linewidth,
+            boundary_group_style=boundary_style,
         )
         outputs.append(
             {
@@ -2657,6 +2734,7 @@ def render_atlas_band_mips(
                 "full_scale": True,
                 "atlas_grid_pitch_um": grid_pitch_um,
                 "boundary_overlay": bool(boundary),
+                "boundary_regions": list(boundary_region) if boundary_groups else [],
                 "output": str(out_path),
             }
         )
