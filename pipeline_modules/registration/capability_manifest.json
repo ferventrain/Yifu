@@ -43,6 +43,7 @@
       "outputs": {
         "upsampled_atlas_label": {"type": "dir", "description": "sample_dir/upsampled_atlas_label (TIFF stack)"},
         "upsampled_atlas_label_zarr": {"type": "path", "optional": true, "description": "sample_dir/upsampled_atlas_label.zarr"},
+        "upsampled_label_ngff_zarr": {"type": "path", "optional": true, "description": "sample_dir/upsampled_label_ngff.zarr — NGFF copy of the label zarr with root .zattrs multiscales + image-label; opens in napari (napari env, napari-ome-zarr plugin) as a Labels layer. Plain copy: regenerate after any registration rerun"},
         "atlas_label_hemisphere_zarr": {"type": "path", "optional": true, "description": "sample_dir/atlas_label_hemisphere.zarr"},
         "warped_mask_dir":       {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_mask (image2atlas mode)"},
         "warped_image_dir":      {"type": "dir", "optional": true, "description": "sample_dir/chX_warped_image (if save_registered_image)"},

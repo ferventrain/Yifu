@@ -7,6 +7,7 @@ open those stores, which is what ``napari-ome-zarr`` 0.10 needs.
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -307,6 +308,30 @@ def ome_ngff_multiscales(
             "datasets": out,
         }
     ]
+
+
+def write_ngff_label_sibling(label_zarr: str | Path, ngff_zarr: str | Path) -> Path:
+    """Copy a label zarr into an NGFF store that napari opens as a Labels layer.
+
+    napari-ome-zarr classifies a store as Labels only when its root .zattrs
+    carries multiscales plus the "image-label" key; the NGFF "labels" group
+    convention is not honored by the plugin. Plain file copy — regenerate the
+    sibling whenever the source label zarr is rewritten.
+    """
+    src = Path(label_zarr)
+    dst = Path(ngff_zarr)
+    if dst.exists():
+        shutil.rmtree(dst)
+    attrs = read_zarr_attrs(src)
+    if "multiscales" not in attrs:
+        attrs["multiscales"] = ome_ngff_multiscales(["0"], ndim=len(read_zarr_shape(src)))
+    dst.mkdir(parents=True)
+    (dst / ".zgroup").write_text(json.dumps({"zarr_format": 2}), encoding="utf-8")
+    payload = dict(attrs)
+    payload["image-label"] = {"version": "0.4"}
+    (dst / ".zattrs").write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    shutil.copytree(src / "0", dst / "0")
+    return dst
 
 
 def create_output_zarr(

@@ -757,6 +757,19 @@ class BidirectionalRegistration:
                                 dataset_name="0",
                             )
 
+                    if self.save_upsampled_label_zarr and label_zarr.exists():
+                        ngff_label_zarr = self.sample_dir / "upsampled_label_ngff.zarr"
+                        if ngff_label_zarr.exists():
+                            logger.info("NGFF atlas label Zarr already exists at %s. Skipping conversion.", ngff_label_zarr)
+                        else:
+                            from pipeline_modules.utils.zarr_io import write_ngff_label_sibling
+
+                            write_ngff_label_sibling(label_zarr, ngff_label_zarr)
+                            logger.info(
+                                "Wrote NGFF atlas label Zarr (opens as napari Labels layer): %s",
+                                ngff_label_zarr,
+                            )
+
                     if self.registration_config.get("save_upsampled_label_hemisphere_zarr", False):
                         hemisphere_zarr = self.sample_dir / "atlas_label_hemisphere.zarr"
                         if hemisphere_zarr.exists():

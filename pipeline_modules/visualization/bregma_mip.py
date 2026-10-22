@@ -34,6 +34,7 @@ rows = DV and cols = ML, matching atlas coronal slices in ``atlas_slice.py``.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -166,6 +167,93 @@ def resolve_voxel_xyz_um(
         DEFAULT_VOXEL_XYZ_UM,
     )
     return DEFAULT_VOXEL_XYZ_UM, "default"
+
+
+# ---------------------------------------------------------------------------
+# Region subtree resolution (for single-region boundary overlays)
+# ---------------------------------------------------------------------------
+
+DEFAULT_REGION_CSV = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+
+
+def region_subtree_ids(acronyms: list[str], *, region_csv: str | Path = DEFAULT_REGION_CSV) -> dict[str, set[int]]:
+    """Map each acronym to the set of its own + descendant structure ids.
+
+    Uses the registration region csv (same id space as the atlas labels):
+    acronym column holds python-repr lists like "['CA1']", structure_id_path
+    holds the full ancestor chain, so subtree membership is plain path
+    containment.
+    """
+    import ast
+
+    want = [a.strip() for a in acronyms if a.strip()]
+    acr_map: dict[str, int] = {}
+    paths: dict[int, list[int]] = {}
+    with open(region_csv, encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                p = json.loads(row["structure_id_path"])
+            except Exception:
+                continue
+            i = int(row["id"])
+            paths[i] = p
+            raw = row.get("acronym") or ""
+            acr = raw
+            for parse in (json.loads, ast.literal_eval):
+                try:
+                    if raw.startswith("["):
+                        acr = parse(raw)[0]
+                    break
+                except Exception:
+                    continue
+            acr_map.setdefault(str(acr), i)
+    out: dict[str, set[int]] = {}
+    for name in want:
+        root = acr_map.get(name)
+        if root is None:
+            raise ValueError(f"Region acronym {name!r} not found in {region_csv}")
+        out[name] = {i for i, p in paths.items() if root in p}
+    return out
+
+
+def _region_contour_lines_mm(
+    mask: np.ndarray,
+    *,
+    row_vox_um: float,
+    col_vox_um: float,
+    smoothing: float = 2.0,
+    downsample: int = 8,
+) -> list[np.ndarray]:
+    """Smooth outlines of a binary region mask, in mm (x=col, y=row) from corner.
+
+    ``smoothing`` is in atlas-voxel units (25 um), matching the stock boundary
+    overlay's physical smoothing (~50 um at the default 2.0). The mask is
+    block-averaged ``downsample``x first, gaussian-smoothed at that physical
+    scale, and contoured at 0.5 — staircase-free on the native grid.
+    """
+    from scipy import ndimage as ndi
+    from skimage import measure
+
+    from pipeline_modules.visualization.atlas_slice import _smooth_contour
+
+    m = np.asarray(mask, dtype=np.float32)
+    if downsample > 1:
+        r, c = m.shape
+        r8, c8 = r - r % downsample, c - c % downsample
+        m = m[:r8, :c8].reshape(r8 // downsample, downsample, c8 // downsample, downsample).mean(axis=(1, 3))
+    if smoothing > 0:
+        sigma = max(0.0, smoothing * 25.0 / (row_vox_um * downsample))
+        m = ndi.gaussian_filter(m, sigma=sigma)
+    lines: list[np.ndarray] = []
+    for contour in measure.find_contours(m, 0.5):
+        if len(contour) < 12:
+            continue
+        path = np.asarray(contour, dtype=np.float64)
+        path = _smooth_contour(path, 2.0)
+        path[:, 0] *= downsample
+        path[:, 1] *= downsample
+        lines.append(path[:, ::-1] * (np.array([col_vox_um, row_vox_um]) / 1000.0))
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1443,6 +1531,10 @@ def render_bregma_png(
     pool_factor: int = 1,
     dpi: int = 200,
     full_scale: bool = False,
+    boundary_groups: list[tuple[str, list[np.ndarray]]] | None = None,
+    boundary_group_colors: list[str] | None = None,
+    boundary_group_linewidth: float = 1.2,
+    boundary_group_style: str = "solid",
 ) -> Path:
     if pool_factor > 1:
         mip = _max_pool(mip, pool_factor)
@@ -1450,8 +1542,9 @@ def render_bregma_png(
     image = np.fliplr(image) if flip_ml else image
 
     scale = 2**meta.level
-    extent_ml_mm = image.shape[1] * meta.voxel_xyz_um[0] * scale / 1000.0
-    extent_dv_mm = image.shape[0] * meta.voxel_xyz_um[2] * scale / 1000.0
+    # extent must stay in full-res physical mm: image is pool_factor-pooled
+    extent_ml_mm = image.shape[1] * meta.voxel_xyz_um[0] * scale * pool_factor / 1000.0
+    extent_dv_mm = image.shape[0] * meta.voxel_xyz_um[2] * scale * pool_factor / 1000.0
 
     n_panels = 2 if atlas_slice_image is not None else 1
     aspect = extent_ml_mm / max(extent_dv_mm, 1e-6)
@@ -1501,6 +1594,24 @@ def render_bregma_png(
         flip_dv=flip_dv,
         flip_ml=flip_ml,
     )
+    if boundary_groups:
+        colors = boundary_group_colors or ["white"] * len(boundary_groups)
+        for (name, lines), color in zip(boundary_groups, colors):
+            _draw_boundary_lines(
+                ax, lines,
+                extent_ml_mm=extent_ml_mm,
+                extent_dv_mm=extent_dv_mm,
+                color=color,
+                linewidth=boundary_group_linewidth,
+                style=boundary_group_style,
+                flip_dv=flip_dv,
+                flip_ml=flip_ml,
+            )
+            if lines:
+                ax.text(
+                    0.02, 0.02 + 0.03 * list(boundary_groups).index((name, lines)),
+                    name, transform=ax.transAxes, color=color, fontsize=9 * max(1.0, (extent_ml_mm / 20.0)),
+                )
     _draw_scale_bar(ax, extent_ml_mm, extent_dv_mm)
 
     ax.set_title(
@@ -1703,7 +1814,13 @@ def render_bregma_mips(
     atlas_grid: bool = True,
     atlas_grid_pitch_um: float | None = None,
     split_atlas: bool = False,
+    overlay_atlas: bool = False,
     split_nucleus_merge: bool = False,
+    boundary_region: list[str] | None = None,
+    boundary_region_colors: list[str] | None = None,
+    ap_window_from_regions: list[str] | None = None,
+    ap_window_margin_mm: float = 0.25,
+    region_csv: str | Path | None = None,
 ) -> dict[str, object]:
     if space == "atlas-band":
         return render_atlas_band_mips(
@@ -1732,6 +1849,7 @@ def render_bregma_mips(
             atlas_grid=atlas_grid,
             atlas_grid_pitch_um=atlas_grid_pitch_um,
             split_atlas=split_atlas,
+            overlay_atlas=overlay_atlas,
             split_nucleus_merge=split_nucleus_merge,
         )
     if space == "atlas":
@@ -1763,27 +1881,32 @@ def render_bregma_mips(
         )
     if space != "native":
         raise ValueError(f"space must be 'atlas' or 'native', got {space}")
-    zarr_path = Path(zarr_path)
-    sample_dir = zarr_path.parent
-    voxel, voxel_source = resolve_voxel_xyz_um(
-        zarr_path, explicit=voxel_xyz_um, config_path=config_path, sample_dir=sample_dir
-    )
-    vox_ml, vox_ap, vox_dv = voxel
-
-    base_arr = open_zarr_dataset(zarr_path, dataset_name=dataset)
-    if base_arr.ndim != 3:
-        raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {base_arr.shape}")
-    native_shape = tuple(int(v) for v in base_arr.shape)
+    zarr_paths = [Path(p.strip()) for p in str(zarr_path).split(",") if p.strip()]
+    if not zarr_paths:
+        raise ValueError("At least one signal zarr is required")
+    sample_dir = zarr_paths[0].parent
+    arrays = [open_zarr_dataset(p, dataset_name=dataset) for p in zarr_paths]
+    for a in arrays:
+        if a.ndim != 3:
+            raise ValueError(f"Expected a 3D (z, y, x) zarr, got shape {a.shape}")
+    native_shape = tuple(int(v) for v in arrays[0].shape)
+    if any(tuple(int(v) for v in a.shape) != native_shape for a in arrays):
+        raise ValueError(f"Multi-channel zarrs must share one shape, got {[a.shape for a in arrays]}")
     if level:
         try:
-            arr = open_zarr_dataset(zarr_path, dataset_name=str(level))
+            arrays = [open_zarr_dataset(p, dataset_name=str(level)) for p in zarr_paths]
         except Exception as exc:
-            raise ValueError(f"Pyramid level {level} not found in {zarr_path}: {exc}") from exc
+            raise ValueError(f"Pyramid level {level} not found: {exc}") from exc
         scale = 2**level
     else:
-        arr = base_arr
         scale = 1
-    n_dv, n_ap, n_ml = (int(v) for v in arr.shape)
+    n_dv, n_ap, n_ml = (int(v) for v in arrays[0].shape)
+    cmaps_resolved = resolve_channel_cmaps(len(arrays), cmaps)
+
+    voxel, voxel_source = resolve_voxel_xyz_um(
+        zarr_paths[0], explicit=voxel_xyz_um, config_path=config_path, sample_dir=sample_dir
+    )
+    vox_ml, vox_ap, vox_dv = voxel
 
     transforms_dir = Path(transforms_dir) if transforms_dir else sample_dir / "transforms"
     label_zarr = Path(label_zarr_path) if label_zarr_path else sample_dir / "upsampled_atlas_label.zarr"
@@ -1800,73 +1923,167 @@ def render_bregma_mips(
         except Exception as exc:  # noqa: BLE001 - optional conveniences
             logger.warning("Reference dir unavailable: %s", exc)
 
-    anchor: ApAnchor | None = None
-    if bregma_index is None and bregma_offset_mm is None and use_transforms and transforms_dir.exists():
-        try:
-            anchor = map_bregma_through_transforms(
-                transforms_dir=transforms_dir,
-                atlas_image_path=atlas_image_path,
-                voxel_xyz_um=voxel,
-                native_shape_zyx=native_shape,
-                label_zarr_path=label_zarr,
-                atlas_label_path=atlas_label_path,
-            )
-            logger.info(
-                "Transform-anchored bregma at AP index %.1f (anterior=%s, label check: %s)",
-                anchor.index, anchor.anterior, anchor.label_check,
-            )
-        except Exception as exc:  # noqa: BLE001 - anchor is an enhancement, fall back
-            logger.warning("Transform anchor unavailable (%s); a manual anchor is required.", exc)
-            anchor = None
-    if anchor is None:
-        anchor = resolve_manual_anchor(
-            n_ap_level=n_ap,
-            n_ap_level0=native_shape[1],
-            level=level,
-            ap_vox_um=vox_ap,
-            bregma_index=bregma_index,
-            bregma_offset_mm=bregma_offset_mm,
-            anterior=anterior,
-        )
-
-    half_window_vox = (thickness_mm / 2.0) * 1000.0 / (vox_ap * scale)
-    out_dir = Path(output_dir) if output_dir else sample_dir / "visualization" / "bregma_mip"
-
     label_arr = None
-    if overlay_labels and label_zarr is not None and label_zarr.exists() and level == 0:
+    if label_zarr is not None and label_zarr.exists() and level == 0:
         candidate = open_zarr_dataset(label_zarr, dataset_name=dataset)
         if tuple(int(v) for v in candidate.shape) == (n_dv, n_ap, n_ml):
             label_arr = candidate
         else:
             logger.warning(
-                "Label zarr shape %s differs from signal %s; skipping overlay.",
+                "Label zarr shape %s differs from signal %s; skipping label overlay.",
                 candidate.shape, (n_dv, n_ap, n_ml),
             )
 
+    anchor: ApAnchor | None = None
+    if ap_window_from_regions:
+        if label_arr is None:
+            raise AnchorError(
+                "--ap-window-from-regions needs a shape-matching label zarr "
+                "(--label-zarr); the label defines the AP window without transforms."
+            )
+        subtree = region_subtree_ids(ap_window_from_regions, region_csv=region_csv or DEFAULT_REGION_CSV)
+        ids_union = sorted(set().union(*subtree.values()))
+
+        def plane_has(ap: int) -> bool:
+            return bool(np.isin(np.asarray(label_arr[:, ap, :]), ids_union).any())
+
+        # Two-stage scan: coarse sweep every 32nd plane, then walk in from the
+        # first/last hit (each plane read is ~300 MB, keep plane reads low).
+        coarse = [ap for ap in range(0, n_ap, 32) if plane_has(ap)]
+        if not coarse:
+            raise AnchorError(
+                f"Region acronyms {ap_window_from_regions} have no voxels in the label zarr"
+            )
+        lo_idx = coarse[0]
+        while lo_idx > 0 and plane_has(lo_idx - 1):
+            lo_idx -= 1
+        hi_idx = coarse[-1]
+        while hi_idx < n_ap - 1 and plane_has(hi_idx + 1):
+            hi_idx += 1
+        margin = int(round(ap_window_margin_mm * 1000.0 / vox_ap))
+        ap_lo_idx = max(0, lo_idx - margin)
+        ap_hi_idx = min(n_ap - 1, hi_idx + margin)
+        logger.info(
+            "AP window from regions %s: label planes [%d, %d], with margin [%d, %d]",
+            ap_window_from_regions, lo_idx, hi_idx, ap_lo_idx, ap_hi_idx,
+        )
+        anchor = ApAnchor(
+            index=(ap_lo_idx + ap_hi_idx) / 2.0, anterior="low", source="label-window"
+        )
+    else:
+        if bregma_index is None and bregma_offset_mm is None and use_transforms and transforms_dir.exists():
+            try:
+                anchor = map_bregma_through_transforms(
+                    transforms_dir=transforms_dir,
+                    atlas_image_path=atlas_image_path,
+                    voxel_xyz_um=voxel,
+                    native_shape_zyx=native_shape,
+                    label_zarr_path=label_zarr,
+                    atlas_label_path=atlas_label_path,
+                )
+                logger.info(
+                    "Transform-anchored bregma at AP index %.1f (anterior=%s, label check: %s)",
+                    anchor.index, anchor.anterior, anchor.label_check,
+                )
+            except Exception as exc:  # noqa: BLE001 - anchor is an enhancement, fall back
+                logger.warning("Transform anchor unavailable (%s); a manual anchor is required.", exc)
+                anchor = None
+        if anchor is None:
+            anchor = resolve_manual_anchor(
+                n_ap_level=n_ap,
+                n_ap_level0=native_shape[1],
+                level=level,
+                ap_vox_um=vox_ap,
+                bregma_index=bregma_index,
+                bregma_offset_mm=bregma_offset_mm,
+                anterior=anterior,
+            )
+
+    out_dir = Path(output_dir) if output_dir else sample_dir / "visualization" / "bregma_mip"
+
     outputs: list[dict[str, object]] = []
     for bregma in bregma_mm:
-        base_index = anchor.index_for(bregma, vox_ap, level=level)
-        centers = coronal_row_ap_centers(
-            n_dv=n_dv,
-            base_ap_index=base_index,
-            anterior=anchor.anterior,
-            tilt_deg=tilt_deg,
-            dv_vox_um=vox_dv * scale,
-            ap_vox_um=vox_ap * scale,
-            tilt_ref_row=tilt_ref_row,
-        )
+        if ap_window_from_regions:
+            base_index = (ap_lo_idx + ap_hi_idx) / 2.0
+            half_window_vox = (ap_hi_idx - ap_lo_idx) / 2.0
+            centers = np.full(n_dv, base_index, dtype=np.float64)
+        else:
+            base_index = anchor.index_for(bregma, vox_ap, level=level)
+            half_window_vox = (thickness_mm / 2.0) * 1000.0 / (vox_ap * scale)
+            centers = coronal_row_ap_centers(
+                n_dv=n_dv,
+                base_ap_index=base_index,
+                anterior=anchor.anterior,
+                tilt_deg=tilt_deg,
+                dv_vox_um=vox_dv * scale,
+                ap_vox_um=vox_ap * scale,
+                tilt_ref_row=tilt_ref_row,
+            )
         if centers.max() < 0 or centers.min() > n_ap - 1:
             raise AnchorError(
                 f"Bregma {bregma:+.2f} mm maps to AP index {base_index:.1f}, outside 0..{n_ap - 1}"
             )
         if centers.min() < 0 or centers.max() > n_ap - 1:
             logger.warning("Tilted window extends past the AP axis for bregma %+.2f; clipping.", bregma)
-        mip = compute_coronal_slab_mip(
-            arr, row_ap_centers=centers, half_window_vox=half_window_vox, dv_block=dv_block
-        )
-
+        mips = [
+            compute_coronal_slab_mip(a, row_ap_centers=centers, half_window_vox=half_window_vox, dv_block=dv_block)
+            for a in arrays
+        ]
         lo = int(np.clip(np.floor(centers.min() - half_window_vox), 0, n_ap - 1))
         hi = int(np.clip(np.ceil(centers.max() + half_window_vox), 0, n_ap - 1))
+
+        boundary = None
+        boundary_groups = None
+        if label_arr is not None:
+            # Same single-center-plane convention as the stock overlay: one
+            # plane's contours only, never stacked across the slab.
+            center_row = int(np.clip(round((n_dv - 1) / 2.0), 0, n_dv - 1))
+            center_ap = int(np.clip(round(centers[center_row]), 0, n_ap - 1))
+            lab_plane = np.asarray(label_arr[:, center_ap, :])
+            if boundary_region:
+                subtree = region_subtree_ids(boundary_region, region_csv=region_csv or DEFAULT_REGION_CSV)
+                group_colors = boundary_region_colors or ["white", "yellow", "cyan", "orange"][: len(boundary_region)]
+                lines_by: dict[str, list[np.ndarray]] = {}
+                for r in boundary_region:
+                    ids_r = np.fromiter(subtree[r], dtype=np.int64)
+                    mask = np.isin(lab_plane, ids_r).astype(np.uint8)
+                    lines_by[r] = _region_contour_lines_mm(
+                        mask, row_vox_um=vox_dv * scale, col_vox_um=vox_ml * scale,
+                        smoothing=boundary_smooth,
+                    ) if mask.any() else []
+                boundary_groups = [(r, lines_by[r]) for r in boundary_region]
+            else:
+                boundary = label_boundary_lines_mm(
+                    lab_plane,
+                    row_vox_um=vox_dv,
+                    col_vox_um=vox_ml,
+                    smoothing=boundary_smooth,
+                    min_area_mm2=boundary_min_area_mm2,
+                )
+
+        if len(mips) > 1:
+            vmaxs = [resolve_display_vmax(m, percentile=percentile, explicit=vmax) for m in mips]
+            mip = _compose_rgb(mips, cmaps_resolved, vmaxs)
+            vmax_used = vmaxs[-1]
+        else:
+            mip = mips[0]
+            vmax_used = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
+
+        atlas_image = None
+        if atlas_panel:
+            atlas_image = _atlas_coronal_image(bregma, atlas_label_path)
+            if atlas_image is not None:
+                meta_atlas_panel = f"coronal AP {bregma:+.2f} mm"
+        else:
+            meta_atlas_panel = ""
+
+        pool_factor = 1
+        if max_pixels > 0 and mip.shape[0] * mip.shape[1] > max_pixels * max_pixels:
+            pool_factor = int(math.ceil(math.sqrt(mip.shape[0] * mip.shape[1]) / max_pixels))
+        stem = "+".join(p.stem for p in zarr_paths)
+        out_path = out_dir / (
+            f"{sample_dir.name}_{stem}_bregma{bregma:+.2f}mm_thick{thickness_mm:.2f}mm_{boundary_style}.png"
+        )
         meta = RenderMeta(
             bregma_mm=bregma,
             thickness_mm=thickness_mm,
@@ -1876,34 +2093,9 @@ def render_bregma_mips(
             voxel_source=voxel_source,
             ap_lo=lo,
             ap_hi=hi,
-            vmax=resolve_display_vmax(mip, percentile=percentile, explicit=vmax),
-            zarr_path=zarr_path,
+            vmax=vmax_used,
+            zarr_path=zarr_paths[0],
             level=level,
-        )
-
-        boundary = None
-        if label_arr is not None:
-            center_row = int(np.clip(round((n_dv - 1) / 2.0), 0, n_dv - 1))
-            center_ap = int(np.clip(round(centers[center_row]), 0, n_ap - 1))
-            boundary = label_boundary_lines_mm(
-                np.asarray(label_arr[:, center_ap, :]),
-                row_vox_um=vox_dv,
-                col_vox_um=vox_ml,
-                smoothing=boundary_smooth,
-                min_area_mm2=boundary_min_area_mm2,
-            )
-
-        atlas_image = None
-        if atlas_panel:
-            atlas_image = _atlas_coronal_image(bregma, atlas_label_path)
-            if atlas_image is not None:
-                meta.atlas_panel = f"coronal AP {bregma:+.2f} mm"
-
-        pool_factor = 1
-        if max_pixels > 0 and mip.shape[0] * mip.shape[1] > max_pixels * max_pixels:
-            pool_factor = int(math.ceil(math.sqrt(mip.shape[0] * mip.shape[1]) / max_pixels))
-        out_path = out_dir / (
-            f"{sample_dir.name}_{zarr_path.stem}_bregma{bregma:+.2f}mm_thick{thickness_mm:.2f}mm_{boundary_style}.png"
         )
         render_bregma_png(
             mip,
@@ -1911,13 +2103,17 @@ def render_bregma_mips(
             meta=meta,
             flip_dv=flip_dv,
             flip_ml=flip_ml,
-            cmap=resolve_channel_cmaps(1, cmaps)[0] if cmaps else "gray",
+            cmap=cmaps_resolved[0],
             boundary_lines=boundary,
             boundary_color=boundary_color,
             boundary_linewidth=boundary_linewidth,
             boundary_style=boundary_style,
             atlas_slice_image=atlas_image,
             pool_factor=pool_factor,
+            boundary_groups=boundary_groups,
+            boundary_group_colors=group_colors if boundary_groups else None,
+            boundary_group_linewidth=boundary_linewidth,
+            boundary_group_style=boundary_style,
         )
         outputs.append(
             {
@@ -1926,6 +2122,7 @@ def render_bregma_mips(
                 "ap_window": [lo, hi],
                 "output": str(out_path),
                 "boundary_overlay": bool(boundary),
+                "boundary_regions": list(boundary_region) if boundary_groups else [],
                 "atlas_panel": atlas_image is not None,
                 "pool_factor": pool_factor,
             }
@@ -1933,7 +2130,7 @@ def render_bregma_mips(
         logger.info("Rendered %s", out_path)
 
     return {
-        "zarr": str(zarr_path),
+        "zarr": [str(p) for p in zarr_paths],
         "level": level,
         "dataset": dataset,
         "voxel_xyz_um": list(voxel),
@@ -2215,6 +2412,7 @@ def render_atlas_band_mips(
     atlas_grid: bool = True,
     atlas_grid_pitch_um: float | None = None,
     split_atlas: bool = False,
+    overlay_atlas: bool = False,
     split_min_line_px: int = 100,
     split_nucleus_merge: bool = False,
 ) -> dict[str, object]:
@@ -2269,7 +2467,7 @@ def render_atlas_band_mips(
     logger.info("Atlas->native mapper ready (%s)", mapper.label_check)
 
     atlas_label_volume = None
-    if overlay_labels or split_atlas:
+    if overlay_labels or split_atlas or overlay_atlas:
         import tifffile
 
         atlas_label_volume = tifffile.imread(str(atlas_label_path))
@@ -2355,12 +2553,11 @@ def render_atlas_band_mips(
                 atlas_res_um=atlas_res_um, vox_ml_um=vox_ml, vox_dv_um=vox_dv,
             )
         vmax_eff = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
-        if split_atlas:
-            # Left half: atlas boundary lines on black (no fill). Right half:
-            # the raw signal, nothing overlaid. The label slice is merged to
-            # the report's nucleus-level parcellation (no layers, no parts)
-            # and outlined per region by contour tracing -- no skeletonization,
-            # so thin sheets like the corpus callosum stay whole.
+        if split_atlas or overlay_atlas:
+            # Atlas boundary lines from contour tracing (no skeletonization, so
+            # thin sheets like the corpus callosum stay whole), rasterized onto
+            # the image grid. overlay_atlas composites them over the FULL raw
+            # signal; split_atlas instead paints them on a black left half.
             from PIL import Image as _PilImage
             from PIL import ImageDraw as _PilDraw
             from matplotlib import colors as _mcolors
@@ -2378,7 +2575,7 @@ def render_atlas_band_mips(
             merged_lines = nucleus_contour_lines_mm(
                 lab_plane, vox_um=atlas_res_um, smoothing=boundary_smooth
             )
-            logger.info("split contours (%s): %d paths from %d groups",
+            logger.info("atlas contours (%s): %d paths from %d groups",
                         "nucleus-merged" if split_nucleus_merge else "raw parcellation",
                         len(merged_lines), int(np.unique(lab_plane[lab_plane > 0]).size))
 
@@ -2398,11 +2595,14 @@ def render_atlas_band_mips(
                 line_mask = sizes[comps] >= split_min_line_px
             normed = np.clip(mip.astype(np.float32) / max(vmax_eff, 1e-6), 0.0, 1.0)
             rgb = np.repeat(normed[..., None], 3, axis=2)
-            mid_col = int(round(DEFAULT_BREGMA_DV_AP_ML[2] * atlas_res_um / grid_pitch_um))
             line_rgb = np.asarray(_mcolors.to_rgb(boundary_color), dtype=np.float32)
-            rgb[:, :mid_col] = np.where(line_mask[:, :mid_col, None], line_rgb, 0.0)
+            if overlay_atlas:
+                rgb[line_mask] = line_rgb
+            else:
+                mid_col = int(round(DEFAULT_BREGMA_DV_AP_ML[2] * atlas_res_um / grid_pitch_um))
+                rgb[:, :mid_col] = np.where(line_mask[:, :mid_col, None], line_rgb, 0.0)
             mip = rgb
-            boundary = None  # the atlas half carries the lines; signal half stays clean
+            boundary = None  # the lines are already composited into the image
         anchor = ApAnchor(
             index=float(np.nanmean(0.5 * (y_win_lo + y_win_hi))),
             anterior="low",
@@ -2424,8 +2624,11 @@ def render_atlas_band_mips(
         )
         # Full-scale render: canvas = image, one display pixel per native voxel
         # (max_pixels/pooling deliberately ignored in this mode).
-        stem = "atlasband_atlasgrid_split" if split_atlas else (
-            "atlasband_atlasgrid" if atlas_grid else "atlasband"
+        stem = (
+            "atlasband_atlasgrid_ovl" if overlay_atlas
+            else "atlasband_atlasgrid_split" if split_atlas
+            else "atlasband_atlasgrid" if atlas_grid
+            else "atlasband"
         )
         out_path = out_dir / (
             f"{sample_dir.name}_{zarr_path.stem}_{stem}_bregma{bregma:+.2f}mm_"
@@ -2602,8 +2805,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flip-ml", action="store_true",
                         help="Flip image horizontally for display")
     parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--max-pixels", type=int, default=3000,
-                        help="Cap long image side via max-pooling (0 disables; default 3000)")
+    parser.add_argument("--max-pixels", type=int, default=0,
+                        help="Cap long image side via max-pooling (0 disables; "
+                             "default 0 = no pooling, full-resolution output)")
     parser.add_argument("--atlas-grid", action=argparse.BooleanOptionalAction, default=True,
                         help="atlas-band only: regrid the band MIP onto the standard atlas "
                              "coronal grid -- upright atlas-space output with native band "
@@ -2621,8 +2825,34 @@ def build_parser() -> argparse.ArgumentParser:
                              "nucleus-level parcellation before contour tracing "
                              "(default off -- raw parcellation contours; "
                              "--split-nucleus-merge enables the merged view)")
+    parser.add_argument("--overlay-atlas", action="store_true",
+                        help="atlas-band only: draw the find_contours parcellation boundary "
+                             "lines over the FULL raw signal image (no split; default off)")
     parser.add_argument("--dv-block", type=int, default=256,
                         help="DV rows per band tile; match the zarr chunk depth (default 256)")
+    parser.add_argument(
+        "--boundary-region", default="",
+        help="Comma acronyms (e.g. DG,CA1): draw ONLY these regions' outlines "
+             "(subtree = the region + its children), each in its own color; "
+             "requires the label zarr. Overrides the all-boundary overlay",
+    )
+    parser.add_argument(
+        "--boundary-region-colors", default="",
+        help="Colors per --boundary-region (default white,yellow,cyan,orange)",
+    )
+    parser.add_argument(
+        "--ap-window-from-regions", default="",
+        help="native mode only: derive the slab AP window from where these "
+             "acronyms' labels appear in the label zarr (no bregma anchor needed)",
+    )
+    parser.add_argument(
+        "--ap-window-margin-mm", type=float, default=0.25,
+        help="Margin added on both sides of the --ap-window-from-regions window "
+             "(default 0.25 mm)",
+    )
+    parser.add_argument("--region-csv", default=None,
+                        help="Region csv for --boundary-region / --ap-window-from-regions "
+                             "acronym and subtree lookup (default: registration/Region_Csv_Rev1_updated.CSV)")
     return parser
 
 
@@ -2672,7 +2902,13 @@ def main(argv: list[str] | None = None) -> int:
             atlas_grid=args.atlas_grid,
             atlas_grid_pitch_um=args.atlas_grid_pitch_um,
             split_atlas=args.split_atlas,
+            overlay_atlas=args.overlay_atlas,
             split_nucleus_merge=args.split_nucleus_merge,
+            boundary_region=[a.strip() for a in args.boundary_region.split(",") if a.strip()] or None,
+            boundary_region_colors=[c.strip() for c in args.boundary_region_colors.split(",") if c.strip()] or None,
+            ap_window_from_regions=[a.strip() for a in args.ap_window_from_regions.split(",") if a.strip()] or None,
+            ap_window_margin_mm=args.ap_window_margin_mm,
+            region_csv=args.region_csv,
         )
     except (AnchorError, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
