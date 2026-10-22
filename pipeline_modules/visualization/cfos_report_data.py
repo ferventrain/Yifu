@@ -200,8 +200,8 @@ def build_region_tree_nodes(region_table: pd.DataFrame) -> list[dict[str, Any]]:
         for region_id in by_id
         if pd.isna(by_id[region_id].parent_id) or int(by_id[region_id].parent_id) not in by_id
     ]
-    if not roots and 997 in by_id:
-        roots = [997]
+    if not roots and (987 in by_id or 997 in by_id):
+        roots = [987] if 987 in by_id else [997]
     if not roots:
         roots = children_by_parent.get(None, [])
     return [build_node(region_id) for region_id in roots]
@@ -600,7 +600,7 @@ def compute_leaf_region_stats(
     present_ids = frozenset(
         int(metric["region_id"])
         for metric in metrics
-        if int(metric["region_id"]) not in {0, 997}
+        if int(metric["region_id"]) not in {0, 987, 997}
         and "root" not in str(metric.get("excel_name") or "").lower()
     )
 

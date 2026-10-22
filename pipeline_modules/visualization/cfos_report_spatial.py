@@ -27,7 +27,7 @@ AXIS_INDEX = {"DV": 0, "AP": 1, "ML": 2}
 AXIS_TO_PLANE = {"AP": "coronal", "ML": "sagittal", "DV": "horizontal"}
 RESOLUTION_UM = 25.0
 DEFAULT_ATLAS_RESOLUTION_UM_DV_AP_ML = (RESOLUTION_UM, RESOLUTION_UM, RESOLUTION_UM)
-ALLEN_ROOT_REGION_ID = 997
+ALLEN_ROOT_REGION_ID = 987  # Rev2 CSV root (legacy Rev1 root was 997)
 
 
 def _spatial_metadata(

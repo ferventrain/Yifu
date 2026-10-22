@@ -24,7 +24,7 @@ DEFAULT_PERCENTILE = 99.5
 DEFAULT_POWER = 1.2
 DEFAULT_SIGMA_UM = 150.0
 DEFAULT_ALPHA_STOPS = ((0.0, 0.0), (0.3, 0.02), (0.6, 0.15), (1.0, 0.9))
-REGION_CSV = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+REGION_CSV = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 
 
 def region_mask_from_acronyms(acronyms: list[str], annotation: np.ndarray, csv_path: str | Path = REGION_CSV) -> np.ndarray:

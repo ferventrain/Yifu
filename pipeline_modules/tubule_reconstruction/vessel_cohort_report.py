@@ -202,7 +202,7 @@ def render_density_heatmap(tissue_volumes: dict[int, float], leaf_by_id: dict[in
         sys.executable, "-m", "pipeline_modules.tubule_reconstruction.vessel_region_density_heatmap",
         "--density_csv", str(density_csv),
         "--output_dir", str(heat_dir),
-        "--cfg", str(Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"),
+        "--cfg", str(Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"),
         "--dpi", "300",
         "--cmap", "inferno",
         "--vmax_percent", f"{vmax:.2f}",

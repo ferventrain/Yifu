@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover
     )
 
 DEFAULT_REGION_CFG = (
-    Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+    Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 )
 
 

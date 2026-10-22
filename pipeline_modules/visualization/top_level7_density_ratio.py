@@ -26,7 +26,7 @@ import pandas as pd
 
 RANK_BY_CHOICES = ("weighted_log_ratio", "abs_log_ratio", "abs_count_diff")
 
-DEFAULT_PARCELLATION_CSV = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+DEFAULT_PARCELLATION_CSV = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 
 _LAYER_NAME_RE = re.compile(r"layer|stratum|subgranular zone", re.IGNORECASE)
 _LAYER_SUFFIX_RE = re.compile(r",\s*(?:1|2/3|4|5|6a|6b)$", re.IGNORECASE)

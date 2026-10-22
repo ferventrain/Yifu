@@ -173,7 +173,7 @@ def resolve_voxel_xyz_um(
 # Region subtree resolution (for single-region boundary overlays)
 # ---------------------------------------------------------------------------
 
-DEFAULT_REGION_CSV = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+DEFAULT_REGION_CSV = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 
 
 def region_subtree_ids(acronyms: list[str], *, region_csv: str | Path = DEFAULT_REGION_CSV) -> dict[str, set[int]]:
@@ -669,7 +669,7 @@ def _structure_tree() -> _StructureTree:
                     raw = row.get("parent_structure_id") or ""
                     if raw:
                         parents[sid] = int(float(raw))
-        known.discard(997)  # root node is not a drawable region
+        known -= {987, 997}  # Rev2 (987) and legacy Rev1 (997) root nodes are not drawable regions
         _STRUCTURE_TREE_CACHE = _StructureTree(parents=parents, known_ids=frozenset(known))
     return _STRUCTURE_TREE_CACHE
 
@@ -722,7 +722,7 @@ def coarsen_label_slice(
             merged = mapping[v]
             if areas.get(merged, 0) < min_vox:
                 parent = tree.parents.get(merged, 0)
-                if parent and parent != 997:  # never merge up into the root node
+                if parent and parent not in (987, 997):  # never merge up into the root node
                     mapping[v] = parent
                     changed = True
         if not changed:
@@ -2852,7 +2852,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--region-csv", default=None,
                         help="Region csv for --boundary-region / --ap-window-from-regions "
-                             "acronym and subtree lookup (default: registration/Region_Csv_Rev1_updated.CSV)")
+                             "acronym and subtree lookup (default: registration/Region_Csv_Rev2_updated.CSV)")
     return parser
 
 

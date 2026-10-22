@@ -116,7 +116,7 @@
     }
   },
   "analysis": {
-    "density_config": "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+    "density_config": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
     "output_format": "xlsx",
     "use_hemisphere_label": false
   }

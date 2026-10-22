@@ -262,7 +262,7 @@ def default_sample_density_excel(sample_dir: str | Path, signal_ch: str = "ch1")
 
 
 def default_region_cfg_path() -> Path:
-    return project_root() / "pipeline_modules" / "registration" / "Region_Csv_Rev1_updated.CSV"
+    return project_root() / "pipeline_modules" / "registration" / "Region_Csv_Rev2_updated.CSV"
 
 
 def resolve_density_excel_path(

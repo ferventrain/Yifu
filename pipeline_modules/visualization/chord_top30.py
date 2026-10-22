@@ -33,7 +33,7 @@ from matplotlib.patches import Patch, Polygon, Wedge
 
 PROJ = Path(r"H:/arivis-analysis/_active/YF2026082501")
 REPO = Path(r"H:/yifu0428/Yifu")
-REGION_CSV = REPO / "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV"
+REGION_CSV = REPO / "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
 OUT_DIR = PROJ / "_figure_materials" / "chord_top30"
 
 # group -> list of sample stats xlsx (one entry per sample; a group may hold

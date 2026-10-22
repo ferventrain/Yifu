@@ -31,7 +31,7 @@
     },
     "standalone_powershell": [
       "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --downsample_method max_pool --workers 8 --keep_downsampled_mask --merge_branch_points_distance_um 15 --prune_spurs_max_length_um 20",
-      "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
+      "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev2_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
     ]
   },
   "entrypoints": [
@@ -131,7 +131,7 @@
       "prerequisites": [
         "skeleton_vertices.csv and skeleton_edges.csv must exist (save_skeleton=true). SWC is NOT required.",
         "Registered annotation label Zarr must exist (e.g. SampleLayout.atlas_label_zarr)",
-        "Allen region CSV must exist (default: pipeline_modules/registration/Region_Csv_Rev1_updated.CSV)"
+        "Allen region CSV must exist (default: pipeline_modules/registration/Region_Csv_Rev2_updated.CSV)"
       ],
       "inputs": {
         "vertex_csv_path":            {"type": "path", "required": true, "description": "skeleton_vertices.csv"},
@@ -159,7 +159,7 @@
       "common_commands": [
         {
           "description": "Whole-brain all-region morphology after skeletonization",
-          "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
+          "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --edge_csv \"S:\\sample\\tubule_reconstruction\\skeleton_edges.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev2_updated.CSV\" --all_regions --output_dir \"S:\\sample\\tubule_reconstruction\" --config \"S:\\Yifu\\config\\config.json\""
         }
       ]
     },
@@ -260,7 +260,7 @@
       "common_commands": [
         {
           "description": "Diameter bins for isocortex and HPF",
-          "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis region --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --annotation_resolution_xyz 1.8,1.8,2.0 --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev1_updated.CSV\" --regions \"Isocortex,HPF\" --output \"S:\\sample\\tubule_reconstruction\\region_diameter_bins.csv\""
+          "powershell": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis region --vertex_csv \"S:\\sample\\tubule_reconstruction\\skeleton_vertices.csv\" --branch_csv \"S:\\sample\\tubule_reconstruction\\vessel_branch_metrics.csv\" --annotation_zarr \"S:\\sample\\upsampled_atlas_label.zarr\" --annotation_resolution_xyz 1.8,1.8,2.0 --cfg \"S:\\Yifu\\pipeline_modules\\registration\\Region_Csv_Rev2_updated.CSV\" --regions \"Isocortex,HPF\" --output \"S:\\sample\\tubule_reconstruction\\region_diameter_bins.csv\""
         }
       ]
     }

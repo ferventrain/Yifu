@@ -152,7 +152,7 @@ class AnalysisCfg(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     density_config: str = Field(
-        "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+        "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
         description="Path to Allen region CSV (absolute or relative to project root)",
     )
     output_format: str = Field("xlsx", description="Output format: 'xlsx'")

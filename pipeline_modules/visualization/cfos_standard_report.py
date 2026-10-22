@@ -1094,7 +1094,7 @@ def _reg_params_html(a: SampleInputs, b: SampleInputs) -> str:
 
 def _methods_html(a: SampleInputs, b: SampleInputs) -> str:
     return ("<ul>"
-            "<li><b>图谱</b>：Allen mouse CCF 25 µm（配准参考 atlas.tiff；标签树 Region_Csv_Rev1_updated，2011 版体）。</li>"
+            "<li><b>图谱</b>：Allen mouse CCF 25 µm（配准参考 atlas.tiff；标签树 Region_Csv_Rev2_updated，2011 版体）。</li>"
             "<li><b>默认分析层</b>：固定互斥脑区集合（分到不分 layer 为止；皮层拆亚区、核团不拆部；父节点直接标注体素计入残余行），A/B 使用同一集合。</li>"
             "<li><b>密度（区域）</b>：检测计数 ÷ 样本空间区域体积（Total Voxels × 原生体素体积），单位 cells/mm³；属<b>样本空间密度</b>定义。</li>"
             "<li><b>密度（空间图）</b>：c-Fos 掩膜信号体积 ÷ 图谱空间分箱体积 = 信号体积占比；与区域密度分属两种定义，不可直接互比。</li>"

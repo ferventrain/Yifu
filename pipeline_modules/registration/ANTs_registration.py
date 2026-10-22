@@ -371,7 +371,7 @@ class BidirectionalRegistration:
         logger.info("Forced register image direction matrix to identity (no flipping)")
         
         # Density Config
-        self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Region_Csv_Rev1_updated.CSV')
+        self.density_cfg_path = density_cfg_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Region_Csv_Rev2_updated.CSV')
 
     def _load_encoded_atlas_label(self, atlas_label_path: str) -> ants.ANTsImage:
         label_array = load_label_array_preserving_ids(atlas_label_path)

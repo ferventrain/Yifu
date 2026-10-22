@@ -34,7 +34,7 @@ DEFAULT_REGION_IDS = [
 ]
 
 EXCLUDED_REGION_IDS = {1024, 304325711}  # grooves, retina
-DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"
+DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 
 
 def parse_figsize(value: str) -> tuple[float, float]:
@@ -290,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Summarize and plot coarse brain-region metrics from region signal Excel output."
     )
     parser.add_argument("--input_excel", required=True, help="Excel output from region_signal_analysis_zarr_graph.py")
-    parser.add_argument("--cfg", default=str(DEFAULT_CFG), help="Path to Region_Csv_Rev1_updated.CSV")
+    parser.add_argument("--cfg", default=str(DEFAULT_CFG), help="Path to Region_Csv_Rev2_updated.CSV")
     parser.add_argument("--metric", required=True, help="Metric column to plot, e.g. 'Voxel Density'")
     parser.add_argument("--title", required=True, help="Figure title")
     parser.add_argument("--ylabel", default=None, help="Y-axis label. Defaults to --metric.")

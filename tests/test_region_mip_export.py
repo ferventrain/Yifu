@@ -34,7 +34,7 @@ class RegionMipExportTests(unittest.TestCase):
     def test_resolve_region_subtree_ids_accepts_acronym(self):
         from pathlib import Path
 
-        cfg = Path(__file__).resolve().parents[1] / "pipeline_modules" / "registration" / "Region_Csv_Rev1_updated.CSV"
+        cfg = Path(__file__).resolve().parents[1] / "pipeline_modules" / "registration" / "Region_Csv_Rev2_updated.CSV"
         subtree_ids, slug, name = resolve_region_subtree_ids("HIP", cfg_path=cfg)
         self.assertGreater(len(subtree_ids), 1)
         self.assertEqual(slug, "HIP")
