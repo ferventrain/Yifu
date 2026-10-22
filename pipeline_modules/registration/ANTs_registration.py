@@ -864,32 +864,36 @@ class BidirectionalRegistration:
                         "(registration.save_upsampled_label=false, save_upsampled_label_zarr=false)."
                     )
                 else:
-                    if label_dir.exists() and any(label_dir.iterdir()):
-                        logger.info("Upsampled atlas label already exists at %s. Skipping upsampling.", label_dir)
-                    else:
-                        self.upsample_label_chunked(
-                            results['warped_label'],
-                            str(label_dir),
-                            label_id_lut=self.atlas_label_id_lut,
-                        )
+                    # Label outputs are derived from THIS registration run:
+                    # stale files from an earlier registration (e.g. before a
+                    # flip_atlas fix) must never survive a re-registration.
+                    # Delete-then-regenerate instead of skip-if-exists (the
+                    # skip kept a pre-flip label on disk through every rerun;
+                    # hit 2026-10-22 on d21/d22).
+                    if label_dir.exists():
+                        shutil.rmtree(label_dir)
+                    self.upsample_label_chunked(
+                        results['warped_label'],
+                        str(label_dir),
+                        label_id_lut=self.atlas_label_id_lut,
+                    )
 
                     if self.save_upsampled_label_zarr:
                         if label_zarr.exists():
-                            logger.info("Upsampled atlas label Zarr already exists at %s. Skipping conversion.", label_zarr)
-                        elif convert_tiff_to_zarr is None:
+                            shutil.rmtree(label_zarr)
+                        if convert_tiff_to_zarr is None:
                             raise RuntimeError("TIFF-to-Zarr conversion support is unavailable.")
-                        else:
-                            convert_tiff_to_zarr(
-                                label_dir,
-                                label_zarr,
-                                chunk_size=self.zarr_chunk_size,
-                                dataset_name="0",
-                            )
+                        convert_tiff_to_zarr(
+                            label_dir,
+                            label_zarr,
+                            chunk_size=self.zarr_chunk_size,
+                            dataset_name="0",
+                        )
 
                     if self.registration_config.get("save_upsampled_label_hemisphere_zarr", False):
                         hemisphere_zarr = self.sample_dir / "atlas_label_hemisphere.zarr"
                         if hemisphere_zarr.exists():
-                            logger.info("Hemisphere atlas label Zarr already exists at %s. Skipping conversion.", hemisphere_zarr)
+                            shutil.rmtree(hemisphere_zarr)
                         else:
                             from pipeline_modules.registration.atlas_label_to_hemisphere import (
                                 convert_hemisphere_from_transform,
