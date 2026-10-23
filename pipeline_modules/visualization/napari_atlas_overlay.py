@@ -308,6 +308,7 @@ def make_atlas_overlay_widget(
         "centroids": {},   # level -> {id: (z,y,x)}
         "rows": [],
         "id_to_row": {},
+        "translate": (0.0, 0.0, 0.0),
         "connected": set(),  # 已挂 data/scale 事件的层 id
     }
 
@@ -375,13 +376,15 @@ def make_atlas_overlay_widget(
             ref = _reference_layer()
             if ref is None:
                 return
-            wanted = choose_label_level(state["levels"], state["shapes"], ref.data.shape)
+            # neurofly 图像层是 XYZ 序（from_roi 里 transpose(2,1,0)），label 是 ZYX
+            img_shape_zyx = tuple(reversed(ref.data.shape))
+            wanted = choose_label_level(state["levels"], state["shapes"], img_shape_zyx)
             layer = None
             for lyr in viewer.layers:
                 if lyr.name == LABEL_LAYER_NAME:
                     layer = lyr
                     break
-            if layer is None or layer.data.shape != state["shapes"][wanted]:
+            if layer is None or tuple(reversed(layer.data.shape)) != state["shapes"][wanted]:
                 _attach_level(wanted, ref)
             else:
                 _rescale_layer(layer, wanted, ref)
@@ -406,28 +409,38 @@ def make_atlas_overlay_widget(
     # ---------- 图谱加载 ----------
 
     def _rescale_layer(layer, level: int, ref):
-        scale = match_label_scale(
-            tuple(float(v) for v in ref.scale), tuple(ref.data.shape), state["shapes"][level],
-        )
-        state["scales"][level] = scale
+        _, scale, translate = _label_transform(level, ref)
         layer.scale = scale
+        layer.translate = translate
         layer.refresh()
 
-    def _attach_level(level: int, ref=None):
+    def _label_transform(level: int, ref):
+        """label 层的 (scale, translate, data)，跟随 neurofly 的 XYZ-序世界坐标。
+
+        neurofly 图像层 scale 恒 1、translate 为 ROI 偏移（层级体素单位），数据
+        已 transpose 成 XYZ。label 数据用 dask 懒转置成 XYZ；scale 按网格 extent
+        对齐（N_lab*s_lab = N_img*s_img）；translate 直接继承图像层（同源网格）。
+        """
+        import dask.array as da
         import zarr
 
-        scale = None
+        arr = da.from_zarr(store=str(state["label_zarr"] / str(level))).transpose(2, 1, 0)
         if ref is not None:
             scale = match_label_scale(
-                tuple(float(v) for v in ref.scale), tuple(ref.data.shape), state["shapes"][level],
+                tuple(float(v) for v in ref.scale), tuple(ref.data.shape), arr.shape,
             )
-            if not all(np.isfinite(s) and s > 0 for s in scale):
-                scale = None  # 图像层 scale 异常时退回占位，不喂非法值给 napari
-        if scale is None:
-            scale = tuple(2.0**level for _ in range(3))  # 无图像层时的占位相对 scale
+            translate = tuple(float(v) for v in ref.translate)
+        else:
+            scale = tuple(2.0**level for _ in range(3))
+            translate = (0.0, 0.0, 0.0)
+        if not all(np.isfinite(s) and s > 0 for s in scale):
+            scale = tuple(2.0**level for _ in range(3))
         state["scales"][level] = scale
-        group = zarr.open_group(store=str(state["label_zarr"]), mode="r")
-        arr = group[str(level)]
+        state["translate"] = translate
+        return arr, scale, translate
+
+    def _attach_level(level: int, ref=None):
+        arr, scale, translate = _label_transform(level, ref)
         existing = None
         for lyr in viewer.layers:
             if lyr.name == LABEL_LAYER_NAME:
@@ -436,14 +449,18 @@ def make_atlas_overlay_widget(
         if existing is not None:
             existing.data = arr
             existing.scale = scale
+            existing.translate = translate
             existing.refresh()
         else:
             viewer.add_labels(
-                arr, name=LABEL_LAYER_NAME, scale=scale, opacity=0.35, blending="translucent",
+                arr, name=LABEL_LAYER_NAME, scale=scale, translate=translate,
+                opacity=0.35, blending="translucent",
             )
+        shape_zyx = state["shapes"][level]
         status.setText(
-            f"图谱 L{level}（{state['shapes'][level][0]}×{state['shapes'][level][1]}×{state['shapes'][level][2]}），"
-            f"参考图像 {ref.name if ref else '无'}，scale {tuple(round(v, 4) for v in scale)}"
+            f"图谱 L{level}（{shape_zyx[0]}×{shape_zyx[1]}×{shape_zyx[2]} zyx，"
+            f"已转 XYZ 对齐 {ref.name if ref else '占位'}，scale "
+            f"{tuple(round(v, 4) for v in scale)}，translate {tuple(round(v, 1) for v in translate)}）"
         )
 
     def _load_label(path: str | Path | None = None):
@@ -478,7 +495,8 @@ def make_atlas_overlay_widget(
         state["scales"] = {}
         ref = _reference_layer()
         if ref is not None:
-            _attach_level(choose_label_level(levels, state["shapes"], ref.data.shape), ref)
+            img_shape_zyx = tuple(reversed(ref.data.shape))
+            _attach_level(choose_label_level(levels, state["shapes"], img_shape_zyx), ref)
         else:
             status.setText(
                 f"图谱就绪（{len(levels)} 层金字塔，{len(state['rows'])} 区域）。"
@@ -492,7 +510,8 @@ def make_atlas_overlay_widget(
         if ref is None or not state["levels"]:
             status.setText("没有可参考的 3D 图像层（先在 neurofly / 其他方式加载图像）")
             return
-        _attach_level(choose_label_level(state["levels"], state["shapes"], ref.data.shape), ref)
+        img_shape_zyx = tuple(reversed(ref.data.shape))
+        _attach_level(choose_label_level(state["levels"], state["shapes"], img_shape_zyx), ref)
 
     btn_reload.clicked.connect(_manual_rematch)
 
@@ -506,9 +525,10 @@ def make_atlas_overlay_widget(
     edit_search.textChanged.connect(_refresh_results)
 
     def _world_centroid(row: RegionRow):
-        """质心的世界坐标：优先用当前展示层的 scale；层缺失则按相对比例换算。"""
+        """质心的世界坐标（XYZ）：translate + centroid_xyz * scale。"""
         import zarr
 
+        translate = state.get("translate", (0.0, 0.0, 0.0))
         for level in reversed(state["levels"]):
             cache = state["centroids"].setdefault(level, {})
             centroid = cache.get(row.region_id)
@@ -523,9 +543,12 @@ def make_atlas_overlay_widget(
                 cache[row.region_id] = centroid
             scale = state["scales"].get(level)
             if scale is None:
-                # 没有图像层参考：按层间 2 倍比例归一到 L0 相对坐标
                 scale = tuple(1.0 / 2.0**level for _ in range(3))
-            return tuple(c * s for c, s in zip(centroid, scale))
+            world_xyz = tuple(
+                t + c * s
+                for t, c, s in zip(translate, reversed(centroid), scale)
+            )
+            return tuple(reversed(world_xyz))  # napari world 按 viewer 轴序（XYZ）
         return None
 
     def _jump(row: RegionRow):
@@ -595,6 +618,32 @@ def _find_label_zarr(sample_dir: Path | None) -> Path | None:
     return None
 
 
+def patch_neurofly_double_click() -> bool:
+    """兜住 neurofly SimpleViewer.on_double_click 的 None 崩溃（ray 未命中时
+    near/far 为 None，原实现直接相减抛 TypeError，会把双击从 goal 层点进
+    label 区域的交互搞崩）。返回是否打了补丁。"""
+    try:
+        from neurofly import simple_viewer
+
+        if getattr(simple_viewer.SimpleViewer.on_double_click, "_atlas_guard", False):
+            return True
+        original = simple_viewer.SimpleViewer.on_double_click
+
+        def guarded(self, layer, event):
+            near, far = layer.get_ray_intersections(
+                event.position, event.view_direction, event.dims_displayed
+            )
+            if near is None or far is None:
+                return  # ray 未命中（点击处无图像体素），neurofly 原实现会崩
+            return original(self, layer, event)
+
+        guarded._atlas_guard = True  # type: ignore[attr-defined]
+        simple_viewer.SimpleViewer.on_double_click = guarded
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--sample-dir", help="样本目录：自动加载 upsampled_atlas_label.zarr")
@@ -607,11 +656,15 @@ def main(argv=None) -> int:
 
     import napari
 
+    patched = patch_neurofly_double_click()
     viewer = napari.current_viewer() or napari.Viewer()
     widget = make_atlas_overlay_widget(
         viewer, label_zarr=label_zarr, region_csv=args.region_csv, auto_load=True,
     )
-    viewer.window.add_dock_widget(widget, area="left", name="图谱叠加")
+    # 右侧 dock：neurofly 的面板在左侧，避免相互挤掉
+    viewer.window.add_dock_widget(widget, area="right", name="图谱叠加")
+    if patched:
+        print("neurofly 双击兼容补丁已应用")
     napari.run()
     return 0
 
