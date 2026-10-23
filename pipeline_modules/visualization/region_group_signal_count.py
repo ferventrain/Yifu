@@ -10,7 +10,6 @@ from pathlib import Path
 from pipeline_modules.utils.deliverable_paths import find_stats_workbook
 from pipeline_modules.utils.region_csv import parse_acronym_text, split_name_and_acronym
 
-
 DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 DEFAULT_GROUPS = Path(__file__).resolve().parents[2] / "config" / "region_groups.json"
 

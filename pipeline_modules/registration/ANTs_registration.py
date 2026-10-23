@@ -890,33 +890,41 @@ class BidirectionalRegistration:
                             dataset_name="0",
                         )
 
+                    if self.save_upsampled_label_zarr and label_zarr.exists():
+                        from pipeline_modules.utils.zarr_io import mark_ngff_label
+
+                        mark_ngff_label(label_zarr)
+                        logger.info(
+                            "Marked label Zarr as NGFF Labels (opens in napari): %s",
+                            label_zarr,
+                        )
+
                     if self.registration_config.get("save_upsampled_label_hemisphere_zarr", False):
                         hemisphere_zarr = self.sample_dir / "atlas_label_hemisphere.zarr"
                         if hemisphere_zarr.exists():
                             shutil.rmtree(hemisphere_zarr)
-                        else:
-                            from pipeline_modules.registration.atlas_label_to_hemisphere import (
-                                convert_hemisphere_from_transform,
-                            )
+                        from pipeline_modules.registration.atlas_label_to_hemisphere import (
+                            convert_hemisphere_from_transform,
+                        )
 
-                            # Warp the standard-space midline with this
-                            # registration's own transform (in-memory objects).
-                            convert_hemisphere_from_transform(
-                                self.sample_dir,
-                                hemisphere_zarr,
-                                atlas_label_tiff=self.atlas_label_path,
-                                transformlist=results["transforms"]["fwdtransforms"],
-                                fixed_image=self.register_image,
-                                target_shape=self.original_shape,
-                                # Hemisphere painting must see the same atlas
-                                # orientation as registration; otherwise an ML
-                                # flip swaps left/right in the output labels.
-                                flip_axes=axes_from_flip(self.effective_flip_atlas),
-                                # NOTE: do NOT pass self.atlas_image here — its
-                                # direction was forced to identity AFTER the label
-                                # image was created; the label warp used the
-                                # original atlas direction, and so must this.
-                            )
+                        # Warp the standard-space midline with this
+                        # registration's own transform (in-memory objects).
+                        convert_hemisphere_from_transform(
+                            self.sample_dir,
+                            hemisphere_zarr,
+                            atlas_label_tiff=self.atlas_label_path,
+                            transformlist=results["transforms"]["fwdtransforms"],
+                            fixed_image=self.register_image,
+                            target_shape=self.original_shape,
+                            # Hemisphere painting must see the same atlas
+                            # orientation as registration; otherwise an ML
+                            # flip swaps left/right in the output labels.
+                            flip_axes=axes_from_flip(self.effective_flip_atlas),
+                            # NOTE: do NOT pass self.atlas_image here — its
+                            # direction was forced to identity AFTER the label
+                            # image was created; the label warp used the
+                            # original atlas direction, and so must this.
+                        )
 
                     if self.save_upsampled_label_zarr and label_zarr.exists():
                         brain_mask_cache = brain_mask_ds_path(label_zarr)
