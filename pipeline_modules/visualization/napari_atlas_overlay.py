@@ -465,11 +465,22 @@ def make_atlas_overlay_widget(
 
     def _load_label(path: str | Path | None = None):
         if path is None:
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                box, "选择 label zarr", "", "Label Zarr (*upsampled_atlas_label.zarr *.zarr)",
+            # zarr 是目录，必须用选目录对话框（getOpenFileName 选不中）
+            picked = QtWidgets.QFileDialog.getExistingDirectory(
+                box, "选择 atlas label zarr 目录（如 upsampled_atlas_label.zarr）",
+                "",
             )
-            if not path:
+            if not picked:
                 return
+            path = picked
+        path = Path(path)
+        if not (path / ".zgroup").exists() and not (path / ".zattrs").exists():
+            # 误选了样本根目录：自动找里面的 label zarr
+            for name in ("upsampled_atlas_label.zarr", "upsampled_label_ngff.zarr"):
+                candidate = path / name
+                if (candidate / ".zgroup").exists() or (candidate / ".zattrs").exists():
+                    path = candidate
+                    break
         state["label_zarr"] = Path(path)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
