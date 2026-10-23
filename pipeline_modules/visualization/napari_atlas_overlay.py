@@ -344,10 +344,19 @@ def make_atlas_overlay_widget(
         return layer.name == LABEL_LAYER_NAME
 
     def _reference_layer():
+        """只认 3D Image 层（neurofly 的 Points 等层 data.shape=(N,3)，不能当图像）。"""
+        try:
+            from napari.layers import Image
+        except ImportError:
+            return None
         for layer in reversed(viewer.layers):
-            if _is_label_layer(layer):
+            if _is_label_layer(layer) or not isinstance(layer, Image):
                 continue
-            if getattr(layer, "ndim", 0) == 3:
+            data = getattr(layer, "data", None)
+            shape = getattr(data, "shape", None)
+            scale = getattr(layer, "scale", None)
+            if shape is not None and len(shape) == 3 and scale is not None and len(scale) == 3 \
+                    and all(np.isfinite(s) and s > 0 for s in scale):
                 return layer
         return None
 
@@ -362,20 +371,22 @@ def make_atlas_overlay_widget(
     def _rematch():
         if not (check_follow.isChecked() and state["levels"]):
             return
-        ref = _reference_layer()
-        if ref is None:
-            return
-        wanted = choose_label_level(state["levels"], state["shapes"], ref.data.shape)
-        layer = viewer.layers.get(LABEL_LAYER_NAME) if hasattr(viewer.layers, "get") else None
-        if layer is None:
+        try:
+            ref = _reference_layer()
+            if ref is None:
+                return
+            wanted = choose_label_level(state["levels"], state["shapes"], ref.data.shape)
+            layer = None
             for lyr in viewer.layers:
                 if lyr.name == LABEL_LAYER_NAME:
                     layer = lyr
                     break
-        if layer is None or layer.data.shape != state["shapes"][wanted]:
-            _attach_level(wanted, ref)
-        else:
-            _rescale_layer(layer, wanted, ref)
+            if layer is None or layer.data.shape != state["shapes"][wanted]:
+                _attach_level(wanted, ref)
+            else:
+                _rescale_layer(layer, wanted, ref)
+        except Exception as exc:  # noqa: BLE001 - 跟随逻辑绝不崩 GUI
+            status.setText(f"跟随图像失败: {exc}")
 
     debounce.timeout.connect(_rematch)
 
@@ -410,6 +421,8 @@ def make_atlas_overlay_widget(
             scale = match_label_scale(
                 tuple(float(v) for v in ref.scale), tuple(ref.data.shape), state["shapes"][level],
             )
+            if not all(np.isfinite(s) and s > 0 for s in scale):
+                scale = None  # 图像层 scale 异常时退回占位，不喂非法值给 napari
         if scale is None:
             scale = tuple(2.0**level for _ in range(3))  # 无图像层时的占位相对 scale
         state["scales"][level] = scale
@@ -463,7 +476,14 @@ def make_atlas_overlay_widget(
                 centroids[int(rid)] = c
         state["centroids"] = {levels[-1]: centroids}
         state["scales"] = {}
-        _attach_level(levels[-1], _reference_layer())
+        ref = _reference_layer()
+        if ref is not None:
+            _attach_level(choose_label_level(levels, state["shapes"], ref.data.shape), ref)
+        else:
+            status.setText(
+                f"图谱就绪（{len(levels)} 层金字塔，{len(state['rows'])} 区域）。"
+                "在 neurofly / 任意方式打开 3D 图像后自动叠加。"
+            )
 
     btn_label.clicked.connect(lambda: _load_label())
 
