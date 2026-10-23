@@ -4,11 +4,13 @@ import numpy as np
 
 from pipeline_modules.visualization.napari_atlas_overlay import (
     RegionRow,
+    _decode_ims_attr,
     choose_label_level,
     ensure_label_pyramid,
     filter_regions,
     label_levels,
     level_scale_zyx,
+    match_label_scale,
     region_centroid,
 )
 
@@ -47,10 +49,8 @@ def test_ensure_label_pyramid_builds_nearest_levels(tmp_path):
         src = np.asarray(group[str(k - 1)])
         dst = np.asarray(group[str(k)])
         assert dst.shape == tuple((s + 1) // 2 for s in src.shape)
-        # 最近邻抽稀：粗层每个值来自细层的偶数位
         idx = tuple(slice(0, s, 2) for s in src.shape)
         np.testing.assert_array_equal(dst, src[idx])
-    # id 5 在各层都存活（块够大）
     for k in levels:
         assert 5 in np.unique(np.asarray(group[str(k)]))
 
@@ -71,14 +71,34 @@ def test_ensure_label_pyramid_idempotent(tmp_path):
     assert first == second
 
 
-def test_choose_label_level_matches_image_voxel():
-    base = (2.0, 0.7, 0.7)
-    # 图像体素足够粗时 label 取最细层（不过度欠采样即可）
-    assert choose_label_level([0, 1, 2, 3], base, (5.6, 5.6, 5.6)) == 0
-    assert choose_label_level([0, 1, 2, 3], base, (1.2, 1.2, 1.2)) == 0
-    assert choose_label_level([0, 1, 2, 3], base, (0.6, 0.6, 0.6)) == 0
-    # 只给粗层列表时取最粗可用层（都超 2× 时兜底）
-    assert choose_label_level([3, 4], base, (0.5, 0.5, 0.5)) == 4
+def test_choose_label_level_by_grid_extent():
+    shapes = {0: (4475, 32752, 18317), 1: (2238, 16376, 9159), 2: (1119, 8188, 4580), 3: (560, 4094, 2290)}
+    # 图像是 ims L3（≈全分辨率 1/8）：L0/L1 太细但满足 N_lab>=N_img/2 → 取最细 L0？
+# 约束是内存：label 体素不超过图像 2 倍细。L0 相对图像体素 8 倍细，违反 → 应取接近的层
+    assert choose_label_level([0, 1, 2, 3], shapes, (560, 4096, 2304)) == 2  # L2 每轴恰 <= 2×图像
+    assert choose_label_level([0, 1, 2, 3], shapes, (545, 1286, 932)) == 3  # 更粗时退到 L3
+    assert choose_label_level([0, 1, 2, 3], shapes, (4475, 32752, 18317)) == 0
+    # 图像比 label 粗层还粗 → 兜底最粗
+    assert choose_label_level([2, 3], shapes, (100, 100, 100)) == 3
+
+
+def test_choose_label_level_requires_all_axes():
+    shapes = {0: (100, 100, 100), 1: (50, 50, 50), 2: (25, 25, 25)}
+    # z 轴不满足 2× 约束（60 > 50/2? 50>=30 满足）——全部满足则取最细
+    assert choose_label_level([0, 1, 2], shapes, (60, 60, 60)) == 0
+    # 图像 z 很粗时 L0 z=100 >= 30 仍满足 → 仍 L0
+    assert choose_label_level([0, 1, 2], shapes, (30, 200, 200)) == 1
+
+
+def test_match_label_scale_extent_alignment():
+    # 同源网格：全分辨率 (100, 200, 200)，图像为 1/4 层（可能带 padding 26 vs 25）
+    img_scale = (1.0, 1.0, 1.0)
+    img_shape = (26, 50, 50)
+    lab_shape = (100, 200, 200)
+    scale = match_label_scale(img_scale, img_shape, lab_shape)
+    # 世界范围一致：N_lab * s_lab == N_img * s_img
+    for nl, sl, ni, si in zip(lab_shape, scale, img_shape, img_scale):
+        assert abs(nl * sl - ni * si) < 1e-9
 
 
 def test_level_scale_multiplies_by_power_of_two():
@@ -93,17 +113,16 @@ def test_filter_regions_ranking():
         RegionRow(7, "root", "root,root"),
     ]
     hits = filter_regions(rows, "ssp")
-    assert [r.region_id for r in hits[:2]] == [2, 1]  # 前缀优先于包含
+    assert [r.region_id for r in hits[:2]] == [2, 1]  # 精确== > 前缀
     assert filter_regions(rows, "visual")[0].region_id == 3
-    assert filter_regions(rows, "7") == [rows[3]]  # id 命中
+    assert filter_regions(rows, "7") == [rows[3]]
     assert filter_regions(rows, "") == []
 
 
-def test_region_centroid(tmp_path):
+def test_region_centroid():
     data = np.zeros((10, 10, 10), dtype="uint16")
     data[2:6, 4:8, 4:8] = 9
-    c = region_centroid(data, 9)
-    assert c == (3.5, 5.5, 5.5)
+    assert region_centroid(data, 9) == (3.5, 5.5, 5.5)
     assert region_centroid(data, 123) is None
 
 
@@ -116,3 +135,13 @@ def test_label_levels_skips_non_numeric(tmp_path):
     group.create_array("1", shape=(2, 2, 2), dtype="uint8", compressors=None)
     group.create_array("extra", shape=(2, 2, 2), dtype="uint8", compressors=None)
     assert label_levels(root) == [0, 1]
+
+
+def test_decode_ims_attr_variants():
+    # MegaSpim 把标量存成逐字符 |S1 数组
+    char_array = np.frombuffer(b"13.0888888888", dtype="S1")
+    assert _decode_ims_attr(char_array) == 13.0888888888
+    assert _decode_ims_attr(np.float64(2.5)) == 2.5
+    assert _decode_ims_attr(np.array([2.5], dtype="f4")) == 2.5
+    assert _decode_ims_attr(None) is None
+    assert _decode_ims_attr(np.frombuffer(b"abc", dtype="S1")) is None
