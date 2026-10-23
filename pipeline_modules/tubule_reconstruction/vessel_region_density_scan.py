@@ -13,23 +13,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import zarr
 
 from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
     _collect_subtree_ids,
     load_region_tree_with_lookups,
     resolve_region_query,
 )
-
-
-def open_zarr_dataset(zarr_path, dataset_name="0"):
-    group = zarr.open(str(zarr_path), mode="r")
-    if dataset_name in group:
-        return group[dataset_name]
-    arrays = list(group.arrays())
-    if len(arrays) == 1:
-        return arrays[0][1]
-    raise ValueError(f"Dataset {dataset_name!r} not found in {zarr_path}")
+from pipeline_modules.utils.parsing import parse_resolution_xyz
+from pipeline_modules.utils.zarr_io import open_zarr_array as open_zarr_dataset
 
 
 def load_foreground_chunks(cache_path):
@@ -42,10 +33,6 @@ def load_foreground_chunks(cache_path):
 
 def region_lookups(cfg_path):
     return load_region_tree_with_lookups(cfg_path)
-
-
-def parse_resolution_xyz(value):
-    return tuple(float(part) for part in str(value).split(","))
 
 
 def main() -> int:

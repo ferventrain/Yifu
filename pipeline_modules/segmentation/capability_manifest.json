@@ -7,7 +7,7 @@
       "id": "threshold_segmentation",
       "function": "pipeline_modules.segmentation.intensity_threshold_segmentor.run_threshold_segmentation",
       "cli": "python pipeline_modules/segmentation/intensity_threshold_segmentor.py",
-      "description": "Apply threshold-based segmentation on a Zarr volume and write a mask Zarr store.",
+      "description": "Apply threshold-based segmentation on a Zarr volume and write a mask Zarr store. Single entry point for four methods: global (default per-tile Otsu/scalar), hysteresis (low/high thresholds with global connectivity), percentile (per-slice histogram percentile), windowed (per-slice local-histogram percentile). The former standalone tools hysteresis_threshold.py, histogram_percentile_threshold.py, windowed_histogram_threshold.py, and threshold_mask_tiff_stacks.py were folded into this program.",
       "inputs": {
         "input_zarr": {"type": "path", "required": true},
         "output_zarr": {"type": "path", "required": true},
@@ -16,12 +16,42 @@
         "min_size": {"type": "int", "default": 10},
         "output_mode": {"type": "string", "default": "binary", "choices": ["binary", "label"]},
         "dataset_name": {"type": "string", "default": "0"},
-        "process_existing_only": {"type": "bool", "default": false}
+        "process_existing_only": {"type": "bool", "default": false},
+        "method": {"type": "string", "default": "global", "choices": ["global", "hysteresis", "percentile", "windowed"], "description": "global: per-tile scalar/Otsu threshold; hysteresis: dual thresholds with global connectivity; percentile: per-slice histogram percentile; windowed: per-slice windowed local histogram percentile"},
+        "low": {"type": "float|null", "default": null, "description": "Hysteresis low (extension) threshold"},
+        "high": {"type": "float|null", "default": null, "description": "Hysteresis high (seed) threshold"},
+        "close_radius": {"type": "int", "default": 0, "description": "Hysteresis morphological closing radius"},
+        "slab_depth": {"type": "int", "default": 64, "description": "Hysteresis slab depth for volumes larger than 4 GB"},
+        "percentile_method": {"type": "string", "default": "blend", "choices": ["blend", "otsu", "triangle", "yen", "li", "knee"]},
+        "clamp_lo": {"type": "float|null", "default": null},
+        "clamp_hi": {"type": "float|null", "default": null},
+        "window": {"type": "int|null", "default": null},
+        "stride": {"type": "int|null", "default": null},
+        "floor": {"type": "float|null", "default": null},
+        "pct_nudge": {"type": "float|null", "default": null},
+        "thr_scale": {"type": "float|null", "default": null},
+        "bright_local_p99": {"type": "float|null", "default": null},
+        "bright_extra_nudge": {"type": "float|null", "default": null},
+        "clean_3d": {"type": "bool", "default": false, "description": "Percentile/windowed methods: apply min_size to 3D connected components instead of per slice"}
       },
       "outputs": {
         "output_zarr": {"type": "dir"},
         "manifest_path": {"type": "path", "description": "_run_manifest.json"}
-      }
+      },
+      "common_commands": [
+        {
+          "description": "Default global Otsu threshold",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\""
+        },
+        {
+          "description": "Hysteresis dual-threshold segmentation",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\" --method hysteresis --low 300 --high 800 --close_radius 1"
+        },
+        {
+          "description": "Per-slice percentile with 3D component cleanup",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\" --method percentile --clamp_lo 95 --clamp_hi 99.5 --clean_3d"
+        }
+      ]
     },
     {
       "id": "cfos_unet_inference",

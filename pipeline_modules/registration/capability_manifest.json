@@ -1,7 +1,7 @@
 {
   "schema_version": "2",
   "module": "registration",
-  "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, region voxel-coverage checking, coarse-region label merging, hemisphere (Left/Right) label generation, and Zarr-native block-graph region signal analysis.",
+  "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, coarse-region label merging, hemisphere (Left/Right) label generation, and Zarr-native block-graph region signal analysis.",
   "production_policy": {
     "id": "no-tiff-imaris-direct",
     "updated": "2026-09-18",
@@ -110,29 +110,6 @@
       },
       "outputs": {
         "hemisphere_zarr": {"type": "path", "description": "sample_dir/atlas_label_hemisphere.zarr with split_x/split_x_per_z attrs"}
-      }
-    },
-    {
-      "id": "check_region_coverage",
-      "function": "pipeline_modules.registration.check_region_coverage_zarr.main",
-      "cli": "python pipeline_modules/registration/check_region_coverage_zarr.py",
-      "description": "Check voxel coverage of a target region subtree inside a registered label volume. Optionally compare against a reference label volume.",
-      "prerequisites": [
-        "Registered label Zarr or NIfTI must exist",
-        "Allen region CSV must be available"
-      ],
-      "inputs": {
-        "label_zarr":           {"type": "path", "required": true},
-        "reference_label_zarr": {"type": "path|null", "default": null},
-        "cfg":                  {"type": "path", "required": true, "description": "Allen region CSV"},
-        "dataset_name":         {"type": "string", "default": "0"},
-        "region_id":            {"type": "int|null", "default": null},
-        "acronym":              {"type": "string|null", "default": null},
-        "block_size":           {"type": "triplet_int|null", "default": null},
-        "top_zero":             {"type": "int", "default": 20}
-      },
-      "outputs": {
-        "report": {"type": "log", "description": "Coverage report emitted as structured log messages"}
       }
     },
     {

@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from pipeline_modules.utils.deliverable_paths import find_stats_workbook
+
 try:
     from pipeline_modules.visualization.coarse_region_metric_plot import (
         DEFAULT_CFG,
@@ -41,22 +43,13 @@ def find_density_excels(root_dir: str | Path) -> list[Path]:
 
     density_files = []
     for sample_dir in sorted([path for path in root.iterdir() if path.is_dir()], key=lambda path: path.name.lower()):
-        matches = sorted(
-            [
-                path
-                for path in sample_dir.glob("*.xlsx")
-                if "density" in path.name.lower()
-                and not path.name.startswith("~$")
-                and "coarse_region_stats" not in path.name.lower()
-            ],
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        if matches:
-            density_files.append(matches[0])
+        try:
+            density_files.append(find_stats_workbook(sample_dir))
+        except FileNotFoundError:
+            continue
 
     if not density_files:
-        raise FileNotFoundError(f"No density *.xlsx files found under child sample folders of: {root}")
+        raise FileNotFoundError(f"No stats workbooks found under child sample folders of: {root}")
     return density_files
 
 

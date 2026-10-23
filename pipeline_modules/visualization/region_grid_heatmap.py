@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from pipeline_modules.utils.deliverable_paths import find_stats_workbook, has_stats_workbook
 from pipeline_modules.visualization.top_level7_density_ratio import (
     DEFAULT_PARCELLATION_CSV,
     build_default_parcellation,
@@ -64,24 +65,6 @@ GROUP_RULES = [
     ("P", "P"), ("MY", "MY"),
     ("CB", "CB"), ("CBX", "CB"), ("CBN", "CB"), ("VERM", "CB"), ("HEM", "CB"),
 ]
-
-
-def find_stats_workbook(sample_dir: str | Path) -> Path:
-    """Newest stats workbook of a cfos run: prefers the atlas-v2 (*_v2.xlsx),
-    falls back to the legacy name."""
-    sample_dir = Path(sample_dir)
-    results = sample_dir / "results"
-    for pattern in ("*_brain_distribution_stats_v2.xlsx", "*_brain_distribution_stats.xlsx"):
-        matches = sorted(
-            (p for p in results.glob(pattern) if not p.name.startswith("~$")),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if matches:
-            return matches[0]
-    raise FileNotFoundError(
-        f"No results/*_brain_distribution_stats*.xlsx under sample dir: {sample_dir}"
-    )
 
 
 def grey_group_of(node_id: int, nodes: dict) -> str | None:
@@ -335,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         names = sorted(
             p.name for p in root.iterdir()
-            if p.is_dir() and any((p / "results").glob("*_brain_distribution_stats.xlsx"))
+            if p.is_dir() and has_stats_workbook(p)
         )
     if len(names) < 2:
         print("Need at least two sample dirs with a stats workbook", file=sys.stderr)

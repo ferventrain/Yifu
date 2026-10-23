@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import sys
 from pathlib import Path
 
@@ -14,6 +13,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from pipeline_modules.utils.region_csv import parse_structure_id_path, split_name_and_acronym
 
 
 DEFAULT_REGION_IDS = [
@@ -45,22 +46,6 @@ def parse_figsize(value: str) -> tuple[float, float]:
     if width <= 0 or height <= 0:
         raise ValueError(f"figsize values must be positive, got: {value}")
     return width, height
-
-
-def split_name_and_acronym(name_text: str) -> tuple[str, str]:
-    name_text = str(name_text).strip()
-    if "," not in name_text:
-        return name_text, ""
-    base_name, acronym = name_text.rsplit(",", 1)
-    return base_name.strip(), acronym.strip()
-
-
-def parse_structure_id_path(path_text: str) -> list[int]:
-    path_text = str(path_text).strip()
-    if path_text.startswith("/"):
-        return [int(part) for part in path_text.strip("/").split("/") if part]
-    path_values = ast.literal_eval(path_text)
-    return [int(value) for value in path_values]
 
 
 def load_region_names(cfg_path: str | Path, region_ids: list[int] | None = None) -> pd.DataFrame:

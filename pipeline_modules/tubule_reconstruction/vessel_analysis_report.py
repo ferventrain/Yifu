@@ -25,6 +25,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from pipeline_modules.utils.parsing import parse_resolution_xyz
+from pipeline_modules.utils.zarr_io import open_zarr_array as open_mask_array
+
 DEFAULT_LENGTH_BIN_EDGES = (0.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
 DEFAULT_DIAM_BIN_EDGES = (0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0)
 DEFAULT_TORT_BIN_EDGES = (1.0, 1.1, 1.2, 1.5, 2.0, 3.0, 5.0)
@@ -36,10 +39,6 @@ VERTEX_CHUNK = 5_000_000
 BRANCH_CHUNK = 1_000_000
 EDT_BRANCH_CHUNK = 500_000
 SPILL_DIRNAME = "_chunk_spill"
-
-
-def parse_resolution_xyz(value):
-    return tuple(float(part) for part in str(value).split(","))
 
 
 def fmt_interval(lower, upper):
@@ -911,18 +910,6 @@ def plot_fractal_dimension(points_df, fd, output_path):
     ax.set_ylabel("Occupied boxes")
     ax.set_title("Box-counting fractal dimension of vessel mask")
     save_figure(fig, output_path)
-
-
-def open_mask_array(mask_zarr, dataset_name="0"):
-    import zarr
-
-    group = zarr.open(str(mask_zarr), mode="r")
-    if dataset_name in group:
-        return group[dataset_name]
-    arrays = list(group.arrays())
-    if len(arrays) == 1:
-        return arrays[0][1]
-    raise ValueError(f"Dataset {dataset_name!r} not found in {mask_zarr}")
 
 
 def _chunk_slices(mask, chunk_index):

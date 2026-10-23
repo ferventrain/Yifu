@@ -3,55 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import sys
 from pathlib import Path
 
+from pipeline_modules.utils.deliverable_paths import find_stats_workbook
+from pipeline_modules.utils.region_csv import parse_acronym_text, split_name_and_acronym
+
 
 DEFAULT_CFG = Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
 DEFAULT_GROUPS = Path(__file__).resolve().parents[2] / "config" / "region_groups.json"
-
-
-def find_density_excel(sample_dir: str | Path) -> Path:
-    sample_dir = Path(sample_dir)
-    if not sample_dir.exists() or not sample_dir.is_dir():
-        raise NotADirectoryError(f"Sample directory not found: {sample_dir}")
-
-    matches = sorted(
-        [
-            path
-            for path in sample_dir.glob("*.xlsx")
-            if path.name.lower().endswith("_result.xlsx")
-            and not path.name.startswith("~$")
-            and "coarse_region" not in path.name.lower()
-            and "level_ratio" not in path.name.lower()
-            and "region_group_signal_count" not in path.name.lower()
-        ],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    if not matches:
-        raise FileNotFoundError(f"No density Excel workbook found in sample directory: {sample_dir}")
-    return matches[0]
-
-
-def parse_acronym_text(acronym_text: object) -> str:
-    try:
-        acronym_values = ast.literal_eval(str(acronym_text))
-        if isinstance(acronym_values, list) and acronym_values:
-            return str(acronym_values[-1]).strip()
-    except Exception:
-        pass
-    return str(acronym_text).strip()
-
-
-def split_name_and_acronym(name_text: object) -> tuple[str, str]:
-    text = str(name_text).strip()
-    if "," not in text:
-        return text, ""
-    base_name, acronym = text.rsplit(",", 1)
-    return base_name.strip(), acronym.strip()
 
 
 def load_region_groups(path: str | Path) -> dict[str, list[str]]:
@@ -227,7 +188,7 @@ def summarize_sample_region_group_signal_count(
     output_prefix: str | Path | None = None,
 ) -> dict[str, Path | pd.DataFrame]:
     sample_dir = Path(sample_dir)
-    excel_path = Path(input_excel) if input_excel else find_density_excel(sample_dir)
+    excel_path = Path(input_excel) if input_excel else find_stats_workbook(sample_dir)
     output_prefix = Path(output_prefix) if output_prefix else sample_dir / sample_dir.name
     table = build_region_group_signal_count_table(excel_path, groups_json=groups_json, cfg=cfg, metric=metric)
     csv_path, xlsx_path = write_outputs(table, output_prefix)

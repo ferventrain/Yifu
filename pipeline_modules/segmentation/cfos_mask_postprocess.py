@@ -10,26 +10,18 @@ from skimage.measure import block_reduce, marching_cubes
 from tqdm import tqdm
 
 try:
+    from pipeline_modules.registration.region_query import resolve_region_subtree
     from pipeline_modules.segmentation.zarr_utils import (
         create_output_zarr,
         export_zarr_to_tiff,
         open_zarr_dataset,
     )
-    from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
-        _collect_subtree_ids,
-        load_region_tree_with_lookups,
-        resolve_region_query,
-    )
 except ImportError:  # pragma: no cover
+    from ..registration.region_query import resolve_region_subtree
     from .zarr_utils import (
         create_output_zarr,
         export_zarr_to_tiff,
         open_zarr_dataset,
-    )
-    from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
-        _collect_subtree_ids,
-        load_region_tree_with_lookups,
-        resolve_region_query,
     )
 
 DEFAULT_REGION_CFG = (
@@ -43,9 +35,7 @@ def _extent_ratio(bbox: tuple[slice, slice, slice]) -> float:
 
 
 def resolve_region_subtree_ids(region_query: str, *, cfg_path: Path) -> tuple[set[int], str]:
-    nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(cfg_path)
-    node = resolve_region_query(region_query, nodes_by_id, acronym_to_ids, name_to_ids)
-    subtree_ids = set(_collect_subtree_ids(node))
+    subtree_ids, node, _ = resolve_region_subtree(region_query, cfg_path)
     display_name = str(node.get("name") or node.get("acronym") or node["id"])
     return subtree_ids, display_name
 

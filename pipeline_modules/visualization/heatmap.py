@@ -50,6 +50,7 @@ from pipeline_modules.visualization.atlas_slice import (
 from pipeline_modules.utils.data_paths import resolve_atlas_label_path
 from pipeline_modules.utils.deliverable_paths import (
     brain_distribution_stats_xlsx,
+    find_stats_workbook,
     heatmap_2d_dir,
     heatmap_3d_colorbar_png,
     heatmap_3d_png,
@@ -275,6 +276,10 @@ def resolve_density_excel_path(
         if not path.exists():
             raise FileNotFoundError(f"Density Excel not found: {path}")
         return path
+    try:
+        return find_stats_workbook(sample_dir)
+    except FileNotFoundError:
+        pass
     for candidate in legacy_brain_distribution_candidates(sample_dir, signal_ch):
         if candidate.exists():
             return candidate
@@ -287,8 +292,11 @@ def resolve_density_excel_path(
 
 def sample_has_density_excel(sample_dir: str | Path, signal_ch: str = "ch1") -> bool:
     sample_dir = Path(sample_dir)
-    if default_sample_density_excel(sample_dir, signal_ch).exists():
+    try:
+        find_stats_workbook(sample_dir)
         return True
+    except FileNotFoundError:
+        pass
     return any(path.exists() for path in legacy_brain_distribution_candidates(sample_dir, signal_ch)[1:])
 
 

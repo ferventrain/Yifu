@@ -124,7 +124,7 @@ class RegionVesselAnalysisCfg(BaseModel):
         ),
     )
     cfg: str = Field(
-        "pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+        "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
         description="Allen region CSV used for id/acronym/name lookups and all_regions export",
     )
     regions: Tuple[str, ...] = Field(

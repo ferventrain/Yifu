@@ -1,5 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Top-30 region selection + chord diagram for YF2026082501 (d22 vs SY1).
+"""Top-30 region selection + chord diagram over standardized cFos samples.
+
+Inputs are sample directories whose standardized stats workbooks live in
+``results/`` (``*_brain_distribution_stats_v2.xlsx``, legacy name as fallback).
+Groups are given on the command line, one ``--group NAME=SAMPLE_DIR[,DIR...]``
+per group; sample directories are resolved against ``--root``.
+
+    python -m pipeline_modules.visualization.chord_top30 \
+        --root H:/arivis-analysis/_active/YF2026082501 \
+        --group d22=YF2026082501_AYD_nao_d22 \
+        --group SY1=YF2026082501_AYD_nao_SY1
 
 Step 1: per group, from the whole-brain region stats xlsx:
     density = count / volume_mm3 (volume==0 -> NaN)
@@ -15,7 +25,7 @@ Step 1: per group, from the whole-brain region stats xlsx:
 
 Step 2: chord diagram (SVG + 300dpi PNG, white background).
 """
-import ast
+import argparse
 import colorsys
 import json
 import math
@@ -31,18 +41,12 @@ import pandas as pd
 from matplotlib import font_manager, patheffects
 from matplotlib.patches import Patch, Polygon, Wedge
 
-PROJ = Path(r"H:/arivis-analysis/_active/YF2026082501")
-REPO = Path(r"H:/yifu0428/Yifu")
-REGION_CSV = REPO / "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
-OUT_DIR = PROJ / "_figure_materials" / "chord_top30"
+from pipeline_modules.utils.deliverable_paths import find_stats_workbook
+from pipeline_modules.utils.region_csv import parse_structure_id_path, split_name_and_acronym
 
-# group -> list of sample stats xlsx (one entry per sample; a group may hold
-# any number of samples). Group density = mean over samples that pass the
-# quorum (more than half the group's samples must have a valid density).
-GROUP_SAMPLES = {
-    "d22": [PROJ / "YF2026082501_AYD_nao_d22/results/YF2026082501_AYD_nao_d22_ch1_brain_distribution_stats_v2.xlsx"],
-    "SY1": [PROJ / "YF2026082501_AYD_nao_SY1/results/YF2026082501_AYD_nao_SY1_ch1_brain_distribution_stats_v2.xlsx"],
-}
+DEFAULT_REGION_CSV = (
+    Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"
+)
 
 DEPTH_START = 4
 TARGET_DEPTH = 6
@@ -58,7 +62,7 @@ def load_tree(csv_path):
     nodes = {}
     for _, row in df.iterrows():
         rid = int(row["id"])
-        path = ast.literal_eval(row["structure_id_path"])
+        path = parse_structure_id_path(row["structure_id_path"])
         nodes[rid] = {
             "id": rid,
             "name": str(row["name"]),
@@ -118,13 +122,6 @@ def descendants(children_map, rid):
             out.append(ch)
             stack.append(ch)
     return out
-
-
-def split_name(full):
-    if "," in full:
-        head, acr = full.rsplit(",", 1)
-        return head, acr
-    return full, ""
 
 
 # ------------------------------------------------------------------- step 1 --
@@ -251,7 +248,7 @@ def select_top30(mean_density, by_name, nodes, children_map, group):
                                            -mean_density.get(n, 0.0)))
     for rank, full in enumerate(ranked, 1):
         node = by_name[full]
-        head, acr = split_name(full)
+        head, acr = split_name_and_acronym(full)
         par = nodes[node["parent"]]["name"] if "parent" in node else ""
         md = mean_density[full]
         rows.append({
@@ -266,16 +263,29 @@ def select_top30(mean_density, by_name, nodes, children_map, group):
     return pd.DataFrame(rows), {r["region_name"] + "," + r["acronym"] for r in rows}
 
 
-def main_step1(nodes, by_name, children_map):
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def sample_voxel_mm3(sample_dir: Path, resolution_xyz: tuple[float, float, float] | None) -> float:
+    if resolution_xyz is not None:
+        rx, ry, rz = resolution_xyz
+    else:
+        cfg_path = sample_dir / "config.json"
+        if not cfg_path.exists():
+            raise FileNotFoundError(
+                f"No config.json under {sample_dir}; pass --resolution_xyz x,y,z "
+                "(micrometres) to compute densities"
+            )
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        rx, ry, rz = cfg["input"]["resolution_xyz"]
+    return float(rx) * float(ry) * float(rz) * 1e-9
+
+
+def main_step1(nodes, by_name, children_map, group_samples, out_dir, resolution_xyz=None):
+    out_dir.mkdir(parents=True, exist_ok=True)
     tables, final_sets = {}, {}
-    for group, sample_xlsx in GROUP_SAMPLES.items():
+    for group, sample_dirs in group_samples.items():
         samples = []
-        for xlsx in sample_xlsx:
-            sample_dir = Path(xlsx).parent.parent  # <sample>/results/<xlsx>
-            cfg = json.load(open(sample_dir / "config.json", encoding="utf-8"))
-            rx, ry, rz = cfg["input"]["resolution_xyz"]
-            voxel_mm3 = rx * ry * rz * 1e-9
+        for sample_dir in sample_dirs:
+            xlsx = find_stats_workbook(sample_dir)
+            voxel_mm3 = sample_voxel_mm3(sample_dir, resolution_xyz)
             label = f"{group}/{sample_dir.name}"
             samples.append(sample_density_table(xlsx, by_name, voxel_mm3, label))
         if len(samples) > 1:
@@ -283,7 +293,7 @@ def main_step1(nodes, by_name, children_map):
                   f"quorum: > {len(samples) / 2:.0f} valid")
         mean_density = group_mean_density(samples, by_name)
         tables[group], final_sets[group] = select_top30(mean_density, by_name, nodes, children_map, group)
-        out = OUT_DIR / f"top30_{group}.csv"
+        out = out_dir / f"top30_{group}.csv"
         tables[group].to_csv(out, index=False, encoding="utf-8-sig")
         print(f"[{group}] wrote {out}")
     return tables, final_sets
@@ -325,10 +335,9 @@ def group_colors(groups):
     return out
 
 
-def draw_chord(tables, final_sets, by_name, nodes, children_map):
+def draw_chord(tables, final_sets, by_name, nodes, children_map, groups, out_dir):
     union = sorted(set().union(*final_sets.values()),
                    key=lambda n: by_name[n]["id"])
-    groups = list(GROUP_SAMPLES)
     shared = {n for n in union if sum(n in final_sets[g] for g in groups) > 1}
 
     # anchor = depth-4 ancestor; sub = depth-5 slot (own id for depth-5 rows)
@@ -495,7 +504,7 @@ def draw_chord(tables, final_sets, by_name, nodes, children_map):
                 path_effects=halo, fontweight=("bold" if bold else "normal"),
                 color=color, zorder=4)
     for f in ordered:
-        _, acr = split_name(f)
+        _, acr = split_name_and_acronym(f)
         radial_label(acr, node_mid[f], "#222222", 8.5)
     for g in groups:
         radial_label(g, node_mid[g], GROUP_COLORS[g], 13, bold=True)
@@ -516,9 +525,9 @@ def draw_chord(tables, final_sets, by_name, nodes, children_map):
              f"of the ribbons it carries (ribbons fill their arcs).",
              ha="center", fontsize=9.5, color="#444444")
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    svg = OUT_DIR / f"chord_top30_{'_'.join(groups)}.svg"
-    png = OUT_DIR / f"chord_top30_{'_'.join(groups)}.png"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    svg = out_dir / f"chord_top30_{'_'.join(groups)}.svg"
+    png = out_dir / f"chord_top30_{'_'.join(groups)}.png"
     fig.savefig(svg, facecolor="white", bbox_inches="tight")
     fig.savefig(png, facecolor="white", dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -527,19 +536,76 @@ def draw_chord(tables, final_sets, by_name, nodes, children_map):
     print(f"union={len(union)} regions, shared={len(shared)}, unique={len(union) - len(shared)}")
 
 
-def main():
+def parse_group_specs(specs: list[str], root: Path) -> dict[str, list[Path]]:
+    groups: dict[str, list[Path]] = {}
+    for spec in specs:
+        name, sep, dirs_text = spec.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            raise ValueError(f"--group expects NAME=SAMPLE_DIR[,DIR...], got: {spec!r}")
+        if name in groups:
+            raise ValueError(f"Duplicate --group name: {name!r}")
+        dirs = [part.strip() for part in dirs_text.split(",") if part.strip()]
+        if not dirs:
+            raise ValueError(f"--group {name!r} has no sample directories")
+        resolved = []
+        for value in dirs:
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = root / path
+            if not path.is_dir():
+                raise NotADirectoryError(f"Sample directory not found: {path}")
+            resolved.append(path)
+        groups[name] = resolved
+    return groups
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Top-30 region selection + chord diagram over standardized cFos samples",
+    )
+    parser.add_argument("--root", required=True, help="Root directory that relative sample dirs resolve against")
+    parser.add_argument(
+        "--group",
+        action="append",
+        required=True,
+        metavar="NAME=SAMPLE_DIR[,DIR...]",
+        help="Group name plus one or more sample directories (repeatable)",
+    )
+    parser.add_argument("--region_csv", default=str(DEFAULT_REGION_CSV), help="Allen region CSV")
+    parser.add_argument("--out_dir", default="", help="Output directory (default: <root>/_figure_materials/chord_top30)")
+    parser.add_argument(
+        "--resolution_xyz",
+        default="",
+        help="Override voxel size in micrometres (x,y,z) when samples have no config.json",
+    )
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).expanduser().resolve()
+    group_samples = parse_group_specs(args.group, root)
+    resolution_xyz = None
+    if str(args.resolution_xyz).strip():
+        parts = [part.strip() for part in str(args.resolution_xyz).split(",") if part.strip()]
+        if len(parts) != 3:
+            raise SystemExit("--resolution_xyz must be x,y,z")
+        resolution_xyz = tuple(float(part) for part in parts)
+    out_dir = Path(args.out_dir) if args.out_dir else root / "_figure_materials" / "chord_top30"
+
     font_manager.fontManager  # init
     plt.rcParams["font.family"] = "DejaVu Sans"
     plt.rcParams["svg.fonttype"] = "none"
-    nodes, by_name, children_map = load_tree(REGION_CSV)
+    nodes, by_name, children_map = load_tree(args.region_csv)
     print(f"region tree ok: {len(nodes)} nodes, root depth counts "
           f"{pd.Series([n['depth'] for n in nodes.values()]).value_counts().sort_index().to_dict()}")
-    tables, final_sets = main_step1(nodes, by_name, children_map)
-    for group in GROUP_SAMPLES:
+    tables, final_sets = main_step1(
+        nodes, by_name, children_map, group_samples, out_dir, resolution_xyz
+    )
+    for group in group_samples:
         print(f"--- top30 {group} ---")
         print(tables[group].to_string(index=False))
-    draw_chord(tables, final_sets, by_name, nodes, children_map)
+    draw_chord(tables, final_sets, by_name, nodes, children_map, list(group_samples), out_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

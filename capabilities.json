@@ -28,11 +28,12 @@
     {
       "id": "registration",
       "path": "pipeline_modules/registration",
-      "description": "ANTs-based atlas-to-sample registration, atlas label upsampling, hemisphere label derivation, region voxel-coverage checking, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
+      "description": "ANTs-based atlas-to-sample registration with mask-shape orientation preflight, atlas label upsampling, hemisphere label derivation, coarse-region label merging, and Zarr-native block-graph region signal analysis.",
       "agent_native": true,
       "capability_manifest": "pipeline_modules/registration/capability_manifest.json",
       "primary_scripts": [
         "pipeline_modules/registration/ANTs_registration.py",
+        "pipeline_modules/registration/orientation.py",
         "pipeline_modules/registration/atlas_label_to_hemisphere.py",
         "pipeline_modules/registration/region_signal_analysis_zarr_graph.py",
         "pipeline_modules/registration/merge_atlas_regions.py"
@@ -89,26 +90,38 @@
     {
       "id": "visualization",
       "path": "pipeline_modules/visualization",
-      "description": "Plotting and export utilities for density tables, atlas-region summaries, mask point clouds, brainrender inputs, and vessel renderings.",
+      "description": "Region-statistics workbooks to figures (coarse bars, group bars, two-sample ratios, region-grid heatmaps, chord diagrams), region-scoped Zarr statistics, atlas-space signal renders, mask point clouds, brainrender inputs, region image exports, and vessel renderings.",
       "agent_native": true,
       "capability_manifest": "pipeline_modules/visualization/capability_manifest.json",
       "primary_scripts": [
         "pipeline_modules/visualization/coarse_region_metric_plot.py",
         "pipeline_modules/visualization/group_density_coarse_region_bar.py",
         "pipeline_modules/visualization/top_level7_density_ratio.py",
+        "pipeline_modules/visualization/region_grid_heatmap.py",
         "pipeline_modules/visualization/region_group_signal_count.py",
+        "pipeline_modules/visualization/chord_top30.py",
+        "pipeline_modules/visualization/cfos_standard_report.py",
+        "pipeline_modules/visualization/region_scope_signal_stats.py",
+        "pipeline_modules/visualization/region_mip_export.py",
+        "pipeline_modules/visualization/region_masked_volume_export.py",
         "pipeline_modules/visualization/warp_mask_zarr_to_atlas_points.py",
         "pipeline_modules/visualization/render_points_brainrender.py",
         "pipeline_modules/visualization/heatmap.py",
         "pipeline_modules/visualization/render_vessels_pyvista.py"
       ],
       "python_package": "pipeline_modules.visualization",
-      "inputs_from": ["density_results_xlsx", "mask_zarr", "atlas_label_zarr"],
+      "inputs_from": ["density_results_xlsx", "mask_zarr", "atlas_label_zarr", "signal_zarr"],
       "outputs_to": [
         "coarse_region_stats",
         "coarse_region_bar_plots",
-        "atlas_points",
+        "region_grid_heatmap",
         "region_group_signal_count",
+        "chord_top30",
+        "region_scope_stats",
+        "cfos_standard_report",
+        "region_mips",
+        "region_masked_volumes",
+        "atlas_points",
         "brainrender_view_json",
         "brainrender_group_pngs"
       ]
@@ -145,7 +158,7 @@
     {
       "id": "utils",
       "path": "pipeline_modules/utils",
-      "description": "Shared utilities: SampleLayout (canonical path registry), PipelineError (structured errors), write_run_manifest.",
+      "description": "Shared utilities: SampleLayout (canonical path registry), PipelineError (structured errors), write_run_manifest, and find_stats_workbook (one-call lookup of a sample's region-stats workbook: results v2 > results legacy > legacy *_result.xlsx).",
       "agent_native": true,
       "capability_manifest": null,
       "python_package": "pipeline_modules.utils",
@@ -153,7 +166,8 @@
         "SampleLayout": "pipeline_modules.utils.sample_layout.SampleLayout",
         "PipelineError": "pipeline_modules.utils.errors.PipelineError",
         "ErrorCode": "pipeline_modules.utils.errors.ErrorCode",
-        "write_run_manifest": "pipeline_modules.utils.run_manifest.write_run_manifest"
+        "write_run_manifest": "pipeline_modules.utils.run_manifest.write_run_manifest",
+        "find_stats_workbook": "pipeline_modules.utils.deliverable_paths.find_stats_workbook"
       }
     }
   ],

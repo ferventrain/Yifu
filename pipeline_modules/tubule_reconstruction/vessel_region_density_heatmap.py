@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, r"H:\yifu0428\Yifu")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
     _collect_subtree_ids,

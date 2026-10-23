@@ -1,7 +1,7 @@
 {
   "schema_version": "1",
   "module": "visualization",
-  "description": "Plotting and export utilities for density tables, atlas-region summaries, mask point clouds, brainrender inputs, and vessel renderings.",
+  "description": "Plotting and export utilities for region statistics workbooks (coarse bars, group bars, two-sample ratios, region-grid heatmaps, chord diagrams), atlas-space signal renders, region-scoped Zarr statistics, mask point clouds, brainrender inputs, and vessel renderings.",
   "entrypoints": [
     {
       "id": "annotate_tissue_roi",
@@ -37,7 +37,7 @@
       "id": "plot_coarse_region_metric",
       "function": "pipeline_modules.visualization.coarse_region_metric_plot.generate_coarse_region_outputs",
       "cli": "python pipeline_modules/visualization/coarse_region_metric_plot.py",
-      "description": "Summarize Level_* sheets from a per-region density Excel workbook into default coarse Allen brain regions, then save atlas-order and value-sorted bar plots.",
+      "description": "Summarize Level_* sheets from ONE sample's region-stats workbook into the default coarse Allen brain divisions, then save atlas-order and value-sorted bar plots. Use when: one sample, broad divisions, bar chart. For several samples use plot_group_density_coarse_regions; for top region-level differences use plot_top_level7_density_ratio.",
       "prerequisites": [
         "Input Excel must be produced by region_signal_analysis_zarr_graph.py or have compatible Level_* sheets",
         "Level_* sheets must include a Name column and the selected metric column",
@@ -47,7 +47,7 @@
         "input_excel": {
           "type": "path",
           "required": true,
-          "description": "Density/results Excel workbook at sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx"
+          "description": "Region-stats workbook; standardized name results/<sample>_<channel>_brain_distribution_stats_v2.xlsx (preferred) or results/<sample>_<channel>_brain_distribution_stats.xlsx"
         },
         "cfg": {
           "type": "path",
@@ -109,23 +109,24 @@
       },
       "common_commands": [
         {
-          "description": "Plot coarse-region cFos voxel density for a sample directory containing <sample_dir_name>_density_result.xlsx",
+          "description": "Plot coarse-region cFos voxel density from a sample's standardized stats workbook",
           "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\coarse_region_metric_plot.py --input_excel \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\tbi_density_result.xlsx\" --metric \"Voxel Density\" --title \"TBI cFos coarse region density\" --ylabel \"cFos voxel density\" --output_prefix \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\\tbi\\tbi_cfos_density\""
         }
       ],
       "sample_layout": {
-        "density_results_xlsx": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx"
+        "stats_workbook_preferred": "sample_dir/results/<sample>_<channel>_brain_distribution_stats_v2.xlsx",
+        "stats_workbook_legacy": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx or sample_dir/*_result.xlsx"
       }
     },
     {
       "id": "plot_group_density_coarse_regions",
       "function": "pipeline_modules.visualization.group_density_coarse_region_bar.generate_group_density_plot",
       "cli": "python pipeline_modules/visualization/group_density_coarse_region_bar.py",
-      "description": "Find density Excel workbooks in direct child sample folders, summarize them into default coarse Allen brain regions, and draw grouped bar plots comparing samples.",
+      "description": "Find one region-stats workbook per direct child sample folder, summarize them into the default coarse Allen brain divisions, and draw grouped bar plots comparing samples. Use when: several samples, broad divisions, grouped bars. For one sample use plot_coarse_region_metric; for high-resolution region-level comparison use plot_region_grid_heatmap.",
       "prerequisites": [
         "Each direct child folder under root_dir is treated as a sample_dir",
-        "Each sample_dir should contain at least one *.xlsx file with density in the filename",
-        "Density workbooks must contain Level_* sheets with Name and selected metric columns"
+        "Each sample_dir must have a stats workbook auto-located by find_stats_workbook: results/*_brain_distribution_stats_v2.xlsx (preferred), results/*_brain_distribution_stats.xlsx, or legacy *_result.xlsx",
+        "Workbooks must contain Level_* sheets with Name and selected metric columns"
       ],
       "inputs": {
         "root_dir": {
@@ -187,16 +188,21 @@
           "description": "Compare coarse-region voxel density across all sample folders under a root folder",
           "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\group_density_coarse_region_bar.py --root_dir \"S:\\Arivis_Analysis\\YF2026032001zzj_cfos\" --metric \"Voxel Density\" --title \"Coarse-region cFos density\" --ylabel \"Voxel density\""
         }
-      ]
+      ],
+      "sample_layout": {
+        "stats_workbook_preferred": "sample_dir/results/<sample>_<channel>_brain_distribution_stats_v2.xlsx",
+        "stats_workbook_legacy": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx or sample_dir/*_result.xlsx"
+      }
     },
     {
       "id": "plot_top_level7_density_ratio",
       "function": "pipeline_modules.visualization.top_level7_density_ratio.generate_top_level_ratio_plot",
       "cli": "python pipeline_modules/visualization/top_level7_density_ratio.py",
-      "description": "Find density Excel workbooks in exactly two child sample folders, compare count metrics over the default parcellation (level auto: Allen tree divided until children would be layers; cortical subareas split, nuclei stay whole, remainder rows keep parent-labelled voxels) or a fixed Level_N sheet, and plot the top absolute log(A/B) region differences.",
+      "description": "Compare exactly TWO samples and plot the top region differences: count metrics over the default parcellation (level auto: Allen tree divided until children would be layers; cortical subareas split, nuclei stay whole, remainder rows keep parent-labelled voxels) or a fixed Level_N sheet. Despite the historical name, level auto is a computed parcellation, not the workbook's Level_7 sheet. Use when: two-sample A/B ranking with signed log ratios. For many samples use plot_region_grid_heatmap; for a full deliverable report use generate_cfos_standard_report.",
       "prerequisites": [
-        "root_dir must contain exactly two child sample_dir folders with density Excel workbooks",
-        "Density workbooks must contain Level_* sheets with Name and selected metric columns",
+        "root_dir must contain exactly two child sample_dir folders with stats workbooks",
+        "Each stats workbook is auto-located by find_stats_workbook: results/*_brain_distribution_stats_v2.xlsx (preferred), results/*_brain_distribution_stats.xlsx, or legacy *_result.xlsx",
+        "Workbooks must contain Level_* sheets with Name and selected metric columns",
         "level auto additionally reads pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
       ],
       "inputs": {
@@ -289,9 +295,10 @@
       "id": "plot_region_grid_heatmap",
       "function": "pipeline_modules.visualization.region_grid_heatmap.main",
       "cli": "python -m pipeline_modules.visualization.region_grid_heatmap --root_dir <batch_dir>",
-      "description": "Region-GRID heatmap (region x sample matrix; 2026-10-14 fixed layout): rows are the top_level7 default-parcellation regions grouped by major division, columns are samples, each cell = per-region cFos density (Signal Voxels / Total Voxels, %). Grey matter only; groups stack naturally into <= max_panels equal-width columns of square cells (top-aligned, ragged bottoms); each group's full name (Isocortex / Cortical subplate / Striatum / Pallidum / Thalamus / Hypothalamus / Midbrain / Pons / Medulla / Cerebellum) is an inline centered band above its rows; vertical sample labels under each panel; white->orange colormap, thick colorbar hugging the last panel. NOT the spatial heatmap: for anatomical atlas-space 2D/3D signal maps use render_signal_heatmap (heatmap.py) instead.",
+      "description": "Region-GRID heatmap (region x sample matrix; 2026-10-14 fixed layout): rows are the top_level7 default-parcellation regions grouped by major division, columns are samples, each cell = per-region cFos density (Signal Voxels / Total Voxels, %). Use when: many samples, region-level quantitative matrix in one figure. For broad divisions use the coarse bar plots; for two-sample ranking use plot_top_level7_density_ratio. Grey matter only; groups stack naturally into <= max_panels equal-width columns of square cells (top-aligned, ragged bottoms); each group's full name (Isocortex / Cortical subplate / Striatum / Pallidum / Thalamus / Hypothalamus / Midbrain / Pons / Medulla / Cerebellum) is an inline centered band above its rows; vertical sample labels under each panel; white->orange colormap, thick colorbar hugging the last panel. NOT the spatial heatmap: for anatomical atlas-space 2D/3D signal maps use render_signal_heatmap (heatmap.py) instead.",
       "prerequisites": [
-        "Each sample child dir has results/*_brain_distribution_stats.xlsx with Level_* sheets (Name + Signal Voxels + Total Voxels columns) — i.e. a finished cfos run",
+        "Each sample child dir has a finished-cfos stats workbook auto-located by find_stats_workbook: results/*_brain_distribution_stats_v2.xlsx (preferred), results/*_brain_distribution_stats.xlsx, or legacy *_result.xlsx",
+        "Workbook Level_* sheets need Name + Signal Voxels + Total Voxels columns",
         "level auto parcellation reads pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
       ],
       "inputs": {
@@ -343,7 +350,11 @@
           "description": "Explicit sample subset and custom output name",
           "powershell": "python -m pipeline_modules.visualization.region_grid_heatmap --root_dir \"H:\\arivis-analysis\\_active\\YF2026082501\" --samples \"YF2026082501_AYD_nao_SY1,YF2026082501_AYD_nao_SY2\" --output_prefix \"H:\\arivis-analysis\\_active\\YF2026082501\\SY_pair\""
         }
-      ]
+      ],
+      "sample_layout": {
+        "stats_workbook_preferred": "sample_dir/results/<sample>_<channel>_brain_distribution_stats_v2.xlsx",
+        "stats_workbook_legacy": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx or sample_dir/*_result.xlsx"
+      }
     },
     {
       "id": "generate_cfos_standard_report",
@@ -351,7 +362,7 @@
       "cli": "python -m pipeline_modules.visualization.cfos_standard_report",
       "description": "Standard two-sample c-Fos descriptive report per spec v1.0: 6-page A4-landscape HTML+PDF (overview / QC / spatial density / Top-N density difference / ROI granularity / methods), Excel tables, figure files, params+provenance. Default region set = the fixed exclusive parcellation from top_level7_density_ratio; ranking by |Δdensity| (B−A) with direction and raw counts kept; 3D isosurfaces at fixed absolute thresholds with shared camera.",
       "prerequisites": [
-        "Both samples have region workbooks (results/*_brain_distribution_stats.xlsx or *_result.xlsx with Level_* sheets)",
+        "Both samples have region workbooks with Level_* sheets, auto-located by find_stats_workbook: results/*_brain_distribution_stats_v2.xlsx (preferred), results/*_brain_distribution_stats.xlsx, or legacy *_result.xlsx",
         "Recommended: visualization/<sample>_ch1_count_volume.tif per sample (warp_mask_zarr_to_atlas_points --volume_mode count); without it spatial pages degrade with an explicit missing-inputs note",
         "Microsoft Edge for HTML->PDF (default path C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe)"
       ],
@@ -404,7 +415,7 @@
       "id": "volume_heatmap_3d",
       "function": "pipeline_modules.visualization.volume_heatmap_3d.main",
       "cli": "python -m pipeline_modules.visualization.volume_heatmap_3d",
-      "description": "Interactive see-through 3D heatmap of an atlas-space c-Fos count volume: annotation-masked, 150um-smoothed, maximum-intensity projection with magma colormap (default). Rotate/zoom in the window, or pass --output for an offscreen screenshot.",
+      "description": "Interactive see-through 3D heatmap of an atlas-space c-Fos count volume: annotation-masked, 150um-smoothed, maximum-intensity projection with magma colormap (default). Rotate/zoom in the window, or pass --output for an offscreen screenshot. Use when: the atlas-space count volume already exists and you want a quick interactive view. Use render_signal_heatmap when you need to warp a sample mask into atlas space first or need 2D slices.",
       "prerequisites": [
         "visualization/<sample>_ch1_count_volume.tif must exist (warp_mask_zarr_to_atlas_points --volume_mode count --skip_points)",
         "BrainGlobe atlas allen_mouse_25um cached"
@@ -479,7 +490,7 @@
       "id": "render_signal_heatmap",
       "function": "pipeline_modules.visualization.heatmap.generate_sample_stack_heatmap",
       "cli": "python pipeline_modules/visualization/heatmap.py",
-      "description": "Warp a sample-space mask into atlas space, cache the atlas-space volume/points, and render 3D or 2D heatmaps.",
+      "description": "Warp a sample-space mask into atlas space, cache the atlas-space volume/points, and render 3D or 2D heatmaps. Use when: starting from mask Zarr/registration transforms, or when you need atlas-space 2D slices or the cached volume. For an existing count volume and an interactive 3D view use volume_heatmap_3d.",
       "prerequisites": [
         "sample_dir should contain <signal_ch>_mask.zarr, <register_ch>_downsample/volume.nii.gz, and transforms/",
         "Atlas reference files should exist under data/reference/",
@@ -1087,10 +1098,10 @@
       "id": "summarize_region_group_signal_count",
       "function": "pipeline_modules.visualization.region_group_signal_count.summarize_sample_region_group_signal_count",
       "cli": "python pipeline_modules/visualization/region_group_signal_count.py",
-      "description": "Summarize a density Excel workbook into configured atlas region groups (default config/region_groups.json), aggregating a chosen metric such as Signal Count.",
+      "description": "Summarize ONE sample's stats workbook into custom named atlas region groups from config/region_groups.json (PFC / HIP / AMY / ...), aggregating a chosen metric such as Signal Count. Use when: your region set is defined by region_groups.json, not the Allen coarse divisions. For Allen divisions use plot_coarse_region_metric; for per-subregion detail inside one region use compute_region_scope_signal_stats.",
       "prerequisites": [
-        "sample_dir must contain a density Excel workbook, commonly <sample_dir_name>_density_result.xlsx",
-        "Region groups JSON and Allen region CSV must be available"
+        "sample_dir must have a stats workbook auto-located by find_stats_workbook: results/*_brain_distribution_stats_v2.xlsx (preferred), results/*_brain_distribution_stats.xlsx, or legacy *_result.xlsx",
+        "Region groups JSON (default config/region_groups.json) and Allen region CSV must be available"
       ],
       "inputs": {
         "sample_dir": {
@@ -1143,7 +1154,187 @@
         }
       ],
       "sample_layout": {
-        "density_results_xlsx": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx"
+        "stats_workbook_preferred": "sample_dir/results/<sample>_<channel>_brain_distribution_stats_v2.xlsx",
+        "stats_workbook_legacy": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx or sample_dir/*_result.xlsx"
+      }
+    },
+    {
+      "id": "plot_chord_top30",
+      "function": "pipeline_modules.visualization.chord_top30.main",
+      "cli": "python -m pipeline_modules.visualization.chord_top30 --root <batch_dir> --group NAME=SAMPLE_DIR[,DIR...] --group NAME2=...",
+      "description": "Select the top-30 parcellated regions per sample group from standardized stats workbooks, then draw a proportional chord diagram (SVG + 300 dpi PNG) showing regions shared between groups vs group-specific. Use when: >=2 sample groups and the question is which high-density regions overlap. For a full two-sample report use generate_cfos_standard_report; for an all-region matrix use plot_region_grid_heatmap. Step 1 per group: merge hemispheres by summed count/volume, density = count / volume_mm3, group mean with >half-valid quorum, top-30 depth-4 parents, top-30 depth-6 descendants, collapse depth-5 parents contributing >2 children to their own row with depth6 backfill; writes top30_<group>.csv. Step 2: arcs grouped by parent; ribbons colored per group with red for regions in >=2 groups' top-30; ribbon width proportional to sqrt(mean density).",
+      "prerequisites": [
+        "Every sample dir has a stats workbook auto-located by find_stats_workbook: results/*_brain_distribution_stats_v2.xlsx (preferred), results/*_brain_distribution_stats.xlsx, or legacy *_result.xlsx",
+        "Each sample dir has config.json with input.resolution_xyz, or pass --resolution_xyz x,y,z",
+        "Region tree CSV defaults to pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
+      ],
+      "inputs": {
+        "root": {
+          "type": "dir",
+          "required": true,
+          "description": "Batch root that relative sample dirs resolve against"
+        },
+        "group": {
+          "type": "repeatable NAME=SAMPLE_DIR[,DIR...]",
+          "required": true,
+          "description": "One flag per group; multiple sample dirs per group are averaged (quorum: more than half valid)"
+        },
+        "region_csv": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
+        },
+        "out_dir": {
+          "type": "path|null",
+          "default": null,
+          "description": "Default <root>/_figure_materials/chord_top30"
+        },
+        "resolution_xyz": {
+          "type": "triplet_float_um|null",
+          "default": null,
+          "description": "Override voxel size when samples have no config.json"
+        }
+      },
+      "outputs": {
+        "top30_csv": {
+          "type": "path",
+          "description": "<out_dir>/top30_<group>.csv (rank, region_id, region_name, acronym, depth, parent_region, mean_density)"
+        },
+        "chord_svg": {
+          "type": "path",
+          "description": "<out_dir>/chord_top30_<group1>_<group2>....svg"
+        },
+        "chord_png": {
+          "type": "path",
+          "description": "<out_dir>/chord_top30_<group1>_<group2>....png (300 dpi)"
+        }
+      },
+      "common_commands": [
+        {
+          "description": "Two-group chord (d22 vs SY1) over standardized results workbooks",
+          "powershell": "python -m pipeline_modules.visualization.chord_top30 --root \"S:\\Arivis_Analysis\\_active\\YF2026082501\" --group d22=YF2026082501_AYD_nao_d22 --group SY1=YF2026082501_AYD_nao_SY1"
+        }
+      ],
+      "sample_layout": {
+        "stats_workbook_preferred": "sample_dir/results/<sample>_<channel>_brain_distribution_stats_v2.xlsx",
+        "stats_workbook_legacy": "sample_dir/results/<sample>_<channel>_brain_distribution_stats.xlsx or sample_dir/*_result.xlsx"
+      }
+    },
+    {
+      "id": "compute_region_scope_signal_stats",
+      "function": "pipeline_modules.visualization.region_scope_signal_stats.compute_region_scope_signal_stats",
+      "cli": "python pipeline_modules/visualization/region_scope_signal_stats.py --sample-dir <sample_dir> --region HIP",
+      "description": "Compute mask / voxel / signal statistics restricted to ONE Allen region subtree by scanning the sample's mask + atlas-label + signal Zarrs directly (no stats workbook). Use when: you need per-subregion counts, density, or intensity inside a single region (e.g. HIP), or a fast voxel-only pass. For whole-brain stats use the registration analysis step; to export images use export_region_mip or export_region_masked_volume.",
+      "prerequisites": [
+        "sample_dir has <signal_ch>.zarr, <signal_ch>_mask.zarr, and upsampled_atlas_label.zarr (SampleLayout naming; explicit flags override)",
+        "Region query resolves against pipeline_modules/registration/Region_Csv_Rev2_updated.CSV by acronym, full name, or id and includes all descendants",
+        "--resolution-xyz must match the Zarr spacing (default 1.8,1.8,2.0 um)",
+        "Runs block-wise; --skip-signal-count skips connected-component counting for a faster voxel-only result"
+      ],
+      "inputs": {
+        "sample_dir": {
+          "type": "dir",
+          "required": true
+        },
+        "region": {
+          "type": "string",
+          "required": true,
+          "examples": [
+            "HIP",
+            "PVH",
+            "Anterior cingulate area",
+            "295"
+          ]
+        },
+        "signal_ch": {
+          "type": "string",
+          "default": "",
+          "description": "Signal channel, e.g. ch3; empty resolves from --config or the sample layout"
+        },
+        "mask_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "label_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "signal_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "hemisphere_zarr": {
+          "type": "path|null",
+          "default": null
+        },
+        "cfg": {
+          "type": "path",
+          "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
+        },
+        "config": {
+          "type": "path|null",
+          "default": null,
+          "description": "Optional pipeline config.json for default signal channel"
+        },
+        "resolution_xyz": {
+          "type": "triplet_float_um",
+          "default": "1.8,1.8,2.0"
+        },
+        "foreground_mode": {
+          "type": "string",
+          "default": "equal",
+          "choices": [
+            "equal",
+            "nonzero"
+          ]
+        },
+        "foreground_label": {
+          "type": "int",
+          "default": 1
+        },
+        "min_voxels": {
+          "type": "int",
+          "default": 10,
+          "description": "Minimum connected-component size for signal counting"
+        },
+        "block_shape": {
+          "type": "z,y,x|null",
+          "default": null
+        },
+        "skip_signal_count": {
+          "type": "bool",
+          "default": false
+        },
+        "output_dir": {
+          "type": "path|null",
+          "default": null,
+          "description": "Defaults to sample_dir/visualization/region_stats"
+        }
+      },
+      "outputs": {
+        "summary_json": {
+          "type": "path",
+          "description": "<sample>_<signal_ch>_<region>_stats.json (summary + subregions)"
+        },
+        "summary_xlsx": {
+          "type": "path",
+          "description": "<sample>_<signal_ch>_<region>_stats.xlsx (Summary + Subregions sheets)"
+        },
+        "subregions_csv": {
+          "type": "path",
+          "description": "<sample>_<signal_ch>_<region>_subregions.csv"
+        }
+      },
+      "common_commands": [
+        {
+          "description": "Whole HIP subtree stats for one sample",
+          "powershell": "python S:\\Yifu\\pipeline_modules\\visualization\\region_scope_signal_stats.py --sample-dir \"S:\\Arivis_Analysis\\sample01\" --region HIP --signal-ch ch3"
+        }
+      ],
+      "sample_layout": {
+        "signal_zarr": "sample_dir/<signal_ch>.zarr",
+        "mask_zarr": "sample_dir/<signal_ch>_mask.zarr",
+        "atlas_label_zarr": "sample_dir/upsampled_atlas_label.zarr",
+        "output_dir": "sample_dir/visualization/region_stats"
       }
     },
     {

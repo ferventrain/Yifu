@@ -202,7 +202,7 @@ def render_density_heatmap(tissue_volumes: dict[int, float], leaf_by_id: dict[in
         sys.executable, "-m", "pipeline_modules.tubule_reconstruction.vessel_region_density_heatmap",
         "--density_csv", str(density_csv),
         "--output_dir", str(heat_dir),
-        "--cfg", str(Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev1_updated.CSV"),
+        "--cfg", str(Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"),
         "--dpi", "300",
         "--cmap", "inferno",
         "--vmax_percent", f"{vmax:.2f}",
@@ -227,10 +227,18 @@ def fmt_um3_to_mm3(value):
     return None if value is None else float(value) / 1e9
 
 
+def load_canonical_volumes(json_path: Path) -> dict[int, float]:
+    """Per-region atlas-canonical tissue volumes (um3) keyed by region id."""
+    data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    return {int(label): float(volume) for label, volume in data["region_volume_um3"].items()}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Whole-brain + hippocampus vessel cohort report for one sample")
     parser.add_argument("--tubule-dir", required=True, help="Sample tubule_reconstruction directory")
     parser.add_argument("--label-zarr", default="", help="upsampled_atlas_label.zarr (optional)")
+    parser.add_argument("--canonical-volumes-json", default="",
+                        help="Atlas-canonical region volumes JSON; used when no label zarr is given")
     parser.add_argument("--sample-id", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--resolution-xyz", default="1.8,1.8,2.0")
@@ -264,9 +272,10 @@ def main() -> int:
     whole_vessel_vol = float(root_row.get("vessel_volume_um3") or 0.0)
     hpf_vessel_vol = float(hpf_row.get("vessel_volume_um3") or 0.0)
 
-    # --- label pass ---
+    # --- tissue volumes: sample label pass, or atlas-canonical fallback ---
     label_result = None
     tissue_volumes = None
+    canonical_mode = False
     if args.label_zarr:
         print(f"Label pass over {args.label_zarr} (stride {args.stride}) ...", flush=True)
         label_result = coarse_label_pass(Path(args.label_zarr), args.stride)
@@ -274,6 +283,12 @@ def main() -> int:
         whole_tissue_vol = float(sum(tissue_volumes.values()))
         hpf_tissue_vol = float(sum(vol for label, vol in tissue_volumes.items() if label in hpf_ids))
         print(f"  brain tissue {whole_tissue_vol/1e9:.1f} mm3 | HPF tissue {hpf_tissue_vol/1e9:.2f} mm3")
+    elif args.canonical_volumes_json:
+        canonical_mode = True
+        tissue_volumes = load_canonical_volumes(Path(args.canonical_volumes_json))
+        whole_tissue_vol = float(sum(tissue_volumes.values()))
+        hpf_tissue_vol = float(sum(vol for label, vol in tissue_volumes.items() if label in hpf_ids))
+        print(f"  canonical atlas tissue {whole_tissue_vol/1e9:.1f} mm3 | canonical HPF {hpf_tissue_vol/1e9:.2f} mm3")
     else:
         whole_tissue_vol = None
         hpf_tissue_vol = None

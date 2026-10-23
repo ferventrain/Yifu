@@ -13,25 +13,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import zarr
+
+from pipeline_modules.utils.parsing import parse_resolution_xyz
+from pipeline_modules.utils.zarr_io import open_zarr_array as open_zarr_dataset
 
 VERTEX_CHUNK = 3_000_000
 EDGE_CHUNK = 3_000_000
 LABEL_CHUNK_CACHE_SIZE = 64
-
-
-def parse_resolution_xyz(value):
-    return tuple(float(part) for part in str(value).split(","))
-
-
-def open_zarr_dataset(zarr_path, dataset_name="0"):
-    group = zarr.open(str(zarr_path), mode="r")
-    if dataset_name in group:
-        return group[dataset_name]
-    arrays = list(group.arrays())
-    if len(arrays) == 1:
-        return arrays[0][1]
-    raise ValueError(f"Dataset {dataset_name!r} not found in {zarr_path}")
 
 
 def grouped_reader(csv_path, usecols, chunksize):

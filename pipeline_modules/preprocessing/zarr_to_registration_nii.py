@@ -22,20 +22,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from pipeline_modules.utils.parsing import parse_resolution_xyz
 from pipeline_modules.utils.run_manifest import write_run_manifest
 from pipeline_modules.utils.zarr_io import open_zarr_array, read_zarr_attrs
 
 logger = logging.getLogger(__name__)
-
-
-def parse_resolution_xyz(resolution_text: str) -> tuple[float, float, float]:
-    parts = [part.strip() for part in str(resolution_text).split(",") if part.strip()]
-    if len(parts) != 3:
-        raise ValueError(f"Resolution must be x,y,z with 3 values: {resolution_text!r}")
-    values = tuple(float(part) for part in parts)
-    if any(value <= 0 for value in values):
-        raise ValueError(f"Resolution values must be positive: {resolution_text!r}")
-    return values
 
 
 def resolve_input_resolution_xyz(

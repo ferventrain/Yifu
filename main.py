@@ -430,13 +430,42 @@ def build_segmentation_command(seg_cfg, zarr_path, mask_zarr_path, probability_z
 
     if seg_method == "threshold":
         th_cfg = seg_cfg["threshold"]
-        return (
+        method = str(th_cfg.get("method", "global") or "global").strip().lower()
+        cmd = (
             f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.intensity_threshold_segmentor '
             f'--input_zarr "{zarr_path}" '
             f'--output_zarr "{mask_zarr_path}" '
             f'--threshold {th_cfg["value"]} '
-            f'--sigma {th_cfg["sigma"]}'
+            f'--sigma {th_cfg["sigma"]} '
+            f'--min_size {th_cfg.get("min_object_size", 10)} '
+            f'--output_mode "{th_cfg.get("output_mode", "binary")}"'
         )
+        if str(th_cfg.get("dataset_name", "0")) != "0":
+            cmd += f' --dataset_name "{th_cfg["dataset_name"]}"'
+        if method != "global":
+            cmd += f' --method "{method}"'
+        if method == "hysteresis":
+            if th_cfg.get("low") is not None:
+                cmd += f' --low {th_cfg["low"]}'
+            if th_cfg.get("high") is not None:
+                cmd += f' --high {th_cfg["high"]}'
+            if th_cfg.get("close_radius"):
+                cmd += f' --close_radius {int(th_cfg["close_radius"])}'
+            if th_cfg.get("slab_depth") and int(th_cfg["slab_depth"]) != 64:
+                cmd += f' --slab_depth {int(th_cfg["slab_depth"])}'
+        if method in ("percentile", "windowed"):
+            if th_cfg.get("percentile_method", "blend") != "blend":
+                cmd += f' --percentile_method "{th_cfg["percentile_method"]}"'
+            for key in ("clamp_lo", "clamp_hi", "floor", "pct_nudge", "thr_scale",
+                        "bright_local_p99", "bright_extra_nudge"):
+                if th_cfg.get(key) is not None:
+                    cmd += f' --{key} {th_cfg[key]}'
+            for key in ("window", "stride"):
+                if th_cfg.get(key) is not None:
+                    cmd += f' --{key} {int(th_cfg[key])}'
+            if th_cfg.get("clean_3d", False):
+                cmd += " --clean_3d"
+        return cmd
 
     if seg_method == "cfos_unet":
         model_cfg = seg_cfg["cfos_unet"]

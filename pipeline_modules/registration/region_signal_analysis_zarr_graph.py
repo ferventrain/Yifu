@@ -4,7 +4,6 @@ Zarr-native block-graph brain region signal analysis.
 """
 
 import argparse
-import ast
 import concurrent.futures
 import json
 import logging
@@ -15,10 +14,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import zarr
 from openpyxl.styles import Alignment, Font
 from scipy import ndimage
 from tqdm import tqdm
+
+from pipeline_modules.utils.parsing import parse_block_shape, parse_resolution_xyz
+from pipeline_modules.utils.region_csv import parse_acronym_text, parse_structure_id_path
+from pipeline_modules.utils.zarr_io import open_zarr_array as open_zarr_dataset
 
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
@@ -122,33 +124,7 @@ def parse_args():
 
 
 def parse_block_size(block_text):
-    if not str(block_text).strip():
-        return None
-    parts = [part.strip() for part in str(block_text).split(",") if part.strip()]
-    if len(parts) != 3:
-        raise ValueError(f"block_size must have 3 comma-separated integers, got: {block_text}")
-    block_size = tuple(int(part) for part in parts)
-    if any(size <= 0 for size in block_size):
-        raise ValueError(f"block_size values must be positive, got: {block_size}")
-    return block_size
-
-
-def parse_resolution_xyz(resolution_text):
-    parts = [part.strip() for part in str(resolution_text).split(",") if part.strip()]
-    if len(parts) != 3:
-        raise ValueError(f"resolution_xyz must have 3 comma-separated values, got: {resolution_text}")
-    resolution_xyz = tuple(float(part) for part in parts)
-    if any(value <= 0 for value in resolution_xyz):
-        raise ValueError(f"resolution_xyz values must be positive, got: {resolution_xyz}")
-    return resolution_xyz
-
-
-def open_zarr_dataset(path_like, dataset_name):
-    try:
-        from pipeline_modules.utils.zarr_io import open_zarr_array
-    except ImportError:
-        from ..utils.zarr_io import open_zarr_array
-    return open_zarr_array(path_like, dataset_name=dataset_name)
+    return parse_block_shape(block_text, allow_empty=True)
 
 
 def validate_zarr_inputs(mask_zarr, label_zarr, signal_zarr):
@@ -210,21 +186,6 @@ def build_boundary_mask(block_shape):
     mask[:, :, 0] = True
     mask[:, :, -1] = True
     return mask
-
-
-def parse_structure_id_path(path_text):
-    path_values = ast.literal_eval(str(path_text))
-    return [int(value) for value in path_values]
-
-
-def parse_acronym_text(acronym_text):
-    try:
-        acronym_values = ast.literal_eval(str(acronym_text))
-        if isinstance(acronym_values, list) and acronym_values:
-            return str(acronym_values[-1])
-    except Exception:
-        pass
-    return str(acronym_text)
 
 
 def load_region_tree(cfg_path):

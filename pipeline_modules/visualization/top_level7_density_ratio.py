@@ -11,7 +11,6 @@ contribute a remainder row for voxels annotated with the parent label itself.
 from __future__ import annotations
 
 import argparse
-import ast
 import re
 import sys
 from pathlib import Path
@@ -23,6 +22,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from pipeline_modules.utils.deliverable_paths import find_stats_workbook
+from pipeline_modules.utils.region_csv import (
+    parse_structure_id_path,
+    split_name_and_acronym as split_raw_name,
+)
 
 RANK_BY_CHOICES = ("weighted_log_ratio", "abs_log_ratio", "abs_count_diff")
 
@@ -48,28 +53,6 @@ def parse_figsize(value: str) -> tuple[float, float]:
     return width, height
 
 
-def find_density_excel(sample_dir: str | Path) -> Path:
-    sample_dir = Path(sample_dir)
-    if not sample_dir.exists() or not sample_dir.is_dir():
-        raise NotADirectoryError(f"Sample directory not found: {sample_dir}")
-
-    matches = sorted(
-        [
-            path
-            for path in sample_dir.glob("*.xlsx")
-            if path.name.lower().endswith("_result.xlsx")
-            and not path.name.startswith("~$")
-            and "coarse_region" not in path.name.lower()
-            and "level_ratio" not in path.name.lower()
-        ],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    if not matches:
-        raise FileNotFoundError(f"No density Excel workbook found in sample directory: {sample_dir}")
-    return matches[0]
-
-
 def find_two_sample_excels(root_dir: str | Path) -> tuple[Path, Path]:
     root_dir = Path(root_dir)
     if not root_dir.exists() or not root_dir.is_dir():
@@ -79,7 +62,7 @@ def find_two_sample_excels(root_dir: str | Path) -> tuple[Path, Path]:
     excels = []
     for sample_dir in sample_dirs:
         try:
-            excels.append(find_density_excel(sample_dir))
+            excels.append(find_stats_workbook(sample_dir))
         except FileNotFoundError:
             continue
 
@@ -88,13 +71,6 @@ def find_two_sample_excels(root_dir: str | Path) -> tuple[Path, Path]:
             f"Expected exactly 2 child sample folders with density Excel files under {root_dir}, found {len(excels)}."
         )
     return excels[0], excels[1]
-
-
-def split_raw_name(raw_name: str) -> tuple[str, str]:
-    if "," in raw_name:
-        base, acronym = raw_name.rsplit(",", 1)
-        return base.strip(), acronym.strip()
-    return raw_name.strip(), ""
 
 
 def load_structure_tree(csv_path: str | Path) -> tuple[dict[int, dict], int]:
@@ -110,11 +86,7 @@ def load_structure_tree(csv_path: str | Path) -> tuple[dict[int, dict], int]:
     nodes = {}
     for _, row in frame.iterrows():
         structure_id = int(row["id"])
-        path_text = row["structure_id_path"]
-        if isinstance(path_text, str):
-            path = [int(value) for value in ast.literal_eval(path_text)]
-        else:
-            path = [int(value) for value in list(path_text)]
+        path = parse_structure_id_path(row["structure_id_path"])
         base_name, acronym = split_raw_name(str(row["name"]))
         nodes[structure_id] = {
             "id": structure_id,

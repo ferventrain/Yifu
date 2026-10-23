@@ -5,9 +5,9 @@ import json
 import pandas as pd
 import pytest
 
+from pipeline_modules.utils.deliverable_paths import find_stats_workbook
 from pipeline_modules.visualization.region_group_signal_count import (
     build_region_group_signal_count_table,
-    find_density_excel,
     load_region_groups,
 )
 
@@ -110,11 +110,19 @@ def test_build_region_group_signal_count_table_sums_acronyms(tmp_path):
     assert by_group.loc["PFC", "sample"] == "sample_a"
 
 
-def test_find_density_excel_prefers_sample_named_result(tmp_path):
+def test_find_stats_workbook_prefers_standardized_then_legacy(tmp_path):
     sample_dir = tmp_path / "sample_b"
-    sample_dir.mkdir()
-    preferred = write_density_excel(sample_dir)
-    other = sample_dir / "newer_density.xlsx"
-    other.write_text("placeholder")
+    results = sample_dir / "results"
+    results.mkdir(parents=True)
+    legacy = sample_dir / "density_result.xlsx"
+    legacy.write_text("placeholder")
+    standard = results / "sample_b_ch1_brain_distribution_stats.xlsx"
+    standard.write_text("placeholder")
+    atlas_v2 = results / "sample_b_ch1_brain_distribution_stats_v2.xlsx"
+    atlas_v2.write_text("placeholder")
 
-    assert find_density_excel(sample_dir) == preferred
+    assert find_stats_workbook(sample_dir) == atlas_v2
+    atlas_v2.unlink()
+    assert find_stats_workbook(sample_dir) == standard
+    standard.unlink()
+    assert find_stats_workbook(sample_dir) == legacy

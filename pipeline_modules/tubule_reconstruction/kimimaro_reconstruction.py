@@ -14,6 +14,9 @@ import pandas as pd
 from scipy import ndimage
 from tqdm import tqdm
 
+from pipeline_modules.utils.parsing import parse_resolution_xyz
+from pipeline_modules.utils.zarr_io import open_zarr_array as open_zarr_dataset
+
 try:
     from pipeline_modules.tubule_reconstruction.config import default_chunk_workers
 except ImportError:  # running the file directly without project root on sys.path
@@ -221,26 +224,6 @@ DEFAULT_TEASAR_PARAMS = {
     "soma_invalidation_const": 300,
     "max_paths": None,
 }
-
-
-def open_zarr_dataset(path_like, dataset_name="0"):
-    try:
-        from pipeline_modules.utils.zarr_io import open_zarr_array
-    except ImportError:  # running the file directly without project root on sys.path
-        from ..utils.zarr_io import open_zarr_array
-    return open_zarr_array(path_like, dataset_name=dataset_name)
-
-
-def parse_resolution_xyz(resolution_text):
-    if isinstance(resolution_text, (tuple, list)):
-        if len(resolution_text) != 3:
-            raise ValueError(f"resolution_xyz must have 3 values, got: {resolution_text}")
-        return tuple(float(v) for v in resolution_text)
-
-    parts = [part.strip() for part in str(resolution_text).split(",") if part.strip()]
-    if len(parts) != 3:
-        raise ValueError(f"resolution_xyz must have 3 comma-separated values, got: {resolution_text}")
-    return tuple(float(part) for part in parts)
 
 
 def resolution_xyz_to_zyx(resolution_xyz):

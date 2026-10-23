@@ -26,7 +26,8 @@
 - `upsample_mask.py`
   低分辨率 mask 上采样到全分辨率 Zarr。
 - 单图像处理脚本
-  `tophat_background.py`、`rolling_ball_background.py`、`scattering_removal.py`、`median_filter.py`、`masked_clahe.py`。
+  `rolling_ball_background.py`、`median_filter.py`、`masked_clahe.py`（tophat 与 scattering removal
+  只通过 `preprocessor.py` 的 `apply_processing_steps` 使用）。
 
 当前还没有完成的 Agent-Native 能力：
 
@@ -356,9 +357,7 @@ python pipeline_modules/preprocessing/upsample_mask.py \
 ### 7.5 单张图像处理脚本
 
 ```bash
-python pipeline_modules/preprocessing/tophat_background.py input.tiff
 python pipeline_modules/preprocessing/rolling_ball_background.py input.tiff --radius 50
-python pipeline_modules/preprocessing/scattering_removal.py input.tiff --sigma 50 --weight 1.0
 python pipeline_modules/preprocessing/median_filter.py input.tiff --kernel_size 3
 python pipeline_modules/preprocessing/masked_clahe.py input.tiff --clip-limit 2.0 --grid-size 16
 python pipeline_modules/preprocessing/masked_clahe.py input.tiff --masked

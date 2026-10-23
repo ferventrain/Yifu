@@ -321,7 +321,7 @@ kimimaro view path/to/output/swc/skeleton_000000.swc
 - `skeleton_vertices.csv`：由 `--save_skeleton` 产出，必须包含 `skeleton_id / node_id / z_um / y_um / x_um`，可选 `radius_um`
 - `skeleton_edges.csv`：必须包含 `skeleton_id / source_node / target_node / edge_length_um` 和源点、终点的 `*_z_um / *_y_um / *_x_um`
 - `annotation_zarr`：已 registered 的 Allen label 体积，与 skeleton 的 um 坐标**共用原点**
-- `region CSV`：如 `pipeline_modules/registration/Region_Csv_Rev1_updated.CSV`
+- `region CSV`：如 `pipeline_modules/registration/Region_Csv_Rev2_updated.CSV`
 
 **关键假设**：skeleton CSV 的 um 坐标和 annotation Zarr 在同一物理坐标系，点通过 `floor(point_um / annotation_resolution_zyx)` 映射到体素。如果两者坐标原点不同，需要先做对齐。
 
@@ -359,7 +359,7 @@ python -m pipeline_modules.tubule_reconstruction.region_vessel_analysis `
   --annotation_zarr registered/annotation.zarr `
   --annotation_dataset_name 0 `
   --annotation_resolution_xyz 25,25,25 `
-  --cfg pipeline_modules/registration/Region_Csv_Rev1_updated.CSV `
+  --cfg pipeline_modules/registration/Region_Csv_Rev2_updated.CSV `
   --regions "CTX;HPF;Thalamus;315" `
   --output_dir out/region_vessels
 ```
@@ -386,7 +386,7 @@ result = analyze_regions_from_skeleton(
     branch_csv_path="out/vessel_branch_metrics.csv",
     mask_zarr_path="sample/ch1_mask.zarr",
     annotation_zarr_path="registered/annotation.zarr",
-    region_cfg_csv="pipeline_modules/registration/Region_Csv_Rev1_updated.CSV",
+    region_cfg_csv="pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
     regions=["CTX", "Hippocampal formation", 315],
     output_dir="out/region_vessels",
     annotation_resolution_xyz="25,25,25",
@@ -400,11 +400,6 @@ summary_df = result["summary_table"]
 - 否则先查 acronym，再查 full name；均不区分大小写
 - 如果一个字符串查询在同一层级上对应多个 id（歧义），会抛 `ValueError` 并建议改用 id
 - 找不到时抛 `KeyError`
-
-### 与 `check_region_coverage_zarr.py` 的区别
-
-`registration/check_region_coverage_zarr.py` 做的是“这个脑区在 label 体里有多少体素”的体素计数；
-`region_vessel_analysis.py` 做的是“这个脑区内血管骨架的长度 / 半径 / 分支拓扑”，侧重血管参数而非体素覆盖率。
 
 ---
 

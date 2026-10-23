@@ -4,8 +4,7 @@ Covers:
 - Pydantic config models (RegistrationCfg, AnalysisCfg)
 - layout_for_sample helper
 - export_json_schema / load_capability_manifest
-- Smoke tests for check_region_coverage helpers (load_region_tree, resolve_target_node)
-- Smoke test for merge_atlas_regions helpers (build_nearest_ancestor_mapping)
+- Smoke test for merge_atlas_regions helpers (load_region_tree, build_nearest_ancestor_mapping)
 """
 
 from __future__ import annotations
@@ -209,12 +208,11 @@ class TestExportAndManifest:
 
         manifest = load_capability_manifest()
         assert manifest["module"] == "registration"
-        assert len(manifest["entrypoints"]) == 6
+        assert len(manifest["entrypoints"]) == 5
         entry_ids = {e["id"] for e in manifest["entrypoints"]}
         assert "run_full_pipeline" in entry_ids
         assert "analyze_zarr_graph" in entry_ids
         assert "convert_atlas_label_to_hemisphere" in entry_ids
-        assert "check_region_coverage" in entry_ids
         assert "merge_atlas_regions" in entry_ids
         assert "run_spinal_segment_analysis" in entry_ids
 

@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import tifffile
 
+from pipeline_modules.registration.region_query import resolve_region_subtree
 from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset
-from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
-    _collect_subtree_ids,
-    load_region_tree_with_lookups,
-    resolve_region_query,
+from pipeline_modules.utils.parsing import (
+    parse_block_shape as _parse_block_shape,
+    sanitize_slug as _sanitize_slug,
 )
 from pipeline_modules.utils.sample_layout import SampleLayout
 from pipeline_modules.visualization.heatmap import resolve_sample_stack_defaults
@@ -27,24 +26,8 @@ DEFAULT_REGION_CFG = (
 )
 
 
-def _sanitize_slug(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
-    return slug.strip("_") or "region"
-
-
-def _parse_block_shape(value: str) -> tuple[int, int, int]:
-    parts = [int(part.strip()) for part in str(value).split(",") if part.strip()]
-    if len(parts) != 3:
-        raise ValueError(f"block_shape must be z,y,x with three integers, got: {value}")
-    if any(part <= 0 for part in parts):
-        raise ValueError(f"block_shape values must be positive, got: {parts}")
-    return tuple(parts)  # type: ignore[return-value]
-
-
 def resolve_region_subtree_ids(region_query: str, *, cfg_path: str | Path) -> tuple[set[int], str, str]:
-    nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(cfg_path)
-    node = resolve_region_query(region_query, nodes_by_id, acronym_to_ids, name_to_ids)
-    subtree_ids = set(_collect_subtree_ids(node))
+    subtree_ids, node, _nodes_by_id = resolve_region_subtree(region_query, cfg_path)
     slug = _sanitize_slug(node.get("acronym") or node.get("name") or str(node["id"]))
     display_name = str(node.get("name") or slug)
     return subtree_ids, slug, display_name

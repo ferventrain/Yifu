@@ -51,6 +51,43 @@ def brain_distribution_stats_xlsx(sample_dir: str | Path, channel: str) -> Path:
     return results_dir(sample_dir) / f"{slug}_{channel_token}_brain_distribution_stats.xlsx"
 
 
+def find_stats_workbook(sample_dir: str | Path) -> Path:
+    """Newest region-stats workbook for one sample.
+
+    Order: atlas-v2 standard (results/*_brain_distribution_stats_v2.xlsx),
+    main.py standard (results/*_brain_distribution_stats.xlsx), then legacy
+    root-level *_result.xlsx from pre-results runs.
+    """
+    sample_dir = Path(sample_dir)
+    if not sample_dir.is_dir():
+        raise NotADirectoryError(f"Sample directory not found: {sample_dir}")
+    searches = [
+        (sample_dir / "results", "*_brain_distribution_stats_v2.xlsx"),
+        (sample_dir / "results", "*_brain_distribution_stats.xlsx"),
+        (sample_dir, "*_result.xlsx"),
+    ]
+    for directory, pattern in searches:
+        matches = sorted(
+            (path for path in directory.glob(pattern) if not path.name.startswith("~$")),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if matches:
+            return matches[0]
+    raise FileNotFoundError(
+        f"No region stats workbook under {sample_dir}: expected "
+        "results/*_brain_distribution_stats[_v2].xlsx or a legacy *_result.xlsx"
+    )
+
+
+def has_stats_workbook(sample_dir: str | Path) -> bool:
+    try:
+        find_stats_workbook(sample_dir)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
 def spinal_segment_stats_xlsx(sample_dir: str | Path, channel: str) -> Path:
     channel_token = normalize_channel(channel)
     slug = sample_slug(sample_dir)

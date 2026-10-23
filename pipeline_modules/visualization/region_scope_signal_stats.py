@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from pipeline_modules.registration.region_query import resolve_region_subtree
 from pipeline_modules.registration.region_signal_analysis_zarr_graph import (
     aggregate_final_region_stats,
     build_binary_mask,
@@ -24,11 +25,7 @@ from pipeline_modules.registration.region_signal_analysis_zarr_graph import (
     validate_zarr_inputs,
 )
 from pipeline_modules.segmentation.zarr_utils import open_zarr_dataset as open_seg_zarr_dataset
-from pipeline_modules.tubule_reconstruction.region_vessel_analysis import (
-    _collect_subtree_ids,
-    load_region_tree_with_lookups,
-    resolve_region_query,
-)
+from pipeline_modules.utils.parsing import parse_block_shape, parse_resolution_xyz
 from pipeline_modules.utils.sample_layout import SampleLayout
 from pipeline_modules.visualization.heatmap import resolve_sample_stack_defaults
 from pipeline_modules.visualization.region_mip_export import DEFAULT_REGION_CFG
@@ -38,9 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_region_subtree_ids(region_query: str, *, cfg_path: str | Path) -> tuple[set[int], str, str, dict[int, dict[str, Any]]]:
-    nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(cfg_path)
-    node = resolve_region_query(region_query, nodes_by_id, acronym_to_ids, name_to_ids)
-    subtree_ids = set(_collect_subtree_ids(node))
+    subtree_ids, node, nodes_by_id = resolve_region_subtree(region_query, cfg_path)
     slug = str(node.get("acronym") or node.get("name") or node["id"]).strip()
     display_name = str(node.get("name") or slug)
     nodes = {
@@ -53,23 +48,6 @@ def resolve_region_subtree_ids(region_query: str, *, cfg_path: str | Path) -> tu
         if int(region_id) in nodes_by_id
     }
     return subtree_ids, slug, display_name, nodes
-
-
-def _parse_resolution_xyz(value: str) -> tuple[float, float, float]:
-    parts = [float(part.strip()) for part in str(value).split(",") if part.strip()]
-    if len(parts) != 3:
-        raise ValueError(f"resolution_xyz must be x,y,z, got: {value}")
-    return parts[0], parts[1], parts[2]
-
-
-def _parse_block_shape(value: str) -> tuple[int, int, int] | None:
-    text = str(value).strip()
-    if not text:
-        return None
-    parts = [int(part.strip()) for part in text.split(",") if part.strip()]
-    if len(parts) != 3:
-        raise ValueError(f"block_shape must be z,y,x, got: {value}")
-    return parts[0], parts[1], parts[2]
 
 
 def _gate_mask_to_scope(
@@ -443,12 +421,12 @@ def main(argv: list[str] | None = None) -> int:
         cfg_path=args.cfg,
         config_path=args.config or None,
         dataset_name=args.dataset_name,
-        block_shape=_parse_block_shape(args.block_shape),
+        block_shape=parse_block_shape(args.block_shape, allow_empty=True),
         foreground_mode=args.foreground_mode,
         foreground_label=int(args.foreground_label),
         min_voxels=int(args.min_voxels),
         pass1_workers=int(args.pass1_workers),
-        resolution_xyz=_parse_resolution_xyz(args.resolution_xyz),
+        resolution_xyz=parse_resolution_xyz(args.resolution_xyz),
         include_signal_count=not bool(args.skip_signal_count),
         output_dir=args.output_dir or None,
         keep_tmp=bool(args.keep_tmp),

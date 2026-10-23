@@ -59,12 +59,28 @@ class _ModelMixin:
 @dataclass(frozen=True)
 class ThresholdSegmentationCfg(_ModelMixin):
     apply: bool = True
+    method: str = "global"
     value: str = "otsu"
     sigma: float = 0.0
     min_object_size: int = 10
     output_mode: str = "binary"
     dataset_name: str = "0"
     process_existing_only: bool = False
+    low: float | None = None
+    high: float | None = None
+    close_radius: int = 0
+    slab_depth: int = 64
+    percentile_method: str = "blend"
+    clamp_lo: float | None = None
+    clamp_hi: float | None = None
+    window: int | None = None
+    stride: int | None = None
+    floor: float | None = None
+    pct_nudge: float | None = None
+    thr_scale: float | None = None
+    bright_local_p99: float | None = None
+    bright_extra_nudge: float | None = None
+    clean_3d: bool = False
 
 
 @dataclass(frozen=True)

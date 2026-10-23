@@ -9,7 +9,6 @@ complete grey-matter coverage with biologically meaningful divisions.
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 import json
 import logging
@@ -17,6 +16,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+from pipeline_modules.utils.region_csv import (
+    parse_acronym_text,
+    parse_structure_id_path,
+    split_name_and_acronym,
+)
 
 try:
     from pipeline_modules.utils.errors import ErrorCode, PipelineError
@@ -202,29 +207,6 @@ def parse_args():
         help="Emit NDJSON log records to stderr instead of plain text",
     )
     return parser.parse_args()
-
-
-def parse_structure_id_path(path_text: str) -> list[int]:
-    path_values = ast.literal_eval(str(path_text))
-    return [int(value) for value in path_values]
-
-
-def parse_acronym_text(acronym_text: str) -> str:
-    try:
-        acronym_values = ast.literal_eval(str(acronym_text))
-        if isinstance(acronym_values, list) and acronym_values:
-            return str(acronym_values[-1])
-    except Exception:
-        pass
-    return str(acronym_text)
-
-
-def split_name_and_acronym(name_text: str) -> tuple[str, str]:
-    name_text = str(name_text).strip()
-    if "," not in name_text:
-        return name_text, ""
-    base_name, suffix = name_text.rsplit(",", 1)
-    return base_name.strip(), suffix.strip()
 
 
 def load_region_tree(cfg_path: str | Path) -> dict[int, dict]:

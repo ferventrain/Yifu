@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 
+from pipeline_modules.utils.deliverable_paths import find_stats_workbook
 from pipeline_modules.visualization.top_level7_density_ratio import (
     DEFAULT_PARCELLATION_CSV,
     build_default_parcellation,
@@ -81,7 +82,11 @@ class SampleInputs:
 
 def find_sample_workbook(sample_dir: str | Path) -> Path:
     sample_dir = Path(sample_dir)
-    candidates = sorted(sample_dir.glob("results/*.xlsx")) + sorted(sample_dir.glob("*_result.xlsx"))
+    try:
+        preferred = find_stats_workbook(sample_dir)
+    except FileNotFoundError:
+        preferred = None
+    candidates = ([preferred] if preferred else []) + sorted(sample_dir.glob("results/*.xlsx")) + sorted(sample_dir.glob("*_result.xlsx"))
     for path in candidates:
         if path.name.startswith("~$"):
             continue

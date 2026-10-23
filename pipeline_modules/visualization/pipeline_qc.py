@@ -72,7 +72,9 @@ def _label_contour(presence: np.ndarray) -> np.ndarray:
 def _read_root_stats(results_dir: Path) -> dict | None:
     import openpyxl
 
-    paths = sorted(results_dir.glob("*_brain_distribution_stats.xlsx"))
+    paths = sorted(results_dir.glob("*_brain_distribution_stats_v2.xlsx"))
+    if not paths:
+        paths = sorted(results_dir.glob("*_brain_distribution_stats.xlsx"))
     if not paths:
         return None
     workbook = openpyxl.load_workbook(paths[0], read_only=True, data_only=True)
