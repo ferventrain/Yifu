@@ -44,7 +44,11 @@ mlruns/
 node_modules/
 package.json
 package-lock.json
-.zcode/
+.zcode/*
+!.zcode/skills/
+.zcode/skills/*
+!.zcode/skills/yifu-develop/
+!.zcode/skills/yifu-work/
 
 # Local one-off helper/run scripts never belong in the repo
 _*.py
