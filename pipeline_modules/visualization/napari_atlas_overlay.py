@@ -424,7 +424,7 @@ def make_atlas_overlay_widget(
         import dask.array as da
         import zarr
 
-        arr = da.from_zarr(store=str(state["label_zarr"] / str(level))).transpose(2, 1, 0)
+        arr = da.from_zarr(str(state["label_zarr"] / str(level))).transpose(2, 1, 0)
         if ref is not None:
             scale = match_label_scale(
                 tuple(float(v) for v in ref.scale), tuple(ref.data.shape), arr.shape,
