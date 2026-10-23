@@ -576,7 +576,7 @@ def main(argv=None) -> int:
 
     import napari
 
-    viewer = napari.CurrentViewer() or napari.Viewer()
+    viewer = napari.current_viewer() or napari.Viewer()
     widget = make_atlas_overlay_widget(
         viewer, label_zarr=label_zarr, region_csv=args.region_csv, label_scale_zyx=scale,
     )
