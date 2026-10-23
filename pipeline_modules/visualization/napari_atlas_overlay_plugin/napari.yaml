@@ -1,0 +1,10 @@
+name: napari-atlas-overlay
+display_name: Atlas Overlay
+contributions:
+  commands:
+    - id: napari-atlas-overlay.make_atlas_overlay_widget
+      title: Atlas overlay (image + atlas label + region search)
+      python_name: napari_atlas_overlay_plugin:make_atlas_overlay_widget
+  widgets:
+    - command: napari-atlas-overlay.make_atlas_overlay_widget
+      display_name: Atlas overlay

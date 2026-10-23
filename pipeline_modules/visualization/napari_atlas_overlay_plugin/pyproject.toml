@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-atlas-overlay"
+version = "0.1.0"
+description = "napari dock widget: atlas label overlay that follows any 3D image layer (neurofly etc.) with region search and click-to-jump."
+requires-python = ">=3.8"
+dependencies = [
+    "napari",
+    "numpy",
+    "zarr",
+    "dask",
+    "qtpy",
+]
+
+[project.entry-points."napari.manifest"]
+napari-atlas-overlay = "napari_atlas_overlay_plugin:napari.yaml"
+
+[tool.setuptools]
+packages = ["napari_atlas_overlay_plugin"]
+
+[tool.setuptools.package-dir]
+napari_atlas_overlay_plugin = "."
+
+[tool.setuptools.package-data]
+napari_atlas_overlay_plugin = ["napari.yaml"]
