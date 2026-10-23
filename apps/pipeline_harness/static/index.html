@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Yifu 流水线监控台</title>
-  <link rel="stylesheet" href="/styles.css?v=17" />
+  <link rel="stylesheet" href="/styles.css?v=18" />
 </head>
 <body>
   <header class="app-header">
@@ -41,8 +41,9 @@
           <button type="submit" class="btn primary">开始分析</button>
         </form>
         <button type="button" id="stage-times-btn" class="btn ghost">环节耗时</button>
+        <button type="button" id="analytics-btn" class="btn ghost">数据分析</button>
       </div>
-      <p class="hint">看板按实验批分组；样本行内选 config 开始（断点自动续跑，补跑放 config_1.json）。批头部最右侧 P0–P3 设项目紧急度，P 高自动置顶（再点一次取消）。样本卡"归档"会删除 zarr/原始 ims/transforms（保留 result、visualization、qc 和小文件）并把目录移入 _archived。刷新页面不会启动任何任务；开始、保存笔记、归档、取消是显式操作。</p>
+      <p class="hint">看板按实验批分组；样本行内选 config 开始（断点自动续跑，补跑放 config_1.json）。批头部最右侧 P0–P3 设项目紧急度，P 高自动置顶（再点一次取消）。样本卡"归档"会删除 zarr/原始 ims/transforms（保留 result、visualization、qc 和小文件）并把目录移入 _archived。刷新页面不会启动任何任务；开始、归档、取消是显式操作。</p>
       <p id="form-error" class="error-banner hidden"></p>
       <div class="board-layout">
         <div id="job-list" class="job-list board-column"></div>
@@ -59,6 +60,50 @@
     <div id="stage-body" class="stage-body"></div>
   </dialog>
 
+  <dialog id="analytics-dialog" class="log-dialog analytics-dialog">
+    <div class="log-head">
+      <strong>数据分析</strong>
+      <div class="analytics-tabs" id="analytics-tabs">
+        <button type="button" class="an-tab active" data-tab="overview">总览</button>
+        <button type="button" class="an-tab" data-tab="stages">环节耗时</button>
+        <button type="button" class="an-tab" data-tab="compare">对比</button>
+        <button type="button" class="an-tab" data-tab="resources">资源</button>
+      </div>
+      <button type="button" id="analytics-close" class="btn">关闭</button>
+    </div>
+    <div class="analytics-body">
+      <p id="analytics-meta" class="stage-meta analytics-meta"></p>
+      <section class="an-pane" data-pane="overview">
+        <div id="an-kpis" class="an-kpis"></div>
+        <div class="an-grid">
+          <div class="an-card"><div id="an-daily-runs" class="an-chart"></div></div>
+          <div class="an-card"><div id="an-daily-hours" class="an-chart"></div></div>
+        </div>
+      </section>
+      <section class="an-pane hidden" data-pane="stages">
+        <div class="an-grid an-grid-wide">
+          <div class="an-card"><div id="an-stage-bars" class="an-chart an-chart-tall"></div></div>
+          <div class="an-card"><div id="an-heatmap" class="an-chart an-chart-tall"></div></div>
+        </div>
+      </section>
+      <section class="an-pane hidden" data-pane="compare">
+        <div class="an-grid">
+          <div class="an-card"><div id="an-profile-box" class="an-chart"></div></div>
+          <div class="an-card"><div id="an-batch-rates" class="an-chart"></div></div>
+        </div>
+        <div class="an-grid an-grid-wide">
+          <div class="an-card"><div id="an-sample-runs" class="an-chart"></div></div>
+        </div>
+      </section>
+      <section class="an-pane hidden" data-pane="resources">
+        <div class="an-grid">
+          <div class="an-card"><div id="an-mem-bars" class="an-chart"></div></div>
+          <div class="an-card"><div id="an-wait-trend" class="an-chart"></div></div>
+        </div>
+      </section>
+    </div>
+  </dialog>
+
   <dialog id="log-dialog" class="log-dialog">
     <div class="log-head">
       <strong id="log-title">日志</strong>
@@ -67,6 +112,7 @@
     <pre id="log-body" class="log-body"></pre>
   </dialog>
 
-  <script src="/app.js?v=20"></script>
+  <script src="/echarts.min.js?v=1"></script>
+  <script src="/app.js?v=22"></script>
 </body>
 </html>

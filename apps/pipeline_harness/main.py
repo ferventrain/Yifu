@@ -41,7 +41,7 @@ from pipeline_modules.harness.worker import (
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 
 STATIC_DIR = APP_DIR / "static"
-ASSET_VERSION = "17"
+ASSET_VERSION = "18"
 
 def _resolve_pipeline_python() -> str | None:
     for key in ("YIFU_PYTHON", "YIFU_PYTHON_EXE"):
@@ -72,13 +72,6 @@ class AddJobBody(BaseModel):
 
 class OpenPathBody(BaseModel):
     path: str = Field(..., min_length=1)
-
-
-class ProjectNotesBody(BaseModel):
-    sample_dir: str = Field(..., min_length=1)
-    requirements: str | None = None
-    retro: str | None = None
-    append_note: str | None = Field(None, max_length=8000)
 
 
 @app.exception_handler(PipelineError)
@@ -182,7 +175,7 @@ def api_projects() -> dict[str, Any]:
     """Project board: jobs grouped by sample (项目) -> parent dir (batch).
 
     Read-only like /api/jobs — grouping plus small reads from the sample dir
-    (notes file, config list, newest run manifest). Never starts anything.
+    (config list, newest run manifest). Never starts anything.
     Batches under the active dir are marked ``under_active``; project order
     honours the saved P0-P3 priorities (pm_board.json); estimates are
     config-driven from run-manifest stage medians; ``resources`` carries the
@@ -314,47 +307,13 @@ def api_stage_times() -> dict[str, Any]:
     return collect_stage_times(store.root, store.active)
 
 
-@app.post("/api/projects/notes")
-def api_project_notes(body: ProjectNotesBody) -> dict[str, Any]:
-    """Write project notes (<batch>/pm_project.json) — an explicit POST,
-    like submitting a job; GET refreshes stay side-effect free.
+@app.get("/api/analytics")
+def api_analytics() -> dict[str, Any]:
+    """Read-only aggregated run/manifest stats for the 数据分析 charts
+    (cached 5 min, same policy as /api/stage-times)."""
+    from apps.pipeline_harness.projects import collect_analytics
 
-    ``sample_dir`` may be a sample dir (notes go to its parent batch) or a
-    batch dir directly: a dir holding config*.json is a SAMPLE -> its parent.
-    """
-    from apps.pipeline_harness.projects import write_project_notes
-
-    target = Path(body.sample_dir).expanduser()
-    try:
-        target = target.resolve()
-    except OSError as exc:
-        raise PipelineError(ErrorCode.ARGUMENT_INVALID, str(exc)) from exc
-    if not is_under(target, store.root):
-        raise PipelineError(
-            ErrorCode.ARGUMENT_INVALID,
-            f"路径不在分析根目录内: {target}",
-            context={"path": str(target), "root": str(store.root)},
-        )
-    if not target.is_dir():
-        raise PipelineError(
-            ErrorCode.INPUT_NOT_FOUND,
-            f"目录不存在: {target}",
-            context={"path": str(target)},
-        )
-    if any(target.glob("config*.json")):
-        target = target.parent
-    if body.requirements is None and body.retro is None and not body.append_note:
-        raise PipelineError(
-            ErrorCode.ARGUMENT_INVALID,
-            "至少提供 requirements / retro / append_note 之一",
-        )
-    state = write_project_notes(
-        target,
-        requirements=body.requirements,
-        retro=body.retro,
-        append_note=body.append_note,
-    )
-    return {"sample_dir": str(target), "notes": state}
+    return collect_analytics(store.root, store.active)
 
 
 @app.post("/api/jobs")

@@ -1,4 +1,4 @@
-"""Tests for the project board: /api/projects grouping and notes POST."""
+"""Tests for the project board: /api/projects grouping and /api/analytics."""
 
 from __future__ import annotations
 
@@ -92,36 +92,50 @@ def test_project_status_follows_newest_run_not_history(analysis_home: Path, monk
     assert len(project["error_history"]) == 1
 
 
-def test_projects_notes_post_and_roundtrip(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):
+def test_analytics_endpoint_aggregates_read_only(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("fastapi")
-    sample = _write_sample(analysis_home, "ot")
+    import apps.pipeline_harness.projects as projects
+
+    projects._STAGE_CACHE["payload"] = None
+    projects._ANALYTICS_CACHE["payload"] = None
+
+    batch = analysis_home / "YF20991001"
+    sample = _write_sample(batch, "ot")
+    manifest = {
+        "module": "segmentation.cfos_unet_inference",
+        "status": "completed",
+        "duration_seconds": 900.0,
+        "ended_at": "2026-10-09T12:00:00+00:00",
+    }
+    (sample / "qc").mkdir(exist_ok=True)
+    (sample / "qc" / "_run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
     store = ActiveStore()
-    store.add_job(sample)
+    job = store.add_job(sample)
+    job["status"] = "succeeded"
+    job["created_at"] = "2026-10-09T10:00:00+00:00"
+    job["started_at"] = "2026-10-09T11:00:00+00:00"
+    job["ended_at"] = "2026-10-09T12:00:00+00:00"
+    job["duration_s"] = 3600.0
+    store.save_job(job)
 
     import importlib
 
     monitor = importlib.import_module("apps.pipeline_harness.main")
     monkeypatch.setattr(monitor, "store", store)
+    payload = monitor.api_analytics()
 
-    body = monitor.ProjectNotesBody(
-        sample_dir=str(sample), requirements="OT 组 cfos 定量", retro="", append_note="首次提交"
-    )
-    result = monitor.api_project_notes(body)
-    assert result["notes"]["requirements"] == "OT 组 cfos 定量"
-    assert result["notes"]["log"][0]["text"] == "首次提交"
-
-    # notes surface in the projects payload — at the BATCH (project) level
-    payload = monitor.api_projects()
-    batch = payload["batches"][0]
-    assert batch["notes"]["requirements"] == "OT 组 cfos 定量"
-    assert batch["notes"]["log"][0]["text"] == "首次提交"
-    assert "notes" not in batch["projects"][0] or batch["projects"][0].get("notes") is None
-
-    # paths outside the analysis root are rejected
-    with pytest.raises(Exception):
-        monitor.api_project_notes(
-            monitor.ProjectNotesBody(sample_dir=str(Path(__file__).absolute()), requirements="x")
-        )
+    assert payload["jobs_scanned"] == 1
+    assert payload["kpi"]["total_runs"] == 1
+    assert payload["kpi"]["success_rate"] == 1.0
+    assert payload["kpi"]["queue_wait_median_s"] == 3600.0
+    assert payload["daily"][0]["date"] == "2026-10-09"
+    assert any(row["module"] == "segmentation.cfos_unet_inference" for row in payload["stages"])
+    heatmap = {row["sample"]: row for row in payload["heatmap"]}
+    assert heatmap["ot"]["batch"] == "YF20991001"
+    assert sum(heatmap["ot"]["bins"]) == 1
+    # a GET stays side-effect free: no worker was spawned, no job mutated
+    assert store.load_job(str(job["id"]))["status"] == "succeeded"
 
 
 def test_projects_get_never_starts_worker(analysis_home: Path, monkeypatch: pytest.MonkeyPatch):

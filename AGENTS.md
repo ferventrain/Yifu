@@ -38,10 +38,13 @@
 **看板用法**：
 1. 两级结构：项目（批=父目录）→ 样本卡；`_active` 下的批排前面，其余批展开排在后面（样式略暗）。
 2. 批头部最右侧 P0-P3 设项目紧急度（存 `_active/pm_board.json`，P 高置顶，再点取消）；样本卡：config 下拉 +
-   "开始/继续"（一键断点续跑）；"需求/复盘"笔记（存 `<样本>/pm_project.json`）；预计时长 chip；
+   "开始/继续"（一键断点续跑）；预计时长 chip；
    run 历史点击展开详情/QC 图/结果；"归档"删样本下 zarr/原始 ims/transforms（留 result*、visualization*、
    qc 和小文件）后把目录移入 `<root>/_archived`，并清掉该样本的任务记录与优先级。
 3. 工具栏"环节耗时"：全部 run manifest 聚合的各模块中位/均值耗时（剔除 incomplete 与 >3 天离群）。
+4. 工具栏"数据分析"（GET `/api/analytics`，只读、缓存 5 分钟、ECharts 本地渲染）：总览（每日 run 堆叠/机时趋势）、
+   环节耗时（模块中位+IQR/P95、样本×单次耗时热力图）、对比（profile 箱线、批完成/中断、样本成功率）、
+   资源（步骤峰值内存、排队等待趋势）。
 
 **不报错的要点**：
 1. 提交/启动 worker 一律用 **micromamba yifu env 的 python**——worker 解释器跟随提交者，系统 python 会拉起无依赖
@@ -50,7 +53,7 @@
    `YIFU_ANALYSIS_ROOT=S:/Arivis_Analysis YIFU_ACTIVE_DIR=S:/Arivis_Analysis/_active`。
 3. PM 启动（重启不杀任务；改后端需重启，改前端刷新 + Ctrl+F5）：
    `YIFU_ANALYSIS_ROOT=... micromamba run -n yifu python -m apps.pipeline_harness.main --port 8766`。
-4. 刷新/GET 永不启动任务；开始、保存笔记、归档、取消才是显式操作。运行中 external 任务显"失联"= 进程死了或心跳断了。
+4. 刷新/GET 永不启动任务；开始、归档、取消才是显式操作。运行中 external 任务显"失联"= 进程死了或心跳断了。
 5. 失败 run 的 manifest 会写 `status: incomplete`（含出错步骤），环节耗时统计自动排除。
 
 

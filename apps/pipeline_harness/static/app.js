@@ -29,6 +29,11 @@ const els = {
   stageBody: document.getElementById("stage-body"),
   stageClose: document.getElementById("stage-close"),
   stageBtn: document.getElementById("stage-times-btn"),
+  analyticsDialog: document.getElementById("analytics-dialog"),
+  analyticsBtn: document.getElementById("analytics-btn"),
+  analyticsClose: document.getElementById("analytics-close"),
+  analyticsTabs: document.getElementById("analytics-tabs"),
+  analyticsMeta: document.getElementById("analytics-meta"),
 };
 
 let openLogJobId = null;
@@ -36,8 +41,6 @@ const batchOpenState = new Map(); // batch name -> user-pinned open/closed
 const runOpenState = new Map(); // "<scope>::<id>" -> pinned open/closed
 const nodeCache = new Map(); // sample key -> live card element (focus protection)
 const batchNodes = new Map(); // batch key -> {node, fingerprint} (DOM reconciliation)
-const dirtyNotes = new Set(); // sample keys with unsaved note edits
-const batchNotesCache = new Map(); // batch name -> live notes node (edit pinning)
 let currentSampleOrder = []; // flat display order of sample_dirs
 let errorHoldUntil = 0;
 
@@ -169,9 +172,9 @@ function renderBoard(data) {
   }
 
   // DOM reconciliation: an unchanged batch keeps its node untouched; a changed
-  // batch swaps only its non-interacted project cards. The node a user is
-  // typing notes in (or has unsaved note edits in) is never detached —
-  // detaching resets focus, IME composition, and <details> open state.
+  // batch swaps only its non-interacted project cards. The card a user is
+  // typing in is never detached — detaching resets focus, IME composition,
+  // and <details> open state.
   // Only TEXT-INPUT widgets pin their card: a button click (run row, config
   // select's row...) must NOT pin, or the very click that toggles a row open
   // would freeze the card and the toggle would never render.
@@ -240,9 +243,7 @@ function reconcileBatch(batch, dim, focusedKey) {
   const entry = batchNodes.get(key);
   if (entry && entry.fingerprint === fingerprint && entry.node.isConnected) return;
 
-  const holdsUserState = batch.projects.some(
-    (p) => sampleKey(p.sample_dir) === focusedKey || dirtyNotes.has(sampleKey(p.sample_dir))
-  );
+  const holdsUserState = batch.projects.some((p) => sampleKey(p.sample_dir) === focusedKey);
   if (entry && entry.node.isConnected && holdsUserState) {
     updateBatchInPlace(entry.node, batch, dim, focusedKey);
     entry.fingerprint = fingerprint;
@@ -270,8 +271,8 @@ function updateBatchInPlace(node, batch, dim, focusedKey) {
     const key = sampleKey(project.sample_dir);
     kept.add(key);
     const old = oldCards.get(key);
-    // the card being typed in (or holding unsaved notes) stays untouched
-    if (old && (key === focusedKey || dirtyNotes.has(key))) continue;
+    // the card being typed in stays untouched
+    if (old && key === focusedKey) continue;
     const fresh = renderProject(project);
     if (old) old.replaceWith(fresh);
     else list.appendChild(fresh);
@@ -440,113 +441,6 @@ function batchHeader(batch) {
   return heading;
 }
 
-function renderBatchNotes(batch) {
-  // Project-level notes: 需求 / 复盘 as two separate entries + 记一笔
-  const notes = batch.notes || {};
-  const key = `batch::${batch.batch}`;
-  const holder = document.createElement("div");
-  holder.className = "batch-notes";
-  holder.dataset.batchKey = key;
-
-  const dirty = new Set(); // scopes with unsaved edits -> pin this node
-
-  const makeEntry = (scope, label, placeholder, rows, value) => {
-    const entryKey = `notes::${key}::${scope}`;
-    const box = document.createElement("details");
-    box.className = "notes";
-    box.open = runOpenState.get(entryKey) === true;
-    box.addEventListener("toggle", () => runOpenState.set(entryKey, box.open));
-    const summary = document.createElement("summary");
-    const renderPreview = () => {
-      const preview = (area.value || "").trim().split("\n")[0] || "点击填写";
-      summary.textContent = `${label}：${preview.slice(0, 80)}`;
-    };
-    const area = document.createElement("textarea");
-    area.rows = rows;
-    area.placeholder = placeholder;
-    area.value = value || "";
-    renderPreview();
-    area.addEventListener("input", () => dirty.add(scope));
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "btn";
-    saveBtn.textContent = "保存";
-    saveBtn.addEventListener("click", async () => {
-      saveBtn.disabled = true;
-      saveBtn.textContent = "保存中…";
-      try {
-        const body = { sample_dir: batch.batch_dir };
-        body[scope === "requirements" ? "requirements" : "retro"] = area.value;
-        await api("/api/projects/notes", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        dirty.delete(scope);
-        renderPreview();
-        showError(`${label}已保存`, 3000, "info");
-      } catch (error) {
-        showError(error.message, 6000);
-      }
-      saveBtn.disabled = false;
-      saveBtn.textContent = "保存";
-    });
-    box.append(summary, area, saveBtn);
-    return box;
-  };
-
-  holder.appendChild(
-    makeEntry("requirements", "需求", "分析需求（这个项目要做什么、对照组、交付物…）", 2, notes.requirements)
-  );
-  holder.appendChild(
-    makeEntry("retro", "复盘", "复盘（踩过的坑、失误、下次注意…）", 3, notes.retro)
-  );
-
-  const quickRow = document.createElement("div");
-  quickRow.className = "quick-note";
-  const quickInput = document.createElement("input");
-  quickInput.type = "text";
-  quickInput.placeholder = "记一笔（时间戳笔记），回车提交";
-  const quickBtn = document.createElement("button");
-  quickBtn.type = "button";
-  quickBtn.className = "btn";
-  quickBtn.textContent = "记一笔";
-  const submitQuick = async () => {
-    const text = quickInput.value.trim();
-    if (!text) return;
-    try {
-      await api("/api/projects/notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sample_dir: batch.batch_dir, append_note: text }),
-      });
-      quickInput.value = "";
-      await refresh();
-    } catch (error) {
-      showError(error.message, 6000);
-    }
-  };
-  quickBtn.addEventListener("click", submitQuick);
-  quickInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") submitQuick();
-  });
-  quickRow.append(quickInput, quickBtn);
-  holder.appendChild(quickRow);
-
-  const noteLog = document.createElement("div");
-  noteLog.className = "note-log";
-  for (const entry of (notes.log || []).slice(-3)) {
-    const line = document.createElement("p");
-    line.textContent = `${(entry.at || "").replace("T", " ").slice(0, 16)}  ${entry.text}`;
-    noteLog.appendChild(line);
-  }
-  holder.appendChild(noteLog);
-
-  // pin while editing: never rebuild a notes node with unsaved input
-  holder._isPinned = () => dirty.size > 0 || (isTextInput(document.activeElement) && holder.contains(document.activeElement));
-  return holder;
-}
-
 function renderBatch(batch) {
   const box = document.createElement("details");
   box.className = "batch" + (batch.priority != null ? ` has-p${batch.priority}` : "");
@@ -557,16 +451,6 @@ function renderBatch(batch) {
   box.open = userChoice != null ? userChoice : hasActive;
   box.addEventListener("toggle", () => batchOpenState.set(batch.batch, box.open));
   box.appendChild(batchHeader(batch));
-
-  // project-level notes (需求/复盘) sit above the sample list
-  const cachedNotes = batchNotesCache.get(batch.batch);
-  if (cachedNotes && cachedNotes._isPinned && cachedNotes._isPinned() && cachedNotes.isConnected) {
-    box.appendChild(cachedNotes);
-  } else {
-    const node = renderBatchNotes(batch);
-    batchNotesCache.set(batch.batch, node);
-    box.appendChild(node);
-  }
 
   const list = document.createElement("div");
   list.className = "batch-projects";
@@ -580,12 +464,12 @@ function renderBatch(batch) {
 function renderProject(project) {
   const key = sampleKey(project.sample_dir);
   const cached = nodeCache.get(key);
-  // Never swap a card holding TEXT-INPUT focus or unsaved note edits —
-  // that is what made notes lose focus/text every 1.5s poll. Button clicks
+  // Never swap a card holding TEXT-INPUT focus — detaching resets focus and
+  // IME composition. Button clicks
   // (run rows, toggles) must NOT pin: the state they change needs re-render.
   const inputFocused = cached && cached.isConnected && isTextInput(document.activeElement) &&
     cached.contains(document.activeElement);
-  if (inputFocused || (cached && cached.isConnected && dirtyNotes.has(key))) {
+  if (inputFocused) {
     return cached;
   }
 
@@ -701,8 +585,6 @@ function renderProject(project) {
   archiveBtn.addEventListener("click", () => archiveSample(project, archiveBtn));
   startRow.append(select, startBtn, openBtn, archiveBtn);
   card.appendChild(startRow);
-
-  // ---- notes moved UP to the project (batch) level; sample rows carry no notes
 
   // ---- error history (auto)
   if (project.error_history && project.error_history.length) {
@@ -1116,7 +998,7 @@ async function archiveSample(project, button) {
   const message =
     `归档 ${project.sample_name}，将删除以下 ${names.length} 项（zarr / 原始 ims / transforms / 完成标记）：\n` +
     `${shown || "（无）"}${more}\n` +
-    `保留 result*、visualization*、qc 及小文件（config、笔记、manifest、日志），目录移入 _archived。\n` +
+    `保留 result*、visualization*、qc 及小文件（config、manifest、日志），目录移入 _archived。\n` +
     `此操作不可撤销，确定继续？`;
   if (!window.confirm(message)) return;
   button.disabled = true;
@@ -1129,7 +1011,6 @@ async function archiveSample(project, button) {
     });
     const key = sampleKey(project.sample_dir);
     nodeCache.delete(key);
-    dirtyNotes.delete(key);
     showError(`已归档：清理 ${result.deleted_count} 项 → ${result.archived_to}`, 10000, "info");
   } catch (error) {
     button.disabled = false;
@@ -1203,3 +1084,399 @@ if (els.stageClose) {
 
 refresh();
 setInterval(refresh, POLL_MS);
+
+// -------------------------------------------------------------- analytics
+
+const AN_COLORS = {
+  ok: "#1f9d5c",
+  run: "#2b7fd4",
+  bad: "#d24a4a",
+  warn: "#c07a1d",
+  idle: "#8b98a6",
+  faint: "#e7ebf0",
+  text: "#1c242e",
+  muted: "#5c6b7a",
+};
+
+const anCharts = new Map(); // element id -> echarts instance
+const anRendered = new Set(); // tabs drawn for the current payload
+let analyticsData = null;
+let analyticsTab = "overview";
+
+function anChart(id, option) {
+  const el = document.getElementById(id);
+  if (!el || typeof echarts === "undefined") return null;
+  let chart = anCharts.get(id);
+  if (!chart || chart.isDisposed()) {
+    chart = echarts.init(el);
+    anCharts.set(id, chart);
+  }
+  chart.setOption(option, true);
+  return chart;
+}
+
+function anBaseGrid(left = 8, right = 16) {
+  return { left, right, top: 34, bottom: 8, containLabel: true };
+}
+
+function anAxis() {
+  return {
+    axisLine: { lineStyle: { color: "#d7dee7" } },
+    axisLabel: { color: AN_COLORS.muted, fontSize: 11 },
+    splitLine: { lineStyle: { color: AN_COLORS.faint } },
+  };
+}
+
+function renderErrorBarLayout(params, api) {
+  const categoryIndex = api.value(0);
+  const low = api.coord([api.value(1), categoryIndex]);
+  const high = api.coord([api.value(2), categoryIndex]);
+  const height = api.size([0, 1])[1] * 0.45;
+  return {
+    type: "group",
+    children: [
+      { type: "line", shape: { x1: low[0], y1: low[1], x2: high[0], y2: high[1] }, style: api.style() },
+      { type: "line", shape: { x1: low[0], y1: low[1] - height / 2, x2: low[0], y2: low[1] + height / 2 }, style: api.style() },
+      { type: "line", shape: { x1: high[0], y1: high[1] - height / 2, x2: high[0], y2: high[1] + height / 2 }, style: api.style() },
+    ],
+  };
+}
+
+function quartile(sorted, q) {
+  if (!sorted.length) return 0;
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+function boxStats(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const q1 = quartile(sorted, 0.25);
+  const q2 = quartile(sorted, 0.5);
+  const q3 = quartile(sorted, 0.75);
+  const iqr = q3 - q1;
+  const inliers = sorted.filter((v) => v >= q1 - 1.5 * iqr && v <= q3 + 1.5 * iqr);
+  return {
+    box: [q1, q2, q3],
+    whisker: [inliers[0] ?? sorted[0], inliers[inliers.length - 1] ?? sorted[sorted.length - 1]],
+    outliers: sorted.filter((v) => !inliers.includes(v)),
+  };
+}
+
+async function openAnalytics() {
+  els.analyticsDialog.showModal();
+  els.analyticsMeta.textContent = "统计中…";
+  try {
+    analyticsData = await api("/api/analytics");
+  } catch (error) {
+    els.analyticsMeta.textContent = `加载失败：${error.message}`;
+    return;
+  }
+  els.analyticsMeta.textContent =
+    `${analyticsData.jobs_scanned} 条 run 记录 · ${analyticsData.manifests_scanned} 个 run manifest（含归档）· ` +
+    `更新于 ${String(analyticsData.generated_at).replace("T", " ").slice(0, 16)}（缓存 5 分钟）`;
+  anRendered.clear();
+  renderAnalyticsTab();
+}
+
+function closeAnalytics() {
+  for (const chart of anCharts.values()) if (!chart.isDisposed()) chart.dispose();
+  anCharts.clear();
+  anRendered.clear();
+  analyticsData = null;
+  els.analyticsDialog.close();
+}
+
+function switchAnalyticsTab(name) {
+  analyticsTab = name;
+  for (const btn of els.analyticsTabs.querySelectorAll(".an-tab")) {
+    btn.classList.toggle("active", btn.dataset.tab === name);
+  }
+  for (const pane of els.analyticsDialog.querySelectorAll(".an-pane")) {
+    pane.classList.toggle("hidden", pane.dataset.pane !== name);
+  }
+  renderAnalyticsTab();
+  for (const chart of anCharts.values()) if (!chart.isDisposed()) chart.resize();
+}
+
+function renderAnalyticsTab() {
+  if (!analyticsData || anRendered.has(analyticsTab)) return;
+  anRendered.add(analyticsTab);
+  const d = analyticsData;
+  if (analyticsTab === "overview") renderAnalyticsOverview(d);
+  else if (analyticsTab === "stages") renderAnalyticsStages(d);
+  else if (analyticsTab === "compare") renderAnalyticsCompare(d);
+  else if (analyticsTab === "resources") renderAnalyticsResources(d);
+}
+
+function renderAnalyticsOverview(d) {
+  const kpi = d.kpi || {};
+  els.analyticsDialog.querySelectorAll("#an-kpis .an-kpi").forEach((node) => node.remove());
+  const fmtHours = (seconds) => (seconds ? `${(seconds / 3600).toFixed(1)} h` : "—");
+  const fmtPct = (value) => (value == null ? "—" : `${Math.round(value * 100)}%`);
+  const kpiItems = [
+    [`${kpi.runs_7d ?? 0} / ${kpi.runs_30d ?? 0}`, "近 7 / 30 天 run 数"],
+    [fmtPct(kpi.success_rate), "30 天成功率"],
+    [fmtHours(kpi.success_s_7d), "近 7 天成功机时"],
+    [kpi.queue_wait_median_s ? `${(kpi.queue_wait_median_s / 3600).toFixed(1)} h` : "—", "排队等待中位"],
+    [String(kpi.total_runs ?? 0), "在册 run 总数"],
+  ];
+  for (const [value, label] of kpiItems) {
+    const card = document.createElement("div");
+    card.className = "an-kpi";
+    const num = document.createElement("strong");
+    num.textContent = value;
+    const lab = document.createElement("span");
+    lab.textContent = label;
+    card.append(num, lab);
+    document.getElementById("an-kpis").appendChild(card);
+  }
+
+  const daily = d.daily || [];
+  const days = daily.map((row) => row.date.slice(5));
+  anChart("an-daily-runs", {
+    title: { text: "每日 run 数", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+    legend: { top: 4, right: 4, textStyle: { fontSize: 11 } },
+    grid: anBaseGrid(),
+    xAxis: { type: "category", data: days, ...anAxis() },
+    yAxis: { type: "value", minInterval: 1, ...anAxis() },
+    series: [
+      { name: "成功", type: "bar", stack: "runs", data: daily.map((r) => r.success), itemStyle: { color: AN_COLORS.ok } },
+      { name: "失败/失联", type: "bar", stack: "runs", data: daily.map((r) => r.failed), itemStyle: { color: AN_COLORS.bad } },
+      { name: "其他", type: "bar", stack: "runs", data: daily.map((r) => r.other), itemStyle: { color: AN_COLORS.idle } },
+    ],
+  });
+  anChart("an-daily-hours", {
+    title: { text: "每日机时（小时，按结束日）", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: { trigger: "axis" },
+    grid: anBaseGrid(),
+    xAxis: { type: "category", data: days, ...anAxis() },
+    yAxis: { type: "value", ...anAxis() },
+    series: [
+      {
+        name: "机时",
+        type: "line",
+        smooth: true,
+        areaStyle: { opacity: 0.15 },
+        data: daily.map((r) => Math.round((r.duration_s / 3600) * 10) / 10),
+        itemStyle: { color: AN_COLORS.run },
+      },
+    ],
+  });
+}
+
+function renderAnalyticsStages(d) {
+  const rows = (d.stages || []).slice().reverse(); // horizontal bars: slowest on top
+  anChart("an-stage-bars", {
+    title: { text: "各环节耗时：中位（IQR — P95）", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: {
+      trigger: "item",
+      formatter: (params) => {
+        const row = rows[params.dataIndex];
+        if (!row) return "";
+        return `<b>${row.module}</b><br/>中位 ${formatDuration(row.median_s)} · 均值 ${formatDuration(row.mean_s)}<br/>P25–P75 ${formatDuration(row.p25_s)} ~ ${formatDuration(row.p75_s)} · P95 ${formatDuration(row.p95_s)}<br/>样本 ${row.count} 次 · 累计 ${formatDuration(row.total_s)}`;
+      },
+    },
+    grid: anBaseGrid(10, 30),
+    xAxis: {
+      type: "value",
+      ...anAxis(),
+      axisLabel: { ...anAxis().axisLabel, formatter: (v) => `${(v / 3600).toFixed(v >= 3600 ? 0 : 1)}h` },
+    },
+    yAxis: { type: "category", data: rows.map((row) => row.module), ...anAxis(), axisLabel: { ...anAxis().axisLabel, fontSize: 10 } },
+    series: [
+      {
+        name: "中位耗时",
+        type: "bar",
+        data: rows.map((row) => Math.max(row.median_s, 1)),
+        itemStyle: { color: AN_COLORS.run },
+        barMaxWidth: 14,
+      },
+      {
+        name: "区间",
+        type: "custom",
+        renderItem: renderErrorBarLayout,
+        encode: { x: [1, 2], y: 0 },
+        data: rows.map((row, i) => [i, row.p25_s, row.p95_s]),
+        style: { stroke: AN_COLORS.warn, lineWidth: 2 },
+        z: 10,
+      },
+    ],
+  });
+
+  const heat = (d.heatmap || []).slice(0, 18).reverse();
+  const bins = d.hist_bins || [];
+  const cells = [];
+  heat.forEach((row, yIndex) => {
+    (row.bins || []).forEach((count, xIndex) => cells.push([xIndex, yIndex, count]));
+  });
+  const maxCount = cells.reduce((acc, cell) => Math.max(acc, cell[2]), 1);
+  anChart("an-heatmap", {
+    title: { text: "样本 × 单次耗时分布（格子=次数，含已归档）", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: {
+      formatter: (params) => {
+        const [xIndex, yIndex, count] = params.data;
+        const row = heat[yIndex];
+        return `<b>${row.sample}</b>（${row.batch} · ${row.profile_label}）<br/>单次 ${bins[xIndex]}：${count} 次<br/>累计 ${formatDuration(row.total_s)}`;
+      },
+    },
+    grid: { left: 10, right: 16, top: 40, bottom: 24, containLabel: true },
+    xAxis: { type: "category", data: bins, ...anAxis(), splitArea: { show: true } },
+    yAxis: { type: "category", data: heat.map((row) => row.sample), ...anAxis(), axisLabel: { ...anAxis().axisLabel, fontSize: 10 } },
+    visualMap: {
+      min: 0,
+      max: maxCount,
+      calculable: false,
+      orient: "horizontal",
+      right: 10,
+      top: 6,
+      itemWidth: 10,
+      itemHeight: 60,
+      inRange: { color: ["#f2f6fa", "#9dc3ea", "#2b7fd4", "#17539b"] },
+      textStyle: { fontSize: 10 },
+    },
+    series: [
+      {
+        type: "heatmap",
+        data: cells,
+        label: { show: true, fontSize: 9, formatter: (p) => (p.data[2] ? p.data[2] : "") },
+        emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.25)" } },
+      },
+    ],
+  });
+}
+
+function renderAnalyticsCompare(d) {
+  const profiles = (d.profiles || []).filter((p) => p.count > 0);
+  const stats = profiles.map((p) => boxStats(p.durations || []));
+  const scatter = [];
+  stats.forEach((st, i) => st.outliers.forEach((v) => scatter.push([i, v / 3600])));
+  anChart("an-profile-box", {
+    title: { text: "各流程整轮耗时分布（小时）", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: { trigger: "item" },
+    grid: anBaseGrid(),
+    xAxis: { type: "category", data: profiles.map((p) => `${p.label} (${p.count})`), ...anAxis() },
+    yAxis: { type: "value", name: "小时", ...anAxis() },
+    series: [
+      {
+        type: "boxplot",
+        itemStyle: { color: "#eaf2fb", borderColor: AN_COLORS.run },
+        data: stats.map((st) => [st.whisker[0] / 3600, st.box[0] / 3600, st.box[1] / 3600, st.box[2] / 3600, st.whisker[1] / 3600]),
+      },
+      { type: "scatter", symbolSize: 7, itemStyle: { color: AN_COLORS.warn }, data: scatter },
+    ],
+  });
+
+  const batches = (d.batches || []).slice(0, 12).reverse();
+  anChart("an-batch-rates", {
+    title: { text: "各批 manifest 完成 / 中断", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: {
+      trigger: "item",
+      formatter: (params) => {
+        const row = batches[params.dataIndex];
+        return `<b>${row.batch}</b><br/>完成 ${row.completed} · 中断 ${row.incomplete} · 成功率 ${Math.round((row.success_rate || 0) * 100)}%`;
+      },
+    },
+    legend: { top: 4, right: 4, textStyle: { fontSize: 11 } },
+    grid: anBaseGrid(10, 24),
+    xAxis: { type: "value", minInterval: 1, ...anAxis() },
+    yAxis: { type: "category", data: batches.map((row) => row.batch), ...anAxis(), axisLabel: { ...anAxis().axisLabel, fontSize: 10 } },
+    series: [
+      { name: "完成", type: "bar", stack: "m", data: batches.map((row) => row.completed), itemStyle: { color: AN_COLORS.ok } },
+      { name: "中断", type: "bar", stack: "m", data: batches.map((row) => row.incomplete), itemStyle: { color: AN_COLORS.bad } },
+    ],
+  });
+
+  const samples = (d.samples || []).slice(0, 20).reverse();
+  anChart("an-sample-runs", {
+    title: { text: "样本 run 次数（颜色=成功率）", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: {
+      trigger: "item",
+      formatter: (params) => {
+        const row = samples[params.dataIndex];
+        return `<b>${row.sample}</b>（${row.batch}）<br/>run ${row.runs} 次 · 失败/失联 ${row.failed} · 成功率 ${Math.round((row.success_rate || 0) * 100)}%`;
+      },
+    },
+    grid: anBaseGrid(10, 24),
+    xAxis: { type: "value", minInterval: 1, ...anAxis() },
+    yAxis: { type: "category", data: samples.map((row) => row.sample), ...anAxis(), axisLabel: { ...anAxis().axisLabel, fontSize: 10 } },
+    series: [
+      {
+        type: "bar",
+        barMaxWidth: 12,
+        data: samples.map((row) => ({
+          value: row.runs,
+          itemStyle: { color: row.success_rate >= 0.8 ? AN_COLORS.ok : row.success_rate >= 0.5 ? AN_COLORS.warn : AN_COLORS.bad },
+        })),
+      },
+    ],
+  });
+}
+
+function renderAnalyticsResources(d) {
+  const byStep = new Map();
+  for (const row of d.memory || []) {
+    byStep.set(row.step, [...(byStep.get(row.step) || []), row.peak_mem_mb]);
+  }
+  const memRows = [...byStep.entries()]
+    .map(([step, values]) => ({ step, median: values.sort((a, b) => a - b)[Math.floor(values.length / 2)], count: values.length }))
+    .sort((a, b) => b.median - a.median)
+    .slice(0, 14)
+    .reverse();
+  const capacity = d.capacity || {};
+  anChart("an-mem-bars", {
+    title: { text: `步骤峰值内存中位（CPU ${capacity.cpu ?? "?"} 核 / GPU ${capacity.gpu ?? "?"} 卡）`, left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: {
+      trigger: "item",
+      formatter: (params) => {
+        const row = memRows[params.dataIndex];
+        return `<b>${row.step}</b><br/>峰值中位 ${(row.median / 1024).toFixed(1)} GB · ${row.count} 次采样`;
+      },
+    },
+    grid: anBaseGrid(10, 24),
+    xAxis: { type: "value", name: "GB", ...anAxis() },
+    yAxis: { type: "category", data: memRows.map((row) => row.step), ...anAxis(), axisLabel: { ...anAxis().axisLabel, fontSize: 10 } },
+    series: [
+      {
+        type: "bar",
+        barMaxWidth: 12,
+        data: memRows.map((row) => Math.round((row.median / 1024) * 100) / 100),
+        itemStyle: { color: AN_COLORS.warn },
+      },
+    ],
+  });
+
+  const daily = d.daily || [];
+  anChart("an-wait-trend", {
+    title: { text: "排队等待中位（提交→开始，小时）", left: 4, textStyle: { fontSize: 13, color: AN_COLORS.text } },
+    tooltip: { trigger: "axis" },
+    grid: anBaseGrid(),
+    xAxis: { type: "category", data: daily.map((row) => row.date.slice(5)), ...anAxis() },
+    yAxis: { type: "value", ...anAxis() },
+    series: [
+      {
+        type: "line",
+        connectNulls: true,
+        data: daily.map((row) => (row.wait_median_s == null ? null : Math.round((row.wait_median_s / 3600) * 10) / 10)),
+        itemStyle: { color: AN_COLORS.run },
+        areaStyle: { opacity: 0.12 },
+      },
+    ],
+  });
+}
+
+if (els.analyticsBtn) els.analyticsBtn.addEventListener("click", openAnalytics);
+if (els.analyticsClose) els.analyticsClose.addEventListener("click", closeAnalytics);
+if (els.analyticsTabs) {
+  els.analyticsTabs.addEventListener("click", (event) => {
+    const btn = event.target.closest(".an-tab");
+    if (btn) switchAnalyticsTab(btn.dataset.tab);
+  });
+}
+window.addEventListener("resize", () => {
+  if (els.analyticsDialog && els.analyticsDialog.open) {
+    for (const chart of anCharts.values()) if (!chart.isDisposed()) chart.resize();
+  }
+});

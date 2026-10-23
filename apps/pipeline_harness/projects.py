@@ -4,8 +4,6 @@ A project = one sample directory; a batch = the sample's parent directory
 (experiment grouping). Everything here is READ-ONLY over existing job
 records/views plus a few small files in the sample dir:
 
-* ``<sample>/pm_project.json`` — human notes (requirements / retro / log),
-  edited via POST /api/projects/notes (the only writer);
 * ``config*.json`` in the sample dir — the run configs the card can start;
 * the newest ``_run_manifest.json`` within depth 2 — provenance summary.
 """
@@ -20,17 +18,14 @@ from typing import Any
 from pipeline_modules.harness.jsonio import read_json, utc_now_iso, write_json_atomic
 from pipeline_modules.harness.progress import planned_step_names
 
-NOTES_FILENAME = "pm_project.json"
-NOTES_SCHEMA_VERSION = "1"
-
 # ------------------------------------------------------------- archive (归档)
 #
 # Archive = strip the heavy intermediates from a finished sample, then move
 # the folder under <root>/_archived. Deleted: zarr stores (v2 group .zgroup /
 # v2 array .zarray / v3 zarr.json markers at the store root), completion
 # markers (*.done.json), raw ims/tiff, and the transforms folder. Kept:
-# result*/visualization* (deliverables), qc (复盘 evidence, tiny), and every
-# small file (config, notes, manifests, logs).
+# result*/visualization* (deliverables), qc (质量检查证据, tiny), and every
+# small file (config, manifests, logs).
 
 ARCHIVE_DIRNAME = "_archived"
 ARCHIVE_KEEP_DIR_PREFIXES = ("result", "visualization")
@@ -131,37 +126,6 @@ _MANIFEST_CANDIDATE_LIMIT = 60
 
 def _norm_key(path_value: str) -> str:
     return str(path_value).replace("\\", "/").rstrip("/").lower()
-
-
-def read_project_notes(project_dir: Path) -> dict[str, Any] | None:
-    """Project-level notes live at the batch dir: <batch>/pm_project.json."""
-    payload = read_json(Path(project_dir) / NOTES_FILENAME, default=None)
-    return payload if isinstance(payload, dict) else None
-
-
-def write_project_notes(
-    project_dir: Path,
-    *,
-    requirements: str | None = None,
-    retro: str | None = None,
-    append_note: str | None = None,
-) -> dict[str, Any]:
-    """Create/update ``<batch>/pm_project.json`` (the notes writer)."""
-    path = Path(project_dir) / NOTES_FILENAME
-    state = read_json(path, default=None) or {}
-    if not isinstance(state, dict):
-        state = {}
-    if requirements is not None:
-        state["requirements"] = str(requirements)
-    if retro is not None:
-        state["retro"] = str(retro)
-    if append_note:
-        entry = {"at": utc_now_iso(), "text": str(append_note)}
-        state.setdefault("log", []).append(entry)
-    state["schema_version"] = NOTES_SCHEMA_VERSION
-    state["updated_at"] = utc_now_iso()
-    write_json_atomic(path, state)
-    return state
 
 
 def list_sample_configs(sample_dir: Path) -> list[str]:
@@ -323,6 +287,15 @@ def _median(values: list[float]) -> float | None:
     if len(numbers) % 2:
         return numbers[mid]
     return (numbers[mid - 1] + numbers[mid]) / 2.0
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    """Nearest-rank percentile (0..1) over positive values."""
+    numbers = sorted(float(v) for v in values if v is not None and float(v) > 0)
+    if not numbers:
+        return None
+    index = min(len(numbers) - 1, max(0, int(round(q * (len(numbers) - 1)))))
+    return numbers[index]
 
 
 #: pipeline profiles for time estimates — vessel vs cfos(unet/threshold) vs
@@ -626,6 +599,104 @@ _MANIFEST_SCAN_LIMIT = 600
 _STAGE_MAX_DURATION_S = 3 * 86400.0
 
 
+def _is_sample_dir(path: Path) -> bool:
+    """A dir holding config*.json is a sample (the board's own rule)."""
+    try:
+        return any(path.glob("config*.json"))
+    except OSError:
+        return False
+
+
+def _iter_batch_dirs(root: Path, active_dir: Path) -> list[Path]:
+    """Dirs that may contain samples: active children, root children, root
+    grandchildren, and the batch dirs inside _archived."""
+    dirs: list[Path] = []
+
+    def append_all(parent: Path) -> None:
+        try:
+            dirs.extend(child for child in parent.iterdir() if child.is_dir() and not child.name.startswith(("_", ".")))
+        except OSError:
+            return
+
+    append_all(Path(active_dir))
+    append_all(Path(root))
+    for child in list(dirs):
+        append_all(child)
+    archived = Path(root) / ARCHIVE_DIRNAME
+    append_all(archived)
+    return list(dict.fromkeys(dirs))
+
+
+def _iter_manifest_entries(root: Path, active_dir: Path):
+    """Yield (manifest payload, sample Path) for every ``_run_manifest.json``
+    under the analysis root, attributed to the real sample dir.
+
+    Walking starts at batch-level dirs; subdirs of a non-sample batch that
+    carry no configs are treated as samples too (root tool folders), and a
+    manifest inside a result subdir (``<sample>/result_x/...``) is credited
+    to its top-level ancestor. Bounded, read-only."""
+    scanned: set[str] = set()
+    for start in _iter_batch_dirs(root, active_dir):
+        if len(scanned) >= _MANIFEST_SCAN_LIMIT:
+            break
+        if _is_sample_dir(start):
+            paths = [start]
+        else:
+            paths = [start]
+            try:
+                paths.extend(
+                    sub for sub in start.iterdir()
+                    if sub.is_dir() and not sub.name.startswith(("_", ".")) and not _is_sample_dir(sub)
+                )
+            except OSError:
+                pass
+        for path in paths:
+            for pattern in ("_run_manifest.json", "*/_run_manifest.json", "*/*/_run_manifest.json"):
+                try:
+                    matches = [manifest for manifest in path.glob(pattern) if manifest.is_file()]
+                except OSError:
+                    continue
+                for manifest in matches:
+                    if len(scanned) >= _MANIFEST_SCAN_LIMIT:
+                        break
+                    if str(manifest) in scanned:
+                        continue
+                    scanned.add(str(manifest))
+                    payload = read_json(manifest, default=None)
+                    if not isinstance(payload, dict):
+                        continue
+                    try:
+                        top = manifest.relative_to(path).parts[0]
+                        candidate = path / top
+                        attributed = candidate if candidate.is_dir() else path
+                    except (IndexError, OSError):
+                        attributed = path
+                    yield payload, attributed
+
+
+def _iter_progress_steps(active_dir: Path):
+    """Yield (step dict, job record) for every step recorded in
+    ``<active>/runs/*/progress.json`` (worker-side memory/duration samples)."""
+    runs_root = Path(active_dir) / "runs" if active_dir is not None else None
+    if runs_root is None or not runs_root.is_dir():
+        return
+    jobs_by_id: dict[str, dict[str, Any]] = {}
+    jobs_dir = Path(active_dir) / "jobs"
+    if jobs_dir.is_dir():
+        for job_file in jobs_dir.glob("*.json"):
+            record = read_json(job_file, default=None)
+            if isinstance(record, dict) and record.get("id"):
+                jobs_by_id[str(record["id"])] = record
+    for progress_file in sorted(runs_root.glob("*/progress.json")):
+        prog = read_json(progress_file, default=None)
+        if not isinstance(prog, dict):
+            continue
+        record = jobs_by_id.get(progress_file.parent.name, {})
+        for step in prog.get("steps") or []:
+            if isinstance(step, dict):
+                yield step, record
+
+
 def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
     """Aggregate per-module durations from run manifests (active + archive).
 
@@ -639,38 +710,12 @@ def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
     if _STAGE_CACHE["payload"] is not None and now - _STAGE_CACHE["at"] < _STAGE_CACHE_TTL_S:
         return _STAGE_CACHE["payload"]
 
-    sample_dirs: list[Path] = []
-    for parent in (root, active_dir):
-        try:
-            for child in parent.iterdir():
-                if not child.is_dir() or child.name.startswith("_") or child.name.startswith("."):
-                    continue
-                sample_dirs.append(child)
-                try:
-                    sample_dirs.extend(grand for grand in child.iterdir() if grand.is_dir() and not grand.name.startswith(("_", ".")))
-                except OSError:
-                    continue
-        except OSError:
-            continue
-    sample_dirs = list(dict.fromkeys(sample_dirs))
-
-    manifests: list[Path] = []
-    for sample in sample_dirs:
-        if len(manifests) >= _MANIFEST_SCAN_LIMIT:
-            break
-        for pattern in ("_run_manifest.json", "*/_run_manifest.json", "*/*/_run_manifest.json"):
-            try:
-                manifests.extend(manifest for manifest in sample.glob(pattern) if manifest.is_file())
-            except OSError:
-                continue
-
     by_module: dict[str, list[float]] = {}
     skipped_outliers = 0
     skipped_incomplete = 0
-    for manifest in manifests[:_MANIFEST_SCAN_LIMIT]:
-        payload = read_json(manifest, default=None)
-        if not isinstance(payload, dict):
-            continue
+    scanned = 0
+    for payload, _sample in _iter_manifest_entries(root, active_dir):
+        scanned += 1
         # legacy manifests (written only on success) have no status field;
         # anything explicitly marked incomplete is a failed/interrupted run
         if str(payload.get("status") or "").lower() == "incomplete":
@@ -688,20 +733,14 @@ def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
     # Peak memory per module: run manifests don't carry it; harness progress
     # files record it per step (worker samples the pipeline process tree).
     peaks_by_module: dict[str, list[float]] = {}
-    runs_root = active_dir / "runs" if active_dir is not None else None
-    if runs_root is not None and runs_root.is_dir():
-        for progress_file in sorted(runs_root.glob("*/progress.json")):
-            prog = read_json(progress_file, default=None)
-            if not isinstance(prog, dict):
-                continue
-            for step in prog.get("steps") or []:
-                if not isinstance(step, dict) or step.get("skipped"):
-                    continue
-                module = step.get("module")
-                peak = step.get("peak_mem_mb")
-                if not module or not isinstance(peak, (int, float)) or float(peak) <= 0:
-                    continue
-                peaks_by_module.setdefault(str(module), []).append(float(peak))
+    for step, _record in _iter_progress_steps(active_dir):
+        if step.get("skipped"):
+            continue
+        module = step.get("module")
+        peak = step.get("peak_mem_mb")
+        if not module or not isinstance(peak, (int, float)) or float(peak) <= 0:
+            continue
+        peaks_by_module.setdefault(str(module), []).append(float(peak))
 
     stages = []
     for module, durations in by_module.items():
@@ -720,13 +759,306 @@ def collect_stage_times(root: Path, active_dir: Path) -> dict[str, Any]:
     stages.sort(key=lambda item: item["median_s"], reverse=True)
     payload = {
         "stages": stages,
-        "manifests_scanned": min(len(manifests), _MANIFEST_SCAN_LIMIT),
+        "manifests_scanned": scanned,
         "outliers_skipped": skipped_outliers,
         "incomplete_skipped": skipped_incomplete,
         "generated_at": utc_now_iso(),
     }
     _STAGE_CACHE["at"] = now
     _STAGE_CACHE["payload"] = payload
+    return payload
+
+
+# ------------------------------------------------------------------ analytics
+#
+# One read-only aggregation feeding the 数据分析 charts. Job records answer
+# "what ran" (status/duration/wait); run manifests answer "which stage took
+# how long, where" (they also cover archived samples, whose job records are
+# deleted). 5-minute cache, same policy as collect_stage_times.
+
+_ANALYTICS_CACHE: dict[str, Any] = {"at": 0.0, "payload": None}
+_HIST_BINS_S = (300.0, 1800.0, 7200.0, 21600.0)
+_HIST_BIN_LABELS = ("< 5 分", "5-30 分", "30 分-2 时", "2-6 时", "≥ 6 时")
+
+
+def _norm_day(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text[:10] if len(text) >= 10 else None
+
+
+def _iso_epoch(value: Any) -> float | None:
+    from datetime import datetime
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _infer_profile_from_modules(modules: set[str]) -> str:
+    if any(str(module).startswith("tubule_reconstruction") for module in modules):
+        return "vessel"
+    if any("spinal" in str(module).lower() for module in modules):
+        return "spinal"
+    if "segmentation.spotiflow_inference" in modules:
+        return "cfos-spotiflow"
+    if "segmentation.cfos_unet_inference" in modules or "segmentation" in modules:
+        return "cfos-unet"
+    if "segmentation.intensity_threshold" in modules:
+        return "cfos-threshold"
+    return "generic"
+
+
+def collect_analytics(root: Path, active_dir: Path) -> dict[str, Any]:
+    """Aggregated stats for the analysis panel. Read-only, cached 5 min."""
+    import time as _time
+
+    now = _time.time()
+    if _ANALYTICS_CACHE["payload"] is not None and now - _ANALYTICS_CACHE["at"] < _STAGE_CACHE_TTL_S:
+        return _ANALYTICS_CACHE["payload"]
+
+    records: list[dict[str, Any]] = []
+    jobs_dir = Path(active_dir) / "jobs"
+    if jobs_dir.is_dir():
+        for job_file in sorted(jobs_dir.glob("*.json")):
+            record = read_json(job_file, default=None)
+            if isinstance(record, dict) and record.get("id"):
+                records.append(record)
+
+    def _ended_day(record: dict[str, Any]) -> str | None:
+        return _norm_day(record.get("ended_at") or record.get("created_at"))
+
+    status_counts: dict[str, int] = {}
+    daily: dict[str, dict[str, Any]] = {}
+    profile_map: dict[str, dict[str, Any]] = {}
+    by_sample: dict[str, dict[str, Any]] = {}
+    wait_values: list[float] = []
+    window_totals = {"runs": 0.0, "success_s": 0.0}
+    for record in records:
+        status = str(record.get("status") or "queued")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        started = _iso_epoch(record.get("started_at"))
+        ended = _iso_epoch(record.get("ended_at"))
+        created = _iso_epoch(record.get("created_at"))
+        duration = float(record.get("duration_s") or 0.0)
+        if not duration and started and ended and ended > started:
+            duration = ended - started
+        if started and created and started > created:
+            wait_values.append(started - created)
+        day = _ended_day(record)
+        if day:
+            bucket = daily.setdefault(
+                day,
+                {"date": day, "runs": 0, "success": 0, "failed": 0, "other": 0,
+                 "duration_s": 0.0, "wait_s": [], "samples": {}},
+            )
+            bucket["runs"] += 1
+            if status in {"succeeded", "done"}:
+                bucket["success"] += 1
+            elif status in {"failed", "stalled"}:
+                bucket["failed"] += 1
+            else:
+                bucket["other"] += 1
+            bucket["duration_s"] += duration
+            if started and created and started > created:
+                bucket["wait_s"].append(started - created)
+            sample_name = str(record.get("sample_name") or Path(str(record.get("sample_dir") or "")).name or "?")
+            bucket["samples"][sample_name] = round(bucket["samples"].get(sample_name, 0.0) + duration / 3600.0, 2)
+        profile = pipeline_profile(_read_config_cached(record.get("config_path")))
+        entry = profile_map.setdefault(
+            profile, {"profile": profile, "label": PROFILE_LABELS.get(profile, profile), "durations": []}
+        )
+        if duration > 0:
+            entry["durations"].append(duration)
+        sample_dir = _norm_key(str(record.get("sample_dir") or ""))
+        if sample_dir:
+            sample = by_sample.setdefault(
+                sample_dir,
+                {"sample": str(record.get("sample_name") or Path(str(record.get("sample_dir") or "")).name),
+                 "batch": Path(str(record.get("sample_dir") or "")).parent.name,
+                 "statuses": {}},
+            )
+            sample["statuses"][status] = sample["statuses"].get(status, 0) + 1
+
+    for cutoff in (7.0, 30.0):
+        days_ago = now - cutoff * 86400.0
+        window_runs = [r for r in records if (_iso_epoch(r.get("ended_at")) or 0.0) >= days_ago and r.get("ended_at")]
+        total = len(window_runs)
+        success = sum(1 for r in window_runs if str(r.get("status")) in {"succeeded", "done"})
+        window_totals[str(int(cutoff))] = {
+            "runs": total,
+            "success_rate": round(success / total, 3) if total else None,
+            "success_s": round(
+                sum(
+                    float(r.get("duration_s") or 0.0)
+                    or max((_iso_epoch(r.get("ended_at")) or 0.0) - (_iso_epoch(r.get("started_at")) or 0.0), 0.0)
+                    for r in window_runs
+                    if str(r.get("status")) in {"succeeded", "done"}
+                ), 1,
+            ),
+        }
+
+    stages_payload = collect_stage_times(root, active_dir)
+    durations_by_module: dict[str, list[float]] = {}
+    sample_entries: dict[str, dict[str, Any]] = {}
+    batches: dict[str, dict[str, Any]] = {}
+    for payload, sample_path in _iter_manifest_entries(root, active_dir):
+        module = str(payload.get("module") or "")
+        duration = payload.get("duration_seconds")
+        incomplete = str(payload.get("status") or "").lower() == "incomplete"
+        valid = bool(module) and isinstance(duration, (int, float)) and 0 < float(duration) <= _STAGE_MAX_DURATION_S
+        sample_key = _norm_key(str(sample_path))
+        entry = sample_entries.setdefault(
+            sample_key,
+            {"sample": sample_path.name, "batch": sample_path.parent.name,
+             "modules": set(), "bin_counts": [0] * len(_HIST_BIN_LABELS), "total_s": 0.0},
+        )
+        batch = batches.setdefault(entry["batch"], {"batch": entry["batch"], "completed": 0, "incomplete": 0})
+        if incomplete:
+            batch["incomplete"] += 1
+            continue
+        batch["completed"] += 1
+        if not valid:
+            continue
+        durations_by_module.setdefault(module, []).append(float(duration))
+        entry["modules"].add(module)
+        bin_index = sum(1 for bound in _HIST_BINS_S if float(duration) >= bound)
+        entry["bin_counts"][bin_index] += 1
+        entry["total_s"] += float(duration)
+
+    stage_rows = []
+    for stage in stages_payload["stages"]:
+        values = durations_by_module.get(str(stage["module"])) or []
+        if values:
+            stage_rows.append(
+                {
+                    "module": stage["module"],
+                    "count": len(values),
+                    "median_s": round(_median(values) or 0.0, 1),
+                    "mean_s": round(sum(values) / len(values), 1),
+                    "total_s": round(sum(values), 1),
+                    "p25_s": round(_percentile(values, 0.25) or 0.0, 1),
+                    "p75_s": round(_percentile(values, 0.75) or 0.0, 1),
+                    "p95_s": round(_percentile(values, 0.95) or 0.0, 1),
+                    "peak_mem_mb_median": stage.get("peak_mem_mb_median"),
+                }
+            )
+
+    module_names = sorted(durations_by_module.keys(), key=lambda name: -sum(durations_by_module[name]))[:12]
+    heatmap: list[dict[str, Any]] = []
+    for info in sample_entries.values():
+        if not info["total_s"]:
+            continue
+        inferred = _infer_profile_from_modules(info["modules"])
+        heatmap.append(
+            {
+                "sample": info["sample"],
+                "batch": info["batch"],
+                "profile": inferred,
+                "profile_label": PROFILE_LABELS.get(inferred, inferred),
+                "bins": list(info["bin_counts"]),
+                "total_s": round(info["total_s"], 1),
+            }
+        )
+    # most expensive samples first, keep the grid readable
+    heatmap.sort(key=lambda row: row["total_s"], reverse=True)
+    heatmap = heatmap[:24]
+
+    profiles = []
+    for profile, entry in profile_map.items():
+        values = entry["durations"]
+        if not values:
+            continue
+        profiles.append(
+            {
+                "profile": profile,
+                "label": entry["label"],
+                "count": len(values),
+                "durations": [round(v, 1) for v in sorted(values)],
+                "median_s": round(_median(values) or 0.0, 1),
+                "min_s": round(min(values), 1),
+                "max_s": round(max(values), 1),
+            }
+        )
+
+    sample_rows = []
+    for sample in by_sample.values():
+        counts = sample["statuses"]
+        total = sum(counts.values())
+        success = counts.get("succeeded", 0) + counts.get("done", 0)
+        failed = counts.get("failed", 0) + counts.get("stalled", 0)
+        sample_rows.append(
+            {"sample": sample["sample"], "batch": sample["batch"], "runs": total,
+             "success_rate": round(success / total, 3) if total else None, "failed": failed}
+        )
+    batch_rows = [
+        {"batch": b["batch"], "completed": b["completed"], "incomplete": b["incomplete"],
+         "total": b["completed"] + b["incomplete"],
+         "success_rate": round(b["completed"] / (b["completed"] + b["incomplete"]), 3) if (b["completed"] + b["incomplete"]) else None}
+        for b in batches.values()
+    ]
+    batch_rows.sort(key=lambda row: row["total"], reverse=True)
+
+    memory_rows = []
+    for step, record in _iter_progress_steps(active_dir):
+        if step.get("skipped"):
+            continue
+        peak = step.get("peak_mem_mb")
+        if not isinstance(peak, (int, float)) or float(peak) <= 0:
+            continue
+        memory_rows.append(
+            {
+                "job": str(record.get("id") or ""),
+                "sample": str(record.get("sample_name") or "?"),
+                "step": str(step.get("name") or step.get("module") or "?"),
+                "peak_mem_mb": round(float(peak), 0),
+                "ended_at": record.get("ended_at"),
+            }
+        )
+    memory_rows = sorted(memory_rows, key=lambda row: row["peak_mem_mb"], reverse=True)[:80]
+
+    daily_days = sorted(daily.keys())
+    daily_rows = []
+    for day in daily_days:
+        bucket = daily[day]
+        waits = bucket.pop("wait_s")
+        bucket["wait_median_s"] = round(_median(waits) or 0.0, 0) if waits else None
+        bucket["duration_s"] = round(bucket["duration_s"], 1)
+        bucket["samples"] = {name: hours for name, hours in bucket["samples"].items() if hours > 0}
+        daily_rows.append(bucket)
+
+    wait_median = round(_median(wait_values) or 0.0, 0) if wait_values else None
+
+    payload = {
+        "generated_at": utc_now_iso(),
+        "manifests_scanned": stages_payload.get("manifests_scanned", 0),
+        "jobs_scanned": len(records),
+        "kpi": {
+            "total_runs": len(records),
+            "success_rate": window_totals["30"]["success_rate"],
+            "runs_7d": window_totals["7"]["runs"],
+            "success_s_7d": window_totals["7"]["success_s"],
+            "runs_30d": window_totals["30"]["runs"],
+            "success_s_30d": window_totals["30"]["success_s"],
+            "queue_wait_median_s": wait_median,
+        },
+        "status_counts": status_counts,
+        "capacity": detect_capacity(),
+        "daily": daily_rows,
+        "stages": stage_rows,
+        "modules": module_names,
+        "hist_bins": list(_HIST_BIN_LABELS),
+        "heatmap": heatmap,
+        "profiles": profiles,
+        "samples": sorted(sample_rows, key=lambda row: row["runs"], reverse=True),
+        "batches": batch_rows,
+        "memory": memory_rows,
+    }
+    _ANALYTICS_CACHE["at"] = now
+    _ANALYTICS_CACHE["payload"] = payload
     return payload
 
 
@@ -829,7 +1161,6 @@ def group_into_batches(
                 "under_active": bool(active_key) and (batch_key == active_key or batch_key.startswith(active_key.rstrip("/") + "/")),
                 # priority lives on the PROJECT (batch), not the sample
                 "priority": priority_map.get(batch_key),
-                "notes": read_project_notes(batch_dir),
                 "projects": [],
             },
         )
