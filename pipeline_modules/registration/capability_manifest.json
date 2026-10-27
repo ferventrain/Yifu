@@ -453,5 +453,22 @@
    "signal_zarr": "SampleLayout.signal_zarr",
    "density_results_xlsx": "SampleLayout.density_results_xlsx"
   }
+ },
+ "atlas_reference": {
+  "description": "本模块使用的脑图谱体系速查（新工程师入门）。",
+  "mouse_allen": {
+   "template": "S:/Yifu_data/reference/atlas.tiff — Allen CCF 小鼠模板（配准参考图）",
+   "label_variants": {
+    "atlas_label.tiff": "原始体系（官方 id，uint32，历史样本/老产物）",
+    "atlas_label_official25_uint32.tiff": "官方 25µm annotation 全量 id（619 出现于 label）",
+    "atlas_label_v2_uint16.tiff": "v2 重编号（id 1..1327，uint16，2026-10 起生产默认，与 Region_Csv_Rev2_updated.CSV 配套）"
+   },
+   "region_csv": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV — 1327 区完整谱系树（root=987）；label 中实际出现 683 个 id，其余为树中名义条目（子层/纤维束/脑裂在 25µm 零体素），structure_id_path 沿路径可归到任意父级",
+   "registration_space": "25µm 等向（downsample NIfTI 在 <sample>/chX_downsample/volume.nii.gz），SyNRA 基线参数在 config template",
+   "products": "transforms/（fwd/inv ants 变换）、warped_label_25um_raw.npy、upsampled_atlas_label.zarr（全分辨率网格、根 .zattrs 带 multiscales+image-label=napari Labels 层、可就地补最近邻金字塔）、atlas_label_hemisphere.zarr（左右半脑，transform 法中线）",
+   "consumers": "脑区信号统计（region_signal_analysis_zarr_graph）、可视化（heatmap/bregma_mip/volume_heatmap_3d 等，默认已全部指向 Rev2）"
+  },
+  "special": "脊髓 SC_P56_Atlas（spinal 模式）；鸟脑 bird_atlas（60 标签，256×308×200 @0.08/0.08/0.1mm，T2_bird 标签外清零）——勿套小鼠模板假设",
+  "legacy_warning": "老样本（huangchunxia 血管等）label 是 Rev1 id 体系（root=997），重算须传 _frangi_trials2/ 本地 Rev1 CSV 副本；代码中 997 兼容回退为其保留"
  }
 }

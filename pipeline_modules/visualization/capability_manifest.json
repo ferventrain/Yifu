@@ -1706,6 +1706,21 @@
         "signal_tiff_dir": "sample_dir/<signal_ch>/",
         "atlas_label_tiff_dir": "sample_dir/upsampled_atlas_label/"
       }
+    },
+    {
+      "id": "napari_atlas_overlay",
+      "cli": "python -m pipeline_modules.visualization.napari_atlas_overlay",
+      "description": "napari 小部件：ims/zarr 图像 + atlas label 金字塔叠加（自动按图像层级选 label 层级，µm 世界坐标对齐），侧边栏脑区搜索（缩写/名称/id）点击跳质心（保持 zoom），状态栏显示鼠标下脑区。label zarr 首次加载时就地补最近邻金字塔（一次性成本）。",
+      "inputs": {
+        "sample_dir": "样本目录（预填 upsampled_atlas_label.zarr 与 config 体素尺寸）",
+        "label_zarr": "atlas label zarr",
+        "label_scale_um": "label 体素 z,y,x µm（缺省读样本 config input.resolution_xyz）",
+        "region_csv": "区域 CSV（默认 Rev2）"
+      },
+      "outputs": {
+        "label_pyramid": "label zarr 内就地新增 1..N 数据集 + multiscales 更新（最近邻抽稀）"
+      },
+      "runtime": "micromamba yifu env（napari 0.7 + napari-ome-zarr；与 neurofly 同环境可同窗叠加）"
     }
   ]
 }

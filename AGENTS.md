@@ -7,6 +7,11 @@
 3. **少改**：一次普通失败不引发改代码；只有结构化错误明确指向配置或 harness 时，才做一次针对性修复。
 4. **新代码先确认归属**：任务确实需要新代码时，先问用户——写进现有仓库，还是放到项目/数据文件夹下用完即删？
 5. **少说话**：执行前只回一条将执行的命令，提交后回 run_id，不长篇解释，不逐步请求确认。
+6. **背景沉淀**：工作中发现 AI 事先不知道的背景信息、或一条能避免未来踩坑的特定经验
+   （格式陷阱、宿主软件行为、设备口径等），主动问操作者要不要写进对应文档自己判断归属：
+   开发方法论/背景 → `.zcode/skills/yifu-develop/SKILL.md`；ims/arivis 对接细节 →
+   同目录 `ims-arivis-integration.md`；调用姿势 → `.zcode/skills/yifu-work/SKILL.md`；
+   都不合适则问是否新建文档。写入的文档进仓库，随工作持续优化。
 
 ## cfos：config 与参数
 
@@ -78,6 +83,9 @@ python -m pipeline_modules.visualization.annotate_tissue_sam_napari --sample-dir
    含义、口径（如圆柱法表面积、血管环数定义）与使用注意；交付前用视觉验收过一遍。
 
 ## 开发约定
+
+**开发任何新程序/工具/小部件前，先读 skill `yifu-develop`**（`.zcode/skills/yifu-develop/SKILL.md`，
+会话未加载时直接读文件）：程序化复现、插桩定位、量化验收、GUI/线程/生命周期防御、宿主源码对齐。
 
 改 main.py 流程、加新步骤或新模块接线后，必须跑一遍 stub 接线测试（不跑算法、几秒完成，
 验证 6 步路径/键名/分支不断链），并让 `tests/test_main_stub_run.py` 的 EXPECTED_COMMANDS
