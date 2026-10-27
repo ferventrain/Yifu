@@ -327,15 +327,70 @@ def ensure_signal_zarr(sample_dir, signal_ch, signal_tiff_dir, zarr_cfg):
     return zarr_path
 
 
-def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res, halo_mask=True):
+def ensure_brain_mask_dl(sample_dir, reg_ch, reg_cfg):
+    """DL whole-brain mask (registration.brain_mask_source="dl_fusion3").
+
+    Runs the aind-brain-segmentation fusion3 model on ch{reg}_downsampled.zarr
+    and writes ch{reg}_brain_mask_dl.zarr on the same grid. The mask replaces
+    the Otsu halo mask inside zarr_to_registration_nii (NIfTI zeroing +
+    brain_mask.nii.gz for N4 and orientation preflight). Falls back to the
+    halo mask when the coarse Zarr is absent (legacy TIFF-branch samples).
+    """
+    if reg_cfg.get("brain_mask_source", "halo") != "dl_fusion3":
+        return None
+    reg_downsampled_zarr = sample_dir / f"ch{reg_ch}_downsampled.zarr"
+    if not reg_downsampled_zarr.exists():
+        print_note(
+            f"brain_mask_source=dl_fusion3 but {reg_downsampled_zarr.name} is missing; "
+            "halo mask stays in charge."
+        )
+        return None
+    mask_zarr = sample_dir / f"ch{reg_ch}_brain_mask_dl.zarr"
+    model_name = Path(
+        reg_cfg.get("brain_mask_model_path")
+        or (project_root / "pipeline_modules/segmentation/models/smartspim_tissue_segmentation.safetensors")
+    ).name
+    cmd = (
+        f'"{PYTHON_EXE}" -m pipeline_modules.segmentation.brain_mask_aind '
+        f'--sample_dir "{sample_dir}" --channel {int(reg_ch)}'
+    )
+    desc = "1.0 Registration brain mask (aind fusion3)"
+    payload = {
+        "step": "brain_mask_dl",
+        "channel": int(reg_ch),
+        "model": model_name,
+        "threshold": 0.7,
+    }
+    complete, reason = _marker_check([mask_zarr], [reg_downsampled_zarr], payload, lambda: mask_zarr.exists())
+    if complete:
+        print_skip(f"DL brain mask up to date ({reason}): {mask_zarr}")
+        return mask_zarr
+    if mask_zarr.exists():
+        print_note(f"DL brain mask exists but {reason}; rebuilding.")
+    run_command(cmd, desc)
+    _mark_done([mask_zarr], [reg_downsampled_zarr], payload)
+    return mask_zarr
+
+
+def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res, halo_mask=True,
+                                   brain_mask=None, brain_mask_erode=1):
     reg_downsample_dir = sample_dir / f"ch{reg_ch}_downsample"
     reg_nifti_path = reg_downsample_dir / "volume.nii.gz"
 
     halo_flag = "" if halo_mask else " --no-halo_mask"
+    brain_flag = ""
+    if brain_mask:
+        brain_flag = f' --brain_mask "{brain_mask}" --brain_mask_erode {int(brain_mask_erode)}'
     target_str = ",".join(f"{float(value):.4f}" for value in target_res)
     reg_tiff_dir = sample_dir / f"ch{reg_ch}"
     reg_zarr_path = sample_dir / f"ch{reg_ch}.zarr"
     reg_downsampled_zarr = sample_dir / f"ch{reg_ch}_downsampled.zarr"
+
+    def _brain_payload(payload):
+        if brain_mask:
+            payload["brain_mask"] = str(brain_mask)
+            payload["brain_mask_erode"] = int(brain_mask_erode)
+        return payload
 
     # Resolve the source branch first so the completion marker can be checked
     # against the exact inputs/payload of the command that would run.
@@ -351,15 +406,15 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res, ha
             f'--output_nii "{reg_nifti_path}" '
             f'--input_resolution_xyz "{input_str}" '
             f'--target_resolution_xyz "{target_str}"'
-            f"{halo_flag}"
+            f"{halo_flag}{brain_flag}"
         )
         desc = "1.1 Downsample registration channel (from coarse Zarr)"
-        source_input, payload = reg_downsampled_zarr, {
+        source_input, payload = reg_downsampled_zarr, _brain_payload({
             "step": "registration_downsample",
             "variant": "coarse_zarr",
             "target_resolution_xyz": list(target_res),
             "halo_mask": bool(halo_mask),
-        }
+        })
     elif not reg_tiff_dir.exists() and reg_zarr_path.exists():
         input_str = ",".join(f"{float(value):.4f}" for value in input_res)
         cmd = (
@@ -368,16 +423,16 @@ def ensure_registration_downsample(sample_dir, reg_ch, input_res, target_res, ha
             f'--output_nii "{reg_nifti_path}" '
             f'--input_resolution_xyz "{input_str}" '
             f'--target_resolution_xyz "{target_str}"'
-            f"{halo_flag}"
+            f"{halo_flag}{brain_flag}"
         )
         desc = "1.1 Downsample registration channel (from Zarr)"
-        source_input, payload = reg_zarr_path, {
+        source_input, payload = reg_zarr_path, _brain_payload({
             "step": "registration_downsample",
             "variant": "zarr",
             "input_resolution_xyz": list(input_res),
             "target_resolution_xyz": list(target_res),
             "halo_mask": bool(halo_mask),
-        }
+        })
     else:
         try:
             factor_str = calculate_downsample_factor_str(input_res, target_res)
@@ -1482,12 +1537,15 @@ def _run_pipeline(args, cfg, config_path, sample_dir):
     if args.skip_registration:
         print_skip("Registration channel downsample skipped (--skip_registration).")
     else:
+        brain_mask_path = ensure_brain_mask_dl(sample_dir, reg_ch, reg_cfg)
         ensure_registration_downsample(
             sample_dir,
             reg_ch,
             cfg["input"]["resolution_xyz"],
             preprocessing_cfg["downsample"]["target_resolution_xyz"],
             halo_mask=bool(reg_cfg.get("halo_mask", True)),
+            brain_mask=brain_mask_path,
+            brain_mask_erode=int(reg_cfg.get("brain_mask_erode", 1)),
         )
 
     print_step(2, "Atlas registration and label outputs")

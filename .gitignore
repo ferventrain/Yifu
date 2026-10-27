@@ -26,6 +26,8 @@ Thumbs.db
 *.tmp
 best_model.pt
 models/
+!pipeline_modules/segmentation/models/
+!pipeline_modules/segmentation/models/*.safetensors
 data/reference/*
 !data/reference/.gitkeep
 results/cellpose_test/YF2025090501_1_lanzhoudaxue_nao_3_C1_Z1410_mask_vis.png

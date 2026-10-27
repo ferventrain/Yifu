@@ -1,194 +1,596 @@
 {
-  "schema_version": "1",
-  "module": "segmentation",
-  "description": "Threshold-based, local-checkpoint 3D U-Net, and Spotiflow spot detection over signal Zarr volumes, with TIFF export helpers.",
-  "entrypoints": [
-    {
-      "id": "threshold_segmentation",
-      "function": "pipeline_modules.segmentation.intensity_threshold_segmentor.run_threshold_segmentation",
-      "cli": "python pipeline_modules/segmentation/intensity_threshold_segmentor.py",
-      "description": "Apply threshold-based segmentation on a Zarr volume and write a mask Zarr store. Single entry point for four methods: global (default per-tile Otsu/scalar), hysteresis (low/high thresholds with global connectivity), percentile (per-slice histogram percentile), windowed (per-slice local-histogram percentile). The former standalone tools hysteresis_threshold.py, histogram_percentile_threshold.py, windowed_histogram_threshold.py, and threshold_mask_tiff_stacks.py were folded into this program.",
-      "inputs": {
-        "input_zarr": {"type": "path", "required": true},
-        "output_zarr": {"type": "path", "required": true},
-        "threshold": {"type": "string", "default": "otsu"},
-        "sigma": {"type": "float", "default": 0.0},
-        "min_size": {"type": "int", "default": 10},
-        "output_mode": {"type": "string", "default": "binary", "choices": ["binary", "label"]},
-        "dataset_name": {"type": "string", "default": "0"},
-        "process_existing_only": {"type": "bool", "default": false},
-        "method": {"type": "string", "default": "global", "choices": ["global", "hysteresis", "percentile", "windowed"], "description": "global: per-tile scalar/Otsu threshold; hysteresis: dual thresholds with global connectivity; percentile: per-slice histogram percentile; windowed: per-slice windowed local histogram percentile"},
-        "low": {"type": "float|null", "default": null, "description": "Hysteresis low (extension) threshold"},
-        "high": {"type": "float|null", "default": null, "description": "Hysteresis high (seed) threshold"},
-        "close_radius": {"type": "int", "default": 0, "description": "Hysteresis morphological closing radius"},
-        "slab_depth": {"type": "int", "default": 64, "description": "Hysteresis slab depth for volumes larger than 4 GB"},
-        "percentile_method": {"type": "string", "default": "blend", "choices": ["blend", "otsu", "triangle", "yen", "li", "knee"]},
-        "clamp_lo": {"type": "float|null", "default": null},
-        "clamp_hi": {"type": "float|null", "default": null},
-        "window": {"type": "int|null", "default": null},
-        "stride": {"type": "int|null", "default": null},
-        "floor": {"type": "float|null", "default": null},
-        "pct_nudge": {"type": "float|null", "default": null},
-        "thr_scale": {"type": "float|null", "default": null},
-        "bright_local_p99": {"type": "float|null", "default": null},
-        "bright_extra_nudge": {"type": "float|null", "default": null},
-        "clean_3d": {"type": "bool", "default": false, "description": "Percentile/windowed methods: apply min_size to 3D connected components instead of per slice"}
-      },
-      "outputs": {
-        "output_zarr": {"type": "dir"},
-        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
-      },
-      "common_commands": [
-        {
-          "description": "Default global Otsu threshold",
-          "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\""
-        },
-        {
-          "description": "Hysteresis dual-threshold segmentation",
-          "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\" --method hysteresis --low 300 --high 800 --close_radius 1"
-        },
-        {
-          "description": "Per-slice percentile with 3D component cleanup",
-          "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\" --method percentile --clamp_lo 95 --clamp_hi 99.5 --clean_3d"
-        }
-      ]
+ "schema_version": "1",
+ "module": "segmentation",
+ "description": "Threshold-based, local-checkpoint 3D U-Net, and Spotiflow spot detection over signal Zarr volumes, with TIFF export helpers.",
+ "entrypoints": [
+  {
+   "id": "brain_mask_aind",
+   "function": "pipeline_modules.segmentation.brain_mask_aind.run_brain_mask",
+   "cli": "python -m pipeline_modules.segmentation.brain_mask_aind",
+   "description": "Deep-learning whole-brain mask for the registration channel: runs the Allen Institute aind-brain-segmentation 2D SwinUNETR tissue model (Neuratt, weights bundled in models/) on three orthogonal planes of ch{channel}_downsampled.zarr, averages the three probability volumes, thresholds (default 0.7), fills holes and keeps sizeable per-slice components. Output mask zarr sits on the coarse grid; main.py (registration.brain_mask_source=dl_fusion3, default in template) wires it into zarr_to_registration_nii --brain_mask, which maps it onto the registration grid (largest 3D component + erosion) and uses it in place of the Otsu halo mask for NIfTI zeroing and brain_mask.nii.gz (N4 + orientation preflight). Replaces the halo mask's Otsu failure modes on dim brain ends (medulla/olfactory bulb) and recovers slices whose single-plane mask keeps only a rim. Runtime ~40-60 min/sample on GPU; memory-safe (per-slice GPU batches, uint8 probability caches under ch{channel}_brain_mask_probs/, deleted after fusion unless --keep_probs).",
+   "inputs": {
+    "sample_dir": {
+     "type": "path",
+     "required": true
     },
-    {
-      "id": "cfos_unet_inference",
-      "function": "pipeline_modules.segmentation.cfos_unet_inference.run_cfos_unet_inference",
-      "cli": "python pipeline_modules/segmentation/cfos_unet_inference.py",
-      "description": "Load a local checkpoint produced by train_cfos_3d_mlflow.py and run sliding-window inference on a Zarr volume.",
-      "inputs": {
-        "input_zarr": {"type": "path", "required": true},
-        "output_zarr": {"type": "path", "required": true},
-        "checkpoint_path": {"type": "path", "required": true},
-        "probability_zarr": {"type": "path|null", "default": null},
-        "dataset_name": {"type": "string", "default": "0"},
-        "patch_size": {"type": "triplet_int|null", "default": null},
-        "overlap": {"type": "float", "default": 0.25},
-        "batch_size": {"type": "int", "default": 4},
-        "device": {"type": "string", "default": "auto"},
-        "foreground_class": {"type": "int", "default": 1},
-        "probability_threshold": {"type": "float", "default": 0.5},
-        "output_mode": {"type": "string", "default": "binary", "choices": ["binary", "multiclass"]},
-        "output_dtype": {"type": "string", "default": "uint8"},
-        "probability_dtype": {"type": "string", "default": "float16"},
-        "process_existing_only": {"type": "bool", "default": false},
-        "skip_below_threshold": {"type": "float|null", "default": 100.0},
-        "label_zarr": {"type": "path|null", "default": null, "description": "Atlas label Zarr on the same grid; chunks whose strided label test finds no labeled voxel are skipped entirely (guards chunk-local normalization against background false positives). main.py wires <sample>/upsampled_atlas_label.zarr when segmentation.cfos_unet.restrict_to_label=true."},
-        "label_stride": {"type": "int", "default": 8, "description": "Sampling stride of the per-chunk label coverage test"},
-        "chunk_size": {"type": "triplet_int|null", "default": null},
-        "normalize_percentiles": {"type": "pair_float", "default": [1.0, 99.5]}
-      },
-      "outputs": {
-        "output_zarr": {"type": "dir"},
-        "probability_zarr": {"type": "dir", "required": false},
-        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
-      }
+    "channel": {
+     "type": "int",
+     "default": 0,
+     "description": "Registration channel number"
     },
-    {
-      "id": "cfos_unet_qc",
-      "function": "pipeline_modules.segmentation.cfos_unet_qc.build_review_queue",
-      "cli": "python -m pipeline_modules.segmentation.cfos_unet_qc",
-      "description": "Rank the worst cFos U-Net blocks for manual review and export image/mask TIFF previews for the selected top blocks. Use records_csv when the image Zarr name is not the default ch{signal_ch}.zarr, for example ch1_preprocessed.zarr.",
-      "usage": {
-        "records_csv_format": "CSV columns: sample_id,image_zarr,mask_zarr,probability_zarr,threshold_zarr. threshold_zarr may be empty.",
-        "example_records_csv": "sample_id,image_zarr,mask_zarr,probability_zarr,threshold_zarr\nHenl_1,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_preprocessed.zarr,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_mask.zarr,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_prob.zarr,",
-        "qc_folder_command": "python -m pipeline_modules.segmentation.cfos_unet_qc --sample_dirs \"H:/path/to/sample\" --signal_ch 3 --top_n 30 --preview_dir \"H:/path/to/sample/qc_preview\" --workers 8",
-        "example_command": "python -m pipeline_modules.segmentation.cfos_unet_qc --records_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\qc_records.csv --output_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\review_queue.csv --top_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue.csv --preview_dir H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue_previews --top_n 30 --max_per_large_grid 10",
-        "selection_rule": "Blocks are first sorted by review_score. The final preview set contains up to top_n blocks, with at most max_per_large_grid blocks per large grid. A large grid is defined by the first two numbers in chunk_index, e.g. chunk_index 7.7.18 belongs to large grid 7-7.",
-        "block_name_rule": "Preview file names and block_id use source sample_id plus chunk position, e.g. Henl_1_7-7-18_mask.tiff.",
-        "preview_layout": "preview_dir/image contains *.tiff using block_id only; preview_dir/mask contains *_mask.tiff."
-      },
-      "inputs": {
-        "records_csv": {"type": "path|null", "default": null},
-        "sample_root": {"type": "path|null", "default": null},
-        "sample_dirs": {"type": "path[]|null", "default": null},
-        "signal_ch": {"type": "string", "default": "2"},
-        "mask_suffix": {"type": "string", "default": "_mask.zarr"},
-        "probability_suffix": {"type": "string", "default": "_prob.zarr"},
-        "threshold_suffix": {"type": "string", "default": ""},
-        "dataset_name": {"type": "string", "default": "0"},
-        "chunk_size": {"type": "triplet_int|null", "default": null},
-        "uncertainty_low": {"type": "float", "default": 0.4},
-        "uncertainty_high": {"type": "float", "default": 0.6},
-        "small_component_max_voxels": {"type": "int", "default": 32},
-        "skip_below_threshold": {"type": "float|null", "default": 100.0},
-        "top_n": {"type": "int", "default": 30},
-        "max_per_large_grid": {"type": "int", "default": 10},
-        "output_csv": {"type": "path|null", "default": null, "description": "Defaults to sample_dir/review_queue.csv for single-sample runs"},
-        "top_csv": {"type": "path|null", "default": null, "description": "Defaults to sample_dir/top{top_n}_review_queue.csv for single-sample runs"},
-        "preview_dir": {"type": "path|null", "default": null, "description": "Defaults to sample_dir/top{top_n}_review_queue_previews for single-sample runs"},
-        "skip_missing": {"type": "bool", "default": false}
-      },
-      "outputs": {
-        "output_csv": {"type": "path", "default": "sample_dir/review_queue.csv"},
-        "top_csv": {"type": "path", "default": "sample_dir/top30_review_queue.csv"},
-        "preview_dir": {"type": "dir", "default": "sample_dir/top30_review_queue_previews"},
-        "preview_image_tiffs": {"type": "dir", "default": "sample_dir/top30_review_queue_previews/image"},
-        "preview_mask_tiffs": {"type": "dir", "default": "sample_dir/top30_review_queue_previews/mask"}
-      }
+    "input_zarr": {
+     "type": "path|null",
+     "default": null,
+     "description": "Default ch{channel}_downsampled.zarr"
     },
-    {
-      "id": "spotiflow_inference",
-      "function": "pipeline_modules.segmentation.spotiflow_inference.run_spotiflow_inference",
-      "cli": "python -m pipeline_modules.segmentation.spotiflow_inference",
-      "description": "Run Spotiflow whole-brain spot detection on a 3D signal Zarr volume, optionally map detections to atlas regions, and export per-region signal counts.",
-      "inputs": {
-        "input_zarr": {"type": "path", "required": true},
-        "output_csv": {"type": "path", "required": true},
-        "model_dir": {"type": "path", "default": "model/spotiflow"},
-        "label_zarr": {"type": "path|null", "default": null},
-        "region_counts_csv": {"type": "path|null", "default": null},
-        "summary_json": {"type": "path|null", "default": null},
-        "cfg": {"type": "path", "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"},
-        "dataset_name": {"type": "string", "default": "0"},
-        "which": {"type": "string", "default": "best", "choices": ["best", "last"]},
-        "prob_thresh": {"type": "float|null", "default": 0.35},
-        "min_distance": {"type": "int", "default": 1},
-        "tile_size": {"type": "triplet_int|null", "default": null},
-        "tile_overlap": {"type": "int", "default": 16},
-        "skip_below_threshold": {"type": "float|null", "default": 100.0},
-        "device": {"type": "string", "default": "auto"},
-        "peak_mode": {"type": "string", "default": "fast", "choices": ["fast", "skimage"]},
-        "normalizer": {"type": "string|null", "default": "auto"},
-        "subpix": {"type": "bool|null", "default": null},
-        "use_tuned_tile_overlap": {"type": "bool", "default": false}
-      },
-      "outputs": {
-        "output_csv": {"type": "path"},
-        "region_counts_csv": {"type": "path", "required": false},
-        "summary_json": {"type": "path"},
-        "manifest_path": {"type": "path", "description": "_run_manifest.json"}
-      }
+    "output_zarr": {
+     "type": "path|null",
+     "default": null,
+     "description": "Default ch{channel}_brain_mask_dl.zarr"
     },
-    {
-      "id": "export_zarr_to_tiff",
-      "function": "pipeline_modules.segmentation.zarr_utils.export_zarr_to_tiff",
-      "cli": "python -c \"from pipeline_modules.segmentation import export_zarr_to_tiff; ...\"",
-      "description": "Export a mask Zarr store into a TIFF stack directory.",
-      "inputs": {
-        "input_zarr": {"type": "path", "required": true},
-        "output_dir": {"type": "path", "required": true},
-        "dataset_name": {"type": "string", "default": "0"}
-      },
-      "outputs": {
-        "output_dir": {"type": "dir"}
-      }
+    "model_path": {
+     "type": "path|null",
+     "default": null,
+     "description": "Default models/smartspim_tissue_segmentation.safetensors"
+    },
+    "threshold": {
+     "type": "float",
+     "default": 0.7
+    },
+    "min_area": {
+     "type": "int",
+     "default": 500,
+     "description": "Per-slice minimum component area in px"
+    },
+    "keep_probs": {
+     "type": "bool",
+     "default": false
+    },
+    "device": {
+     "type": "string",
+     "default": "cuda"
     }
-  ],
-  "configuration_models": {
-    "SegmentationCfg": "pipeline_modules.segmentation.config.SegmentationCfg",
-    "ThresholdSegmentationCfg": "pipeline_modules.segmentation.config.ThresholdSegmentationCfg",
-    "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg",
-    "SpotiflowInferenceCfg": "pipeline_modules.segmentation.config.SpotiflowInferenceCfg"
+   },
+   "outputs": {
+    "output_zarr": {
+     "type": "dir"
+    },
+    "qc_montage": {
+     "type": "path",
+     "description": "qc/brain_mask_dl.png overlay of 6 slices"
+    },
+    "manifest_path": {
+     "type": "path",
+     "description": "_run_manifest.json"
+    }
+   },
+   "when_to_use": "Registration-channel brain mask (main.py step 1.0, brain_mask_source=dl_fusion3). For cfos signal segmentation use cfos_unet_inference or threshold_segmentation instead."
   },
-  "sample_layout": {
-    "class": "pipeline_modules.utils.sample_layout.SampleLayout",
-    "relevant_paths": {
-      "signal_zarr": "SampleLayout.signal_zarr",
-      "mask_zarr": "SampleLayout.mask_zarr",
-      "mask_tiff_dir": "SampleLayout.mask_tiff_dir"
+  {
+   "id": "threshold_segmentation",
+   "function": "pipeline_modules.segmentation.intensity_threshold_segmentor.run_threshold_segmentation",
+   "cli": "python pipeline_modules/segmentation/intensity_threshold_segmentor.py",
+   "description": "Apply threshold-based segmentation on a Zarr volume and write a mask Zarr store. Single entry point for four methods: global (default per-tile Otsu/scalar), hysteresis (low/high thresholds with global connectivity), percentile (per-slice histogram percentile), windowed (per-slice local-histogram percentile). The former standalone tools hysteresis_threshold.py, histogram_percentile_threshold.py, windowed_histogram_threshold.py, and threshold_mask_tiff_stacks.py were folded into this program.",
+   "inputs": {
+    "input_zarr": {
+     "type": "path",
+     "required": true
+    },
+    "output_zarr": {
+     "type": "path",
+     "required": true
+    },
+    "threshold": {
+     "type": "string",
+     "default": "otsu"
+    },
+    "sigma": {
+     "type": "float",
+     "default": 0.0
+    },
+    "min_size": {
+     "type": "int",
+     "default": 10
+    },
+    "output_mode": {
+     "type": "string",
+     "default": "binary",
+     "choices": [
+      "binary",
+      "label"
+     ]
+    },
+    "dataset_name": {
+     "type": "string",
+     "default": "0"
+    },
+    "process_existing_only": {
+     "type": "bool",
+     "default": false
+    },
+    "method": {
+     "type": "string",
+     "default": "global",
+     "choices": [
+      "global",
+      "hysteresis",
+      "percentile",
+      "windowed"
+     ],
+     "description": "global: per-tile scalar/Otsu threshold; hysteresis: dual thresholds with global connectivity; percentile: per-slice histogram percentile; windowed: per-slice windowed local histogram percentile"
+    },
+    "low": {
+     "type": "float|null",
+     "default": null,
+     "description": "Hysteresis low (extension) threshold"
+    },
+    "high": {
+     "type": "float|null",
+     "default": null,
+     "description": "Hysteresis high (seed) threshold"
+    },
+    "close_radius": {
+     "type": "int",
+     "default": 0,
+     "description": "Hysteresis morphological closing radius"
+    },
+    "slab_depth": {
+     "type": "int",
+     "default": 64,
+     "description": "Hysteresis slab depth for volumes larger than 4 GB"
+    },
+    "percentile_method": {
+     "type": "string",
+     "default": "blend",
+     "choices": [
+      "blend",
+      "otsu",
+      "triangle",
+      "yen",
+      "li",
+      "knee"
+     ]
+    },
+    "clamp_lo": {
+     "type": "float|null",
+     "default": null
+    },
+    "clamp_hi": {
+     "type": "float|null",
+     "default": null
+    },
+    "window": {
+     "type": "int|null",
+     "default": null
+    },
+    "stride": {
+     "type": "int|null",
+     "default": null
+    },
+    "floor": {
+     "type": "float|null",
+     "default": null
+    },
+    "pct_nudge": {
+     "type": "float|null",
+     "default": null
+    },
+    "thr_scale": {
+     "type": "float|null",
+     "default": null
+    },
+    "bright_local_p99": {
+     "type": "float|null",
+     "default": null
+    },
+    "bright_extra_nudge": {
+     "type": "float|null",
+     "default": null
+    },
+    "clean_3d": {
+     "type": "bool",
+     "default": false,
+     "description": "Percentile/windowed methods: apply min_size to 3D connected components instead of per slice"
     }
+   },
+   "outputs": {
+    "output_zarr": {
+     "type": "dir"
+    },
+    "manifest_path": {
+     "type": "path",
+     "description": "_run_manifest.json"
+    }
+   },
+   "common_commands": [
+    {
+     "description": "Default global Otsu threshold",
+     "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\""
+    },
+    {
+     "description": "Hysteresis dual-threshold segmentation",
+     "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\" --method hysteresis --low 300 --high 800 --close_radius 1"
+    },
+    {
+     "description": "Per-slice percentile with 3D component cleanup",
+     "powershell": "python S:\\Yifu\\pipeline_modules\\segmentation\\intensity_threshold_segmentor.py --input_zarr \"S:\\sample\\ch1.zarr\" --output_zarr \"S:\\sample\\ch1_mask.zarr\" --method percentile --clamp_lo 95 --clamp_hi 99.5 --clean_3d"
+    }
+   ]
+  },
+  {
+   "id": "cfos_unet_inference",
+   "function": "pipeline_modules.segmentation.cfos_unet_inference.run_cfos_unet_inference",
+   "cli": "python pipeline_modules/segmentation/cfos_unet_inference.py",
+   "description": "Load a local checkpoint produced by train_cfos_3d_mlflow.py and run sliding-window inference on a Zarr volume.",
+   "inputs": {
+    "input_zarr": {
+     "type": "path",
+     "required": true
+    },
+    "output_zarr": {
+     "type": "path",
+     "required": true
+    },
+    "checkpoint_path": {
+     "type": "path",
+     "required": true
+    },
+    "probability_zarr": {
+     "type": "path|null",
+     "default": null
+    },
+    "dataset_name": {
+     "type": "string",
+     "default": "0"
+    },
+    "patch_size": {
+     "type": "triplet_int|null",
+     "default": null
+    },
+    "overlap": {
+     "type": "float",
+     "default": 0.25
+    },
+    "batch_size": {
+     "type": "int",
+     "default": 4
+    },
+    "device": {
+     "type": "string",
+     "default": "auto"
+    },
+    "foreground_class": {
+     "type": "int",
+     "default": 1
+    },
+    "probability_threshold": {
+     "type": "float",
+     "default": 0.5
+    },
+    "output_mode": {
+     "type": "string",
+     "default": "binary",
+     "choices": [
+      "binary",
+      "multiclass"
+     ]
+    },
+    "output_dtype": {
+     "type": "string",
+     "default": "uint8"
+    },
+    "probability_dtype": {
+     "type": "string",
+     "default": "float16"
+    },
+    "process_existing_only": {
+     "type": "bool",
+     "default": false
+    },
+    "skip_below_threshold": {
+     "type": "float|null",
+     "default": 100.0
+    },
+    "label_zarr": {
+     "type": "path|null",
+     "default": null,
+     "description": "Atlas label Zarr on the same grid; chunks whose strided label test finds no labeled voxel are skipped entirely (guards chunk-local normalization against background false positives). main.py wires <sample>/upsampled_atlas_label.zarr when segmentation.cfos_unet.restrict_to_label=true."
+    },
+    "label_stride": {
+     "type": "int",
+     "default": 8,
+     "description": "Sampling stride of the per-chunk label coverage test"
+    },
+    "chunk_size": {
+     "type": "triplet_int|null",
+     "default": null
+    },
+    "normalize_percentiles": {
+     "type": "pair_float",
+     "default": [
+      1.0,
+      99.5
+     ]
+    }
+   },
+   "outputs": {
+    "output_zarr": {
+     "type": "dir"
+    },
+    "probability_zarr": {
+     "type": "dir",
+     "required": false
+    },
+    "manifest_path": {
+     "type": "path",
+     "description": "_run_manifest.json"
+    }
+   }
+  },
+  {
+   "id": "cfos_unet_qc",
+   "function": "pipeline_modules.segmentation.cfos_unet_qc.build_review_queue",
+   "cli": "python -m pipeline_modules.segmentation.cfos_unet_qc",
+   "description": "Rank the worst cFos U-Net blocks for manual review and export image/mask TIFF previews for the selected top blocks. Use records_csv when the image Zarr name is not the default ch{signal_ch}.zarr, for example ch1_preprocessed.zarr.",
+   "usage": {
+    "records_csv_format": "CSV columns: sample_id,image_zarr,mask_zarr,probability_zarr,threshold_zarr. threshold_zarr may be empty.",
+    "example_records_csv": "sample_id,image_zarr,mask_zarr,probability_zarr,threshold_zarr\nHenl_1,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_preprocessed.zarr,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_mask.zarr,H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\ch1_prob.zarr,",
+    "qc_folder_command": "python -m pipeline_modules.segmentation.cfos_unet_qc --sample_dirs \"H:/path/to/sample\" --signal_ch 3 --top_n 30 --preview_dir \"H:/path/to/sample/qc_preview\" --workers 8",
+    "example_command": "python -m pipeline_modules.segmentation.cfos_unet_qc --records_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\qc_records.csv --output_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\review_queue.csv --top_csv H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue.csv --preview_dir H:\\arivis-analysis\\YF2025122602czeryuan\\Henl_1\\top30_review_queue_previews --top_n 30 --max_per_large_grid 10",
+    "selection_rule": "Blocks are first sorted by review_score. The final preview set contains up to top_n blocks, with at most max_per_large_grid blocks per large grid. A large grid is defined by the first two numbers in chunk_index, e.g. chunk_index 7.7.18 belongs to large grid 7-7.",
+    "block_name_rule": "Preview file names and block_id use source sample_id plus chunk position, e.g. Henl_1_7-7-18_mask.tiff.",
+    "preview_layout": "preview_dir/image contains *.tiff using block_id only; preview_dir/mask contains *_mask.tiff."
+   },
+   "inputs": {
+    "records_csv": {
+     "type": "path|null",
+     "default": null
+    },
+    "sample_root": {
+     "type": "path|null",
+     "default": null
+    },
+    "sample_dirs": {
+     "type": "path[]|null",
+     "default": null
+    },
+    "signal_ch": {
+     "type": "string",
+     "default": "2"
+    },
+    "mask_suffix": {
+     "type": "string",
+     "default": "_mask.zarr"
+    },
+    "probability_suffix": {
+     "type": "string",
+     "default": "_prob.zarr"
+    },
+    "threshold_suffix": {
+     "type": "string",
+     "default": ""
+    },
+    "dataset_name": {
+     "type": "string",
+     "default": "0"
+    },
+    "chunk_size": {
+     "type": "triplet_int|null",
+     "default": null
+    },
+    "uncertainty_low": {
+     "type": "float",
+     "default": 0.4
+    },
+    "uncertainty_high": {
+     "type": "float",
+     "default": 0.6
+    },
+    "small_component_max_voxels": {
+     "type": "int",
+     "default": 32
+    },
+    "skip_below_threshold": {
+     "type": "float|null",
+     "default": 100.0
+    },
+    "top_n": {
+     "type": "int",
+     "default": 30
+    },
+    "max_per_large_grid": {
+     "type": "int",
+     "default": 10
+    },
+    "output_csv": {
+     "type": "path|null",
+     "default": null,
+     "description": "Defaults to sample_dir/review_queue.csv for single-sample runs"
+    },
+    "top_csv": {
+     "type": "path|null",
+     "default": null,
+     "description": "Defaults to sample_dir/top{top_n}_review_queue.csv for single-sample runs"
+    },
+    "preview_dir": {
+     "type": "path|null",
+     "default": null,
+     "description": "Defaults to sample_dir/top{top_n}_review_queue_previews for single-sample runs"
+    },
+    "skip_missing": {
+     "type": "bool",
+     "default": false
+    }
+   },
+   "outputs": {
+    "output_csv": {
+     "type": "path",
+     "default": "sample_dir/review_queue.csv"
+    },
+    "top_csv": {
+     "type": "path",
+     "default": "sample_dir/top30_review_queue.csv"
+    },
+    "preview_dir": {
+     "type": "dir",
+     "default": "sample_dir/top30_review_queue_previews"
+    },
+    "preview_image_tiffs": {
+     "type": "dir",
+     "default": "sample_dir/top30_review_queue_previews/image"
+    },
+    "preview_mask_tiffs": {
+     "type": "dir",
+     "default": "sample_dir/top30_review_queue_previews/mask"
+    }
+   }
+  },
+  {
+   "id": "spotiflow_inference",
+   "function": "pipeline_modules.segmentation.spotiflow_inference.run_spotiflow_inference",
+   "cli": "python -m pipeline_modules.segmentation.spotiflow_inference",
+   "description": "Run Spotiflow whole-brain spot detection on a 3D signal Zarr volume, optionally map detections to atlas regions, and export per-region signal counts.",
+   "inputs": {
+    "input_zarr": {
+     "type": "path",
+     "required": true
+    },
+    "output_csv": {
+     "type": "path",
+     "required": true
+    },
+    "model_dir": {
+     "type": "path",
+     "default": "model/spotiflow"
+    },
+    "label_zarr": {
+     "type": "path|null",
+     "default": null
+    },
+    "region_counts_csv": {
+     "type": "path|null",
+     "default": null
+    },
+    "summary_json": {
+     "type": "path|null",
+     "default": null
+    },
+    "cfg": {
+     "type": "path",
+     "default": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
+    },
+    "dataset_name": {
+     "type": "string",
+     "default": "0"
+    },
+    "which": {
+     "type": "string",
+     "default": "best",
+     "choices": [
+      "best",
+      "last"
+     ]
+    },
+    "prob_thresh": {
+     "type": "float|null",
+     "default": 0.35
+    },
+    "min_distance": {
+     "type": "int",
+     "default": 1
+    },
+    "tile_size": {
+     "type": "triplet_int|null",
+     "default": null
+    },
+    "tile_overlap": {
+     "type": "int",
+     "default": 16
+    },
+    "skip_below_threshold": {
+     "type": "float|null",
+     "default": 100.0
+    },
+    "device": {
+     "type": "string",
+     "default": "auto"
+    },
+    "peak_mode": {
+     "type": "string",
+     "default": "fast",
+     "choices": [
+      "fast",
+      "skimage"
+     ]
+    },
+    "normalizer": {
+     "type": "string|null",
+     "default": "auto"
+    },
+    "subpix": {
+     "type": "bool|null",
+     "default": null
+    },
+    "use_tuned_tile_overlap": {
+     "type": "bool",
+     "default": false
+    }
+   },
+   "outputs": {
+    "output_csv": {
+     "type": "path"
+    },
+    "region_counts_csv": {
+     "type": "path",
+     "required": false
+    },
+    "summary_json": {
+     "type": "path"
+    },
+    "manifest_path": {
+     "type": "path",
+     "description": "_run_manifest.json"
+    }
+   }
+  },
+  {
+   "id": "export_zarr_to_tiff",
+   "function": "pipeline_modules.segmentation.zarr_utils.export_zarr_to_tiff",
+   "cli": "python -c \"from pipeline_modules.segmentation import export_zarr_to_tiff; ...\"",
+   "description": "Export a mask Zarr store into a TIFF stack directory.",
+   "inputs": {
+    "input_zarr": {
+     "type": "path",
+     "required": true
+    },
+    "output_dir": {
+     "type": "path",
+     "required": true
+    },
+    "dataset_name": {
+     "type": "string",
+     "default": "0"
+    }
+   },
+   "outputs": {
+    "output_dir": {
+     "type": "dir"
+    }
+   }
   }
+ ],
+ "configuration_models": {
+  "SegmentationCfg": "pipeline_modules.segmentation.config.SegmentationCfg",
+  "ThresholdSegmentationCfg": "pipeline_modules.segmentation.config.ThresholdSegmentationCfg",
+  "CfosUNetInferenceCfg": "pipeline_modules.segmentation.config.CfosUNetInferenceCfg",
+  "SpotiflowInferenceCfg": "pipeline_modules.segmentation.config.SpotiflowInferenceCfg"
+ },
+ "sample_layout": {
+  "class": "pipeline_modules.utils.sample_layout.SampleLayout",
+  "relevant_paths": {
+   "signal_zarr": "SampleLayout.signal_zarr",
+   "mask_zarr": "SampleLayout.mask_zarr",
+   "mask_tiff_dir": "SampleLayout.mask_tiff_dir"
+  }
+ }
 }

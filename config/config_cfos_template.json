@@ -75,22 +75,28 @@
     "annotation_path": "${YIFU_DATA_DIR}/reference/atlas_label_v2_uint16.tiff",
     "transform_type": "SyNRA",
     "allow_reflection": false,
-    "flip_atlas": [false, false, false],
+    "flip_atlas": [
+      false,
+      false,
+      false
+    ],
     "auto_orient": true,
     "orientation_confidence_min": 0.02,
-        "save_upsampled_label": false,
-        "save_upsampled_label_zarr": true,
-        "save_upsampled_label_hemisphere_zarr": true,
-      "grad_step": 0.15,
-      "syn_iterations": [
-        70,
-        50,
-        30,
-        10
-      ],
-      "halo_mask": true,
-      "n4_preprocess": true,
-      "rigid_preflight_qc": true
+    "save_upsampled_label": false,
+    "save_upsampled_label_zarr": true,
+    "save_upsampled_label_hemisphere_zarr": true,
+    "grad_step": 0.15,
+    "syn_iterations": [
+      70,
+      50,
+      30,
+      10
+    ],
+    "halo_mask": true,
+    "n4_preprocess": true,
+    "rigid_preflight_qc": true,
+    "brain_mask_source": "dl_fusion3",
+    "brain_mask_erode": 1
   },
   "segmentation": {
     "method": "cfos_unet",
@@ -100,10 +106,21 @@
       "save_probability": false,
       "probability_zarr": "",
       "dataset_name": "0",
-      "patch_size": [256, 256, 256],
-      "chunk_size": [256, 256, 256],
+      "patch_size": [
+        256,
+        256,
+        256
+      ],
+      "chunk_size": [
+        256,
+        256,
+        256
+      ],
       "normalize_scope": "global",
-      "normalize_percentiles": [1.0, 99.5],
+      "normalize_percentiles": [
+        1.0,
+        99.5
+      ],
       "overlap": 0.25,
       "batch_size": 16,
       "device": "auto",
@@ -126,25 +143,29 @@
       "downsample_factor": 4
     }
   },
-    "analysis": {
-        "density_config": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
-        "output_format": "xlsx",
-        "use_hemisphere_label": true
-    },
-    "tubule_reconstruction": {
-        "enabled": false,
-        "dust_threshold": 100,
-        "save_skeleton": true,
-        "save_swc": false,
-        "chunkwise": true,
-        "chunk_workers": 8,
-        "process_existing_only": true,
-        "halo_zyx": [2, 4, 4],
-        "downsample_factor": 4,
-        "region_analysis": {
-            "enabled": true,
-            "all_regions": true,
-            "cfg": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
-        }
+  "analysis": {
+    "density_config": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV",
+    "output_format": "xlsx",
+    "use_hemisphere_label": true
+  },
+  "tubule_reconstruction": {
+    "enabled": false,
+    "dust_threshold": 100,
+    "save_skeleton": true,
+    "save_swc": false,
+    "chunkwise": true,
+    "chunk_workers": 8,
+    "process_existing_only": true,
+    "halo_zyx": [
+      2,
+      4,
+      4
+    ],
+    "downsample_factor": 4,
+    "region_analysis": {
+      "enabled": true,
+      "all_regions": true,
+      "cfg": "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
     }
+  }
 }

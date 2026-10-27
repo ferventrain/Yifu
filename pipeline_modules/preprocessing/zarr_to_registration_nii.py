@@ -151,6 +151,70 @@ def compute_halo_brain_mask(volume: np.ndarray) -> tuple[np.ndarray, dict]:
     return mask, stats
 
 
+def _zoom_mask_to_shape(mask: np.ndarray, target_shape: tuple[int, int, int]) -> np.ndarray:
+    """Nearest-neighbour zoom for binary masks (order=0 keeps components sharp)."""
+    from scipy import ndimage
+
+    if tuple(mask.shape) == target_shape:
+        return mask
+    factors = [target / current for target, current in zip(target_shape, mask.shape)]
+    zoomed = ndimage.zoom(mask.astype(np.uint8), factors, order=0, mode="nearest")
+    return zoomed > 0
+
+
+def load_external_brain_mask(mask_zarr: str | Path, target_shape: tuple[int, int, int], erode: int = 1):
+    """Map an external (e.g. aind fusion3 DL) coarse-grid mask onto the
+    registration grid and clean it up the same way the halo mask is: keep the
+    largest 3D component (stray tissue fragments have no atlas counterpart and
+    only drag the metric) and erode ``erode`` voxels off the boundary rim.
+
+    Returns (mask bool array, stats dict).
+    """
+    from scipy import ndimage
+
+    arr = open_zarr_array(mask_zarr, dataset_name="0")
+    depth = arr.shape[0]
+    slabs = []
+    for z in range(depth):
+        slab = (np.asarray(arr[z]) > 0).astype(np.uint8)[None]  # (1, ny, nx)
+        slabs.append(_zoom_mask_to_shape(slab, (1, target_shape[1], target_shape[2]))[0].astype(np.uint8))
+        if (z + 1) % 256 == 0 or z + 1 == depth:
+            logger.info("Brain mask xy mapping %d/%d slabs", z + 1, depth)
+    stacked = _zoom_mask_to_shape(np.stack(slabs, axis=0), target_shape)
+    del slabs
+
+    labels, count = ndimage.label(stacked)
+    if count > 1:
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        mask = labels == int(np.argmax(sizes))
+        components = count
+    else:
+        mask = stacked
+        components = count
+    del labels, stacked
+    if erode > 0:
+        structure = ndimage.generate_binary_structure(3, 1)
+        mask = ndimage.binary_erosion(mask, structure=structure, iterations=erode)
+
+    stats = {
+        "applied": True,
+        "source": str(mask_zarr),
+        "erode": int(erode),
+        "components": int(components),
+        "voxels": int(mask.sum()),
+    }
+    logger.info(
+        "External brain mask: %s, %d component(s), kept %d/%d voxels after erode=%d",
+        Path(mask_zarr).name,
+        components,
+        int(mask.sum()),
+        int(mask.size),
+        erode,
+    )
+    return mask, stats
+
+
 def convert_zarr_to_registration_nii(
     input_zarr: str | Path,
     output_nii: str | Path,
@@ -160,6 +224,8 @@ def convert_zarr_to_registration_nii(
     dataset_name: str = "0",
     flip_y: bool = False,
     halo_mask: bool = True,
+    brain_mask_zarr: str | Path | None = None,
+    brain_mask_erode: int = 1,
 ) -> dict:
     """Rescale a Zarr volume to the target isotropic spacing and write a NIfTI.
 
@@ -170,7 +236,13 @@ def convert_zarr_to_registration_nii(
     ``halo_mask`` (default on) zeroes everything outside an auto-detected
     brain mask before writing, so the scattering halo around the tissue never
     reaches the registration metric. The mask is also saved next to the NIfTI
-    as ``brain_mask.nii.gz``."""
+    as ``brain_mask.nii.gz``.
+
+    ``brain_mask_zarr`` overrides the Otsu halo mask with an external coarse-
+    grid brain mask (e.g. ``ch0_brain_mask_dl.zarr`` from
+    pipeline_modules.segmentation.brain_mask_aind): the mask is mapped onto
+    the registration grid, reduced to its largest 3D component, eroded
+    ``brain_mask_erode`` voxels, then used for the same zeroing + mask NIfTI."""
     import nibabel as nib
     from scipy import ndimage
 
@@ -225,7 +297,16 @@ def convert_zarr_to_registration_nii(
     del volume
 
     halo_stats: dict = {"applied": False}
-    if halo_mask:
+    brain_mask_stats: dict = {"applied": False, "source": None}
+    if brain_mask_zarr is not None:
+        # DL mask (registration.brain_mask_source=dl_fusion3) replaces the Otsu
+        # halo mask for zeroing; N4/orientation read the same brain_mask.nii.gz.
+        mask, brain_mask_stats = load_external_brain_mask(
+            brain_mask_zarr, (out_nz, out_ny, out_nx), erode=brain_mask_erode
+        )
+        volume_u16 = np.where(mask, volume_u16, 0).astype(np.uint16)
+        del mask
+    elif halo_mask:
         mask, halo_stats = compute_halo_brain_mask(volume_u16)
         volume_u16 = np.where(mask, volume_u16, 0).astype(np.uint16)
         del mask
@@ -249,7 +330,7 @@ def convert_zarr_to_registration_nii(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     nib.save(nib.Nifti1Image(volume_xyz, affine), str(output_path))
 
-    if halo_mask:
+    if halo_mask or brain_mask_stats["applied"]:
         # Same geometry as volume.nii.gz (xyz transpose + unit affine) so the
         # mask can be overlaid on the registration volume directly.
         mask_nii_path = output_path.parent / "brain_mask.nii.gz"
@@ -261,6 +342,7 @@ def convert_zarr_to_registration_nii(
                 "original_shape": [nz, ny, nx],
                 "spacing_xyz": [res_x, res_y, res_z],
                 "halo_mask": halo_stats,
+                "brain_mask": brain_mask_stats,
             },
             handle,
         )
@@ -273,6 +355,7 @@ def convert_zarr_to_registration_nii(
         "input_resolution_xyz": [res_x, res_y, res_z],
         "target_resolution_xyz": [tgt_x, tgt_y, tgt_z],
         "halo_mask": halo_stats,
+        "brain_mask": brain_mask_stats,
     }
 
 
@@ -298,6 +381,18 @@ def parse_args() -> argparse.Namespace:
         "around the tissue so registration cannot inflate past the boundary "
         "(default on; --no-halo_mask to disable)",
     )
+    parser.add_argument(
+        "--brain_mask",
+        default=None,
+        help="Coarse-grid brain-mask Zarr (e.g. ch0_brain_mask_dl.zarr) that replaces "
+        "the Otsu halo mask for zeroing and brain_mask.nii.gz",
+    )
+    parser.add_argument(
+        "--brain_mask_erode",
+        type=int,
+        default=1,
+        help="Voxels eroded off the external brain-mask boundary (default 1)",
+    )
     parser.add_argument("--json_logs", action="store_true", help="Emit NDJSON log records to stderr")
     return parser
 
@@ -318,6 +413,8 @@ def main() -> int:
         dataset_name=args.dataset_name,
         flip_y=args.flip_y,
         halo_mask=args.halo_mask,
+        brain_mask_zarr=args.brain_mask,
+        brain_mask_erode=args.brain_mask_erode,
     )
     write_run_manifest(
         Path(args.output_nii).parent,
@@ -330,6 +427,8 @@ def main() -> int:
             "dataset_name": args.dataset_name,
             "flip_y": args.flip_y,
             "halo_mask": args.halo_mask,
+            "brain_mask": args.brain_mask,
+            "brain_mask_erode": args.brain_mask_erode,
         },
         outputs=[Path(args.output_nii)],
         started_at=started_at,

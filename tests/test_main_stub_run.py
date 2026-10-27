@@ -16,7 +16,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 EXPECTED_COMMANDS = [
-    "1.1 Downsample registration channel",
+    "1.0 Registration brain mask (aind fusion3)",
+    "1.1 Downsample registration channel (from coarse Zarr)",
     "2.1 ANTs registration (atlas -> image)",
     "2.3 Hemisphere Zarr from registration transform",
     "3.3 Convert signal TIFF to Zarr",
@@ -39,6 +40,9 @@ def _build_stub_config(tmp_path: Path) -> Path:
 
     sample_dir = tmp_path / "SAMPLE_STUB"
     sample_dir.mkdir(parents=True)
+    # Brain-mask step 1.0 (registration.brain_mask_source=dl_fusion3) reads the
+    # coarse registration Zarr; an empty dir is enough for --stub wiring.
+    (sample_dir / "ch0_downsampled.zarr").mkdir()
     # Hemisphere step 2.3 requires saved fwd transforms on disk (the flat-plane
     # label fallback was removed); a dummy marker file is enough for --stub.
     (sample_dir / "transforms").mkdir()
