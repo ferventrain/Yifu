@@ -185,6 +185,7 @@ def test_fix_layer_scales_sets_um_spacing():
 
     class FakeLayer:
         scale = (1.0, 1.0, 1.0)
+        translate = (0.0, 0.0, 0.0)
 
     class FakePano:
         scale = (1.0, 1.0, 1.0)
@@ -203,6 +204,7 @@ def test_fix_layer_scales_sets_um_spacing():
     class FakeLayer2:
         def __init__(self):
             self.scale = (1.0, 1.0, 1.0)
+            self.translate = (0.0, 0.0, 0.0)
 
     class FakePanel:
         pass

@@ -1283,13 +1283,24 @@ def _fix_layer_scales(panel) -> None:
         if not np.allclose(np.asarray(image_layer.scale, dtype=float),
                            np.asarray(new_scale, dtype=float), rtol=0.01):
             image_layer.scale = new_scale
-        # db/标注坐标是层级体素索引，neurofly 靠全层 scale=1 对齐；image 层改成
-        # µm 后，当前 level 的配套层（点/边/goal）必须同步同一 scale
+        # db/标注坐标是层级体素绝对索引；image 层改成 µm scale 后，配套层
+        # （点/边/goal）同步同一 scale，且 translate 必须补
+        # translate = image.translate * (1 - scale)：
+        # napari world = data*scale + translate；neurofly 的 image.translate
+        # 是体素单位的 ROI 偏移（napari 不乘 scale），体素绝对坐标的点要落在
+        # 图像体素 v 上，需 world(v) = image.translate + (v - image.translate)*scale
+        it = tuple(float(v) for v in image_layer.translate)
+        new_translate = tuple(t * (1 - s) for t, s in zip(it, new_scale))
         for attr in ("point_layer", "edge_layer", "ex_edge_layer", "goal_layer"):
             layer = getattr(panel, attr, None)
-            if layer is not None and not np.allclose(
+            if layer is None:
+                continue
+            if not np.allclose(
                     np.asarray(layer.scale, dtype=float), np.asarray(new_scale, dtype=float), rtol=0.01):
                 layer.scale = new_scale
+            if not np.allclose(
+                    np.asarray(layer.translate, dtype=float), np.asarray(new_translate, dtype=float), rtol=1e-6):
+                layer.translate = new_translate
 
     # panorama 图像层是粗层数据 → scale 用 pano 层 spacing；而 panorama 的
     # db 点层坐标是 hr 层绝对体素（与 point_layer 同口径）→ scale 必须用
