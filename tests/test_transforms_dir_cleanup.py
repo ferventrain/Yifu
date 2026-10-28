@@ -11,8 +11,10 @@ def test_save_registration_results_clears_stale_transforms(tmp_path: Path) -> No
     be removed before the new generation is copied in."""
     import importlib.util
 
+    repo = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location(
-        "ants_registration_module", REPO_MODULE := Path(r"H:/yifu0428/Yifu/pipeline_modules/registration/ANTs_registration.py")
+        "ants_registration_module",
+        REPO_MODULE := repo / "pipeline_modules" / "registration" / "ANTs_registration.py",
     )
     assert spec is not None
     # Parsing the whole module requires heavy deps (ants). Instead assert the

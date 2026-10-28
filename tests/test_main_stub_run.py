@@ -37,6 +37,8 @@ def _build_stub_config(tmp_path: Path) -> Path:
     template["registration"]["atlas_path"] = str(tmp_path / "reference" / "atlas.tiff")
     template["registration"]["annotation_path"] = str(tmp_path / "reference" / "atlas_label.tiff")
     template["segmentation"]["cfos_unet"]["checkpoint_path"] = str(tmp_path / "models" / "best_model.pt")
+    # DL brain mask 默认关闭（template=halo）；stub 测试显式打开以维持 1.0 步骤接线覆盖
+    template["registration"]["brain_mask_source"] = "dl_fusion3"
 
     sample_dir = tmp_path / "SAMPLE_STUB"
     sample_dir.mkdir(parents=True)

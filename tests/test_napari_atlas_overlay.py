@@ -19,7 +19,7 @@ def _make_label_store(root, shape=(37, 45, 53)):
     import zarr
 
     root.mkdir(parents=True, exist_ok=True)
-    group = zarr.open_group(str(root), mode="w")
+    group = zarr.open_group(str(root), mode="w", zarr_format=2)
     arr = group.create_array("0", shape=shape, chunks=(8, 8, 8), dtype="uint16", compressors=None)
     data = np.zeros(shape, dtype="uint16")
     data[10:20, 10:20, 10:20] = 5
@@ -130,7 +130,7 @@ def test_label_levels_skips_non_numeric(tmp_path):
     root = tmp_path / "lab.zarr"
     import zarr
 
-    group = zarr.open_group(str(root), mode="w")
+    group = zarr.open_group(str(root), mode="w", zarr_format=2)
     group.create_array("0", shape=(4, 4, 4), dtype="uint8", compressors=None)
     group.create_array("1", shape=(2, 2, 2), dtype="uint8", compressors=None)
     group.create_array("extra", shape=(2, 2, 2), dtype="uint8", compressors=None)
@@ -145,3 +145,87 @@ def test_decode_ims_attr_variants():
     assert _decode_ims_attr(np.array([2.5], dtype="f4")) == 2.5
     assert _decode_ims_attr(None) is None
     assert _decode_ims_attr(np.frombuffer(b"abc", dtype="S1")) is None
+
+
+def test_scan_level_centroids_one_pass():
+    from pipeline_modules.visualization.napari_atlas_overlay import scan_level_centroids
+
+    data = np.zeros((6, 8, 10), dtype="uint16")
+    data[1:3, 2:6, 4:8] = 5
+    data[4:6, 0:2, 0:2] = 9
+    centroids, counts = scan_level_centroids(data)
+    assert counts == {5: 32, 9: 8}
+    assert centroids[5] == (1.5, 3.5, 5.5)
+    assert centroids[9] == (4.5, 0.5, 0.5)
+
+
+def test_resolve_display_set_self_children_or_none():
+    from pipeline_modules.visualization.napari_atlas_overlay import (
+        RegionRow,
+        build_children_map,
+        resolve_display_set,
+    )
+
+    rows = [
+        RegionRow(1, "A", "Area A", (1,)),
+        RegionRow(10, "A1", "Area A one", (1, 10)),
+        RegionRow(11, "A2", "Area A two", (1, 11)),
+        RegionRow(12, "A1a", "Area A one alpha", (1, 10, 12)),
+        RegionRow(2, "B", "Area B", (2,)),
+    ]
+    children = build_children_map(rows)
+    assert resolve_display_set(2, {2, 10}, children) == [2]
+    assert resolve_display_set(1, {10, 12}, children) == [10, 12]
+    assert resolve_display_set(1, set(), children) == []
+    assert resolve_display_set(99, {10}, children) == []
+
+
+def test_fix_layer_scales_sets_um_spacing():
+    from pipeline_modules.visualization.napari_atlas_overlay import _fix_layer_scales
+
+    class FakeLayer:
+        scale = (1.0, 1.0, 1.0)
+
+    class FakePano:
+        scale = (1.0, 1.0, 1.0)
+        visible = True
+
+    class FakePanoPoints:
+        scale = (1.0, 1.0, 1.0)
+
+    class FakeImage:
+        resolution_levels = ["L0", "L7"]
+
+        def __init__(self, info):
+            self.info = info
+            self.rois = [[0, 0, 0, 18317, 32752, 4475], [0, 0, 0, 285, 512, 35]]
+
+    class FakeLayer2:
+        def __init__(self):
+            self.scale = (1.0, 1.0, 1.0)
+
+    class FakePanel:
+        pass
+
+    info = [
+        {"spacing": [0.71, 0.71, 2.0], "image_size": [18317, 32752, 4475]},
+        {"spacing": [64.27, 64.0, 128.0], "image_size": [285, 512, 35]},
+    ]
+    panel = FakePanel()
+    panel.image = FakeImage(info)
+    panel.image_layer = FakeLayer()
+    panel.panorama_image = FakePano()
+    panel.panorama_points = FakePanoPoints()
+    panel.resolution_dropdown = None
+    panel.level = None
+    panel.point_layer = FakeLayer2()
+    _fix_layer_scales(panel)
+    assert np.allclose(panel.image_layer.scale, (0.71, 0.71, 2.0))
+    # 配套层（点层）必须与 image 层同步 scale，db 体素坐标才能对齐
+    assert np.allclose(panel.point_layer.scale, (0.71, 0.71, 2.0))
+    # panorama 用第一个全轴 <1000 的层（此处 idx 1）
+    assert np.allclose(panel.panorama_image.scale, (64.27, 64.0, 128.0))
+    # panorama 点层坐标是 hr 层绝对体素 → scale 用 hr spacing（0.71/2.0 口径）
+    assert np.allclose(panel.panorama_points.scale, (0.71, 0.71, 2.0))
+    _fix_layer_scales(panel)
+    assert np.allclose(panel.image_layer.scale, (0.71, 0.71, 2.0))

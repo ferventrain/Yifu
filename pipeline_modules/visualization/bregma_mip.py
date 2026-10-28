@@ -1821,6 +1821,7 @@ def render_bregma_mips(
     ap_window_from_regions: list[str] | None = None,
     ap_window_margin_mm: float = 0.25,
     region_csv: str | Path | None = None,
+    channel_windows: list[tuple[float, float]] | None = None,
 ) -> dict[str, object]:
     if space == "atlas-band":
         return render_atlas_band_mips(
@@ -1853,6 +1854,8 @@ def render_bregma_mips(
             split_nucleus_merge=split_nucleus_merge,
             boundary_region=boundary_region,
             boundary_region_colors=boundary_region_colors,
+            region_csv=region_csv,
+            channel_windows=channel_windows,
         )
     if space == "atlas":
         return render_atlas_space_mips(
@@ -2419,6 +2422,8 @@ def render_atlas_band_mips(
     split_nucleus_merge: bool = False,
     boundary_region: list[str] | None = None,
     boundary_region_colors: list[str] | None = None,
+    region_csv: str | Path | None = None,
+    channel_windows: list[tuple[float, float]] | None = None,
 ) -> dict[str, object]:
     """Atlas-space slab with per-pixel curved windows, native-voxel band MIP.
 
@@ -2592,13 +2597,26 @@ def render_atlas_band_mips(
         if boundary_region:
             # Per-region outlines traced straight on the atlas label slice:
             # upright on the atlas grid, replaces the stock all-boundary overlay.
+            # The plane is picked INSIDE the slab where the regions actually have
+            # voxels -- at bregma-centered slabs the center plane can sit anterior
+            # of the hippocampus entirely.
             if atlas_label_volume is None:
                 raise ValueError("--boundary-region needs the atlas label volume")
             ids_map = region_subtree_ids(
                 boundary_region, region_csv=region_csv or DEFAULT_REGION_CSV
             )
-            lab_plane = np.asarray(
-                atlas_label_volume[:, int(np.clip(round(ap_center), 0, n_ap_a - 1)), :]
+            ids_union = np.array(sorted(set().union(*ids_map.values())), dtype=np.int64)
+            lab_lo = int(np.clip(round(ap_center - half_vox), 0, n_ap_a - 1))
+            lab_hi = int(np.clip(round(ap_center + half_vox), 0, n_ap_a - 1))
+            best_ap, best_n = int(np.clip(round(ap_center), 0, n_ap_a - 1)), -1
+            for ap in range(lab_lo, lab_hi + 1):
+                n_ = int(np.isin(np.asarray(atlas_label_volume[:, ap, :]), ids_union).sum())
+                if n_ > best_n:
+                    best_ap, best_n = ap, n_
+            lab_plane = np.asarray(atlas_label_volume[:, best_ap, :])
+            logger.info(
+                "boundary-region plane: atlas AP %d (%d subtree voxels in slab %d-%d)",
+                best_ap, best_n, lab_lo, lab_hi,
             )
             lines_by: dict[str, list[np.ndarray]] = {}
             for r in boundary_region:
@@ -2617,7 +2635,14 @@ def render_atlas_band_mips(
                 : len(boundary_region)
             ]
             boundary = None  # region outlines replace the stock all-boundary lines
-        if len(mips) > 1:
+        if channel_windows is not None:
+            # 用户固定窗口: (min, max), 低于 min 归零, 高于 max 饱和
+            mips = [np.clip(m - wmin, 0.0, None).astype(np.float32)
+                    for m, (wmin, wmax) in zip(mips, channel_windows)]
+            vmaxs = [wmax - wmin for wmin, wmax in channel_windows]
+            vmax_eff = vmaxs[-1]
+            mip = _compose_rgb(mips, cmaps, vmaxs)
+        elif len(mips) > 1:
             vmaxs = [resolve_display_vmax(m, percentile=percentile, explicit=vmax) for m in mips]
             vmax_eff = vmaxs[-1]
             mip = _compose_rgb(mips, cmaps, vmaxs)
@@ -2713,7 +2738,7 @@ def render_atlas_band_mips(
             meta=meta,
             flip_dv=flip_dv,
             flip_ml=flip_ml,
-            cmap=resolve_channel_cmaps(1, cmaps)[0] if cmaps else "gray",
+            cmap=cmaps[0] if cmaps else "gray",
             boundary_lines=boundary,
             boundary_color=boundary_color,
             boundary_linewidth=boundary_linewidth,
@@ -2931,6 +2956,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--region-csv", default=None,
                         help="Region csv for --boundary-region / --ap-window-from-regions "
                              "acronym and subtree lookup (default: registration/Region_Csv_Rev2_updated.CSV)")
+    parser.add_argument("--channel-windows", default="",
+                        help="Per-channel fixed display windows as 'min:max' comma-separated, "
+                             "aligned with --zarr order (e.g. '150:600,100:1000,200:3000'); "
+                             "values below min read as 0, above max saturate. Overrides "
+                             "--percentile/--vmax when set")
     return parser
 
 
@@ -2938,6 +2968,20 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = build_parser().parse_args(argv)
     boundary_style = args.boundary_style or ("solid" if args.bilateral else "dashed")
+    channel_windows = None
+    if args.channel_windows:
+        try:
+            channel_windows = [
+                tuple(float(v) for v in part.split(":", 1))
+                for part in args.channel_windows.split(",") if part.strip()
+            ]
+            if not all(len(w) == 2 and w[0] < w[1] for w in channel_windows):
+                raise ValueError
+        except ValueError:
+            print(f"Error: bad --channel-windows {args.channel_windows!r}; "
+                  "expected 'min:max' comma-separated, e.g. '150:600,100:1000,200:3000'",
+                  file=sys.stderr)
+            return 1
     try:
         payload = render_bregma_mips(
             zarr_path=args.zarr,
@@ -2987,6 +3031,7 @@ def main(argv: list[str] | None = None) -> int:
             ap_window_from_regions=[a.strip() for a in args.ap_window_from_regions.split(",") if a.strip()] or None,
             ap_window_margin_mm=args.ap_window_margin_mm,
             region_csv=args.region_csv,
+            channel_windows=channel_windows,
         )
     except (AnchorError, ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

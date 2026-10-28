@@ -28,6 +28,7 @@ MegaSpim level-2 exports) feeds slices at half that sampling, which validated
 without resampling.
 """
 from __future__ import annotations
+import json
 
 import argparse
 import logging
@@ -44,6 +45,88 @@ IMG_SIZE = 1024
 BATCH_Z = 4
 BATCH_YX = 8
 PROB_SCALE = 255.0
+
+
+class _RamVolume:
+    """内存卷垫片：兼容三轴 slab 赋值语义（zarr3 v2 异步写在本机不可靠，先入内存）。"""
+
+    def __init__(self, shape):
+        self.buf = np.zeros(shape, dtype=np.uint8)
+
+    def __setitem__(self, key, value):
+        self.buf[key] = np.asarray(value, dtype=np.uint8)
+
+
+def _dump_volume_v2(path, buf, chunk_yx=(512, 512), log=print):
+    """手工 v2 落盘（zstd、全零 chunk 跳过、边缘补零）——zarr 写路径的可靠替代。"""
+    import json
+    import shutil
+    import time
+
+    from numcodecs import Blosc
+
+    path = Path(path)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    (path / ".zarray").write_text(json.dumps({
+        "shape": [int(v) for v in buf.shape], "chunks": [1, chunk_yx[0], chunk_yx[1]],
+        "dtype": buf.dtype.str, "fill_value": 0, "order": "C", "filters": None,
+        "dimension_separator": ".", "zarr_format": 2,
+        "compressor": {"id": "blosc", "cname": "zstd", "clevel": 5, "shuffle": 1, "blocksize": 0},
+    }), encoding="utf-8")
+    (path / ".zattrs").write_text(json.dumps({"multiscales": [{"version": "0.4", "datasets": [
+        {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]}]}]}), encoding="utf-8")
+    arr_dir = path
+    codec = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
+    t0 = time.time()
+    count = 0
+    for z in range(buf.shape[0]):
+        plane = np.ascontiguousarray(buf[z])
+        for yo in range(0, buf.shape[1], chunk_yx[0]):
+            for xo in range(0, buf.shape[2], chunk_yx[1]):
+                sub = plane[yo:yo + chunk_yx[0], xo:xo + chunk_yx[1]]
+                if not sub.any():
+                    continue
+                if sub.shape != (chunk_yx[0], chunk_yx[1]):
+                    pad = np.zeros((chunk_yx[0], chunk_yx[1]), dtype=sub.dtype)
+                    pad[: sub.shape[0], : sub.shape[1]] = sub
+                    sub = pad
+                if not sub.flags["C_CONTIGUOUS"]:
+                    sub = np.ascontiguousarray(sub)
+                (arr_dir / f"{z}.{yo // chunk_yx[0]}.{xo // chunk_yx[1]}").write_bytes(codec.encode(sub))
+                count += 1
+    log(f"  dumped {buf.shape} -> {count} chunks in {time.time() - t0:.0f}s")
+
+
+def _load_volume_v2(path):
+    """读回手工 v2 卷（缺 chunk 补零）。"""
+    import json
+
+    import numpy as np
+
+    path = Path(path)
+    meta = json.loads((path / "0" / ".zarray").read_text(encoding="utf-8"))
+    shape = tuple(meta["shape"])
+    out = np.zeros(shape, dtype=np.dtype(meta["dtype"]))
+    from numcodecs import Blosc
+
+    codec = Blosc.from_config(meta["compressor"]) if meta.get("compressor") else None
+    arr_dir = path / "0"
+    for f in arr_dir.iterdir():
+        if f.name.startswith("."):
+            continue
+        idx = tuple(int(v) for v in f.name.split("."))
+        raw = codec.decode(f.read_bytes())
+        zz = slice(idx[0], min(idx[0] + meta["chunks"][0], shape[0]))
+        yy = slice(idx[1], min(idx[1] + meta["chunks"][1], shape[1]))
+        xx = slice(idx[2], min(idx[2] + meta["chunks"][2], shape[2]))
+        block = np.frombuffer(raw, dtype=np.dtype(meta["dtype"])).reshape(
+            min(meta["chunks"][0], shape[0] - idx[0]),
+            min(meta["chunks"][1], shape[1] - idx[1]),
+            min(meta["chunks"][2], shape[2] - idx[2]))
+        out[zz, yy, xx] = block
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -63,13 +146,17 @@ def build_model(model_path: str | Path, device: str = "cuda"):
     class _NeurattInference(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.model = SwinUNETR(
-                img_size=(IMG_SIZE, IMG_SIZE),
+            kwargs = dict(
                 in_channels=1,
                 out_channels=1,
                 feature_size=12,
                 spatial_dims=2,
             )
+            try:
+                # monai >=1.4 移除了 img_size（全卷积，本就未使用）
+                self.model = SwinUNETR(img_size=(IMG_SIZE, IMG_SIZE), **kwargs)
+            except TypeError:
+                self.model = SwinUNETR(**kwargs)
 
         def forward(self, x):
             return self.model(x)
@@ -177,9 +264,9 @@ def run_brain_mask(
     prob_dir.mkdir(parents=True, exist_ok=True)
 
     def compute_plane(tag: str, n_slices: int, batch: int, chunk, setter, get_slice, dsize):
-        """Infer one orientation into its uint8 probability cache."""
+        """Infer one orientation into its uint8 probability cache (RAM, dumped at end)."""
         nonlocal done
-        _, store = create_output_zarr(prob_paths[tag], (depth, height, width), chunk, "uint8")
+        ram = _RamVolume((depth, height, width))
         for i in range(0, n_slices, batch):
             idxs = list(range(i, min(i + batch, n_slices)))
             slabs = np.stack([np.asarray(get_slice(k), np.float32) for k in idxs])
@@ -188,9 +275,15 @@ def run_brain_mask(
                 full = np.clip(
                     _resize_prob(probs[j], dsize) * PROB_SCALE, 0, 255
                 ).astype(np.uint8)
-                setter(store, k, full)
+                if tag == "A":
+                    ram.buf[k] = full              # (h, w)
+                elif tag == "B":
+                    ram.buf[:, k, :] = full        # cv2.resize 已返回 (depth, width)
+                else:
+                    ram.buf[:, :, k] = full        # (depth, height)
             done += len(idxs)
             progress(f"prob_{tag}")
+        _dump_volume_v2(prob_paths[tag], ram.buf, log=progress)
 
     def _resize_prob(prob: np.ndarray, dsize) -> np.ndarray:
         import cv2
@@ -198,35 +291,37 @@ def run_brain_mask(
         return cv2.resize(prob, dsize, interpolation=cv2.INTER_LINEAR)
 
     compute_plane("A", depth, BATCH_Z, (1, height, width),
-                  lambda s, k, v: s.__setitem__(slice(k, k + 1), v[None]),
-                  lambda k: volume[k], (width, height))
+                  lambda s, k, v: None, lambda k: volume[k], (width, height))
     compute_plane("B", height, BATCH_YX, (depth, 1, width),
-                  lambda s, k, v: s.__setitem__((slice(None), slice(k, k + 1)), v[:, None]),
-                  lambda k: volume[:, k, :], (width, depth))
+                  lambda s, k, v: None, lambda k: volume[:, k, :], (width, depth))
     compute_plane("C", width, BATCH_YX, (depth, height, 1),
-                  lambda s, k, v: s.__setitem__((slice(None), slice(None), slice(k, k + 1)), v[..., None]),
-                  lambda k: volume[:, :, k], (height, depth))
+                  lambda s, k, v: None, lambda k: volume[:, :, k], (height, depth))
 
     # fuse: stream output z-slices; plane B/C rows touch every y/x chunk, so
     # this pass re-reads their full volumes once (a few minutes on NVMe).
     pa_store = _open_read(prob_paths["A"])
     pb_store = _open_read(prob_paths["B"])
     pc_store = _open_read(prob_paths["C"])
-    mask_root, mask_arr = create_output_zarr(output_zarr, (depth, height, width), (1, height, width), "uint8")
+    mask_ram = _RamVolume((depth, height, width))
     fractions: list[float] = []
     for k in range(depth):
-        mask_arr[k] = fuse_slab(pa_store[k], pb_store[k], pc_store[k], threshold,
-                                min_area=min_area).astype(np.uint8)
+        slab = fuse_slab(pa_store[k], pb_store[k], pc_store[k], threshold,
+                         min_area=min_area).astype(np.uint8)
+        mask_ram[(slice(k, k + 1),)] = slab[None]
         done += 1
-        fractions.append(float(mask_arr[k].mean()))
+        fractions.append(float(slab.mean()))
         progress("fuse")
-    mask_root.attrs["brain_mask_aind"] = {
+    _dump_volume_v2(output_zarr, mask_ram.buf, log=progress)
+    out_meta = Path(output_zarr) / ".zattrs"
+    meta = json.loads(out_meta.read_text(encoding="utf-8"))
+    meta["brain_mask_aind"] = {
         "source_zarr": str(input_zarr),
         "model_path": str(model_path),
         "threshold": threshold,
         "planes": ["z", "y", "x"],
         "mean_fraction": round(float(np.mean(fractions)), 5),
     }
+    out_meta.write_text(json.dumps(meta, indent=1), encoding="utf-8")
 
     if not keep_probs:
         import shutil

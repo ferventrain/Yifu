@@ -1,0 +1,103 @@
+{
+  "schema_version": "1",
+  "module": "HE",
+  "description": "Virtual H&E false coloring of paired two-channel TIFF slice stacks (MegaSpim All_Channels exports): per-slice restoration (RL deconvolution, FFT destripe, rolling-ball background, optional CLAHE) + Beer-Lambert falsecolor rendering (Liu Lab falsecolor package, per-plane tile flat-field) with optional background masking and RGB post-sharpening.",
+  "notes_for_agents": [
+    "Production entry is falsecolor_batch. Run with the micromamba yifu env python only (the falsecolor package lives in that env).",
+    "Channel convention: nuclei_channel=1, cyto_channel=0 (ch1 nuclear stain, ch0 cytoplasm/autofluorescence). Verify per sample before batch runs.",
+    "All-default invocation = current latest method: he_preprocess (deconv rl sigma 1.2 x10 -> destripe fft 0.85 -> rolling_ball r5) + asymmetric background subtract (nuc 3x, cyto 1x) + pre-color sharpen 0.05 + per-plane tile flat-field (256 px, nuc 0.7 / cyto 2.6) + HE palette.",
+    "--flatfield (default on) REQUIRES --backend gpu (numba CUDA). On GPU-less hosts the backend silently falls back to cpu and the run then aborts on the flatfield check -- pass --no-flatfield (and tune nuc/cyto_normfactor) instead.",
+    "Resume is default-on: non-empty existing outputs are skipped; a _falsecolor_progress.json is kept in the output dir.",
+    "For production runs submit via PM wrap: `python -m pipeline_modules.harness wrap --sample-dir <dir> --title <ASCII title> -- <command>`. The program prints [done/total] lines but no PROGRESS protocol lines (no progress bar; heartbeat + log tail still tracked). Wrap runs the child with cwd=sample-dir, so set PYTHONPATH=<repo root> or run from the repo root.",
+    "Input discovery expects <prefix>_ch<N>.tif(f) pairs; output goes to <input_dir>_FalseColor (unless --output_dir) as <prefix>_HE.tif RGB uint8 slices."
+  ],
+  "entrypoints": [
+    {
+      "id": "falsecolor_batch",
+      "function": "pipeline_modules.HE.falsecolor_batch.main",
+      "cli": "python -m pipeline_modules.HE.falsecolor_batch --input_dir <All_Channels dir>",
+      "description": "Batch virtual H&E conversion of paired ch0/ch1 TIFF slices (production entry).",
+      "inputs": {
+        "input_dir": {
+          "type": "path",
+          "required": true,
+          "description": "Directory containing <prefix>_ch0/_ch1 TIFF pairs (e.g. All_Channels export)"
+        },
+        "output_dir": {
+          "type": "path|null",
+          "default": null,
+          "description": "Defaults to <input_dir>_FalseColor"
+        },
+        "nuclei_channel": {"type": "int", "default": 1},
+        "cyto_channel": {"type": "int", "default": 0},
+        "backend": {
+          "type": "string",
+          "default": "gpu",
+          "description": "gpu=rapidFalseColor (numba CUDA), cpu=falseColor; auto-falls back to cpu when CUDA is unavailable"
+        },
+        "workers": {
+          "type": "int",
+          "default": 16,
+          "description": "Parallel worker processes; preprocess is CPU-bound, pair with OMP_NUM_THREADS=1-2"
+        },
+        "he_preprocess": {
+          "type": "bool",
+          "default": true,
+          "description": "Per-slice chain: RL deconvolution (deconv_backend rl, sigma 1.2, iterations 10) -> FFT destripe (strength 0.85, notch 2.0, orientation horizontal) -> rolling ball r5 on nuclei; see --deconv_*/--destripe_*/--rolling_ball_radius flags"
+        },
+        "flatfield": {
+          "type": "bool",
+          "default": true,
+          "description": "Per-plane tile-median flat-field (tile 256, nuc scale 0.7, cyto scale 2.6); requires gpu backend; replaces global normfactors"
+        },
+        "bg_nuc_factor": {"type": "float", "default": 3.0, "description": "Subtract factor*background from nuclei before coloring (with flatfield)"},
+        "bg_cyto_factor": {"type": "float", "default": 1.0, "description": "Subtract factor*background from cyto before coloring (with flatfield)"},
+        "sharpen_alpha": {"type": "float", "default": 0.05, "description": "Pre-color edge sharpen (colleague sharpenImage)"},
+        "color_key": {"type": "string", "default": "HE", "description": "falsecolor palette: HE | IHC"},
+        "nuclei_hue": {"type": "string", "default": "default", "description": "HE preset: default | blue | purple"},
+        "nuc_threshold": {"type": "int", "default": 100},
+        "cyto_threshold": {"type": "int", "default": 100},
+        "nuc_normfactor": {"type": "int", "default": 8200, "description": "Global nuclei normalization (ignored when flatfield on)"},
+        "cyto_normfactor": {"type": "int", "default": 2100, "description": "Global cyto normalization (ignored when flatfield on)"},
+        "mask_background": {
+          "type": "string",
+          "default": "none",
+          "description": "Post-color background masking: none | channels | rgb | channels+rgb | hsv (see --background_threshold/--white_threshold/--pale_signal_threshold/--hsv_* companions)"
+        },
+        "fill_holes": {"type": "bool", "default": false, "description": "Restore color inside masked holes within tissue"},
+        "contrast": {"type": "float", "default": 1.0, "description": "Post-color contrast around near-white background"},
+        "sharpen": {"type": "float", "default": 0.0, "description": "Post-color unsharp-mask amount"},
+        "suffix": {"type": "string", "default": "_HE.tif"},
+        "test": {"type": "int", "default": 0, "description": "Process only the first N pairs (smoke test)"},
+        "middle": {"type": "int", "default": 0, "description": "Process N pairs from the center of the stack"},
+        "slice_start": {"type": "int", "default": 0},
+        "slice_count": {"type": "int", "default": 0, "description": "0 = to end"},
+        "resume": {"type": "bool", "default": true, "description": "Skip slices whose output already exists"}
+      },
+      "outputs": {
+        "he_tiff_dir": {
+          "type": "path",
+          "description": "<output_dir>/<prefix>_HE.tif RGB uint8 slices + _falsecolor_progress.json resume state"
+        }
+      }
+    },
+    {
+      "id": "he_single_slice_preview",
+      "function": "pipeline_modules.HE.pipeline.main",
+      "cli": "python -m pipeline_modules.HE.pipeline --input_dir <dir> --middle 1 --crop 2048 --output_he he.tif",
+      "description": "Single-slice preprocess + HE render without UI (or --preview to hand off to the napari preview); also exports preprocessed nuclei/cyto and an Otsu nuclei mask."
+    },
+    {
+      "id": "he_napari_preview",
+      "function": "pipeline_modules.HE.napari_he_preview.main",
+      "cli": "python -m pipeline_modules.HE.napari_he_preview --input_dir <dir> --middle 1 --crop 2048",
+      "description": "Interactive napari preview: nuclei/seg/cyto/HE layers with live parameter sliders."
+    },
+    {
+      "id": "he_param_tuner",
+      "function": "pipeline_modules.HE.falsecolor_param_tuner.main",
+      "cli": "python -m pipeline_modules.HE.falsecolor_param_tuner --input_dir <dir> --middle 1 --crop 1536 [--mode grid --output_dir D:/fc_tune_grid]",
+      "description": "Interactive or grid sweep of colleague-style parameters (flatfield scales, bg factors, sharpen alpha)."
+    }
+  ]
+}

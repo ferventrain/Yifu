@@ -95,7 +95,7 @@
     "halo_mask": true,
     "n4_preprocess": true,
     "rigid_preflight_qc": true,
-    "brain_mask_source": "dl_fusion3",
+    "brain_mask_source": "halo",
     "brain_mask_erode": 1
   },
   "segmentation": {

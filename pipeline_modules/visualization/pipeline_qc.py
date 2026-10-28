@@ -189,29 +189,49 @@ def measure_boundary_alignment(nii_path: Path, label_zarr_path: Path) -> dict:
     label = open_zarr_array(label_zarr_path)
     lz, ly, lx = (int(v) for v in label.shape)
 
-    tissue = np.transpose(nii_xyz[:, :, nz // 2]) > np.percentile(nii_xyz[:, :, nz // 2], 55)
-    tissue = ndimage.binary_closing(tissue, iterations=3)
-    label_plane = _resample_plane(np.asarray(label[lz // 2]) > 0, tissue.shape)
+    def plane_iou(vz: int):
+        tissue = np.transpose(nii_xyz[:, :, vz]) > np.percentile(nii_xyz[:, :, vz], 55)
+        if not tissue.any():
+            return None
+        tissue = ndimage.binary_closing(tissue, iterations=3)
+        zi = min(round(vz * lz / nz), lz - 1)
+        label_plane = _resample_plane(np.asarray(label[zi]) > 0, tissue.shape)
 
-    def iou(shift_y, shift_x):
-        moved = np.roll(label_plane, (shift_y, shift_x), axis=(0, 1))
-        inter = int((moved & tissue).sum())
-        union = int((moved | tissue).sum())
-        return inter / union if union else 0.0
+        def iou(shift_y, shift_x):
+            moved = np.roll(label_plane, (shift_y, shift_x), axis=(0, 1))
+            inter = int((moved & tissue).sum())
+            union = int((moved | tissue).sum())
+            return inter / union if union else 0.0
 
-    base = iou(0, 0)
-    best, best_shift = base, (0, 0)
-    for dy in range(-8, 9):
-        for dx in range(-8, 9):
-            value = iou(dy, dx)
-            if value > best:
-                best, best_shift = value, (dy, dx)
+        base = iou(0, 0)
+        best, best_shift = base, (0, 0)
+        for dy in range(-8, 9):
+            for dx in range(-8, 9):
+                value = iou(dy, dx)
+                if value > best:
+                    best, best_shift = value, (dy, dx)
+        return {"iou_zero_shift": round(base, 3), "iou_best_shift": round(best, 3),
+                "best_shift_px_zyx": [best_shift[0], best_shift[1]]}
+
+    planes = {}
+    for name, vz in (("anterior", nz // 4), ("middle", nz // 2), ("posterior", 3 * nz // 4)):
+        result = plane_iou(vz)
+        if result is not None:
+            planes[name] = result
+    if not planes:
+        return {"status": "WARN", "reason": "no measurable planes"}
+    ious = [v["iou_zero_shift"] for v in planes.values()]
+    med_iou = sorted(ious)[len(ious) // 2]
+    big_shift = [v for v in planes.values()
+                 if abs(v["best_shift_px_zyx"][0]) > 4 or abs(v["best_shift_px_zyx"][1]) > 4]
+    status = "INFO"
+    if big_shift and med_iou < 0.2:
+        status = "FAIL"  # 多平面最优平移大且零位移 IoU 低：真实错位
     return {
-        "status": "INFO",
-        "iou_zero_shift": round(base, 3),
-        "iou_best_shift": round(best, 3),
-        "best_shift_px_zyx": [best_shift[0], best_shift[1]],
-        "note": "<=2 px residual is expected at 25 um SyN granularity; large optimal shift indicates true misregistration",
+        "status": status,
+        "planes": planes,
+        "median_iou_zero_shift": round(med_iou, 3),
+        "note": "<=2 px residual is expected at 25 um SyN granularity; multi-plane best-shift >4px with low IoU indicates true misregistration",
     }
 
 
@@ -441,6 +461,133 @@ def save_segmentation_blocks(signal_zarr_path: Path, mask_zarr_path: Path, label
     return written
 
 
+def registration_qc(
+    sample_dir: Path,
+    *,
+    nii_path: Path | None = None,
+    label_zarr_path: Path | None = None,
+    hemi_zarr_path: Path | None = None,
+    warped_dir: Path | None = None,
+    output_dir: Path | None = None,
+    render: bool = True,
+) -> dict:
+    """配准专项 QC：单样本直调入口。
+
+    只做配准相关检查（网格形状、边界对齐多平面、y 翻转检测、配准相关系数），
+    并渲染 registration_views.png。产物 registration_verdict.json。
+    分割/半球等后续产物检查走 run_qc()（内部会调用本函数）。
+    """
+    sample_dir = Path(sample_dir)
+    nii_path = nii_path or sample_dir / "ch0_downsample" / "volume.nii.gz"
+    label_zarr_path = label_zarr_path or sample_dir / "upsampled_atlas_label.zarr"
+    hemi_zarr_path = hemi_zarr_path or sample_dir / "atlas_label_hemisphere.zarr"
+    warped_dir = warped_dir or sample_dir / "ch0_warped_image"
+    output_dir = output_dir or sample_dir / "qc"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    checks: dict[str, dict] = {}
+    grid_cfg = _load_grid_config(sample_dir)
+    if grid_cfg:
+        checks["grid_shape"] = check_grid_shape(
+            nii_path, sample_dir / "original_shape.json", *grid_cfg
+        )
+    else:
+        checks["grid_shape"] = {"status": "WARN", "reason": "config.json unreadable; grid check skipped"}
+    checks["registration_correlation"] = check_registration_correlation(nii_path, warped_dir)
+    try:
+        checks["boundary_alignment"] = measure_boundary_alignment(nii_path, label_zarr_path)
+    except Exception:
+        logger.exception("boundary alignment measurement failed")
+        checks["boundary_alignment"] = {"status": "WARN", "reason": "measurement raised"}
+    try:
+        checks["orientation_check"] = check_orientation(nii_path, label_zarr_path)
+    except Exception:
+        logger.exception("orientation check failed")
+        checks["orientation_check"] = {"status": "WARN", "reason": "check raised"}
+
+    if render:
+        try:
+            render_registration_views(nii_path, label_zarr_path, hemi_zarr_path, output_dir / "registration_views.png")
+        except Exception:
+            logger.exception("registration views failed")
+
+    statuses = [str(check.get("status")) for check in checks.values()]
+    overall = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
+    verdict = {
+        "sample": sample_dir.name,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "checks": checks,
+        "overall": overall,
+    }
+    (output_dir / "registration_verdict.json").write_text(
+        json.dumps(verdict, indent=1, ensure_ascii=False), encoding="utf-8"
+    )
+    logger.info("Registration QC: %s (%s)", overall,
+                json.dumps({k: v.get("status") for k, v in checks.items()}))
+    return verdict
+
+
+def _load_grid_config(sample_dir: Path):
+    try:
+        config = json.loads((sample_dir / "config.json").read_text(encoding="utf-8"))
+        return (
+            [float(v) for v in config["input"]["resolution_xyz"]],
+            [float(v) for v in config["preprocessing"]["downsample"]["target_resolution_xyz"]],
+        )
+    except Exception:
+        return None
+
+
+def check_orientation(nii_path: Path, label_zarr_path: Path, n_planes: int = 5) -> dict:
+    """y 翻转数字门：label 与信号逐 z 平面的 y 质心相关性。
+
+    正常配准（同向）相关 > 0；auto_orient 误翻 / 轴序错误导致整体镜像时
+    相关 < 0，直接 FAIL。稀疏标记样本信号弱，质心用 >p70 亮区而非全非零。
+    """
+    import nibabel as nib
+    from scipy import ndimage
+
+    if not nii_path.exists() or not label_zarr_path.exists():
+        return {"status": "WARN", "reason": "missing inputs"}
+    nii_zyx = np.transpose(np.asanyarray(nib.load(str(nii_path)).dataobj), (2, 1, 0))
+    label = open_zarr_array(label_zarr_path)
+    z_full = int(label.shape[0])
+    lab_y, sig_y = [], []
+    for frac in np.linspace(0.2, 0.8, n_planes):
+        zi = int(z_full * frac)
+        plane = np.asarray(label[zi]) > 0
+        if not plane.any():
+            continue
+        rows = plane.mean(axis=1)
+        ylab = float((np.arange(len(rows)) * rows).sum() / rows.sum())
+        vz = min(round(zi * nii_zyx.shape[0] / z_full), nii_zyx.shape[0] - 1)
+        sl = nii_zyx[vz].astype(np.float32)
+        bright = sl > np.percentile(sl, 70)
+        rows2 = bright.mean(axis=1)
+        if rows2.sum() <= 0:
+            continue
+        ysig = float((np.arange(len(rows2)) * rows2).sum() / rows2.sum())
+        lab_y.append(ylab)
+        sig_y.append(ysig)
+    if len(lab_y) < 3:
+        return {"status": "WARN", "reason": f"only {len(lab_y)} planes measurable"}
+    corr = float(np.corrcoef(np.array(lab_y), np.array(sig_y))[0, 1])
+    # 数字只做参考：明确翻转（corr<0）才 FAIL，弱相关一律 INFO 不拦截——
+    # 稀疏样本信号弱时质心噪声大，硬门会误报（ot 实测 corr=0.246 但配准正常）
+    if corr < 0:
+        status = "FAIL"
+    elif corr < 0.3:
+        status = "INFO"
+    else:
+        status = "INFO"
+    return {
+        "status": status,
+        "y_centroid_corr": round(corr, 3),
+        "n_planes": len(lab_y),
+        "note": "label-vs-signal y-centroid correlation per z plane; corr<0 = axis flipped (FAIL), weak signal gives noisy corr (INFO not FAIL)",
+    }
+
+
 def run_qc(
     sample_dir: Path,
     *,
@@ -526,6 +673,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--signal_zarr", default="")
     parser.add_argument("--mask_zarr", default="")
     parser.add_argument("--output_dir", default="")
+    parser.add_argument("--registration_only", action="store_true",
+                        help="only run registration QC (registration_qc)")
     return parser.parse_args()
 
 
@@ -533,6 +682,16 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args()
     sample_dir = Path(args.sample_dir)
+    if args.registration_only:
+        registration_qc(
+            sample_dir,
+            nii_path=Path(args.nii) if args.nii else None,
+            label_zarr_path=Path(args.label_zarr) if args.label_zarr else None,
+            hemi_zarr_path=Path(args.hemi_zarr) if args.hemi_zarr else None,
+            warped_dir=Path(args.warped_dir) if args.warped_dir else None,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+        )
+        return 0
     config_path = Path(args.config) if args.config else sample_dir / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     started = time.time()
