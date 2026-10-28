@@ -12,6 +12,28 @@
    开发方法论/背景 → `.zcode/skills/yifu-develop/SKILL.md`；ims/arivis 对接细节 →
    同目录 `ims-arivis-integration.md`；调用姿势 → `.zcode/skills/yifu-work/SKILL.md`；
    都不合适则问是否新建文档。写入的文档进仓库，随工作持续优化。
+7. **不乱放**：临时脚本和中间产物只进三个固定去处——项目文件夹 `<analysis_root>/_active/<项目>/`、
+   样本级 `<样本>/Temp/`、仓库 `_tmp/`（gitignored）——绝不落仓库根、数据根、别的样本目录或随手新建的目录。
+   自己本次产生的临时物用完即删；生产数据的删除仍须用户明确指示。
+8. **验证要见证据、一步一步**：说"查过了 / 是对的"必须附可复查的证据（命令 + 输出关键行，或文件路径 + 数字），
+   没实际执行过的验证不得声称；验证方式要和对象匹配（GUI / 宿主软件里要人眼看的东西直接交用户操作）。
+   多步排查不擅自连环推进：做一步 → 摆证据 → 定下一步。
+9. **说人话**：结论先行，一句话能说清的不用三句；不堆内部代号、缩写和长清单；关键数字直接给；
+   汇报 = 结论 + 证据 + 下一步建议。
+
+## 意图路由（开工先对号入座）
+
+接手任务先判断属于哪条轨道，按表读前置材料再动手：
+
+| 任务意图 | 轨道 | 先读 |
+|---|---|---|
+| 跑样本 / 补跑 / 出报告 / 查结果 / 操作 PM | 调用 | 本文件 + 根 `capabilities.json`（按需再读模块 manifest） |
+| 做新程序 / 改工具 / 接新管线步骤 / 排查"结果不对"类症状 | 开发 | `.zcode/skills/yifu-develop/SKILL.md`（含症状排查、接线测试与测试纪律） |
+| Imaris / arivis / 其他宿主软件对接 | 互操作 | `.zcode/skills/yifu-develop/ims-arivis-integration.md` |
+| 项目分析（组合指标 / 出图 / 交付） | 分析 | `.zcode/skills/yifu-work/SKILL.md` + 该项目 `PROJECT.md` |
+| 移动 / 删除 / 清理 / 归档数据 | 运维 | 只读取证 → 向用户提案 → 拍板后执行，不先动手 |
+
+拿不准属于哪条轨道时，先问一句再动。
 
 ## cfos：config 与参数
 
@@ -68,30 +90,6 @@ python -m pipeline_modules.visualization.annotate_tissue_sam_napari --sample-dir
 
 输入输出、QC 卷不存在时的错误指引等完整契约见 `pipeline_modules/visualization/capability_manifest.json`
 的 `annotate_tissue_roi` 条目（本文不重复维护）。
-
-## 项目分析工作模式
-
-1. **开工先读 manifest**：第一次接手一个项目（或动工具箱）前，先读仓库根的 `capabilities.json`，
-   再按需读涉及模块的 `capability_manifest.json`——可用程序、CLI 契约、输入输出都在那里，不凭记忆猜。
-2. **repo 只调用、不改动**：跑项目分析时不修改 `pipeline_modules/` 里的程序。唯一例外是发现明确 bug：
-   先向用户报告，做最小修复，并跑相关测试（例：slice_heatmap_render 的 colorbar 标签被画布裁掉）。
-3. **组合分析程序放项目文件夹**：为特定分析组合新写的程序（多次调用 repo 程序、拼不同指标）写到
-   `<analysis_root>/_active/<项目>/` 下，不进 repo；repo 程序按 CLI / capability_manifest 契约调用。
-4. **结果归一**：每个项目跑完，所有分析结果（Excel/图表/热图等）集合到该项目的单一结果文件夹
-   （如 `<项目>/_reports/`），不散落在各样本目录。
-5. **说明文档（PDF）**：结果文件夹必须附一份面向用户的 PDF 说明，逐项解释图表和表格——每个指标的
-   含义、口径（如圆柱法表面积、血管环数定义）与使用注意；交付前用视觉验收过一遍。
-
-## 开发约定
-
-**开发任何新程序/工具/小部件前，先读 skill `yifu-develop`**（`.zcode/skills/yifu-develop/SKILL.md`，
-会话未加载时直接读文件）：程序化复现、插桩定位、量化验收、GUI/线程/生命周期防御、宿主源码对齐。
-
-改 main.py 流程、加新步骤或新模块接线后，必须跑一遍 stub 接线测试（不跑算法、几秒完成，
-验证 6 步路径/键名/分支不断链），并让 `tests/test_main_stub_run.py` 的 EXPECTED_COMMANDS
-覆盖新步骤的命令描述。手动跑法：在空样本目录放 config 后
-`python main.py --config <cfg> --sample_dir <dir> --stub`，末行 `STUB_SUMMARY` 应列出全部命令。
-新模块自身的算法测试照常进 `tests/`；失败测试不修就删或改，不留长期红测试。
 
 ## 标准入口
 
