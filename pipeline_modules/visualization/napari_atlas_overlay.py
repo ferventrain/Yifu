@@ -894,10 +894,17 @@ def make_atlas_overlay_widget(
             existing.translate = translate
             existing.refresh()
         else:
+            prev_active = viewer.layers.selection.active
             viewer.add_labels(
                 arr, name=LABEL_LAYER_NAME, scale=scale, translate=translate,
                 opacity=0.35, blending="translucent",
             )
+            # napari 自动把新层设为 active，会抢走 neurofly point_layer 的选中
+            # （按 d 变成 viewer 级 refresh → 中心点乱切）；恢复原选中
+            if prev_active is not None and prev_active.name != LABEL_LAYER_NAME:
+                viewer.layers.selection.active = prev_active
+            elif prev_active is None:
+                viewer.layers.selection.active = viewer.layers["image"] if "image" in viewer.layers else None
         _restore_neurofly_combos()  # napari 图层事件会清空 neurofly 下拉框
         shape_zyx = state["shapes"][level]
         status.setText(
