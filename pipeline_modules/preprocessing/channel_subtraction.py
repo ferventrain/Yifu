@@ -1,5 +1,21 @@
+"""Subtract an autofluorescence background channel from the signal channels.
+
+The background channel is read from its Zarr store (``<sample>/ch0.zarr``,
+resolved via SampleLayout) block-by-block through ``zarr_io`` — never from a
+TIFF folder. Signal channels stay TIFF folders and the output layout is
+unchanged: ``<sample>/chX_subtracted/`` TIFFs with the original filenames.
+
+Each worker opens the background Zarr once (lazily cached per process) and
+pulls single z-planes; the Zarr chunking makes every plane read a block read.
+
+This step is only for samples with a noticeable autofluorescence background
+(the channel whose signal bleeds into the others); keep it disabled otherwise
+so thresholds stay comparable across samples.
+"""
+
 import os
 import re
+import sys
 import argparse
 import numpy as np
 import tifffile
@@ -13,7 +29,17 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from pipeline_modules.utils.sample_layout import SampleLayout
+from pipeline_modules.utils.zarr_io import open_zarr_array
+
 DEFAULT_RANDOM_SEED = 42
+
+_BG_ARRAY_CACHE: dict[str, object] = {}
+
 
 def parse_filename(filename):
     """
@@ -25,6 +51,7 @@ def parse_filename(filename):
     if match:
         return match.group(1), match.group(2)
     return None, None
+
 
 def _normalize_to_uint8(image):
     """Normalize an array to uint8 for thresholding, preserving relative contrast."""
@@ -89,20 +116,14 @@ def _estimate_tissue_non_signal_mask(img_cx_sample, img_c0_sample):
     return fit_mask
 
 
-def collect_background_pixels(cx_file, c0_file, sample_size=10000, random_seed=DEFAULT_RANDOM_SEED):
-    """
-    Collect background pixels from a single image for global estimation.
-    Returns (cx_bg, c0_bg) arrays of background pixel intensities.
-    """
-    img_cx = tifffile.imread(str(cx_file))
-    img_c0 = tifffile.imread(str(c0_file))
-    
+def _collect_from_images(img_cx, img_c0, sample_size=10000, random_seed=DEFAULT_RANDOM_SEED):
+    """Background-pixel sampling core shared by the TIFF and Zarr entry points."""
     if img_cx.ndim != 2 or img_cx.shape != img_c0.shape:
         return None, None
-    
+
     img_cx_flat = img_cx.flatten()
     img_c0_flat = img_c0.flatten()
-    
+
     if len(img_cx_flat) > sample_size:
         rng = np.random.default_rng(random_seed)
         idx = rng.choice(len(img_cx_flat), sample_size, replace=False)
@@ -116,47 +137,104 @@ def collect_background_pixels(cx_file, c0_file, sample_size=10000, random_seed=D
 
     if np.sum(bg_mask) < 50:
         return None, None
-    
+
     cx_bg = img_cx_sample[bg_mask]
     c0_bg = img_c0_sample[bg_mask]
-    
+
     return cx_bg, c0_bg
+
+
+def _get_background_array(bg_zarr_path):
+    """Open the background channel Zarr once per process (plane reads stay
+    block-granular thanks to the store's own chunking)."""
+    key = str(bg_zarr_path)
+    if key not in _BG_ARRAY_CACHE:
+        _BG_ARRAY_CACHE[key] = open_zarr_array(key)
+    return _BG_ARRAY_CACHE[key]
+
+
+def read_background_plane(bg_zarr_path, z_index):
+    """Read one background plane (block-by-block via zarr_io)."""
+    array = _get_background_array(bg_zarr_path)
+    return np.asarray(array[int(z_index)])
+
+
+def collect_background_pixels_from_zarr(cx_file, bg_zarr_path, z_index, sample_size=10000, random_seed=DEFAULT_RANDOM_SEED):
+    """
+    Collect background pixels from a signal TIFF slice and the background Zarr
+    plane at the same z index. Returns (cx_bg, c0_bg) arrays or (None, None).
+    """
+    img_cx = tifffile.imread(str(cx_file))
+    img_c0 = read_background_plane(bg_zarr_path, z_index)
+    return _collect_from_images(img_cx, img_c0, sample_size=sample_size, random_seed=random_seed)
 
 
 def estimate_global_weight(cx_files, c0_files, plot_path=None, random_seed=DEFAULT_RANDOM_SEED):
     """
-    Estimate global weight from collected background pixels from multiple images.
+    Estimate global weight from collected background pixels of sampled TIFF
+    slice pairs (legacy path, kept for preprocessor.run_channel_subtraction).
     If plot_path is provided, saves a summary scatter plot.
     """
     all_cx_bg = []
     all_c0_bg = []
-    
+
     for i, (cx_file, c0_file) in enumerate(zip(cx_files, c0_files)):
-        cx_bg, c0_bg = collect_background_pixels(
-            cx_file,
-            c0_file,
+        img_cx = tifffile.imread(str(cx_file))
+        img_c0 = tifffile.imread(str(c0_file))
+        cx_bg, c0_bg = _collect_from_images(
+            img_cx,
+            img_c0,
             random_seed=random_seed + i,
         )
         if cx_bg is not None and len(cx_bg) > 0:
             all_cx_bg.extend(cx_bg)
             all_c0_bg.extend(c0_bg)
-    
+
+    return _fit_global_weight(all_cx_bg, all_c0_bg, len(cx_files), plot_path=plot_path, random_seed=random_seed)
+
+
+def estimate_global_weight_from_zarr(cx_files, bg_zarr_path, z_indices, plot_path=None, random_seed=DEFAULT_RANDOM_SEED):
+    """
+    Estimate global weight from background pixels sampled between signal TIFF
+    slices and the background channel Zarr (read block-by-block via zarr_io).
+    If plot_path is provided, saves a summary scatter plot.
+    """
+    all_cx_bg = []
+    all_c0_bg = []
+
+    for i, (cx_file, z_index) in enumerate(zip(cx_files, z_indices)):
+        img_cx = tifffile.imread(str(cx_file))
+        img_c0 = read_background_plane(bg_zarr_path, z_index)
+        cx_bg, c0_bg = _collect_from_images(
+            img_cx,
+            img_c0,
+            random_seed=random_seed + i,
+        )
+        if cx_bg is not None and len(cx_bg) > 0:
+            all_cx_bg.extend(cx_bg)
+            all_c0_bg.extend(c0_bg)
+
+    return _fit_global_weight(all_cx_bg, all_c0_bg, len(cx_files), plot_path=plot_path, random_seed=random_seed)
+
+
+def _fit_global_weight(all_cx_bg, all_c0_bg, n_images, plot_path=None, random_seed=DEFAULT_RANDOM_SEED):
+    """Shared lstsq/RANSAC fit for the global background weight."""
     if len(all_cx_bg) < 500:
         print(f"  Warning: too few background pixels collected, using a=1.0")
         return 1.0
-    
+
     all_cx_bg = np.array(all_cx_bg)
     all_c0_bg = np.array(all_c0_bg)
-    
+
     A = np.vstack([all_c0_bg, np.ones(len(all_c0_bg))]).T
     result = np.linalg.lstsq(A, all_cx_bg, rcond=None)
     coeff = result[0]
     a, b = coeff[0], coeff[1]
-    
+
     residuals = np.abs(all_cx_bg - (a * all_c0_bg + b))
     mad = np.median(np.abs(residuals - np.median(residuals)))
     threshold = 5 * mad if mad > 0 else 100
-    
+
     if len(all_cx_bg) > 5000:
         ransac = RANSACRegressor(random_state=42, max_trials=100, residual_threshold=threshold)
         ransac.fit(all_c0_bg.reshape(-1, 1), all_cx_bg)
@@ -165,33 +243,33 @@ def estimate_global_weight(cx_files, c0_files, plot_path=None, random_seed=DEFAU
         inlier_mask = ransac.inlier_mask_
     else:
         inlier_mask = np.ones_like(all_cx_bg, dtype=bool)
-    
+
     a = max(0.2, min(a, 1.6))
-    
+
     if plot_path is not None:
         plt.figure(figsize=(10, 7))
-        
+
         sample_size = min(5000, len(all_cx_bg))
         rng = np.random.default_rng(random_seed)
         idx_sample = rng.choice(len(all_cx_bg), sample_size, replace=False)
         cx_sample = all_cx_bg[idx_sample]
         c0_sample = all_c0_bg[idx_sample]
         mask_sample = inlier_mask[idx_sample]
-        
+
         if np.sum(~mask_sample) > 0:
             plt.scatter(c0_sample[~mask_sample], cx_sample[~mask_sample], 
                        c='orange', alpha=0.5, s=10, label='Outliers')
         plt.scatter(c0_sample[mask_sample], cx_sample[mask_sample], 
-                   c='blue', alpha=0.5, s=10, label='Background inliers')
-        
+                   c='blue', alpha=0.5, s=15, label='Background inliers')
+
         x_min, x_max = 0, all_c0_bg.max()
         x_fit = np.linspace(x_min, x_max, 100)
         y_fit = a * x_fit + b
         plt.plot(x_fit, y_fit, 'k--', linewidth=2, label=f'Global fit: Cx = {a:.3f} * C0 + {b:.1f}')
-        
+
         plt.xlabel('C0 (autofluorescence) intensity')
         plt.ylabel('Cx (signal channel) intensity')
-        plt.title(f'Global weight estimation - {len(cx_files)} images, {np.sum(inlier_mask)} tissue non-signal pixels used')
+        plt.title(f'Global weight estimation - {n_images} images, {np.sum(inlier_mask)} tissue non-signal pixels used')
         plt.legend(loc='upper left')
         plt.grid(alpha=0.3)
         plt.tight_layout()
@@ -199,11 +277,11 @@ def estimate_global_weight(cx_files, c0_files, plot_path=None, random_seed=DEFAU
         plt.close()
 
     print(
-        f"  Weight fit diagnostics: slices={len(cx_files)}, "
+        f"  Weight fit diagnostics: slices={n_images}, "
         f"pixels={len(all_cx_bg)}, inliers={int(np.sum(inlier_mask))}, "
         f"a={a:.4f}, b={b:.2f}"
     )
-    
+
     return a
 
 
@@ -310,32 +388,34 @@ def estimate_background_weight(img_cx, img_c0, sample_size=10000, plot_path=None
     return a
 
 
-def subtract_worker(cx_file, c0_file, output_path, compression='lzw', global_weight=1.0):
+def subtract_worker(cx_file, bg_zarr_path, z_index, output_path, compression='lzw', global_weight=1.0):
     """
-    Worker function to perform subtraction for a single image pair.
+    Worker function to perform subtraction for a single slice: the background
+    plane is read block-by-block from the background channel Zarr.
     Uses pre-estimated global weight.
     """
     try:
         # Load images
         img_cx = tifffile.imread(str(cx_file))
-        img_c0 = tifffile.imread(str(c0_file))
-        
+        img_c0 = read_background_plane(bg_zarr_path, z_index)
+
         # Ensure same shape
         if img_cx.shape != img_c0.shape:
-            return f"Error: Shape mismatch for {cx_file.name}"
-        
+            return f"Error: Shape mismatch for {cx_file.name} (bg plane {int(z_index)} of {bg_zarr_path})"
+
         # Perform subtraction: Cx - global_weight * C0
         dtype = img_cx.dtype
         max_val = np.iinfo(dtype).max
-        
+
         # Subtract and clip using vectorized numpy operations
         subtracted = np.clip(img_cx.astype(np.int32) - global_weight * img_c0.astype(np.int32), 0, max_val).astype(dtype)
-        
+
         # Save result
         tifffile.imwrite(str(output_path), subtracted, compression=compression)
         return "success"
     except Exception as e:
         return f"Error processing {cx_file.name}: {str(e)}"
+
 
 def process_channel_subtraction(root_path, max_workers=None, compression='lzw', weight=1.0, adaptive=False, save_plots=False, 
                                sample_ratio=0.005, min_samples=10, max_samples=50, background_channel='ch0'):
@@ -344,33 +424,19 @@ def process_channel_subtraction(root_path, max_workers=None, compression='lzw', 
         print(f"Error: {root_path} is not a valid directory.")
         return
 
-    # Find the background channel folder
-    pattern = f"*{background_channel}*"
-    bg_folders = [f for f in root.iterdir() if f.is_dir() and (f.name == background_channel or f.name.startswith(f"{background_channel}_"))]
-    if not bg_folders:
-        bg_folders = list(root.glob(pattern))
-    
-    if not bg_folders:
-        print(f"Error: Could not find folder matching '{background_channel}' in {root_path}.")
+    # The background channel is read from its Zarr store, resolved through SampleLayout.
+    background_channel = background_channel.lower()
+    layout = SampleLayout(sample_dir=root, signal_ch=background_channel, reg_ch=background_channel)
+    bg_zarr = layout.signal_zarr  # <root>/<background_channel>.zarr
+    if not bg_zarr.exists():
+        print(f"Error: background channel Zarr not found: {bg_zarr}.")
+        print("       The background channel must exist as a Zarr store (ims_to_zarr / tiff_to_zarr);")
+        print("       the TIFF-folder background source was removed.")
         return
-    
-    bg_dir = bg_folders[0]
-    print(f"Using {bg_dir.name} as background channel (autofluorescence reference).")
 
-    # Map Z-index to file path in background channel
-    bg_files = {}
-    for f in bg_dir.glob("*.tif*"):
-        _, z_idx = parse_filename(f.name)
-        if z_idx:
-            bg_files[z_idx] = f
-    
-    if not bg_files:
-        print(f"Error: No valid TIFF files found in {bg_dir.name}.")
-        return
-    
-    print(f"Found {len(bg_files)} reference files in {bg_dir.name}.")
-
-
+    bg_array = open_zarr_array(bg_zarr)
+    bg_planes = int(bg_array.shape[0])
+    print(f"Using {bg_zarr.name} as background channel (autofluorescence reference), {bg_planes} planes.")
 
     if adaptive:
         print(f"Global adaptive weight estimation: ON (sample_ratio={sample_ratio}, min={min_samples}, max={max_samples})")
@@ -381,80 +447,88 @@ def process_channel_subtraction(root_path, max_workers=None, compression='lzw', 
 
     if max_workers is None:
         max_workers = max(1, multiprocessing.cpu_count() // 2)
-    
+
     # Windows has a limit of 61 for ProcessPoolExecutor's max_workers
     if os.name == 'nt' and max_workers > 61:
         print(f"Note: Capping max_workers to 61 due to Windows limitations (original: {max_workers})")
         max_workers = 61
-    
+
     print(f"Using {max_workers} workers for parallel processing.")
 
-    # Traverse other folders (excluding ch0 and output folders)
-    for folder in root.iterdir():
-        if not folder.is_dir() or folder == ch0_dir or folder.name.endswith("_subtracted"):
+    # Traverse other channel folders (excluding the background channel itself
+    # and every derived output folder)
+    skip_suffixes = ("_subtracted", "_preprocessed", "_downsample", "_downsampled", "_mask", "_warped_image")
+    for folder in sorted(root.iterdir()):
+        if not folder.is_dir():
             continue
-        
+        name = folder.name.lower()
+        if name == background_channel or name.endswith(skip_suffixes) or name.endswith(".zarr"):
+            continue
+        if not re.fullmatch(r"ch\d+", name):
+            continue
+
         target_subtracted_dir = root / f"{folder.name}_subtracted"
         target_subtracted_dir.mkdir(parents=True, exist_ok=True)
-        
+
         print(f"Processing folder: {folder.name} -> {target_subtracted_dir.name}")
-        
+
         # Find files in current channel folder
-        cx_files = list(folder.glob("*.tif*"))
+        cx_files = sorted(folder.glob("*.tif*"))
         if not cx_files:
             print(f"No TIFF files found in {folder.name}, skipping.")
             continue
-        
-        # Match files with ch0
+
+        # Map slices to background Zarr planes: the store was written from the
+        # sorted slice stack, so the plane index is the position in the sorted
+        # list, clamped to the background depth.
         matched_pairs = []
-        for cx_file in cx_files:
-            _, z_idx = parse_filename(cx_file.name)
-            if z_idx in bg_files:
-                matched_pairs.append((cx_file, bg_files[z_idx]))
-        
+        for position, cx_file in enumerate(cx_files):
+            if position < bg_planes:
+                matched_pairs.append((cx_file, position))
+
         if not matched_pairs:
-            print(f"No matched files found in {folder.name}, skipping.")
+            print(f"No slices align with {bg_zarr.name} ({bg_planes} planes) in {folder.name}, skipping.")
             continue
-        
-        print(f"  Found {len(matched_pairs)} matched files")
-        
+
+        print(f"  Found {len(matched_pairs)} slices matched to background planes")
+
         # Global adaptive estimation: sample some images to estimate global weight
         if adaptive:
             n_total = len(matched_pairs)
             n_sample = max(min_samples, min(max_samples, int(n_total * sample_ratio)))
             print(f"  Sampling {n_sample} images out of {n_total} for global weight estimation")
-            
-            # Random sample
-            idx_sample = np.random.choice(n_total, n_sample, replace=False)
-            sample_pairs = [matched_pairs[i] for i in idx_sample]
+
+            # Deterministic spread over the stack
+            step = max(1, n_total // max(1, n_sample))
+            sample_pairs = matched_pairs[::step][:n_sample]
             sample_cx = [p[0] for p in sample_pairs]
-            sample_c0 = [p[1] for p in sample_pairs]
-            
-            # Estimate global weight
+            sample_z = [p[1] for p in sample_pairs]
+
+            # Estimate global weight (background read from the Zarr, block-by-block)
             if save_plots:
                 plot_path = target_subtracted_dir / f"{folder.name}_global_fit.png"
-                global_a = estimate_global_weight(sample_cx, sample_c0, plot_path=plot_path)
+                global_a = estimate_global_weight_from_zarr(sample_cx, bg_zarr, sample_z, plot_path=plot_path)
                 print(f"  Global fit plot saved to: {plot_path}")
             else:
-                global_a = estimate_global_weight(sample_cx, sample_c0)
-            
+                global_a = estimate_global_weight_from_zarr(sample_cx, bg_zarr, sample_z)
+
             final_weight = weight * global_a
             print(f"  Estimated a = {global_a:.4f}, final effective weight = {final_weight:.4f}")
         else:
             final_weight = weight
-        
+
         # Prepare tasks for parallel processing
         tasks = []
-        for cx_file, c0_file in matched_pairs:
+        for cx_file, z_index in matched_pairs:
             output_path = target_subtracted_dir / cx_file.name
             if not output_path.exists(): # Basic resume support
-                tasks.append((cx_file, c0_file, output_path, compression, final_weight))
-        
+                tasks.append((cx_file, bg_zarr, z_index, output_path, compression, final_weight))
+
         # Execute tasks in parallel
         print(f"  Processing {len(tasks)} remaining files (resume enabled)")
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_file = {executor.submit(subtract_worker, *task): task[0].name for task in tasks}
-            
+
             for future in tqdm(as_completed(future_to_file), total=len(tasks), desc=f"  Subtracting"):
                 result = future.result()
                 if result != "success":
@@ -463,9 +537,9 @@ def process_channel_subtraction(root_path, max_workers=None, compression='lzw', 
     print("All processing complete.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parallel subtract background channel from other channel images for autofluorescence removal.")
-    parser.add_argument("path", type=str, help="Root path containing channel folders")
-    parser.add_argument("--bg-channel", type=str, default="ch0", help="Background channel folder name (default: ch0)")
+    parser = argparse.ArgumentParser(description="Parallel subtract background channel (chX.zarr) from other channel TIFF folders for autofluorescence removal. Only for samples with a noticeable autofluorescence background.")
+    parser.add_argument("path", type=str, help="Root path containing channel folders and the background channel Zarr")
+    parser.add_argument("--bg-channel", type=str, default="ch0", help="Background channel label; read from <path>/chX.zarr (default: ch0)")
     parser.add_argument("--workers", type=int, default=None, help="Number of parallel processes (default: CPU_COUNT // 2)")
     parser.add_argument("--compression", type=str, default="lzw", choices=["lzw", "none", "zlib"], help="TIFF compression (default: lzw)")
     parser.add_argument("--weight", type=float, default=1.0, help="Base weight for subtraction: result = Cx - (weight * a) * Cbg (default: 1.0)")
@@ -474,12 +548,12 @@ if __name__ == "__main__":
     parser.add_argument("--sample-ratio", type=float, default=0.005, help="Ratio of images to sample for global estimation (default: 0.005)")
     parser.add_argument("--min-samples", type=int, default=10, help="Minimum number of images to sample (default: 10)")
     parser.add_argument("--max-samples", type=int, default=50, help="Maximum number of images to sample (default: 50)")
-    
+
     args = parser.parse_args()
-    
+
     # Map 'none' to None for tifffile
     comp = None if args.compression == 'none' else args.compression
-    
+
     process_channel_subtraction(args.path, max_workers=args.workers, compression=comp, 
                                weight=args.weight, adaptive=args.adaptive, save_plots=args.save_plots,
                                sample_ratio=args.sample_ratio, min_samples=args.min_samples, max_samples=args.max_samples,

@@ -26,6 +26,13 @@ try:
 except ImportError:  # pragma: no cover
     from ..segmentation.zarr_utils import open_zarr_dataset
 
+try:
+    from pipeline_modules.utils.config_layering import resolve_partial_config
+    from pipeline_modules.utils.errors import ErrorCode, PipelineError
+except ImportError:  # pragma: no cover
+    from ..utils.config_layering import resolve_partial_config
+    from ..utils.errors import ErrorCode, PipelineError
+
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +70,71 @@ def parse_block_shape(value: str, fallback: tuple[int, int, int]) -> tuple[int, 
     return block_shape
 
 
+_TRUE_TOKENS = {"1", "true", "yes", "y", "t"}
+
+
+def parse_flip_atlas(value: str | list[bool] | tuple[bool, ...]) -> list[bool]:
+    """Parse a ``[ML, AP, DV]`` flip triplet (booleans or 0/1 tokens)."""
+    if isinstance(value, (list, tuple)):
+        parts = [bool(item) for item in value]
+    else:
+        tokens = [part.strip() for part in str(value).split(",") if part.strip()]
+        if len(tokens) != 3:
+            raise ValueError(f"flip_atlas must have 3 comma-separated values in ML,AP,DV order, got: {value}")
+        parts = [token.lower() in _TRUE_TOKENS for token in tokens]
+    if len(parts) != 3:
+        raise ValueError(f"flip_atlas must have 3 entries [ML, AP, DV], got: {value}")
+    return parts
+
+
+def resolve_flip_atlas(
+    sample_dir: str | Path | None,
+    explicit: str | list[bool] | tuple[bool, ...] = "",
+) -> list[bool]:
+    """Resolve the atlas flip the registration actually applied.
+
+    The registration mirrors the atlas before estimating transforms
+    (``registration.flip_atlas`` or its auto-orientation preflight), so the
+    inverse transforms land in the *mirrored* atlas index frame. Downstream
+    atlas-space outputs must mirror back to the standard atlas frame.
+    """
+    if isinstance(explicit, (list, tuple)) or str(explicit).strip():
+        return parse_flip_atlas(explicit)
+    if not sample_dir:
+        return [False, False, False]
+    report_path = Path(sample_dir) / "qc" / "orientation_check.json"
+    if report_path.exists():
+        try:
+            applied = json.loads(report_path.read_text(encoding="utf-8")).get("applied_flip")
+            if applied is not None and len(applied) == 3:
+                return [bool(value) for value in applied]
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read %s; falling back to config flip_atlas", report_path)
+    config_path = Path(sample_dir) / "config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            configured = (config.get("registration") or {}).get("flip_atlas")
+            if configured is not None and len(configured) == 3:
+                return [bool(value) for value in configured]
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read %s; assuming no atlas flip", config_path)
+    return [False, False, False]
+
+
+def atlas_flip_axes_zyx(flip_atlas: list[bool] | tuple[bool, ...]) -> tuple[int, ...]:
+    """Map an ``[ML, AP, DV]`` flip to axis indices of a ``(DV, AP, ML)`` volume."""
+    flip = parse_flip_atlas(list(flip_atlas))
+    return tuple(sorted(2 - index for index, flag in enumerate(flip) if flag))
+
+
+def apply_atlas_flip(volume_zyx: np.ndarray, flip_atlas: list[bool] | tuple[bool, ...]) -> np.ndarray:
+    axes = atlas_flip_axes_zyx(flip_atlas)
+    if not axes:
+        return volume_zyx
+    return np.ascontiguousarray(np.flip(volume_zyx, axis=axes))
+
+
 def resolve_mask_zarr(
     *,
     sample_dir: str | Path | None,
@@ -78,6 +150,58 @@ def resolve_mask_zarr(
     if not path.exists():
         raise FileNotFoundError(f"Mask Zarr not found: {path}")
     return path
+
+
+def resolve_resolution_xyz(
+    *,
+    sample_dir: str | Path | None,
+    explicit: str = "",
+    config_path: str | Path | None = None,
+) -> tuple[tuple[float, float, float], str]:
+    """Resolve the sample-native mask voxel size in microns (x, y, z).
+
+    Precedence: explicit ``--resolution_xyz`` flag > sample config
+    ``input.resolution_xyz`` (run configs such as ``config_1.json`` are
+    layered over ``config.json``/template by :func:`resolve_partial_config`).
+    There is deliberately no hardcoded default — a wrong value silently
+    mis-locates every atlas point.
+    """
+    if str(explicit).strip():
+        return parse_triplet(explicit, name="resolution_xyz"), "flag"
+    resolved_config_path: Path | None = None
+    if config_path:
+        resolved_config_path = Path(config_path)
+    elif sample_dir:
+        candidate = Path(sample_dir) / "config.json"
+        if candidate.exists():
+            resolved_config_path = candidate
+    if resolved_config_path is not None and resolved_config_path.exists():
+        _, config = resolve_partial_config(resolved_config_path)
+        raw = (config.get("input") or {}).get("resolution_xyz")
+        if raw is not None:
+            try:
+                values = [float(value) for value in raw]
+            except (TypeError, ValueError):
+                values = []
+            if len(values) == 3 and all(value > 0 for value in values):
+                return (values[0], values[1], values[2]), f"config:{resolved_config_path}"
+            raise PipelineError(
+                ErrorCode.CONFIG_INVALID,
+                f"input.resolution_xyz in {resolved_config_path} is not 3 positive numbers: {raw}",
+                {"config_path": str(resolved_config_path), "resolution_xyz": raw,
+                 "suggestion": "fix input.resolution_xyz (x,y,z in microns) or pass --resolution_xyz"},
+            )
+    raise PipelineError(
+        ErrorCode.CONFIG_INVALID,
+        "Sample voxel resolution unavailable: no --resolution_xyz flag and no "
+        "input.resolution_xyz in the sample config.",
+        {
+            "sample_dir": str(sample_dir) if sample_dir else None,
+            "config_path": str(resolved_config_path) if resolved_config_path else None,
+            "suggestion": "pass --resolution_xyz x,y,z (microns) or set input.resolution_xyz "
+                          "in <sample_dir>/config.json",
+        },
+    )
 
 
 def iter_block_slices(shape: tuple[int, int, int], block_shape: tuple[int, int, int]):
@@ -392,6 +516,7 @@ def warp_sample_grid_to_atlas(
     transformlist: list[str],
     interpolator: str,
     binarize: bool,
+    flip_atlas: list[bool] | tuple[bool, ...] = (False, False, False),
 ) -> tuple[np.ndarray, tuple[float, float, float]]:
     try:
         import ants
@@ -419,6 +544,9 @@ def warp_sample_grid_to_atlas(
     atlas_volume_zyx = np.transpose(warped.numpy(), (2, 1, 0))
     if binarize:
         atlas_volume_zyx = atlas_volume_zyx > 0
+    # Inverse transforms end in the mirrored atlas frame when registration
+    # flipped the atlas; mirror back so callers see the standard atlas grid.
+    atlas_volume_zyx = apply_atlas_flip(atlas_volume_zyx, flip_atlas)
     atlas_resolution_xyz = tuple(float(v) for v in atlas_ref.spacing)
     return atlas_volume_zyx.astype(np.uint8 if binarize else np.float32), atlas_resolution_xyz
 
@@ -486,7 +614,23 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--transforms_dir", default="", help="Directory containing inv_* transforms.")
     parser.add_argument("--transforms", default="", help="Comma-separated inverse transform paths in ANTs order.")
-    parser.add_argument("--resolution_xyz", required=True, help="Input mask voxel size in microns as x,y,z.")
+    parser.add_argument(
+        "--resolution_xyz",
+        default="",
+        help=(
+            "Input mask voxel size in microns as x,y,z. "
+            "When omitted, read from the sample config input.resolution_xyz; "
+            "there is no hardcoded default."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default="",
+        help=(
+            "Config path used for input.resolution_xyz (e.g. a run config config_1.json; "
+            "missing keys layer over config.json/template). Defaults to <sample_dir>/config.json."
+        ),
+    )
     parser.add_argument("--target_resolution_xyz", default="25,25,25", help="Sample grid size in microns as x,y,z.")
     parser.add_argument("--foreground_mode", choices=("nonzero", "equal"), default="nonzero")
     parser.add_argument("--foreground_label", type=int, default=1)
@@ -498,6 +642,14 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Worker processes for mask binning. 0 uses cpu_count // 4 (default). 1 disables parallel binning.",
     )
     parser.add_argument("--min_voxels_per_point", type=int, default=1)
+    parser.add_argument(
+        "--flip_atlas",
+        default="",
+        help=(
+            "Atlas flip applied by registration as ML,AP,DV booleans (e.g. false,true,false). "
+            "Defaults to qc/orientation_check.json applied_flip, then config registration.flip_atlas."
+        ),
+    )
     parser.add_argument("--volume_mode", choices=("binary", "count"), default="binary", help="Output atlas volume values.")
     parser.add_argument("--max_points", type=int, default=150_000, help="Randomly keep N atlas voxels; 0 disables cap.")
     parser.add_argument("--output", default="", help="Output atlas-space CSV path.")
@@ -525,10 +677,21 @@ def main() -> int:
     )
     transforms_dir = args.transforms_dir or str(Path(sample_reference_nii).parents[1] / "transforms")
     transformlist = resolve_inverse_transforms(transforms_dir, args.transforms)
+    flip_atlas = resolve_flip_atlas(sample_dir, args.flip_atlas)
+    logger.info(
+        "Registration atlas flip %s -> atlas-space output axes %s",
+        flip_atlas,
+        atlas_flip_axes_zyx(flip_atlas),
+    )
 
     sample_ref = ants.image_read(str(sample_reference_nii))
     sample_shape_zyx = tuple(int(v) for v in sample_ref.shape[::-1])
-    resolution_xyz = parse_triplet(args.resolution_xyz, name="resolution_xyz")
+    resolution_xyz, resolution_source = resolve_resolution_xyz(
+        sample_dir=sample_dir,
+        explicit=args.resolution_xyz,
+        config_path=args.config or None,
+    )
+    logger.info("Sample resolution %s um (x,y,z) from %s", resolution_xyz, resolution_source)
     target_resolution_xyz = parse_triplet(args.target_resolution_xyz, name="target_resolution_xyz")
 
     arr = open_zarr_dataset(mask_zarr_path, dataset_name=args.dataset_name)
@@ -555,6 +718,7 @@ def main() -> int:
         transformlist=transformlist,
         interpolator="linear" if args.volume_mode == "count" else "nearestNeighbor",
         binarize=args.volume_mode == "binary",
+        flip_atlas=flip_atlas,
     )
     if args.skip_points and not args.atlas_resolution_xyz.strip():
         atlas_resolution_xyz = raw_atlas_spacing_xyz
@@ -565,6 +729,7 @@ def main() -> int:
     summary.update(
         {
             "success": True,
+            "resolution_xyz_source": resolution_source,
             "sample_reference_nii": str(sample_reference_nii),
             "atlas_image": str(args.atlas_image),
             "atlas_name": args.atlas_name,
@@ -572,6 +737,8 @@ def main() -> int:
             "atlas_shape_zyx": list(atlas_volume.shape),
             "raw_atlas_image_spacing_xyz": list(raw_atlas_spacing_xyz),
             "atlas_resolution_xyz": list(atlas_resolution_xyz),
+            "flip_atlas": list(flip_atlas),
+            "flip_axes_zyx": list(atlas_flip_axes_zyx(flip_atlas)),
             "exported_points": exported_points,
             "max_points": int(args.max_points),
             "coordinate_space": "atlas",
@@ -606,4 +773,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except PipelineError as error:
+        print(json.dumps(error.to_dict(), ensure_ascii=False), file=sys.stderr)
+        raise SystemExit(error.exit_code)

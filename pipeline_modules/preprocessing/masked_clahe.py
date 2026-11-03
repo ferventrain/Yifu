@@ -3,7 +3,6 @@ import numpy as np
 import sys
 import os
 import tifffile
-import argparse
 
 
 def clahe_array(
@@ -165,18 +164,5 @@ def clahe_enhance(image_path: str, clip_limit: float = 2.0, grid_size: tuple = (
         print(f"CLAHE结果已保存至: {output_path} (dtype={dtype})")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="CLAHE contrast enhancement. Works great after Tophat background removal.")
-    parser.add_argument("image_path", type=str, help="Input image path")
-    parser.add_argument("--masked", action="store_true", help="Use Otsu mask to only enhance foreground (default: False, enhance whole image)")
-    parser.add_argument("--clip-limit", type=float, default=2.0, help="CLAHE clip limit (default: 2.0)")
-    parser.add_argument("--grid-size", type=int, default=16, help="CLAHE grid size (default: 8)")
-    
-    args = parser.parse_args()
-    
-    grid_size = (args.grid_size, args.grid_size)
-    clahe_enhance(args.image_path, clip_limit=args.clip_limit, grid_size=grid_size, use_mask=args.masked)
-
-
-if __name__ == "__main__":
-    main()
+# Library-only step of run_preprocessing (pipeline_modules/HE/preprocess.py imports
+# clahe_array). The standalone CLI was removed; there is no independent entry point.

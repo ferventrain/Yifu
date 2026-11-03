@@ -617,8 +617,13 @@
     },
     "resolution_xyz": {
      "type": "triplet_float_um",
-     "required": true,
-     "description": "Input mask voxel size in microns as x,y,z"
+     "required": false,
+     "description": "Sample-native input mask voxel size in microns as x,y,z. Precedence: explicit --resolution_xyz flag wins, otherwise input.resolution_xyz is read from the sample config. No hardcoded default: if neither is available the script raises PipelineError CONFIG_INVALID (a wrong value silently mis-locates every atlas point). Distinct from --target_resolution_xyz, which is the atlas-space sample grid size (default 25um, Allen 25um atlas), not the voxel resolution."
+    },
+    "config": {
+     "type": "path|null",
+     "default": null,
+     "description": "Config used to read input.resolution_xyz; defaults to sample_dir/config.json. Run configs (config_1.json ...) may be passed explicitly and are layered over sibling config.json and config/config_cfos_template.json via pipeline_modules.utils.config_layering.resolve_partial_config."
     },
     "target_resolution_xyz": {
      "type": "triplet_float_um",
@@ -626,7 +631,8 @@
       25.0,
       25.0,
       25.0
-     ]
+     ],
+     "description": "Atlas-space grid bin size in microns as x,y,z (25um Allen atlas grid); unrelated to the sample-native resolution_xyz."
     },
     "foreground_mode": {
      "type": "string",
@@ -658,6 +664,11 @@
     "skip_points": {
      "type": "bool",
      "default": false
+    },
+    "flip_atlas": {
+     "type": "string",
+     "default": "auto",
+     "description": "Atlas flip the registration applied, as ML,AP,DV booleans (e.g. false,true,false). Default reads qc/orientation_check.json applied_flip, then config registration.flip_atlas; the atlas-space output is mirrored back so it matches the standard atlas frame."
     }
    },
    "outputs": {
@@ -678,7 +689,8 @@
    },
    "sample_layout": {
     "mask_zarr": "sample_dir/<signal_ch>_mask.zarr",
-    "atlas_points_csv": "sample_dir/visualization/points.csv"
+    "atlas_points_csv": "sample_dir/visualization/points.csv",
+    "config": "sample_dir/config.json (resolution_xyz source when the flag is omitted)"
    },
    "guide": {
     "summary": "Warp sample-space mask Zarr to Allen atlas space and export points.csv. Called automatically by render_points_brainrender when cached atlas outputs are missing.",

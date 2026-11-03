@@ -133,6 +133,19 @@ WHITE_ORANGE_RED_BLACK_CMAP = LinearSegmentedColormap.from_list(
     ],
 )
 
+# Magma-like ramp for signal density on dark panels: black -> red -> white.
+BLACK_RED_WHITE_CMAP = LinearSegmentedColormap.from_list(
+    "black_red_white",
+    [
+        (0.00, "#000000"),
+        (0.20, "#2a0000"),
+        (0.45, "#7f0000"),
+        (0.65, "#d10000"),
+        (0.85, "#ff5a3c"),
+        (1.00, "#ffffff"),
+    ],
+)
+
 WHITE_BLUE_RED_CMAP = LinearSegmentedColormap.from_list(
     "white_blue_red",
     [
@@ -1346,6 +1359,8 @@ def _contours_to_svg_d(contours: list[np.ndarray]) -> list[str]:
 def _colormap_by_name(name: str):
     if name == "white_orange_red_black":
         return WHITE_ORANGE_RED_BLACK_CMAP
+    if name == "black_red_white":
+        return BLACK_RED_WHITE_CMAP
     if name == "white_blue_red":
         return WHITE_BLUE_RED_CMAP
     if name == "signal_count_diff":

@@ -6,7 +6,7 @@ from tqdm import tqdm
 from pipeline_modules.utils.zarr_io import array_compressor, create_output_zarr, open_zarr_array
 
 
-def upsample_mask(input_mask_zarr, output_mask_zarr, full_res_zarr, chunk_size=(128, 256, 256)):
+def upsample_mask(input_mask_zarr, output_mask_zarr, full_res_zarr, chunk_size=(256, 256, 256)):
     """Upsample a downsampled mask back to full resolution using nearest neighbor interpolation.
     
     Args:
@@ -69,7 +69,7 @@ def main():
     parser.add_argument('--input_mask_zarr', required=True, help='Path to input downsampled mask zarr')
     parser.add_argument('--output_mask_zarr', required=True, help='Path to output full resolution mask zarr')
     parser.add_argument('--full_res_zarr', required=True, help='Path to full resolution signal zarr (provides output shape)')
-    parser.add_argument('--chunk_size', default="128,256,256", help='Output chunk size z,y,x')
+    parser.add_argument('--chunk_size', default="256,256,256", help='Output chunk size z,y,x')
     
     args = parser.parse_args()
     
@@ -77,7 +77,7 @@ def main():
         cz, cy, cx = map(int, args.chunk_size.split(','))
         chunk_size = (cz, cy, cx)
     except:
-        chunk_size = (128, 256, 256)
+        chunk_size = (256, 256, 256)
     
     upsample_mask(
         args.input_mask_zarr,

@@ -7,7 +7,7 @@
       "id": "brain_mask_aind",
       "function": "pipeline_modules.segmentation.brain_mask_aind.run_brain_mask",
       "cli": "python -m pipeline_modules.segmentation.brain_mask_aind",
-      "description": "Deep-learning whole-brain mask for the registration channel: runs the Allen Institute aind-brain-segmentation 2D SwinUNETR tissue model (Neuratt, weights bundled in models/) on three orthogonal planes of ch{channel}_downsampled.zarr, averages the three probability volumes, thresholds (default 0.7), fills holes and keeps sizeable per-slice components. Output mask zarr sits on the coarse grid; main.py (registration.brain_mask_source=dl_fusion3, default in template) wires it into zarr_to_registration_nii --brain_mask, which maps it onto the registration grid (largest 3D component + erosion) and uses it in place of the Otsu halo mask for NIfTI zeroing and brain_mask.nii.gz (N4 + orientation preflight). Replaces the halo mask's Otsu failure modes on dim brain ends (medulla/olfactory bulb) and recovers slices whose single-plane mask keeps only a rim. Runtime ~40-60 min/sample on GPU; memory-safe (per-slice GPU batches, uint8 probability caches under ch{channel}_brain_mask_probs/, deleted after fusion unless --keep_probs).",
+      "description": "Deep-learning whole-brain mask for the registration channel: runs the Allen Institute aind-brain-segmentation 2D SwinUNETR tissue model (Neuratt, weights bundled in models/) on three orthogonal planes of ch{channel}_downsampled.zarr, averages the three probability volumes, thresholds (default 0.7), fills holes and keeps sizeable per-slice components. Output mask zarr sits on the coarse grid; main.py step 1.0 always runs this and wires it into zarr_to_registration_nii --brain_mask (the only mask source), which maps it onto the registration grid (largest 3D component + erosion) and uses it for NIfTI zeroing and brain_mask.nii.gz (N4 + orientation preflight). Supersedes the removed Otsu halo mask, whose failure modes were dim brain ends (medulla/olfactory bulb) and slices whose single-plane mask keeps only a rim. Runtime ~40-60 min/sample on GPU; memory-safe (per-slice GPU batches, uint8 probability caches under ch{channel}_brain_mask_probs/, deleted after fusion unless --keep_probs).",
       "inputs": {
         "sample_dir": {
           "type": "path",
@@ -35,7 +35,7 @@
         },
         "threshold": {
           "type": "float",
-          "default": 0.7
+          "default": 0.5
         },
         "min_area": {
           "type": "int",
@@ -64,7 +64,7 @@
           "description": "_run_manifest.json"
         }
       },
-      "when_to_use": "Registration-channel brain mask (main.py step 1.0, brain_mask_source=dl_fusion3). For cfos signal segmentation use cfos_unet_inference or threshold_segmentation instead."
+      "when_to_use": "Registration-channel brain mask (main.py step 1.0, the only mask source). For cfos signal segmentation use cfos_unet_inference or threshold_segmentation instead."
     },
     {
       "id": "threshold_segmentation",

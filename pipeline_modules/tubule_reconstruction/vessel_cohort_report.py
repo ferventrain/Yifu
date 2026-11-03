@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import subprocess
@@ -46,7 +47,31 @@ from pipeline_modules.tubule_reconstruction.vessel_analysis_report import (
     stream_vertex_stats_from_edges,
 )
 
-HPF_ROOT_ID = 1089  # Allen "Hippocampal formation"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Default region CSV is the Rev2 lineage (production default since 2026-10).
+# Rev1 kept ONLY as an explicit CLI choice for pre-2026-10 cohorts, never as a
+# default (enforced by tests/test_atlas_v2_defaults.py).
+DEFAULT_REGION_CSV = "pipeline_modules/registration/Region_Csv_Rev2_updated.CSV"
+
+
+def resolve_region_csv(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _parse_path_ids(text) -> list[int]:
+    """Parse structure_id_path into integer ids, accepting both dialects:
+    bracket lists ``[997, 8, ...]`` (Region_Csv Rev1/Rev2) and slash strings
+    ``/997/8/.../`` (allen_mouse_25um_structures.csv)."""
+    text = str(text).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            return [int(v) for v in ast.literal_eval(text)]
+        except (ValueError, SyntaxError):
+            return []
+    return [int(v) for v in text.strip("/").split("/") if v]
 
 
 def read_structures(csv_path: Path) -> dict[int, dict]:
@@ -61,14 +86,32 @@ def read_structures(csv_path: Path) -> dict[int, dict]:
                 "acronym": row.get("acronym", ""),
                 "name": row.get("name", ""),
                 "path": row.get("structure_id_path", ""),
+                "path_ids": _parse_path_ids(row.get("structure_id_path", "")),
             }
     return structures
 
 
+def find_hpf_root_id(structures: dict[int, dict]) -> int:
+    """Derive the hippocampal-formation root id from the chosen region CSV.
+
+    The same acronym "HPF" maps to id 1089 in Rev1 and id 1078 in Rev2, so the
+    id must be read from the CSV in use rather than hardcoded.
+    """
+    for sid, info in structures.items():
+        acronym = str(info.get("acronym", ""))
+        name = str(info.get("name", ""))
+        if "HPF" in acronym or name.startswith("Hippocampal formation"):
+            return int(sid)
+    raise SystemExit(
+        "Could not derive the HPF root id from the region CSV; "
+        "pass --hpf-root-id explicitly."
+    )
+
+
 def subtree_ids(structures: dict[int, dict], root_id: int) -> set[int]:
-    needle = f"/{root_id}/"
+    root_id = int(root_id)
     ids = {root_id}
-    ids.update(sid for sid, info in structures.items() if needle in info["path"])
+    ids.update(sid for sid, info in structures.items() if root_id in info.get("path_ids", []))
     return ids
 
 
@@ -172,25 +215,46 @@ def branch_metrics(branch_table: pd.DataFrame) -> dict:
 
 
 def render_density_heatmap(tissue_volumes: dict[int, float], leaf_by_id: dict[int, dict],
-                           output_dir: Path, figures_dir: Path) -> list[Path]:
+                           output_dir: Path, figures_dir: Path, region_csv: Path,
+                           structures: dict[int, dict] | None = None) -> list[Path]:
     """Call the existing vessel_region_density_heatmap program (atlas-space,
-    dpi-300 HD coronal slices). Empty regions are prefilled with 0 via a root
-    row; leaf rows then overwrite with their real density."""
+    dpi-300 HD coronal slices).
+
+    ``region_csv`` (the cohort's chosen Allen region CSV, Rev2 by default) is
+    forwarded as the subprocess ``--cfg`` so the region->value id join matches
+    the label volume; do NOT reintroduce a hardcoded Rev1 default.
+    Density rows carry per-id SUBTREE values: a row's vessel volume is the
+    subtree union, so its denominator must be the subtree tissue volume
+    (self-labeled voxels + all descendants). Feeding parent rows with
+    self-only tissue produced density blowups (root 600%+) that painted
+    whole territories one flat color. Rows are ordered largest-subtree
+    first so leaf rows overwrite parent aggregates on shared ids.
+    """
+    if structures is None:
+        structures = read_structures(region_csv)
+    subtree_cache: dict[int, list[int]] = {}
+
+    def subtree(id_int: int) -> list[int]:
+        if id_int not in subtree_cache:
+            subtree_cache[id_int] = list(subtree_ids(structures, id_int))
+        return subtree_cache[id_int]
+
     density_csv = output_dir / "region_density_for_heatmap.csv"
-    # root row prefills every label with 0 (empty regions read as 0); leaf rows
-    # then overwrite with real densities. Queries use numeric region ids: some
-    # acronyms are digit strings ("5") which the resolver treats as ids.
-    rows = [{"query": "root", "density_vessel_fraction": 0.0}]
+    rows = []
     percents = []
     for label, tissue_vol in tissue_volumes.items():
         row = leaf_by_id.get(int(label))
         if row is None:
             continue
+        sub_ids = subtree(int(label))
+        sub_tissue = sum(tissue_volumes.get(sid, 0.0) for sid in sub_ids)
         vessel_vol = float(row.get("vessel_volume_um3") or 0.0)
-        fraction = vessel_vol / tissue_vol if tissue_vol > 0 else 0.0
-        rows.append({"query": int(label), "density_vessel_fraction": fraction})
+        fraction = vessel_vol / sub_tissue if sub_tissue > 0 else 0.0
+        rows.append({"query": int(label), "density_vessel_fraction": fraction,
+                     "n_sub": len(sub_ids)})
         if fraction > 0:
             percents.append(fraction * 100.0)
+    rows.sort(key=lambda r: -r["n_sub"])  # parents first, leaves overwrite
     pd.DataFrame(rows).to_csv(density_csv, index=False)
 
     # color ceiling ~95th percentile keeps the bulk of regions in a readable
@@ -202,7 +266,9 @@ def render_density_heatmap(tissue_volumes: dict[int, float], leaf_by_id: dict[in
         sys.executable, "-m", "pipeline_modules.tubule_reconstruction.vessel_region_density_heatmap",
         "--density_csv", str(density_csv),
         "--output_dir", str(heat_dir),
-        "--cfg", str(Path(__file__).resolve().parents[1] / "registration" / "Region_Csv_Rev2_updated.CSV"),
+        # id join must match the label volume: forward the cohort's chosen region
+        # CSV (Rev2 by default; Rev1 only when passed explicitly)
+        "--cfg", str(region_csv),
         "--dpi", "300",
         "--cmap", "inferno",
         "--vmax_percent", f"{vmax:.2f}",
@@ -245,7 +311,27 @@ def main() -> int:
     parser.add_argument("--stride", type=int, default=8, help="Sampling stride for the label pass")
     parser.add_argument("--metrics", default="length,diameter,degree,tortuosity",
                         help="Sections: length,length_fraction,diameter,degree,tortuosity")
-    parser.add_argument("--structures-csv", default="", help="Allen structures CSV (defaults to repo copy)")
+    parser.add_argument(
+        "--region-csv",
+        default=DEFAULT_REGION_CSV,
+        help=(
+            "Allen region CSV that drives the structures map, HPF subtree derivation "
+            "and the heatmap subprocess --cfg. Default is the Rev2 lineage "
+            "(Region_Csv_Rev2_updated.CSV). Pass the Rev1 CSV to reproduce a "
+            "pre-2026-10 vessel cohort."
+        ),
+    )
+    parser.add_argument(
+        "--hpf-root-id",
+        type=int,
+        default=None,
+        help="Override the hippocampal-formation root id (default: derived from --region-csv)",
+    )
+    parser.add_argument(
+        "--structures-csv",
+        default="",
+        help="Override the structures CSV (default: use --region-csv, so ids stay consistent)",
+    )
     args = parser.parse_args()
 
     tubule_dir = Path(args.tubule_dir)
@@ -256,10 +342,11 @@ def main() -> int:
 
     resolution = tuple(float(part) for part in args.resolution_xyz.split(","))
     voxel_volume = float(np.prod(resolution))
-    structures_csv = Path(args.structures_csv) if args.structures_csv else \
-        Path(__file__).resolve().parents[2] / "allen_mouse_25um_structures.csv"
+    region_csv = resolve_region_csv(args.region_csv)
+    structures_csv = Path(args.structures_csv) if args.structures_csv else region_csv
     structures = read_structures(structures_csv)
-    hpf_ids = subtree_ids(structures, HPF_ROOT_ID)
+    hpf_root_id = args.hpf_root_id if args.hpf_root_id is not None else find_hpf_root_id(structures)
+    hpf_ids = subtree_ids(structures, hpf_root_id)
 
     metrics = set(part for part in args.metrics.split(",") if part)
 
@@ -421,7 +508,8 @@ def main() -> int:
                 "血管体积密度_%": density,
             })
         density_table = pd.DataFrame(density_rows).sort_values("血管体积密度_%", ascending=False)
-        heatmap_slices = render_density_heatmap(tissue_volumes, leaf_by_id, output_dir, figures_dir)
+        heatmap_slices = render_density_heatmap(tissue_volumes, leaf_by_id, output_dir, figures_dir,
+                                                region_csv=region_csv, structures=structures)
 
     # --- workbook ---
     from openpyxl.drawing.image import Image as XLImage

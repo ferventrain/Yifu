@@ -33,7 +33,6 @@ _BOOKKEEPING_KEYS = {
     "downsample",
     "zarr",
     "channel_subtraction",
-    "edge_signal_removal",
     "surface_brightness_homogenize",
 }
 

@@ -10,12 +10,9 @@ Backends:
 
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
-import tifffile
 from scipy import ndimage as ndi
 
 DestripeFn = Callable[..., np.ndarray]
@@ -230,51 +227,5 @@ def destripe_2d(
     return _BACKENDS[name](image, **kwargs)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="2D stripe removal (pluggable backends).")
-    parser.add_argument("input", type=Path, help="Input TIFF path.")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Output TIFF. Defaults to <stem>_destripe.tif beside input.",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=tuple(list_destripe_backends()),
-        default="fft",
-    )
-    parser.add_argument("--strength", type=float, default=0.85)
-    parser.add_argument("--notch_width", type=float, default=2.0)
-    parser.add_argument("--keep_fraction", type=float, default=0.04)
-    parser.add_argument("--sigma", type=float, default=40.0, help="Smooth-backend sigma.")
-    parser.add_argument(
-        "--orientation",
-        choices=("horizontal", "vertical", "both"),
-        default="horizontal",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    image = tifffile.imread(str(args.input))
-    if image.ndim > 2:
-        raise SystemExit(f"Expected 2D TIFF, got shape={image.shape}")
-    out = destripe_2d(
-        image,
-        backend=args.backend,
-        strength=args.strength,
-        notch_width=args.notch_width,
-        keep_fraction=args.keep_fraction,
-        sigma=args.sigma,
-        orientation=args.orientation,
-    )
-    output = args.output or args.input.with_name(f"{args.input.stem}_destripe{args.input.suffix}")
-    tifffile.imwrite(str(output), out)
-    print(f"Wrote {output} (backend={args.backend})")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# Library-only step of run_preprocessing (pipeline_modules/HE/preprocess.py imports
+# destripe_2d). The standalone CLI was removed; there is no independent entry point.

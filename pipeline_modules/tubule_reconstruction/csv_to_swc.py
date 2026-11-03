@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from pipeline_modules.tubule_reconstruction.kimimaro_reconstruction import write_swc_files
+from pipeline_modules.tubule_reconstruction._recon_common import write_swc_files
 
 
 def main():

@@ -20,7 +20,7 @@
       "cli": "python pipeline_modules/registration/ANTs_registration.py",
       "description": "Run ANTs registration (atlas2image or image2atlas), save warped labels, and optionally save transforms and registered image. Writes upsampled_atlas_label.zarr and (when configured) atlas_label_hemisphere.zarr natively; the label TIFF stack is a transient intermediate removed when registration.save_upsampled_label=false.",
       "prerequisites": [
-        "Downsampled registration-channel NIfTI must exist at SampleLayout.reg_downsample_nii (build it from an ims pyramid level via zarr_to_registration_nii; no TIFF folder required); main.py step 1.0 (registration.brain_mask_source=dl_fusion3, template default) precomputes a DL brain mask via pipeline_modules.segmentation.brain_mask_aind and passes it as --brain_mask, replacing the Otsu halo mask for the NIfTI zeroing and brain_mask.nii.gz",
+        "Downsampled registration-channel NIfTI must exist at SampleLayout.reg_downsample_nii (build it from an ims pyramid level via zarr_to_registration_nii; no TIFF folder required); main.py step 1.0 always precomputes the DL brain mask via pipeline_modules.segmentation.brain_mask_aind (the only mask source; registration.brain_mask_source / halo_mask were removed and are ignored) and passes it to preprocessing.zarr_to_registration_nii via that script's own required --brain_mask flag (NOT an ANTs_registration flag; ANTs_registration accepts no --brain_mask) for the NIfTI zeroing and brain_mask.nii.gz",
         "Allen atlas template + annotation NIfTI must be available",
         "For label upsampling without TIFF folders: sample_dir/original_shape.json with the full-res signal (z,y,x) shape"
       ],
@@ -60,12 +60,13 @@
         },
         "registration_type": {
           "type": "string",
-          "default": "SyN",
+          "default": "SyNRA",
           "choices": [
             "Rigid",
             "Affine",
             "SyN",
-            "SyNRA"
+            "SyNRA",
+            "ElasticSyN"
           ]
         },
         "save_registered_image": {
@@ -440,6 +441,9 @@
   "configuration_models": {
     "RegistrationCfg": "pipeline_modules.registration.config.RegistrationCfg",
     "AnalysisCfg": "pipeline_modules.registration.config.AnalysisCfg"
+  },
+  "library_helpers": {
+    "label_codec": "pipeline_modules/registration/label_codec.py — library-only helper (no CLI entrypoint, not a runnable step), imported by ANTs_registration.py and atlas_label_to_hemisphere.py: load_label_array_preserving_ids also performs the tifffile (Z,Y,X) -> ANTs (X,Y,Z) transpose and dtype promotion, and legacy official-id labels (>2^24) remain reachable via the atlas_label_to_hemisphere.py CSV fallback and the README example config, so it cannot be dropped even for v2-only (uint16, id 1..1327) usage."
   },
   "sample_layout": {
     "class": "pipeline_modules.utils.sample_layout.SampleLayout",

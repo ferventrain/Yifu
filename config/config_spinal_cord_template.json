@@ -58,20 +58,6 @@
             "erode_px": 16.0,
             "max_workers": 0
         },
-        "edge_signal_removal": {
-            "apply": false,
-            "inward_px": 50,
-            "outward_px": 0,
-            "prior_curve_scale": 1.15,
-            "prior_curve_smooth_sigma": 2.0,
-            "contour_min_object_area_px": 50,
-            "contour_morph_radius_px": 2,
-            "contour_dilation_px": 2,
-            "brightness_pct": 90.0,
-            "min_area_px": 50,
-            "suppression_weight": 1.0,
-            "max_workers": 8
-        },
         "downsample": {
             "target_resolution_xyz": [25.0, 25.0, 25.0],
             "chunk_size": 100
@@ -87,7 +73,7 @@
         "mode": "atlas2image",
         "atlas_path": "${YIFU_DATA_DIR}/reference/atlas.tiff",
         "annotation_path": "${YIFU_DATA_DIR}/reference/atlas_label_v2_uint16.tiff",
-        "transform_type": "SyN",
+        "transform_type": "SyNRA",
         "allow_reflection": false,
         "save_upsampled_label": true,
         "save_upsampled_label_zarr": true,

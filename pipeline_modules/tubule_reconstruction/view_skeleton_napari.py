@@ -6,12 +6,12 @@ import numpy as np
 import pandas as pd
 
 try:
-    from .kimimaro_reconstruction import open_zarr_dataset, parse_resolution_xyz
+    from ._recon_common import open_zarr_dataset, parse_resolution_xyz
 except ImportError:
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
         sys.path.append(str(project_root))
-    from pipeline_modules.tubule_reconstruction.kimimaro_reconstruction import (
+    from pipeline_modules.tubule_reconstruction._recon_common import (
         open_zarr_dataset,
         parse_resolution_xyz,
     )
@@ -94,7 +94,7 @@ def build_argparser():
     parser.add_argument("--image_zarr", default="", help="Optional image Zarr path")
     parser.add_argument("--mask_zarr", default="", help="Optional mask Zarr path")
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the image/mask Zarr group")
-    parser.add_argument("--resolution_xyz", default="1,1,1", help="Voxel size in microns as x,y,z")
+    parser.add_argument("--resolution_xyz", default="1.8,1.8,2.0", help="Voxel size in microns as x,y,z")
     parser.add_argument("--chunk_index", default="", help="Optional chunk index like 0.11.8")
     parser.add_argument("--max_edges", type=int, default=0, help="Limit the number of displayed edges (0 = no limit)")
     return parser

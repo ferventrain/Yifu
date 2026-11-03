@@ -43,12 +43,10 @@ def run_formal_register_job(
     """CLI/worker entry: atlas prep + ANTs registration (no GUI)."""
     import nibabel as nib
 
-    from pipeline_modules.registration.spinalj_atlas_register import (
-        convert_atlas_to_nifti,
-        run_ants_registration,
-    )
     from pipeline_modules.registration.spinalj_straighten_register import (
         _resample_atlas_to_spacing,
+        convert_atlas_to_nifti,
+        run_ants_registration,
     )
 
     out_dir = Path(out_dir)

@@ -34,7 +34,16 @@ from pipeline_modules.visualization.heatmap import (
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--density_csv", required=True)
+    parser.add_argument(
+        "--density_csv",
+        default="",
+        help=(
+            "Region density CSV with 'query' and 'density_vessel_fraction' columns; "
+            "produced by region_vessel_analysis --volume_only "
+            "(region_vessel_volume_density.csv). Omit when --id_value_csv covers all ids"
+        ),
+    )
+    parser.add_argument("--id_value_csv", default="", help="Direct id->density CSV painted by exact atlas id (no subtree resolution)")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--cfg", required=True, help="Allen region CSV")
     parser.add_argument("--label_path", default=None, help="atlas label TIFF (default resolve_atlas_label_path)")
@@ -46,13 +55,27 @@ def main() -> int:
     parser.add_argument("--dpi", type=int, default=300)
     args = parser.parse_args()
 
-    density = pd.read_csv(args.density_csv)
+    density = (pd.read_csv(args.density_csv) if args.density_csv
+               else pd.DataFrame(columns=["query", "density_vessel_fraction"]))
     label_path = Path(args.label_path) if args.label_path else resolve_atlas_label_path()
     nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(args.cfg)
 
     value_by_label: dict[int, float] = {}
+    if getattr(args, "id_value_csv", ""):
+        # direct id -> value rows (e.g. 2022-edition fine regions absent from
+        # the region CSV tree); painted by exact id, no subtree resolution
+        id_value = pd.read_csv(args.id_value_csv)
+        for _, row in id_value.iterrows():
+            value_by_label[int(row["id"])] = float(row["density_vessel_fraction"]) * 100.0
+        print(f"Mapped {len(id_value)} ids from id_value csv {args.id_value_csv}")
     for _, row in density.iterrows():
-        query = str(row["query"])
+        # iterrows upcasts a fully numeric query column to float64, turning
+        # region id 1 into "1.0"; restore integer ids before resolving
+        raw_query = row["query"]
+        if isinstance(raw_query, float) and float(raw_query).is_integer():
+            query = str(int(raw_query))
+        else:
+            query = str(raw_query)
         fraction = float(row["density_vessel_fraction"])
         node = resolve_region_query(query, nodes_by_id, acronym_to_ids, name_to_ids)
         for label_id in _collect_subtree_ids(node):

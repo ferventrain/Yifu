@@ -1,10 +1,16 @@
 """Per-brain-region vessel parameter analysis.
 
-Given skeleton CSV outputs from ``kimimaro_reconstruction`` (vertex/edge tables
-in micron coordinates) plus a registered Allen-style annotation label Zarr and
-a region CSV, compute vessel parameters for a user-supplied list of brain
-regions. Regions can be specified by acronym, full name, or integer id, and
-each query includes all descendants in the region tree.
+Given skeleton CSV outputs from a vessel reconstruction (vertex/edge tables in
+micron coordinates) plus a registered Allen-style annotation label Zarr and a
+region CSV, compute vessel parameters for a user-supplied list of brain regions.
+Regions can be specified by acronym, full name, or integer id, and each query
+includes all descendants in the region tree.
+
+``--volume_only`` is an opt-in path (merged from the former
+``vessel_region_density_scan.py``): it computes per-region vessel VOLUME density
+straight from the mask Zarr + atlas annotation with no skeletonisation, writing
+``region_vessel_volume_density.csv/.json``. All skeleton-based behaviour and
+outputs are unchanged.
 """
 
 from __future__ import annotations
@@ -21,8 +27,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from pipeline_modules.tubule_reconstruction.kimimaro_reconstruction import (
-    _branch_table_from_tables,
+from pipeline_modules.tubule_reconstruction._recon_common import (
+    branch_table_from_tables as _branch_table_from_tables,
     iter_all_chunk_indices,
     open_zarr_dataset,
     parse_resolution_xyz,
@@ -905,15 +911,264 @@ def _finalize_region_analysis(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Volume-density-only mode (merged from vessel_region_density_scan.py)
+#
+# Computes per-atlas-region vessel VOLUME density directly from the binary mask
+# Zarr + registered atlas annotation, with NO skeletonisation. Emits the same
+# ``region_vessel_volume_density.csv/.json`` the standalone scan used to write.
+# ---------------------------------------------------------------------------
+
+VOLUME_DENSITY_DEFAULT_REGIONS = "CTX;CNU;CB;BS;TH;HY;PAL;OLF;HPF"
+
+_VOLUME_DENSITY_COLUMNS = [
+    "query",
+    "region_id",
+    "region_acronym",
+    "region_name",
+    "num_subtree_ids",
+    "vessel_mask_voxels",
+    "region_voxels",
+    "vessel_volume_um3",
+    "region_volume_um3",
+    "density_vessel_fraction",
+    "density_um3_per_mm3",
+]
+
+
+def _load_foreground_chunks(cache_path):
+    """Read ``foreground_chunks`` from a reconstruction JSON (``["z.y.x", ...]``).
+
+    Returns an empty list when the file is missing / has no entries, so the
+    caller falls back to scanning all chunks.
+    """
+    payload = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+    chunks = payload.get("foreground_chunks")
+    if not chunks:
+        return []
+    return [tuple(int(part) for part in str(value).split(".")) for value in chunks]
+
+
+def _all_mask_chunk_indices(mask_zarr):
+    grid = np.ceil(np.asarray(mask_zarr.shape) / np.asarray(mask_zarr.chunks)).astype(int)
+    return [
+        tuple(index)
+        for index in np.ndindex(tuple(grid))
+        if all(int(index[axis]) * int(mask_zarr.chunks[axis]) < int(mask_zarr.shape[axis]) for axis in range(3))
+    ]
+
+
+def _mask_slices_for_chunk(mask_zarr, chunk_index):
+    return tuple(
+        slice(
+            int(chunk_index[axis]) * int(mask_zarr.chunks[axis]),
+            min(int((chunk_index[axis] + 1) * mask_zarr.chunks[axis]), int(mask_zarr.shape[axis])),
+        )
+        for axis in range(3)
+    )
+
+
+def analyze_regions_volume_density(
+    mask_zarr_path,
+    annotation_zarr_path,
+    region_cfg_csv,
+    regions=None,
+    output_dir=None,
+    mask_dataset_name="0",
+    foreground_label=1,
+    annotation_dataset_name="0",
+    annotation_resolution_xyz=None,
+    config_path=None,
+    foreground_chunks_json=None,
+):
+    """Per-region vessel VOLUME density from mask + atlas annotation (no skeleton).
+
+    Opt-in path of ``region_vessel_analysis`` (``--volume_only``). Merged from the
+    former ``vessel_region_density_scan.py``; the standalone script is deleted.
+
+    The former required input ``foreground_chunks_min100.json`` had no producer in
+    the repo, so this mode now SCANS ALL MASK CHUNKS BY DEFAULT. Pass
+    ``--foreground_chunks_json`` to restrict the scan to a precomputed foreground
+    chunk list (documented, optional).
+    """
+    if mask_zarr_path is None:
+        raise ValueError("--volume_only requires --mask_zarr.")
+    if annotation_zarr_path is None:
+        raise ValueError("--volume_only requires --annotation_zarr.")
+    if region_cfg_csv is None:
+        raise ValueError("region_cfg_csv (--cfg) is required.")
+
+    region_queries = parse_region_list(regions) if regions else parse_region_list(VOLUME_DENSITY_DEFAULT_REGIONS)
+    if not region_queries:
+        raise ValueError("--volume_only requires at least one --regions query.")
+
+    logger.info("Loading region tree from %s", region_cfg_csv)
+    nodes_by_id, acronym_to_ids, name_to_ids = load_region_tree_with_lookups(region_cfg_csv)
+
+    if annotation_resolution_xyz is None:
+        if config_path is None:
+            config_path = _default_config_path()
+        if config_path is None:
+            raise ValueError(
+                "annotation_resolution_xyz was not provided and config/config.json was not found. "
+                "Pass --config or --annotation_resolution_xyz."
+            )
+        annotation_resolution_xyz = _load_input_resolution_xyz_from_config(config_path)
+    annotation_resolution_xyz = parse_resolution_xyz(annotation_resolution_xyz)
+    voxel_volume = float(np.prod(annotation_resolution_xyz))
+
+    mask_zarr = open_zarr_dataset(mask_zarr_path, dataset_name=mask_dataset_name)
+    annotation_zarr = open_zarr_dataset(annotation_zarr_path, dataset_name=annotation_dataset_name)
+    if len(mask_zarr.shape) != 3 or len(annotation_zarr.shape) != 3:
+        raise ValueError(
+            f"Mask and annotation Zarrs must be 3D: mask={mask_zarr.shape}, annotation={annotation_zarr.shape}"
+        )
+    if tuple(mask_zarr.shape) != tuple(annotation_zarr.shape):
+        raise ValueError(
+            f"Mask and annotation Zarr shapes must match for volume density: "
+            f"mask={mask_zarr.shape}, annotation={annotation_zarr.shape}"
+        )
+
+    resolved = []
+    for query in region_queries:
+        try:
+            node = resolve_region_query(query, nodes_by_id, acronym_to_ids, name_to_ids)
+        except Exception as exc:
+            logger.warning("region %r not found (%s)", query, exc)
+            continue
+        resolved.append({"query": query, "node": node, "subtree_ids": _collect_subtree_ids(node)})
+    if not resolved:
+        raise ValueError("No --regions queries resolved against the region CSV.")
+
+    all_subtree_ids = sorted({int(v) for entry in resolved for v in entry["subtree_ids"]})
+    max_label = int(all_subtree_ids[-1]) if all_subtree_ids else 0
+
+    vessel_voxels_by_label = np.zeros(max_label + 1, dtype=np.int64)
+    region_voxels_by_label = np.zeros(max_label + 1, dtype=np.int64)
+
+    if foreground_chunks_json:
+        chunk_indices = _load_foreground_chunks(foreground_chunks_json)
+        logger.info("Loaded %d foreground chunk(s) from %s", len(chunk_indices), foreground_chunks_json)
+    else:
+        chunk_indices = []
+    if not chunk_indices:
+        chunk_indices = _all_mask_chunk_indices(mask_zarr)
+        logger.info("Scanning all %d mask chunk(s) (no foreground_chunks_json provided)", len(chunk_indices))
+
+    for chunk_index in tqdm(chunk_indices, desc="Vessel voxel histogram"):
+        slices = _mask_slices_for_chunk(mask_zarr, chunk_index)
+        mask_block = np.asarray(mask_zarr[slices])
+        vessel_mask = mask_block > 0 if foreground_label is None else mask_block == foreground_label
+        if not np.any(vessel_mask):
+            continue
+        label_block = np.asarray(annotation_zarr[slices]).astype(np.int64)
+        values = label_block[vessel_mask]
+        if values.size == 0:
+            continue
+        values = values[(values > 0) & (values <= max_label)]
+        if values.size == 0:
+            continue
+        counts = np.bincount(values)
+        vessel_voxels_by_label[: len(counts)] += counts
+
+    logger.info("Label histogram from full-resolution atlas ...")
+    total_chunks = np.ceil(np.asarray(annotation_zarr.shape) / np.asarray(annotation_zarr.chunks)).astype(int)
+    for index in np.ndindex(tuple(total_chunks)):
+        slices = tuple(
+            slice(
+                int(index[axis]) * int(annotation_zarr.chunks[axis]),
+                min(int((index[axis] + 1) * annotation_zarr.chunks[axis]), int(annotation_zarr.shape[axis])),
+            )
+            for axis in range(3)
+        )
+        block = np.asarray(annotation_zarr[slices]).astype(np.int64)
+        counts = np.bincount(block.ravel())
+        region_voxels_by_label[: min(len(counts), max_label + 1)] += counts[: max_label + 1]
+
+    rows = []
+    for entry in resolved:
+        node = entry["node"]
+        ids = [int(v) for v in entry["subtree_ids"] if int(v) <= max_label]
+        mask_voxels = int(vessel_voxels_by_label[ids].sum()) if ids else 0
+        region_voxels = int(region_voxels_by_label[ids].sum()) if ids else 0
+        vessel_volume = float(mask_voxels * voxel_volume)
+        region_volume = float(region_voxels * voxel_volume)
+        density_voxel = float(mask_voxels / region_voxels) if region_voxels else np.nan
+        density_um3_per_mm3 = float(vessel_volume / (region_volume / 1e9)) if region_volume else np.nan
+        rows.append({
+            "query": entry["query"],
+            "region_id": int(node["id"]),
+            "region_acronym": node.get("acronym", ""),
+            "region_name": node.get("name", ""),
+            "num_subtree_ids": len(ids),
+            "vessel_mask_voxels": mask_voxels,
+            "region_voxels": region_voxels,
+            "vessel_volume_um3": vessel_volume,
+            "region_volume_um3": region_volume,
+            "density_vessel_fraction": density_voxel,
+            "density_um3_per_mm3": density_um3_per_mm3,
+        })
+
+    table = pd.DataFrame(rows, columns=_VOLUME_DENSITY_COLUMNS)
+    result = {
+        "summary_table": table,
+        "resolved_regions": resolved,
+    }
+
+    if output_dir is not None:
+        output_root = Path(output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        density_csv_path = output_root / "region_vessel_volume_density.csv"
+        density_json_path = output_root / "region_vessel_volume_density.json"
+        table.to_csv(density_csv_path, index=False)
+
+        json_rows = []
+        for row in table.to_dict(orient="records"):
+            sanitized = {}
+            for key, value in row.items():
+                if isinstance(value, float) and np.isnan(value):
+                    sanitized[key] = None
+                elif isinstance(value, np.generic):
+                    sanitized[key] = value.item()
+                else:
+                    sanitized[key] = value
+            json_rows.append(sanitized)
+        with open(density_json_path, "w", encoding="utf-8") as handle:
+            json.dump({"regions": json_rows}, handle, indent=2, ensure_ascii=False)
+
+        result["density_csv_path"] = density_csv_path
+        result["density_json_path"] = density_json_path
+
+    return result
+
+
 def build_argparser():
     parser = argparse.ArgumentParser(
         description=(
             "Compute per-brain-region vessel parameters from existing "
-            "kimimaro skeleton CSV outputs (vertex/edge tables in um)."
+            "skeleton CSV outputs (vertex/edge tables in um), or --volume_only "
+            "for per-region vessel volume density from mask + atlas annotation."
         )
     )
-    parser.add_argument("--vertex_csv", required=True, help="Path to skeleton_vertices.csv")
-    parser.add_argument("--edge_csv", required=True, help="Path to skeleton_edges.csv")
+    parser.add_argument("--vertex_csv", help="Path to skeleton_vertices.csv (required unless --volume_only)")
+    parser.add_argument("--edge_csv", help="Path to skeleton_edges.csv (required unless --volume_only)")
+    parser.add_argument(
+        "--volume_only",
+        action="store_true",
+        help=(
+            "Compute per-atlas-region vessel VOLUME density straight from --mask_zarr + "
+            "--annotation_zarr (no skeletonisation). Writes region_vessel_volume_density.csv/.json "
+            "instead of the skeleton-based summary. Merged from vessel_region_density_scan.py."
+        ),
+    )
+    parser.add_argument(
+        "--foreground_chunks_json",
+        default="",
+        help=(
+            "Optional reconstruction JSON with a 'foreground_chunks' list to restrict the "
+            "--volume_only scan. Omit to scan all mask chunks (the default)."
+        ),
+    )
     parser.add_argument(
         "--branch_csv",
         help="Path to vessel_branch_metrics.csv. Defaults to vertex_csv directory/vessel_branch_metrics.csv.",
@@ -996,6 +1251,31 @@ def main():
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     try:
+        if args.volume_only:
+            result = analyze_regions_volume_density(
+                mask_zarr_path=args.mask_zarr,
+                annotation_zarr_path=args.annotation_zarr,
+                region_cfg_csv=args.cfg,
+                regions=args.regions,
+                output_dir=args.output_dir,
+                mask_dataset_name=args.mask_dataset_name,
+                foreground_label=None if str(args.foreground_label).strip() == "" else int(args.foreground_label),
+                annotation_dataset_name=args.annotation_dataset_name,
+                annotation_resolution_xyz=args.annotation_resolution_xyz,
+                config_path=args.config,
+                foreground_chunks_json=args.foreground_chunks_json or None,
+            )
+            summary_table = result["summary_table"]
+            logger.info("Per-region vessel volume density: %d row(s)", len(summary_table))
+            if "density_csv_path" in result:
+                logger.info("Density CSV:  %s", result["density_csv_path"])
+            if "density_json_path" in result:
+                logger.info("Density JSON: %s", result["density_json_path"])
+            return
+
+        if not args.vertex_csv or not args.edge_csv:
+            raise ValueError("--vertex_csv and --edge_csv are required unless --volume_only is set.")
+
         result = analyze_regions_from_skeleton(
             vertex_csv_path=args.vertex_csv,
             edge_csv_path=args.edge_csv,

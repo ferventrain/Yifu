@@ -27,7 +27,7 @@ class TestRegistrationCfg:
         cfg = RegistrationCfg()
         assert cfg.method == "ants"
         assert cfg.mode == "atlas2image"
-        assert cfg.transform_type == "SyN"
+        assert cfg.transform_type == "SyNRA"
         assert cfg.allow_reflection is False
         assert cfg.save_registered_image is False
         assert cfg.save_upsampled_label is True

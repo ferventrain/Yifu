@@ -240,7 +240,7 @@ def _contrast_limits_from_volume(vol: np.ndarray) -> tuple[float, float]:
 def load_atlas_template_zyx(atlas_dir: Path, cache_dir: Path) -> tuple[np.ndarray, tuple[float, float, float]]:
     import nibabel as nib
 
-    from pipeline_modules.registration.spinalj_atlas_register import convert_atlas_to_nifti
+    from pipeline_modules.registration.spinalj_straighten_register import convert_atlas_to_nifti
 
     paths = convert_atlas_to_nifti(Path(atlas_dir), Path(cache_dir))
     nii = nib.load(str(paths["template"]))

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from pipeline_modules.tubule_reconstruction.kimimaro_reconstruction import summarize_branch_table
+from pipeline_modules.tubule_reconstruction._recon_common import summarize_branch_table
 
 
 def test_summarize_branch_table_uses_requested_fields_only():

@@ -141,7 +141,7 @@ def load_atlas_template_zyx(atlas_dir: Path, *, cache_dir: Path | None = None) -
     """Load SpinalJ Template as ZYX float32 (native 10×10×20)."""
     import nibabel as nib
 
-    from pipeline_modules.registration.spinalj_atlas_register import convert_atlas_to_nifti
+    from pipeline_modules.registration.spinalj_straighten_register import convert_atlas_to_nifti
 
     cache = cache_dir or (Path(atlas_dir) / "_nifti_cache")
     paths = convert_atlas_to_nifti(Path(atlas_dir), cache)

@@ -1090,11 +1090,11 @@ def _reg_params_html(a: SampleInputs, b: SampleInputs) -> str:
         rows.append(
             f"<tr><td>{sample.sample_id}</td><td>{reg.get('method', '—')}/{reg.get('transform_type', '—')}</td>"
             f"<td>{reg.get('mode', '—')}</td><td>{reg.get('grad_step', '—')} / {reg.get('syn_iterations', '—')}</td>"
-            f"<td>{'开' if reg.get('halo_mask') else '关'}</td><td>{duration or '—'}</td></tr>"
+            f"<td>{duration or '—'}</td></tr>"
         )
-    return ("<table><thead><tr><th>样本</th><th>方法</th><th>方向</th><th>grad_step / 迭代</th><th>halo mask</th><th>配准耗时</th></tr></thead>"
+    return ("<table><thead><tr><th>样本</th><th>方法</th><th>方向</th><th>grad_step / 迭代</th><th>配准耗时</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table>"
-            "<div class='note'>参数与耗时取自样本 config.json 的 registration 块和 _run_manifest.json；n4 预处理与刚性预检按管线默认开启（qc 目录含 rigid/final 检查图）。</div>")
+            "<div class='note'>参数与耗时取自样本 config.json 的 registration 块和 _run_manifest.json；配准输入用 DL brain mask（--brain_mask）裁出脑区，n4 预处理与刚性预检按管线默认开启（qc 目录含 rigid/final 检查图）。</div>")
 
 
 def _methods_html(a: SampleInputs, b: SampleInputs) -> str:

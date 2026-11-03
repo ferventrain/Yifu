@@ -15,6 +15,9 @@ Two modes:
 - ``--from_source_ims``: other channels of the original IMS are streamed into
   the new file and the mask replaces channel ``--channel`` (or is appended via
   ``--append_as_new_channel``).
+- ``--replacement_dense``: the replacement Zarr is a dense image (e.g. a
+  brightness-corrected signal) rather than a sparse mask. Pyramid levels use
+  mean pooling, and the source channel's color/name metadata is inherited.
 CLI::
 
     python -m pipeline_modules.utils.masked_zarr_to_ims \
@@ -163,6 +166,7 @@ class OutputChannel:
     source: str  # "mask" or "ims"
     dtype: np.dtype
     source_dataset: Any | None = None  # h5py dataset for source == "ims"
+    dense: bool = False  # replacement Zarr holds a dense image, not a sparse mask
 
 
 def _list_source_channels(handle: Any) -> list[int]:
@@ -220,6 +224,16 @@ def _set_attr(group: Any, name: str, text: Any) -> None:
     group.attrs[name] = _ims_attr(text)
 
 
+def _int_attr(group: Any, name: str) -> int | None:
+    """Read an integer-ish Imaris attribute, tolerating missing/odd encodings."""
+    if group is None or name not in group.attrs:
+        return None
+    try:
+        return int(float(_hdf_attr_text(group.attrs[name])))
+    except (TypeError, ValueError):
+        return None
+
+
 def _hdf_attr_text(value: Any) -> str:
     """Decode an HDF5 attr that Imaris may store as str, bytes, or a |S1 array."""
     if isinstance(value, np.ndarray):
@@ -251,6 +265,7 @@ def build_output_channels(
     append_as_new_channel: bool,
     resolution_level: int = DEFAULT_RESOLUTION_LEVEL,
     timepoint: int = DEFAULT_TIMEPOINT,
+    replacement_dense: bool = False,
 ) -> list[OutputChannel]:
     """Plan the channels of the new file. Validates shapes against the mask."""
     if source_handle is None:
@@ -299,7 +314,13 @@ def build_output_channels(
     for entry in channels:
         if entry.index == mask_index:
             planned.append(
-                OutputChannel(index=entry.index, name=f"ch{entry.index}", source="mask", dtype=mask_dtype)
+                OutputChannel(
+                    index=entry.index,
+                    name=f"ch{entry.index}",
+                    source="mask",
+                    dtype=mask_dtype,
+                    dense=bool(replacement_dense),
+                )
             )
         else:
             planned.append(entry)
@@ -342,10 +363,23 @@ def _init_ims_skeleton(
             compression="gzip",
             compression_opts=max(1, int(gzip_level)),
         )
-        _set_attr(channel_group, "ImageSizeX", str(width))
-        _set_attr(channel_group, "ImageSizeY", str(height))
-        _set_attr(channel_group, "ImageSizeZ", str(depth))
-        hist_max = 1 if entry.source == "mask" else int(np.iinfo(np.dtype(entry.dtype)).max)
+        # Imaris stores the physical extent (unpadded) here, while Data may be
+        # padded to chunk multiples. Reusing the source extent keeps the voxel
+        # size exact even though the array is larger than the extent.
+        source_channel = None
+        if source_handle is not None:
+            source_channel = source_handle.get(
+                f"DataSet/ResolutionLevel 0/TimePoint 0/Channel {entry.index}"
+            )
+        src_x = _int_attr(source_channel, "ImageSizeX")
+        src_y = _int_attr(source_channel, "ImageSizeY")
+        src_z = _int_attr(source_channel, "ImageSizeZ")
+        _set_attr(channel_group, "ImageSizeX", str(src_x if src_x else width))
+        _set_attr(channel_group, "ImageSizeY", str(src_y if src_y else height))
+        _set_attr(channel_group, "ImageSizeZ", str(src_z if src_z else depth))
+        hist_max = (
+            1 if entry.source == "mask" and not entry.dense else int(np.iinfo(np.dtype(entry.dtype)).max)
+        )
         _set_attr(channel_group, "HistogramMin", "0.000")
         _set_attr(channel_group, "HistogramMax", f"{hist_max:.3f}")
         _set_attr(channel_group, "HistogramMin1024", "0.000")
@@ -373,9 +407,16 @@ def _init_ims_skeleton(
         if source_image is not None:
             for key, value in source_image.attrs.items():
                 image.attrs[str(key)] = value
-    _set_attr(image, "X", str(width))
-    _set_attr(image, "Y", str(height))
-    _set_attr(image, "Z", str(depth))
+    if source_handle is None:
+        _set_attr(image, "X", str(width))
+        _set_attr(image, "Y", str(height))
+        _set_attr(image, "Z", str(depth))
+    else:
+        # Keep the source's unpadded extent (X/Y/Z) copied above; only fill keys
+        # the source did not carry.
+        for key, dim in (("X", width), ("Y", height), ("Z", depth)):
+            if key not in image.attrs:
+                _set_attr(image, key, str(dim))
     _set_attr(image, "Noc", str(len(channels)))
     _set_attr(image, "Not", "1")
     if "ExtMin0" not in image.attrs:
@@ -392,19 +433,20 @@ def _init_ims_skeleton(
 
     for entry in channels:
         channel_info = info.require_group(f"Channel {entry.index}")
-        if entry.source == "ims" and source_handle is not None:
+        if (entry.source == "ims" or entry.dense) and source_handle is not None:
             source_channel_info = source_handle.get(f"DataSetInfo/Channel {entry.index}")
             if source_channel_info is not None:
                 for key, value in source_channel_info.attrs.items():
                     channel_info.attrs[str(key)] = value
+        is_sparse_mask = entry.source == "mask" and not entry.dense
         if "Color" not in channel_info.attrs:
-            _set_attr(channel_info, "Color", "0.000 1.000 0.000" if entry.source == "mask" else "1.000 0.000 0.000")
+            _set_attr(channel_info, "Color", "0.000 1.000 0.000" if is_sparse_mask else "1.000 0.000 0.000")
         for key, value in (
             ("ColorMode", "BaseColor"),
             ("ColorOpacity", "1.000"),
             ("GammaCorrection", "1.000"),
             ("Description", "(description not specified)"),
-            ("ColorRange", "0.000 1.000" if entry.source == "mask" else "0.000 65535.000"),
+            ("ColorRange", "0.000 1.000" if is_sparse_mask else "0.000 65535.000"),
         ):
             if key not in channel_info.attrs:
                 _set_attr(channel_info, key, value)
@@ -592,6 +634,12 @@ def _write_pyramid_levels(
 ) -> tuple[list[list[int]], dict[int, Any]]:
     level_shapes = [list(int(v) for v in shape_zyx)]
     current: dict[int, Any] = dict(data_by_channel)
+    image_group = handle.get("DataSetInfo/Image")
+    extent_xyz = (
+        _int_attr(image_group, "X"),
+        _int_attr(image_group, "Y"),
+        _int_attr(image_group, "Z"),
+    )
     max_itemsize = max(np.dtype(entry.dtype).itemsize for entry in channels)
     level = 0
     while True:
@@ -626,19 +674,24 @@ def _write_pyramid_levels(
                 # ~125-voxel dot to exact zero by level 4-5, making the channel
                 # vanish at low zoom (dense source channels keep plain mean,
                 # matching real arivis files).
-                method="max" if entry.source == "mask" else "mean",
+                method="max" if entry.source == "mask" and not entry.dense else "mean",
                 chunk_size=chunk_size,
                 z_block=z_block,
                 label=f"L{level} ch{entry.index}",
             )
-            _set_attr(
-                level_group[f"Channel {entry.index}"],
-                "ImageSizeX",
-                str(out_shape[2]),
+            if all(v is not None for v in extent_xyz):
+                ex, ey, ez = (int(v) for v in extent_xyz)  # type: ignore[arg-type]
+                size_x = max(1, min(ex // (2**level), out_shape[2]))
+                size_y = max(1, min(ey // (2**level), out_shape[1]))
+                size_z = max(1, min(ez // (2**level), out_shape[0]))
+            else:
+                size_z, size_y, size_x = out_shape
+            _set_attr(level_group[f"Channel {entry.index}"], "ImageSizeX", str(size_x))
+            _set_attr(level_group[f"Channel {entry.index}"], "ImageSizeY", str(size_y))
+            _set_attr(level_group[f"Channel {entry.index}"], "ImageSizeZ", str(size_z))
+            hist_max = (
+                1 if entry.source == "mask" and not entry.dense else int(np.iinfo(np.dtype(entry.dtype)).max)
             )
-            _set_attr(level_group[f"Channel {entry.index}"], "ImageSizeY", str(out_shape[1]))
-            _set_attr(level_group[f"Channel {entry.index}"], "ImageSizeZ", str(out_shape[0]))
-            hist_max = 1 if entry.source == "mask" else int(np.iinfo(np.dtype(entry.dtype)).max)
             _set_attr(level_group[f"Channel {entry.index}"], "HistogramMin", "0.000")
             _set_attr(level_group[f"Channel {entry.index}"], "HistogramMax", f"{hist_max:.3f}")
             next_level[entry.index] = dataset
@@ -654,6 +707,7 @@ def write_masked_ims(
     source_ims: str | Path | None = None,
     mask_channel: int = 0,
     append_as_new_channel: bool = False,
+    replacement_dense: bool = False,
     pyramid_levels: int = 0,
     chunk_size: tuple[int, int, int] | str = DEFAULT_MASK_CHUNK,
     z_block: int = DEFAULT_Z_BLOCK,
@@ -716,6 +770,7 @@ def write_masked_ims(
                 mask_dtype,
                 mask_channel=mask_channel,
                 append_as_new_channel=append_as_new_channel,
+                replacement_dense=bool(replacement_dense),
             )
             data_by_channel = _init_ims_skeleton(
                 out_handle,
@@ -748,11 +803,14 @@ def write_masked_ims(
                     counts,
                     vmax,
                 )
-                _set_attr(
-                    out_handle[f"DataSetInfo/Channel {entry.index}"],
-                    "ColorRange",
-                    f"0.000 {_percentile_nonzero(counts, 0.99):.3f}",
-                )
+                if entry.source != "ims":
+                    # Source channels keep the display range copied from the
+                    # source file; only the replacement channel is re-measured.
+                    _set_attr(
+                        out_handle[f"DataSetInfo/Channel {entry.index}"],
+                        "ColorRange",
+                        f"0.000 {_percentile_nonzero(counts, 0.99):.3f}",
+                    )
             level_shapes = [list(mask_shape)]
             coarsest: dict[int, Any] = dict(data_by_channel)
             if pyramid_levels > 0:
@@ -778,6 +836,7 @@ def write_masked_ims(
         "source_ims": str(source_path) if source_path is not None else None,
         "shape": list(mask_shape),
         "mask_dtype": str(mask_dtype),
+        "replacement_dense": bool(replacement_dense),
         "channels": [
             {"index": entry.index, "name": entry.name, "source": entry.source, "dtype": str(entry.dtype)}
             for entry in channels
@@ -799,6 +858,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--from_source_ims", default="", help="Original .ims whose other channels are streamed into the output")
     parser.add_argument("--channel", type=int, default=0, help="Output channel index that receives the mask (with --from_source_ims)")
     parser.add_argument("--append_as_new_channel", action="store_true", help="Append the mask as a new channel instead of replacing --channel")
+    parser.add_argument(
+        "--replacement_dense",
+        action="store_true",
+        help="The replacement Zarr is a dense image: mean pyramid pooling, source channel color/range",
+    )
     parser.add_argument("--pyramid", type=int, default=0, choices=(0, 1, 2), help="Extra 2x majority-vote resolution levels to write (default: 0)")
     parser.add_argument(
         "--chunk_size",
@@ -823,6 +887,7 @@ def main() -> int:
             source_ims=args.from_source_ims or None,
             mask_channel=int(args.channel),
             append_as_new_channel=bool(args.append_as_new_channel),
+            replacement_dense=bool(args.replacement_dense),
             pyramid_levels=int(args.pyramid),
             chunk_size=args.chunk_size,
             z_block=int(args.z_block),

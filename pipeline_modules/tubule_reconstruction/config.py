@@ -249,7 +249,7 @@ class TubuleReconstructionCfg(BaseModel):
     )
     method: str = Field(
         "vessel_express",
-        description="Skeletonizer: vessel_express (Lee + native EDT) or kimimaro (chunkwise TEASAR)",
+        description="Skeletonizer: vessel_express (Lee + native EDT). The kimimaro engine was removed.",
     )
     through_angle_deg: float = Field(150.0, ge=0.0, description="Through-line angle for voxel-kink suppression")
     kink_align_deg: float = Field(45.0, ge=0.0, description="Drop extra arm if aligned within this angle")
@@ -294,9 +294,9 @@ class TubuleReconstructionCfg(BaseModel):
     @field_validator("method", mode="before")
     @classmethod
     def _validate_method(cls, value: Any) -> str:
-        method = str(value or "kimimaro").strip().lower()
-        if method not in {"kimimaro", "vessel_express"}:
-            raise ValueError("method must be kimimaro or vessel_express")
+        method = str(value or "vessel_express").strip().lower()
+        if method != "vessel_express":
+            raise ValueError("method must be vessel_express (the kimimaro engine was removed)")
         return method
 
     @field_validator("downsample_method", mode="before")

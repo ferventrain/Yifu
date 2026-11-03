@@ -64,9 +64,14 @@ def _coerce_int_triplet(value: Any) -> tuple[int, int, int]:
 
 
 class RegistrationCfg(BaseModel):
-    """Configuration for ANTs-based atlas ↔ sample registration."""
+    """Configuration for ANTs-based atlas ↔ sample registration.
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    ``extra="ignore"``: legacy keys removed from the pipeline (``halo_mask``,
+    ``brain_mask_source``, ``brain_mask_model_path`` …) are silently ignored so
+    old sample configs still load.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
     method: str = Field("ants", description="Registration backend; currently only 'ants'")
     mode: str = Field(
@@ -76,8 +81,8 @@ class RegistrationCfg(BaseModel):
     atlas_path: str = Field("", description="Path to Allen atlas template image (.tiff / .nii.gz)")
     annotation_path: str = Field("", description="Path to Allen atlas annotation label image")
     transform_type: str = Field(
-        "SyN",
-        description="ANTs transform type: Rigid, Affine, SyN, SyNRA",
+        "SyNRA",
+        description="ANTs transform type: Rigid, Affine, SyN, SyNRA, ElasticSyN (default SyNRA, matches config template)",
     )
     grad_step: float = Field(
         0.1,
@@ -89,15 +94,6 @@ class RegistrationCfg(BaseModel):
         description=(
             "SyN multi-resolution iterations per level; the level count sets the "
             "shrink factors (2^k) and smoothing sigmas. Last level may be 0 (converge only)."
-        ),
-    )
-    halo_mask: bool = Field(
-        True,
-        description=(
-            "Zero the registration input outside an auto-detected brain mask "
-            "(Otsu-based, halo rim eroded) so the scattering halo around the "
-            "tissue cannot inflate the atlas. Applied when the registration "
-            "NIfTI is built; see preprocessing.zarr_to_registration_nii."
         ),
     )
     allow_reflection: bool = Field(

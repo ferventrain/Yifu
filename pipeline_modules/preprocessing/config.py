@@ -9,7 +9,7 @@ The public classes still expose ``model_validate()``, ``model_dump()``, and
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -62,7 +62,12 @@ class _ModelMixin:
             return data
         if not isinstance(data, Mapping):
             raise TypeError(f"{cls.__name__}.model_validate expects a mapping, got {type(data)!r}")
-        return cls(**dict(data))
+        # Legacy keys removed from the pipeline (e.g. edge_signal_removal,
+        # halo_mask, brain_mask_source in old configs) are silently ignored so
+        # old sample configs still load.
+        allowed = {f.name for f in fields(cls)}
+        payload = {key: value for key, value in dict(data).items() if key in allowed}
+        return cls(**payload)
 
     def model_dump(self) -> dict[str, Any]:
         return asdict(self)
@@ -145,23 +150,6 @@ class SurfaceBrightnessHomogenizeCfg(_ModelMixin):
 
 
 @dataclass(frozen=True)
-class EdgeSignalRemovalCfg(_ModelMixin):
-    apply: bool = False
-    inward_px: int = 50
-    outward_px: int = 0
-    prior_curve_scale: float = 1.15
-    prior_curve_smooth_sigma: float = 2.0
-    contour_min_object_area_px: int = 50
-    contour_morph_radius_px: int = 2
-    contour_dilation_px: int = 2
-    brightness_pct: float = 90.0
-    min_area_px: int = 50
-    suppression_weight: float = 1.0
-    max_workers: int = 8
-    adaptive_block_size: int | None = None
-
-
-@dataclass(frozen=True)
 class DownsampleCfg(_ModelMixin):
     target_resolution_xyz: tuple[float, float, float] = (25.0, 25.0, 25.0)
     chunk_size: int = 100
@@ -191,7 +179,6 @@ class PreprocessingCfg(_ModelMixin):
     scattering_removal: ScatteringRemovalCfg = field(default_factory=ScatteringRemovalCfg)
     clahe: ClaheCfg = field(default_factory=ClaheCfg)
     surface_brightness_homogenize: SurfaceBrightnessHomogenizeCfg = field(default_factory=SurfaceBrightnessHomogenizeCfg)
-    edge_signal_removal: EdgeSignalRemovalCfg = field(default_factory=EdgeSignalRemovalCfg)
     downsample: DownsampleCfg = field(default_factory=DownsampleCfg)
     zarr: ZarrCfg = field(default_factory=ZarrCfg)
 
@@ -204,7 +191,6 @@ class PreprocessingCfg(_ModelMixin):
         object.__setattr__(self, "scattering_removal", ScatteringRemovalCfg.model_validate(self.scattering_removal))
         object.__setattr__(self, "clahe", ClaheCfg.model_validate(self.clahe))
         object.__setattr__(self, "surface_brightness_homogenize", SurfaceBrightnessHomogenizeCfg.model_validate(self.surface_brightness_homogenize))
-        object.__setattr__(self, "edge_signal_removal", EdgeSignalRemovalCfg.model_validate(self.edge_signal_removal))
         object.__setattr__(self, "downsample", DownsampleCfg.model_validate(self.downsample))
         object.__setattr__(self, "zarr", ZarrCfg.model_validate(self.zarr))
 
@@ -222,7 +208,6 @@ class PreprocessingCfg(_ModelMixin):
                 "scattering_removal": {"type": "object"},
                 "clahe": {"type": "object"},
                 "surface_brightness_homogenize": {"type": "object"},
-                "edge_signal_removal": {"type": "object"},
                 "downsample": {"type": "object"},
                 "zarr": {"type": "object"},
             },

@@ -4,7 +4,6 @@ from .config import (
     ChannelSubtractionCfg,
     ClaheCfg,
     DownsampleCfg,
-    EdgeSignalRemovalCfg,
     MedianFilterCfg,
     PreprocessingCfg,
     RollingBallCfg,
@@ -53,14 +52,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional runtime depend
     def convert_tiff_to_zarr(*args, **kwargs):  # type: ignore[no-redef]
         raise ModuleNotFoundError(f"TIFF-to-Zarr support is unavailable: {_tiff_to_zarr_import_error}")
 
-try:
-    from .edge_signal_removal import remove_edge_signal
-except ModuleNotFoundError as exc:  # pragma: no cover - optional runtime dependency missing
-    _edge_import_error = str(exc)
-
-    def remove_edge_signal(*args, **kwargs):  # type: ignore[no-redef]
-        raise ModuleNotFoundError(f"edge signal removal support is unavailable: {_edge_import_error}")
-
 def homogenize_surface_brightness(*args, **kwargs):
     """Lazy wrapper so ``python -m`` on the module is not shadowed by package import."""
     try:
@@ -75,7 +66,6 @@ __all__ = [
     "ChannelSubtractionCfg",
     "ClaheCfg",
     "DownsampleCfg",
-    "EdgeSignalRemovalCfg",
     "ImageDownsampler",
     "MedianFilterCfg",
     "PreprocessingCfg",
@@ -93,6 +83,5 @@ __all__ = [
     "load_capability_manifest",
     "normalize_channel_list",
     "homogenize_surface_brightness",
-    "remove_edge_signal",
     "run_preprocessing",
 ]

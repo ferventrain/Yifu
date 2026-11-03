@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 
 import numpy as np
@@ -43,20 +42,6 @@ def median_filter_image(image_path: str, output_path: str = "", kernel_size: int
     return save_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Apply a median filter to a TIFF image.")
-    parser.add_argument("image_path", help="Input TIFF image path")
-    parser.add_argument("--output", default="", help="Output TIFF path")
-    parser.add_argument("--kernel_size", type=int, default=3, help="Odd median kernel size")
-    args = parser.parse_args()
-
-    output_path = median_filter_image(
-        image_path=args.image_path,
-        output_path=args.output,
-        kernel_size=args.kernel_size,
-    )
-    print(f"Median filter result saved to: {output_path}")
-
-
-if __name__ == "__main__":
-    main()
+# Library-only step of run_preprocessing (pipeline_modules/HE/preprocess.py and
+# preprocessor.py import these functions). The standalone CLI was removed; there
+# is no independent entry point.

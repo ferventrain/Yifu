@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 from typing import Tuple
 
@@ -70,20 +69,6 @@ def rolling_ball_background_correction(image_path: str, output_path: str = "", r
     return save_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Apply rolling-ball background subtraction to a TIFF image.")
-    parser.add_argument("image_path", help="Input TIFF image path")
-    parser.add_argument("--output", default="", help="Output TIFF path")
-    parser.add_argument("--radius", type=int, default=50, help="Rolling ball radius in pixels")
-    args = parser.parse_args()
-
-    output_path = rolling_ball_background_correction(
-        image_path=args.image_path,
-        output_path=args.output,
-        radius=args.radius,
-    )
-    print(f"Rolling-ball result saved to: {output_path}")
-
-
-if __name__ == "__main__":
-    main()
+# Library-only step of run_preprocessing (pipeline_modules/HE/preprocess.py and
+# preprocessor.py import rolling_ball_background). The standalone CLI was removed;
+# there is no independent entry point.

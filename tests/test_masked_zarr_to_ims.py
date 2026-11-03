@@ -11,6 +11,7 @@ from pipeline_modules.utils.masked_zarr_to_ims import (
     _hdf_attr_text,
     clamp_ims_chunks,
     downsample_block_majority,
+    downsample_block_mean,
     iter_z_ranges,
     write_masked_ims,
 )
@@ -176,6 +177,46 @@ def test_write_mask_ims_replaces_source_channel(tmp_path: Path):
         assert _hdf_attr_text(handle["DataSetInfo/Image"].attrs["X"]) == "16"
 
 
+def test_write_mask_ims_dense_replacement_uses_mean_and_source_metadata(tmp_path: Path):
+    shape = (4, 8, 8)
+    source_volumes = {
+        0: (np.arange(int(np.prod(shape))).reshape(shape) % 1000).astype(np.uint16),
+        1: (np.arange(int(np.prod(shape))).reshape(shape) % 997).astype(np.uint16),
+    }
+    dense = ((np.arange(int(np.prod(shape))).reshape(shape) * 7) % 4000).astype(np.uint16)
+    source_ims = tmp_path / "source.ims"
+    _write_synthetic_ims(source_ims, source_volumes, channel_names={0: "Signal", 1: "Red"})
+    zarr_path = _write_mask_zarr(tmp_path / "dense.zarr", dense)
+    output_ims = tmp_path / "dense.ims"
+
+    result = write_masked_ims(
+        zarr_path,
+        output_ims,
+        source_ims=source_ims,
+        mask_channel=0,
+        replacement_dense=True,
+        pyramid_levels=1,
+        chunk_size=(4, 8, 8),
+        z_block=4,
+    )
+
+    assert result["replacement_dense"] is True
+    assert result["level_shapes"] == [[4, 8, 8], [2, 4, 4]]
+    assert np.array_equal(_read_ims_channel(output_ims, 0), dense)
+    assert np.array_equal(_read_ims_channel(output_ims, 1), source_volumes[1])
+
+    with h5py.File(output_ims, "r") as handle:
+        level1 = np.asarray(handle["DataSet/ResolutionLevel 1/TimePoint 0/Channel 0/Data"][:])
+        np.testing.assert_array_equal(level1, downsample_block_mean(dense))
+        level0_channel = handle["DataSet/ResolutionLevel 0/TimePoint 0/Channel 0"]
+        assert _hdf_attr_text(level0_channel.attrs["HistogramMax"]) == f"{int(dense.max())}.000"
+        assert "Histogram" in level0_channel
+        info = handle["DataSetInfo/Channel 0"]
+        assert _hdf_attr_text(info.attrs["Color"]) == "1.000 0.000 0.000"
+        color_range = _hdf_attr_text(info.attrs["ColorRange"])
+        assert color_range != "0.000 1.000"
+
+
 def test_write_mask_ims_appends_mask_as_new_channel(tmp_path: Path):
     shape = (8, 16, 16)
     source_volume = (np.arange(int(np.prod(shape))).reshape(shape) % 1000).astype(np.uint16)
@@ -232,6 +273,75 @@ def test_source_channel_name_from_byte_array(tmp_path: Path):
         # Creator app version is carried from the source; format version stays at the root.
         assert _hdf_attr_text(handle["DataSetInfo/Imaris"].attrs["Version"]) == "9.5.0"
         assert _hdf_attr_text(handle["DataSetInfo/Channel 0"].attrs["Name"]) == "(name not specified)"
+
+
+def test_write_mask_ims_keeps_source_channel_color_range(tmp_path: Path):
+    shape = (4, 8, 8)
+    volumes = {
+        0: np.full(shape, 100, dtype=np.uint16),
+        1: np.full(shape, 200, dtype=np.uint16),
+    }
+    source_ims = tmp_path / "source.ims"
+    _write_synthetic_ims(source_ims, volumes)
+    with h5py.File(source_ims, "a") as handle:
+        handle["DataSetInfo/Channel 1"].attrs["ColorRange"] = "0.000 1234.000"
+
+    output_ims = tmp_path / "out.ims"
+    write_masked_ims(
+        _write_mask_zarr(tmp_path / "dense.zarr", volumes[0]),
+        output_ims,
+        source_ims=source_ims,
+        mask_channel=0,
+        replacement_dense=True,
+        chunk_size=(4, 8, 8),
+        z_block=4,
+    )
+
+    with h5py.File(output_ims, "r") as handle:
+        assert _hdf_attr_text(handle["DataSetInfo/Channel 1"].attrs["ColorRange"]) == "0.000 1234.000"
+        # The replacement channel is re-measured from its own histogram.
+        assert _hdf_attr_text(handle["DataSetInfo/Channel 0"].attrs["ColorRange"]) != "0.000 1234.000"
+
+
+def test_write_mask_ims_preserves_source_unpadded_extent(tmp_path: Path):
+    shape = (4, 8, 8)
+    volumes = {
+        0: np.zeros(shape, dtype=np.uint16),
+        1: np.ones(shape, dtype=np.uint16),
+    }
+    source_ims = tmp_path / "source.ims"
+    _write_synthetic_ims(source_ims, volumes)
+    # Real Imaris files keep the physical extent (7,7,3) while Data is padded to
+    # (8,8,4); the writer must not overwrite it with the array shape.
+    with h5py.File(source_ims, "a") as handle:
+        image = handle["DataSetInfo/Image"]
+        image.attrs["X"], image.attrs["Y"], image.attrs["Z"] = "7", "7", "3"
+        for channel in (0, 1):
+            group = handle[f"DataSet/ResolutionLevel 0/TimePoint 0/Channel {channel}"]
+            group.attrs["ImageSizeX"] = "7"
+            group.attrs["ImageSizeY"] = "7"
+            group.attrs["ImageSizeZ"] = "3"
+
+    output_ims = tmp_path / "out.ims"
+    write_masked_ims(
+        _write_mask_zarr(tmp_path / "dense.zarr", volumes[0]),
+        output_ims,
+        source_ims=source_ims,
+        mask_channel=0,
+        replacement_dense=True,
+        pyramid_levels=1,
+        chunk_size=(4, 8, 8),
+        z_block=4,
+    )
+
+    with h5py.File(output_ims, "r") as handle:
+        image = handle["DataSetInfo/Image"]
+        assert [_hdf_attr_text(image.attrs[k]) for k in ("X", "Y", "Z")] == ["7", "7", "3"]
+        for level, sizes in ((0, ("7", "7", "3")), (1, ("3", "3", "1"))):
+            channel = handle[f"DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0"]
+            assert [
+                _hdf_attr_text(channel.attrs[k]) for k in ("ImageSizeX", "ImageSizeY", "ImageSizeZ")
+            ] == list(sizes)
 
 
 def test_write_mask_ims_shape_mismatch_raises(tmp_path: Path):

@@ -220,7 +220,7 @@ def inverse_permute_to_lsfm(
     vol_atlas_zyx: np.ndarray,
     permute_zyx_to_atlas_zyx: tuple[int, int, int],
 ) -> np.ndarray:
-    """Undo sample→atlas permute used in downsample_reorient_lsfm_stack."""
+    """Undo sample→atlas axis permute (e.g. atlas_z<-sample_y) from the SpinalJ downsample stage."""
     p = tuple(int(x) for x in permute_zyx_to_atlas_zyx)
     inv = [0, 0, 0]
     for out_ax, src_ax in enumerate(p):

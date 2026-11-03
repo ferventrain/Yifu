@@ -601,6 +601,19 @@ def _load_cached_volume_mode(cached_volume_path: Path) -> str | None:
         return None
 
 
+def _load_cached_volume_flip(cached_volume_path: Path) -> list[bool] | None:
+    meta_path = cached_volume_path.with_suffix(".json")
+    if not meta_path.exists():
+        return None
+    try:
+        flip = load_json(meta_path).get("flip_atlas")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if flip is None or len(flip) != 3:
+        return None
+    return [bool(value) for value in flip]
+
+
 def _legacy_rgb_heat_volume(local_signal, edge, atlas_mask):
     signal = np.asarray(local_signal, dtype=np.float32)
     max_val = signal.max()
@@ -813,14 +826,17 @@ def ensure_atlas_count_volume(
     volume_mode: str,
     output_volume: str | Path | None = None,
     bin_workers: int = 0,
+    flip_atlas: list[bool] | tuple[bool, ...] | None = None,
 ) -> tuple[np.ndarray, Path, dict[str, object]]:
     if ants is None:
         raise ImportError("ANTsPy is required to build atlas-space volumes.")
 
     from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import (
         accumulate_sample_grid,
+        atlas_flip_axes_zyx,
         parse_block_shape,
         parse_triplet,
+        resolve_flip_atlas,
         resolve_inverse_transforms,
         resolve_mask_zarr,
         resolve_sample_reference_nii,
@@ -850,11 +866,31 @@ def ensure_atlas_count_volume(
     }
 
     cached_mode = _load_cached_volume_mode(cached_volume_path)
-    use_cached_volume = cached_volume_path.exists() and (cached_mode is None or cached_mode == volume_mode)
+    resolved_flip_atlas = (
+        list(flip_atlas) if flip_atlas is not None else resolve_flip_atlas(sample_dir_value)
+    )
+    summary["flip_atlas"] = list(resolved_flip_atlas)
+    summary["flip_axes_zyx"] = list(atlas_flip_axes_zyx(resolved_flip_atlas))
+    cached_flip = _load_cached_volume_flip(cached_volume_path)
+    if cached_flip is None:
+        # Legacy volumes predate flip handling; only an unflipped sample can reuse them.
+        flip_matches = not any(resolved_flip_atlas)
+    else:
+        flip_matches = cached_flip == list(resolved_flip_atlas)
+    use_cached_volume = (
+        cached_volume_path.exists()
+        and (cached_mode is None or cached_mode == volume_mode)
+        and flip_matches
+    )
     if cached_volume_path.exists() and cached_mode is not None and cached_mode != volume_mode:
         print(
             f"Cached atlas volume uses volume_mode={cached_mode!r}; "
             f"recomputing with requested volume_mode={volume_mode!r}."
+        )
+    if cached_volume_path.exists() and not flip_matches:
+        print(
+            f"Cached atlas volume flip_atlas={cached_flip} does not match registration "
+            f"flip_atlas={list(resolved_flip_atlas)}; recomputing."
         )
 
     if use_cached_volume:
@@ -915,6 +951,7 @@ def ensure_atlas_count_volume(
         transformlist=transformlist,
         interpolator="linear" if volume_mode == "count" else "nearestNeighbor",
         binarize=volume_mode == "binary",
+        flip_atlas=resolved_flip_atlas,
     )
     summary["raw_atlas_image_spacing_xyz"] = list(raw_atlas_spacing_xyz)
 
@@ -927,6 +964,8 @@ def ensure_atlas_count_volume(
             {
                 "volume_mode": volume_mode,
                 "target_resolution_xyz": list(target_resolution),
+                "flip_atlas": list(resolved_flip_atlas),
+                "flip_axes_zyx": list(atlas_flip_axes_zyx(resolved_flip_atlas)),
                 "output_volume": str(cached_volume_path),
             },
             handle,
@@ -1964,6 +2003,7 @@ def _render_region_metric_slice_array(
     background: str = "white",
     include_colorbar: bool = True,
     vcenter: float | None = None,
+    annotate_values: bool = False,
 ) -> tuple[np.ndarray, dict[str, int]]:
     from pipeline_modules.visualization.slice_heatmap_render import (
         DEFAULT_PIXEL_SCALE,
@@ -2029,6 +2069,46 @@ def _render_region_metric_slice_array(
         finally:
             plt.close(fig)
 
+    if annotate_values:
+        from PIL import ImageDraw, ImageFont
+
+        img = Image.fromarray(slice_rgb)
+        draw = ImageDraw.Draw(img)
+        font = None
+        for fp in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf"):
+            try:
+                font = ImageFont.truetype(fp, max(12, 5 * pixel_scale))
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        midline_x = 228.0  # atlas ML index of the midline (25um grid)
+        ids_on_slice = np.unique(label_arr[label_arr > 0])
+        n_drawn = 0
+        for lab_id in ids_on_slice.tolist():
+            v = region_values.get(lab_id)
+            if v is None or not np.isfinite(v) or v <= 0:
+                continue
+            ys, xs = np.nonzero(label_arr == lab_id)
+            if len(ys) < 60:
+                continue
+            mid = int(midline_x)
+            hemis = []
+            for side_mask, side_name in ((xs < mid, "L"), (xs >= mid, "R")):
+                if side_mask.sum() >= 40:
+                    hemis.append((float(xs[side_mask].mean()), float(ys[side_mask].mean())))
+            for cx_atlas, cy_atlas in hemis:
+                cx = cx_atlas * pixel_scale
+                cy = cy_atlas * pixel_scale
+                draw.text((cx, cy), f"{v:.1f}", fill=(225, 225, 225), font=font,
+                          anchor="mm", stroke_width=max(1, pixel_scale // 3),
+                          stroke_fill=(25, 25, 25))
+                n_drawn += 1
+        if n_drawn:
+            print(f"annotated {n_drawn} hemisphere values", flush=True)
+        slice_rgb = np.asarray(img)
+
     if include_colorbar:
         rgba, layout = attach_colorbar_to_slice_rgb(
             slice_rgb,
@@ -2070,6 +2150,8 @@ def render_region_metric_atlas_slice(
     brain_outline_width: float = 0.0,
     show_region_contours: bool = True,
     colorbar_label: str = "Signal Count",
+    annotate_values: bool = False,
+    background: str = "white",
 ) -> Path:
     atlas_slice = extract_atlas_slice(label_path, spec)
     finite_values = [float(value) for value in region_values.values() if np.isfinite(value)]
@@ -2089,6 +2171,8 @@ def render_region_metric_atlas_slice(
         brain_outline_width=float(brain_outline_width),
         colorbar_label=colorbar_label,
         show_region_contours=show_region_contours,
+        annotate_values=annotate_values,
+        background=background,
     )
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2110,6 +2194,7 @@ def render_local_signal_atlas_slice(
     brain_outline_width: float = 0.0,
     show_region_contours: bool = True,
     colorbar_label: str = "Signal Intensity",
+    background: str = "white",
 ) -> Path:
     atlas_slice = extract_atlas_slice(label_path, spec)
     signal_slice = _slice_signal_volume(local_signal_volume, atlas_slice)
@@ -2131,6 +2216,7 @@ def render_local_signal_atlas_slice(
         brain_outline_width=float(brain_outline_width),
         colorbar_label=colorbar_label,
         show_region_contours=show_region_contours,
+        background=background,
     )
 
     output_path = Path(output_path)

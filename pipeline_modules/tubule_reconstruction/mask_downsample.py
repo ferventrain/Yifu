@@ -17,7 +17,7 @@ import numpy as np
 import zarr
 from tqdm import tqdm
 
-from pipeline_modules.tubule_reconstruction.kimimaro_reconstruction import (
+from pipeline_modules.tubule_reconstruction._recon_common import (
     chunk_index_to_slices,
     iter_all_chunk_indices,
     open_zarr_dataset,

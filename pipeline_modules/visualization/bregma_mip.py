@@ -297,6 +297,27 @@ def resolve_manual_anchor(
     )
 
 
+def _mirror_atlas_voxel(ml, ap, dv, *, atlas_shape_xyz, flip_atlas):
+    """Mirror unflipped atlas voxel indices into the frame the transforms used.
+
+    The registration mirrors the atlas before estimating transforms
+    (``registration.flip_atlas``), so stored transforms expect coordinates in
+    the mirrored atlas index frame.
+    """
+    flip_ml, flip_ap, flip_dv = (bool(v) for v in flip_atlas)
+    n_ml, n_ap, n_dv = atlas_shape_xyz[:3]
+    ml = np.asarray(ml, dtype=np.float64)
+    ap = np.asarray(ap, dtype=np.float64)
+    dv = np.asarray(dv, dtype=np.float64)
+    if flip_ml:
+        ml = (n_ml - 1.0) - ml
+    if flip_ap:
+        ap = (n_ap - 1.0) - ap
+    if flip_dv:
+        dv = (n_dv - 1.0) - dv
+    return ml, ap, dv
+
+
 def map_bregma_through_transforms(
     *,
     transforms_dir: str | Path,
@@ -306,6 +327,7 @@ def map_bregma_through_transforms(
     bregma_dv_ap_ml: tuple[int, int, int] = DEFAULT_BREGMA_DV_AP_ML,
     label_zarr_path: str | Path | None = None,
     atlas_label_path: str | Path | None = None,
+    flip_atlas: str | list[bool] | tuple[bool, ...] = "",
 ) -> ApAnchor:
     """Map the atlas bregma voxel into native sample space with stored fwd transforms.
 
@@ -346,10 +368,17 @@ def map_bregma_through_transforms(
     atlas = ants.image_read(str(atlas_image_path))
     atlas.set_direction(np.eye(3))
     vox_ml, vox_ap, vox_dv = voxel_xyz_um
+    from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import resolve_flip_atlas
+
+    resolved_flip = resolve_flip_atlas(Path(transforms_dir).parent, flip_atlas)
+    atlas_shape_xyz = tuple(int(v) for v in atlas.shape)
 
     def atlas_point(dv_ap_ml_point: tuple[float, float, float]) -> pd.DataFrame:
         p_dv, p_ap, p_ml = dv_ap_ml_point
         # ANTs numpy order for both spaces is (x=ML, y=AP, z=DV).
+        p_ml, p_ap, p_dv = _mirror_atlas_voxel(
+            p_ml, p_ap, p_dv, atlas_shape_xyz=atlas_shape_xyz, flip_atlas=resolved_flip
+        )
         numpy_idx = np.array([p_ml, p_ap, p_dv], dtype=np.float64)
         phys = (
             np.asarray(atlas.origin, dtype=np.float64)
@@ -418,7 +447,10 @@ def map_bregma_through_transforms(
     # sample AP index moves.
     _pd, p_ap_um, _pm = map_um((dv_i, ap_i - 1000.0 / 25.0, ml_i), transformlist)
     anchor.anterior = "high" if p_ap_um / vox_ap > anchor.index else "low"
-    anchor.label_check = f"ok via interior landmark (region {expected}, convention {convention})"
+    anchor.label_check = (
+        f"ok via interior landmark (region {expected}, convention {convention}, "
+        f"atlas flip {list(resolved_flip)})"
+    )
     return anchor
 
 
@@ -1141,6 +1173,8 @@ class AtlasNativeMapper:
     fixed_spacing_xyz: tuple[float, float, float]
     fixed_shape_xyz: tuple[int, int, int]  # (ML, AP, DV) downsample grid
     native_shape_zyx: tuple[int, int, int]
+    flip_atlas: tuple[bool, bool, bool] = (False, False, False)  # (ML, AP, DV)
+    atlas_shape_xyz: tuple[int, int, int] = (0, 0, 0)  # ANTs order (ML, AP, DV)
     label_check: str = "skipped"
     chunk_points: int = 250_000
 
@@ -1160,6 +1194,13 @@ class AtlasNativeMapper:
         ap = np.broadcast_to(np.asarray(ap, dtype=np.float64), dv.shape)
         ml = np.broadcast_to(np.asarray(ml, dtype=np.float64), dv.shape)
         flat_dv, flat_ap, flat_ml = dv.ravel(), ap.ravel(), ml.ravel()
+        flat_ml, flat_ap, flat_dv = _mirror_atlas_voxel(
+            flat_ml,
+            flat_ap,
+            flat_dv,
+            atlas_shape_xyz=self.atlas_shape_xyz,
+            flip_atlas=self.flip_atlas,
+        )
         out = np.empty((3, flat_dv.size), dtype=np.float64)
         ao_x, ao_y, ao_z = self.atlas_origin_xyz
         as_x, as_y, as_z = self.atlas_spacing_xyz
@@ -1205,9 +1246,12 @@ def resolve_atlas_native_mapper(
     native_shape_zyx: tuple[int, int, int],
     fixed_nii: str | Path | None = None,
     chunk_points: int = 250_000,
+    flip_atlas: str | list[bool] | tuple[bool, ...] = "",
 ) -> AtlasNativeMapper:
     """Build an atlas->native point mapper validated on an interior landmark."""
     import ants
+
+    from pipeline_modules.visualization.warp_mask_zarr_to_atlas_points import resolve_flip_atlas
 
     transforms_dir = Path(transforms_dir)
     fwd = sorted(transforms_dir.glob("fwd_*"), key=lambda p: p.name)
@@ -1250,6 +1294,8 @@ def resolve_atlas_native_mapper(
     atlas.set_direction(np.eye(3))
     atlas_origin = tuple(float(v) for v in atlas.origin)
     atlas_spacing = tuple(float(v) for v in atlas.spacing)
+    atlas_shape_xyz = tuple(int(v) for v in atlas.shape)
+    resolved_flip = tuple(bool(v) for v in resolve_flip_atlas(sample_dir, flip_atlas))
 
     def make(transformlist: list[Path]) -> AtlasNativeMapper:
         return AtlasNativeMapper(
@@ -1261,6 +1307,8 @@ def resolve_atlas_native_mapper(
             fixed_spacing_xyz=fixed_spacing,
             fixed_shape_xyz=fixed_shape,
             native_shape_zyx=native_shape_zyx,
+            flip_atlas=resolved_flip,
+            atlas_shape_xyz=atlas_shape_xyz,
             chunk_points=chunk_points,
         )
 
@@ -1291,7 +1339,10 @@ def resolve_atlas_native_mapper(
     convention, transformlist = chosen
     mapper = make(transformlist)
     mapper.convention = convention
-    mapper.label_check = f"ok via interior landmark (region {expected}, convention {convention}, fixed grid {fixed_path.name})"
+    mapper.label_check = (
+        f"ok via interior landmark (region {expected}, convention {convention}, "
+        f"fixed grid {fixed_path.name}, atlas flip {list(resolved_flip)})"
+    )
     return mapper
 
 

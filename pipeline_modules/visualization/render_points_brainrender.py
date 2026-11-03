@@ -129,7 +129,7 @@ def infer_columns(table: pd.DataFrame) -> tuple[str, str, str]:
     return resolved[0], resolved[1], resolved[2]
 
 
-def load_points(csv_path: str | Path, columns: tuple[str, str, str] | None) -> np.ndarray:
+def load_points(csv_path: str | Path, columns: tuple[str, str, str] | None, value_column: str | None = None):
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Points CSV not found: {csv_path}")
@@ -145,9 +145,17 @@ def load_points(csv_path: str | Path, columns: tuple[str, str, str] | None) -> n
 
     coords = table.loc[:, [x_col, y_col, z_col]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
     valid = np.all(np.isfinite(coords), axis=1)
+    values = None
+    if value_column:
+        if value_column not in table.columns:
+            raise KeyError(f"Missing value column in {csv_path}: {value_column}")
+        values = pd.to_numeric(table[value_column], errors="coerce").to_numpy(dtype=np.float64)
+        valid = valid & np.isfinite(values)
     coords = coords[valid]
     if coords.size == 0:
         raise ValueError(f"No valid numeric point coordinates found in {csv_path}")
+    if values is not None:
+        return coords, values[valid]
     return coords
 
 
@@ -1244,6 +1252,10 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--atlas_name", default="allen_mouse_25um", help="BrainGlobe atlas name.")
     parser.add_argument("--point_color", default="#ff4d6d", help="Point color.")
+    parser.add_argument("--color_by_column", default="", help="Per-point color from this CSV column's numeric value (e.g. radius_um). Incompatible with row-filtering options.")
+    parser.add_argument("--colormap", default="inferno", help="Matplotlib colormap for --color_by_column.")
+    parser.add_argument("--color_vmin", type=float, default=None, help="Value mapped to the colormap low end (default: data min).")
+    parser.add_argument("--color_vmax", type=float, default=None, help="Value mapped to the colormap high end (default: data max).")
     parser.add_argument("--point_alpha", type=float, default=0.95, help="Point opacity from 0 to 1.")
     parser.add_argument("--point_radius", type=float, default=40.0, help="Point sphere radius in atlas units (um).")
     parser.add_argument(
@@ -1431,7 +1443,18 @@ def main() -> int:
 
     columns = parse_columns(args.columns) if args.columns else None
     points_csv = resolve_points_csv(args)
-    points = load_points(points_csv, columns)
+    if args.color_by_column and (args.filter_to_brain or args.filter_points_by_group
+                                 or args.only_region or args.screenshot_per_group
+                                 or args.group_names or args.region_groups):
+        raise ValueError(
+            "--color_by_column keeps all CSV rows in order; do not combine it with "
+            "row-filtering options (--filter_to_brain, --filter_points_by_group, "
+            "--only_region, --screenshot_per_group, --group_names, --region_groups).")
+
+    points = load_points(points_csv, columns, args.color_by_column or None)
+    point_values = None
+    if args.color_by_column:
+        points, point_values = points
     ensure_atlas_available(args.atlas_name)
     atlas_resolution = parse_triplet(args.atlas_resolution_xyz) if args.atlas_resolution_xyz else None
     requested_region = args.only_region or args.region
@@ -1629,6 +1652,20 @@ def main() -> int:
             scene.close()
             print(f"Saved {group.name}: {kept}/{total} points -> {saved_path}")
         return 0
+
+    if args.color_by_column:
+        import matplotlib
+
+        cmap = matplotlib.colormaps[args.colormap]
+        vmin = args.color_vmin if args.color_vmin is not None else float(np.min(point_values))
+        vmax = args.color_vmax if args.color_vmax is not None else float(np.max(point_values))
+        span = max(vmax - vmin, 1e-9)
+        normed = np.clip((point_values - vmin) / span, 0.0, 1.0)
+        point_color = [tuple(float(c) for c in cmap(x)[:3]) for x in normed]
+        print(
+            f"Colored {len(point_color):,} points by {args.color_by_column} "
+            f"({args.colormap}, {vmin:.2f}-{vmax:.2f})"
+        )
 
     scene = render_points_scene(
         points,

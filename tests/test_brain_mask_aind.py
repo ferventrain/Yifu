@@ -90,13 +90,11 @@ def test_convert_uses_external_brain_mask(tmp_path):
         output_nii,
         input_resolution_xyz=(12.0, 12.0, 16.0),
         target_resolution_xyz=(24.0, 24.0, 32.0),
-        halo_mask=True,
-        brain_mask_zarr=tmp_path / "ch0_brain_mask_dl.zarr",
+        brain_mask=tmp_path / "ch0_brain_mask_dl.zarr",
         brain_mask_erode=0,
     )
 
     assert result["brain_mask"]["applied"] is True
-    assert not result["halo_mask"]["applied"]
 
     # Expected mask on the registration grid: nearest zoom + largest component,
     # mirroring what load_external_brain_mask does (erode=0 here).

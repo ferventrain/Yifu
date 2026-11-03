@@ -37,13 +37,13 @@ def _build_stub_config(tmp_path: Path) -> Path:
     template["registration"]["atlas_path"] = str(tmp_path / "reference" / "atlas.tiff")
     template["registration"]["annotation_path"] = str(tmp_path / "reference" / "atlas_label.tiff")
     template["segmentation"]["cfos_unet"]["checkpoint_path"] = str(tmp_path / "models" / "best_model.pt")
-    # DL brain mask 默认关闭（template=halo）；stub 测试显式打开以维持 1.0 步骤接线覆盖
-    template["registration"]["brain_mask_source"] = "dl_fusion3"
+    # DL brain mask is now the only mask source (main.py step 1.0 always runs);
+    # the coarse registration Zarr below drives its wiring coverage.
 
     sample_dir = tmp_path / "SAMPLE_STUB"
     sample_dir.mkdir(parents=True)
-    # Brain-mask step 1.0 (registration.brain_mask_source=dl_fusion3) reads the
-    # coarse registration Zarr; an empty dir is enough for --stub wiring.
+    # Brain-mask step 1.0 reads the coarse registration Zarr; an empty dir is
+    # enough for --stub wiring.
     (sample_dir / "ch0_downsampled.zarr").mkdir()
     # Hemisphere step 2.3 requires saved fwd transforms on disk (the flat-plane
     # label fallback was removed); a dummy marker file is enough for --stub.

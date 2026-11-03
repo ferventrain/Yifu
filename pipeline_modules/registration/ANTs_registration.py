@@ -644,8 +644,9 @@ class BidirectionalRegistration:
     def _apply_n4_preprocess(self, fixed: ants.ANTsImage) -> ants.ANTsImage:
         """N4 bias correction (mask-constrained, SimpleITK) before matching.
 
-        Uses the halo brain_mask.nii.gz written next to the registration
-        volume; skips with a warning when absent (e.g. halo_mask disabled).
+        Uses the DL brain_mask.nii.gz written next to the registration
+        volume (zarr_to_registration_nii --brain_mask); skips with a warning
+        when absent.
         """
         import nibabel as nib
 
@@ -688,7 +689,7 @@ class BidirectionalRegistration:
             "Rigid pre-check done in %.0fs -> %s", time.time() - started, out_png
         )
 
-    def register(self, mode: str = 'atlas2image', registration_type: str = 'SyN', **kwargs) -> Dict:
+    def register(self, mode: str = 'atlas2image', registration_type: str = 'SyNRA', **kwargs) -> Dict:
         """执行配准"""
         if mode not in ['atlas2image', 'image2atlas']:
             raise ValueError(f"Invalid mode: {mode}")
@@ -1003,7 +1004,7 @@ class BidirectionalRegistration:
         elif not mask_folder.exists():
             logger.info("Density analysis skipped. Mask folder %s not found.", mask_folder)
 
-    def run_full_pipeline(self, mode: str = 'atlas2image', registration_type: str = 'SyN',
+    def run_full_pipeline(self, mode: str = 'atlas2image', registration_type: str = 'SyNRA',
                          save_registered_image: bool = True, save_transforms: bool = False) -> None:
         """运行完整流程"""
         results = self.register(mode, registration_type)
@@ -1026,7 +1027,7 @@ def main():
     parser.add_argument('--register_channel', required=True, help='Registration channel')
     parser.add_argument('--save_registered_image', action='store_true', help='Save registered image')
     parser.add_argument('--mode', default='atlas2image', choices=['atlas2image', 'image2atlas'], help='Direction')
-    parser.add_argument('--registration_type', default='SyN', choices=['Rigid', 'Affine', 'SyN', 'SyNRA', 'ElasticSyN'])
+    parser.add_argument('--registration_type', default='SyNRA', choices=['Rigid', 'Affine', 'SyN', 'SyNRA', 'ElasticSyN'])
     parser.add_argument('--upsample_method', default='nearest', choices=['nearest', 'linear', 'cubic', 'quintic'])
     parser.add_argument('--chunk_size', type=int, default=50, help='Chunk size for upsampling')
     parser.add_argument('--save_transforms', action='store_true', help='Save transforms')
