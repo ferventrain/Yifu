@@ -231,6 +231,10 @@ def run(
     sidecar: str | None = None,
     max_chunks: int | None = None,
     skip_max_below: int = 0,
+    shard_idx: int = -1,
+    num_shards: int = 0,
+    skip_db: bool = False,
+    extra_sidecars: list[str] | None = None,
 ) -> dict:
     from neurofly.common import default_seger_weight_path
     from neurofly.dbio import segs2db
@@ -261,11 +265,19 @@ def run(
     print(f"atlas label level L{label_k} shape(zyx) {label_shape_k}", flush=True)
 
     # ---- chunk 划分（与 process_whole 一致）----
-    rois = patchify_without_splices(image.rois[level], chunk_size, splices=splice)
+    rois_all = patchify_without_splices(image.rois[level], chunk_size, splices=splice)
+    if num_shards > 0:
+        rois = [r for i, r in enumerate(rois_all) if i % num_shards == shard_idx]
+        print(f"shard {shard_idx}/{num_shards}: {len(rois)} chunks (of {len(rois_all)})", flush=True)
+    else:
+        rois = rois_all
     print(f"total chunks: {len(rois)}", flush=True)
 
     sidecar_path = Path(sidecar) if sidecar else Path(db_path).with_suffix(".chunks.jsonl")
-    done = load_sidecar(sidecar_path)
+    done = {}
+    for sp in [sidecar_path] + [Path(s) for s in (extra_sidecars or [])]:
+        for key, segs in load_sidecar(sp).items():
+            done.setdefault(key, segs)
     seger = make_seger_torch(ckpt_path, bg_thres)
 
     skipped = 0
@@ -342,6 +354,9 @@ def run(
         key = ",".join(str(int(v)) for v in roi)
         for seg in done.get(key, []):
             all_segs.append(seg)
+    if skip_db:
+        print(f"SHARD DONE: {len(all_segs)} segments (db build deferred)", flush=True)
+        return {"segments": len(all_segs), "skipped_chunks": skipped, "chunks": len(rois)}
     for i, seg in enumerate(all_segs):
         seg["sid"] = i
     db_out = Path(db_path)
@@ -369,6 +384,10 @@ def main(argv=None) -> int:
     parser.add_argument("--sidecar", default=None, help="断点续跑 sidecar（默认 <db>.chunks.jsonl）")
     parser.add_argument("--max-chunks", type=int, default=None,
                         help="最多处理 N 个非跳过 chunk 后停止（冒烟验证用；已处理块仍会入库）")
+    parser.add_argument("--shard_idx", type=int, default=-1)
+    parser.add_argument("--num_shards", type=int, default=0)
+    parser.add_argument("--skip_db", action="store_true")
+    parser.add_argument("--extra_sidecar", action="append", default=None)
     parser.add_argument("--skip-max-below", type=int, default=0,
                         help="块最大强度 ≤ 此值即跳过（如 100；0=不启用）")
     args = parser.parse_args(argv)
@@ -379,6 +398,8 @@ def main(argv=None) -> int:
         chunk_size=args.chunk_size, bg_thres=args.bg_thres, splice=args.splice,
         min_coverage=args.min_coverage, sidecar=args.sidecar, max_chunks=args.max_chunks,
         skip_max_below=args.skip_max_below,
+        shard_idx=args.shard_idx, num_shards=args.num_shards,
+        skip_db=args.skip_db, extra_sidecars=args.extra_sidecar,
     )
     print(json.dumps(stats))
     return 0

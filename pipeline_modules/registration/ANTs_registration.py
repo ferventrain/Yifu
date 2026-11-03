@@ -334,6 +334,9 @@ class BidirectionalRegistration:
         # matching toggle; defaults keep the production behavior.
         self.syn_metric = str(registration_config.get("syn_metric", "mattes"))
         self.histogram_matching = bool(registration_config.get("histogram_matching", True))
+        # Restrict the affine/SyN metric to the halo brain_mask.nii.gz so the
+        # scattering halo cannot pull the deformation (opt-in via config).
+        self.mask_registration = bool(registration_config.get("mask_registration", False))
         logger.info(
             "SyN deformation params: grad_step=%s, syn_iterations=%s, syn_metric=%s, histogram_matching=%s",
             self.grad_step,
@@ -664,6 +667,30 @@ class BidirectionalRegistration:
             direction=fixed.direction,
         )
 
+    def _load_registration_mask(self):
+        """Load the halo brain_mask.nii.gz on the registration grid.
+
+        Passed to ants.registration so the metric only sees in-brain voxels
+        (same file the masked N4 uses). Returns None when absent — standalone
+        reg dirs without the halo_mask step keep the old unmasked behavior.
+        """
+        mask_path = self.sample_dir / f"ch{self.register_channel}_downsample" / "brain_mask.nii.gz"
+        if not mask_path.exists():
+            logger.warning("mask_registration on but mask not found at %s; proceeding unmasked", mask_path)
+            return None
+        mask = _ants_image_read(mask_path)
+        mask.set_direction(np.eye(3))
+        if tuple(mask.shape) != tuple(self.register_image.shape):
+            raise ValueError(
+                f"brain_mask shape {mask.shape} does not match registration image {self.register_image.shape}"
+            )
+        logger.info(
+            "Registration mask loaded: %s (in-mask %.1f%%)",
+            mask_path.name,
+            100.0 * float(np.count_nonzero(mask.numpy()) / mask.numpy().size),
+        )
+        return mask
+
     def _run_rigid_preflight_qc(self, fixed: ants.ANTsImage, moving: ants.ANTsImage) -> None:
         """Fast rigid pre-pass (~20s) + QC image for early failure detection.
 
@@ -711,11 +738,18 @@ class BidirectionalRegistration:
             if self.rigid_preflight_qc:
                 self._run_rigid_preflight_qc(self.register_image, self.atlas_image)
             logger.info("Mode: Atlas -> Image")
+            reg_kwargs = dict(kwargs)
+            if self.mask_registration:
+                mask_img = self._load_registration_mask()
+                if mask_img is not None:
+                    # fixed = sample: mask cuts the halo out of every stage
+                    reg_kwargs['mask'] = mask_img
+                    reg_kwargs['mask_all_stages'] = True
             reg_result = self._perform_registration(
                 fixed=self.register_image,
                 moving=self.atlas_image,
                 reg_type=registration_type,
-                **kwargs
+                **reg_kwargs
             )
             try:
                 render_alignment_check_png(
@@ -744,11 +778,18 @@ class BidirectionalRegistration:
             
         else: # image2atlas
             logger.info("Mode: Image -> Atlas")
+            reg_kwargs = dict(kwargs)
+            if self.mask_registration:
+                mask_img = self._load_registration_mask()
+                if mask_img is not None:
+                    # fixed = atlas here: the sample side is the moving image
+                    reg_kwargs['moving_mask'] = mask_img
+                    reg_kwargs['mask_all_stages'] = True
             reg_result = self._perform_registration(
-                fixed=self.atlas_image, 
-                moving=self.register_image, 
-                reg_type=registration_type, 
-                **kwargs
+                fixed=self.atlas_image,
+                moving=self.register_image,
+                reg_type=registration_type,
+                **reg_kwargs
             )
             
             # Simplified: Target image warping logic moved to analysis/heatmap program

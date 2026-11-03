@@ -1786,6 +1786,8 @@ def render_bregma_mips(
     boundary_smooth: float = 2.0,
     boundary_min_area_mm2: float = 0.5,
     bilateral: bool = False,
+    no_boundary: bool = False,
+    gamma: float = 1.0,
     fixed_nii: str | Path | None = None,
     chunk_points: int = 250_000,
     bregma_index: float | None = None,
@@ -1854,8 +1856,10 @@ def render_bregma_mips(
             split_nucleus_merge=split_nucleus_merge,
             boundary_region=boundary_region,
             boundary_region_colors=boundary_region_colors,
+            no_boundary=no_boundary,
             region_csv=region_csv,
             channel_windows=channel_windows,
+            gamma=gamma,
         )
     if space == "atlas":
         return render_atlas_space_mips(
@@ -2039,7 +2043,7 @@ def render_bregma_mips(
 
         boundary = None
         boundary_groups = None
-        if label_arr is not None:
+        if label_arr is not None and not no_boundary:
             # Same single-center-plane convention as the stock overlay: one
             # plane's contours only, never stacked across the slab.
             center_row = int(np.clip(round((n_dv - 1) / 2.0), 0, n_dv - 1))
@@ -2422,8 +2426,10 @@ def render_atlas_band_mips(
     split_nucleus_merge: bool = False,
     boundary_region: list[str] | None = None,
     boundary_region_colors: list[str] | None = None,
+    no_boundary: bool = False,
     region_csv: str | Path | None = None,
     channel_windows: list[tuple[float, float]] | None = None,
+    gamma: float = 1.0,
 ) -> dict[str, object]:
     """Atlas-space slab with per-pixel curved windows, native-voxel band MIP.
 
@@ -2640,6 +2646,9 @@ def render_atlas_band_mips(
             mips = [np.clip(m - wmin, 0.0, None).astype(np.float32)
                     for m, (wmin, wmax) in zip(mips, channel_windows)]
             vmaxs = [wmax - wmin for wmin, wmax in channel_windows]
+            if gamma != 1.0:
+                mips = [((m / v) ** (1.0 / gamma) * v).astype(np.float32)
+                        for m, v in zip(mips, vmaxs)]
             vmax_eff = vmaxs[-1]
             mip = _compose_rgb(mips, cmaps, vmaxs)
         elif len(mips) > 1:
@@ -2838,6 +2847,15 @@ def build_parser() -> argparse.ArgumentParser:
              "boundary divisions (solid white on black), the right half is the raw MIP",
     )
     parser.add_argument(
+        "--no-boundary", action="store_true",
+        help="Skip all boundary/outline overlays (MIP only)",
+    )
+    parser.add_argument(
+        "--gamma", type=float, default=1.0,
+        help="Gamma applied to each windowed channel before composing "
+             "(>1 brightens midtones; default 1.0 = off)",
+    )
+    parser.add_argument(
         "--bregma-mm", required=True, type=parse_bregma_list,
         help="AP mm relative to bregma (anterior positive); comma list allowed",
     )
@@ -3026,6 +3044,8 @@ def main(argv: list[str] | None = None) -> int:
             split_atlas=args.split_atlas,
             overlay_atlas=args.overlay_atlas,
             split_nucleus_merge=args.split_nucleus_merge,
+            no_boundary=args.no_boundary,
+            gamma=args.gamma,
             boundary_region=[a.strip() for a in args.boundary_region.split(",") if a.strip()] or None,
             boundary_region_colors=[c.strip() for c in args.boundary_region_colors.split(",") if c.strip()] or None,
             ap_window_from_regions=[a.strip() for a in args.ap_window_from_regions.split(",") if a.strip()] or None,
