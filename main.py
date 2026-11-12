@@ -359,7 +359,7 @@ def ensure_brain_mask_dl(sample_dir, reg_ch, reg_cfg):
         "step": "brain_mask_dl",
         "channel": int(reg_ch),
         "model": model_name,
-        "threshold": 0.7,
+        "threshold": 0.5,
     }
     complete, reason = _marker_check([mask_zarr], [reg_downsampled_zarr], payload, lambda: mask_zarr.exists())
     if complete:

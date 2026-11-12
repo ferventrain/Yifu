@@ -230,7 +230,7 @@ def run_brain_mask(
     output_zarr: str | Path | None = None,
     model_path: str | Path | None = None,
     prob_dir: str | Path | None = None,
-    threshold: float = 0.7,
+    threshold: float = 0.5,
     keep_probs: bool = False,
     device: str = "cuda",
     min_area: int = 500,
@@ -385,7 +385,7 @@ def main() -> int:
     parser.add_argument("--output_zarr", default=None, help="Mask Zarr (default ch{channel}_brain_mask_dl.zarr)")
     parser.add_argument("--model_path", default=None, help=f"Checkpoint (default {DEFAULT_MODEL_PATH.name} in models/)")
     parser.add_argument("--prob_dir", default=None, help="Probability cache dir (default ch{channel}_brain_mask_probs)")
-    parser.add_argument("--threshold", type=float, default=0.7, help="Fused probability threshold")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Fused probability threshold")
     parser.add_argument("--min_area", type=int, default=500,
                         help="Per-slice minimum component area in px (default 500)")
     parser.add_argument("--keep_probs", action="store_true", help="Keep the three uint8 probability caches")
