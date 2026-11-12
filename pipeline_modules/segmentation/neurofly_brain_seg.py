@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -287,6 +288,10 @@ def run(
         roi = [int(v) for v in roi]
         key = ",".join(str(v) for v in roi)
         if key in done:
+            continue
+        skip_rois = os.environ.get("NEUROFLY_SKIP_ROIS", "")
+        if key in {k for k in skip_rois.split(";") if k}:
+            print(f"PROGRESS skip hung roi {key} (env NEUROFLY_SKIP_ROIS)", flush=True)
             continue
 
         # ---- atlas 门控：先算覆盖率，全覆盖为 0 跳过 ----
