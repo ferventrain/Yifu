@@ -51,7 +51,11 @@ def pid_matches(pid: int | None, created_at: float | None) -> bool:
         return True
     actual = pid_created_at(pid)
     if actual is None:
-        return True
+        # OpenProcess can keep reporting a dead pid as alive (handle-kept-alive
+        # corpse / access-denied liveness) while psutil can no longer query it
+        # at all. Unqueryable == not the same live instance: never report a
+        # match, or a stale job record blocks the queue forever.
+        return False
     return abs(actual - float(created_at)) <= 5.0
 
 

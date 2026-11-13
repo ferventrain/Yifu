@@ -1839,6 +1839,7 @@ def render_bregma_mips(
     bilateral: bool = False,
     no_boundary: bool = False,
     gamma: float = 1.0,
+    auto_symmetry: bool = False,
     fixed_nii: str | Path | None = None,
     chunk_points: int = 250_000,
     bregma_index: float | None = None,
@@ -1911,6 +1912,7 @@ def render_bregma_mips(
             region_csv=region_csv,
             channel_windows=channel_windows,
             gamma=gamma,
+            auto_symmetry=auto_symmetry,
         )
     if space == "atlas":
         return render_atlas_space_mips(
@@ -2481,6 +2483,7 @@ def render_atlas_band_mips(
     region_csv: str | Path | None = None,
     channel_windows: list[tuple[float, float]] | None = None,
     gamma: float = 1.0,
+    auto_symmetry: bool = False,
 ) -> dict[str, object]:
     """Atlas-space slab with per-pixel curved windows, native-voxel band MIP.
 
@@ -2708,6 +2711,42 @@ def render_atlas_band_mips(
             mip = _compose_rgb(mips, cmaps, vmaxs)
         else:
             vmax_eff = resolve_display_vmax(mip, percentile=percentile, explicit=vmax)
+        if auto_symmetry:
+            # per-MIP left-right symmetry optimum (small in-plane roll sweep)
+            from PIL import Image as _I
+
+            mip_u8 = (np.clip(mip, 0.0, 1.0) * 255).astype(np.uint8)
+            small = _I.fromarray(mip_u8).resize(
+                (1200, int(mip_u8.shape[0] * 1200 / mip_u8.shape[1])), _I.BILINEAR)
+            best_ang, best_iou = 0.0, -1.0
+            th = -6.0
+            while th <= 6.0 + 1e-9:
+                r = small.rotate(th, resample=_I.BILINEAR, fillcolor=(0, 0, 0))
+                lum = np.asarray(r).astype(np.float32).mean(2)
+                mask = lum > 12
+                ys, xs = np.nonzero(mask)
+                slab_iou = 0.0
+                if len(xs) >= 1000:
+                    xc = xs.mean()
+                    H, W = mask.shape
+                    fl = mask[:, ::-1]
+                    for dx in range(-30, 31, 3):
+                        ax = int(round(xc + dx))
+                        seg = fl[:, max(0, ax - W):]
+                        wseg = min(W, seg.shape[1])
+                        inter = int((mask[:, :wseg] & seg[:, :wseg]).sum())
+                        union = int((mask[:, :wseg] | seg[:, :wseg]).sum())
+                        val = inter / union if union else 0.0
+                        if val > slab_iou:
+                            slab_iou = val
+                if slab_iou > best_iou:
+                    best_iou, best_ang = slab_iou, th
+                th += 0.25
+            if abs(best_ang) > 1e-6:
+                from scipy import ndimage as _ndi
+                mip = _ndi.rotate(mip, best_ang, axes=(1, 0), reshape=False,
+                                  order=1, mode="constant", cval=0.0)
+            logger.info("auto-symmetry: best roll %+.2f deg (IoU %.4f)", best_ang, best_iou)
         if split_atlas or overlay_atlas:
             # Atlas boundary lines from contour tracing (no skeletonization, so
             # thin sheets like the corpus callosum stay whole), rasterized onto
@@ -2900,6 +2939,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-boundary", action="store_true",
         help="Skip all boundary/outline overlays (MIP only)",
+    )
+    parser.add_argument(
+        "--auto-symmetry", action="store_true",
+        help="Per-MIP: sweep small rolls and keep the most left-right-symmetric view",
     )
     parser.add_argument(
         "--gamma", type=float, default=1.0,
@@ -3097,6 +3140,7 @@ def main(argv: list[str] | None = None) -> int:
             split_nucleus_merge=args.split_nucleus_merge,
             no_boundary=args.no_boundary,
             gamma=args.gamma,
+            auto_symmetry=args.auto_symmetry,
             boundary_region=[a.strip() for a in args.boundary_region.split(",") if a.strip()] or None,
             boundary_region_colors=[c.strip() for c in args.boundary_region_colors.split(",") if c.strip()] or None,
             ap_window_from_regions=[a.strip() for a in args.ap_window_from_regions.split(",") if a.strip()] or None,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
@@ -24,7 +25,14 @@ import numpy as np
 from scipy import ndimage
 from skimage.io import imread, imsave
 
-from pipeline_modules.HE.preprocess import HePreprocessParams, preprocess_cyto, preprocess_nuclei
+from pipeline_modules.HE.preprocess import (
+    HePreprocessParams,
+    apply_channel_shift,
+    estimate_channel_shift,
+    parse_hex_rgb,
+    preprocess_cyto,
+    preprocess_nuclei,
+)
 
 CHANNEL_SUFFIX_RE = re.compile(r"^(?P<prefix>.+)_ch(?P<channel>\d+)\.tiff?$", re.IGNORECASE)
 
@@ -57,6 +65,24 @@ def resolve_color_settings(color_key: str, nuclei_hue: str) -> dict[str, list[fl
     settings["nuclei"] = list(preset["nuclei"])
     settings["cyto"] = list(preset["cyto"])
     return settings
+
+
+def display_rgb_to_od(rgb: tuple[int, int, int], strength: float = 1.0) -> list[float]:
+    """Display RGB (0-255) -> Beer-Lambert absorption vector (max-normalized, scaled).
+
+    Same recipe the presets were built from: OD = -ln(channel/255), normalized so the
+    strongest channel is 1.0, then scaled by ``strength`` (stain darkness). Channels are
+    clamped to >=1 to keep -ln finite for near-black picks.
+    """
+    od = [-math.log(max(int(c), 1) / 255.0) for c in rgb]
+    peak = max(od)
+    return [v / peak * float(strength) for v in od]
+
+
+def od_to_display_rgb(od: list[float]) -> tuple[int, int, int]:
+    """Representative display color of an OD vector (max channel mapped to e^-1)."""
+    peak = max(od) or 1.0
+    return tuple(int(round(255.0 * math.exp(-v / peak))) for v in od)  # type: ignore[return-value]
 
 
 def discover_channel_pairs(
@@ -329,12 +355,13 @@ def render_falsecolor(
     flatfield_scale: float = 1.0,
     flatfield_nuc_scale: float = 0.7,
     flatfield_cyto_scale: float = 2.6,
+    color_settings: dict | None = None,
 ) -> np.ndarray:
-    color_settings = resolve_color_settings(color_key, nuclei_hue)
+    settings = color_settings if color_settings is not None else resolve_color_settings(color_key, nuclei_hue)
     if color_key.upper() == "IHC":
-        cyto_settings = color_settings["anti"]
+        cyto_settings = settings["anti"]
     else:
-        cyto_settings = color_settings["cyto"]
+        cyto_settings = settings["cyto"]
 
     if flatfield:
         if backend != "gpu":
@@ -354,7 +381,7 @@ def render_falsecolor(
         return falsecolor.rapidFalseColor(
             nuclei,
             cyto,
-            color_settings["nuclei"],
+            settings["nuclei"],
             cyto_settings,
             nuc_normfactor=nuc_field,
             cyto_normfactor=cyto_field,
@@ -368,7 +395,7 @@ def render_falsecolor(
         return falsecolor.rapidFalseColor(
             nuclei,
             cyto,
-            color_settings["nuclei"],
+            settings["nuclei"],
             cyto_settings,
             nuc_normfactor=nuc_normfactor,
             cyto_normfactor=cyto_normfactor,
@@ -384,7 +411,7 @@ def render_falsecolor(
         nuc_normfactor=nuc_normfactor,
         cyto_normfactor=cyto_normfactor,
         color_key=color_key,
-        color_settings=color_settings,
+        color_settings=settings,
     )
 
 
@@ -480,6 +507,27 @@ def fill_internal_holes(
     return output
 
 
+def resolve_custom_colors(task: dict) -> dict | None:
+    """Custom stain colors from task (nuclei_rgb/cyto_rgb hex + strengths), else None.
+
+    Missing side defaults to the hue preset; HE palette only.
+    """
+    nuc_rgb = parse_hex_rgb(task.get("nuclei_rgb"))
+    cyto_rgb = parse_hex_rgb(task.get("cyto_rgb"))
+    if nuc_rgb is None and cyto_rgb is None:
+        return None
+    if str(task.get("color_key", "HE")).upper() != "HE":
+        raise ValueError("Custom stain colors (--nuclei_rgb/--cyto_rgb) require color_key=HE")
+    base = dict(resolve_color_settings("HE", task.get("nuclei_hue", "default")))
+    nuc_strength = task.get("nuclei_strength")
+    cyto_strength = task.get("cyto_strength")
+    if nuc_rgb is not None:
+        base["nuclei"] = display_rgb_to_od(nuc_rgb, 1.0 if nuc_strength is None else float(nuc_strength))
+    if cyto_rgb is not None:
+        base["cyto"] = display_rgb_to_od(cyto_rgb, 1.0 if cyto_strength is None else float(cyto_strength))
+    return base
+
+
 def _process_one_slice(task: dict) -> dict:
     prefix = task["prefix"]
     nuclei_path = Path(task["nuclei_path"])
@@ -502,6 +550,7 @@ def _process_one_slice(task: dict) -> dict:
         pp.destripe.sigma = float(task.get("destripe_smooth_sigma", 40.0))
         pp.destripe.orientation = task.get("destripe_orientation", "horizontal")
         pp.rolling_ball.radius = int(task.get("rolling_ball_radius", 5))
+        pp.skip_rolling_ball = not bool(task.get("use_rolling_ball", True))
         pp.lcn.clip_limit = float(task.get("lcn_clip_limit", 2.0))
         pp.lcn.grid_size = int(task.get("lcn_grid_size", 16))
         cyto_pre = preprocess_cyto(cyto_raw, pp)
@@ -515,6 +564,15 @@ def _process_one_slice(task: dict) -> dict:
     else:
         nuclei_for_color = nuclei_raw
         cyto_for_color = cyto_raw
+
+    align_shift = None
+    if task.get("align_channels"):
+        shift, ok = estimate_channel_shift(
+            nuclei_for_color, cyto_for_color, max_shift=float(task.get("align_max_shift", 32.0))
+        )
+        if ok:
+            cyto_for_color = apply_channel_shift(cyto_for_color, shift)
+            align_shift = [round(float(shift[0]), 2), round(float(shift[1]), 2)]
 
     nuclei, cyto = preprocess_colleague_tricks(
         nuclei_for_color,
@@ -543,6 +601,7 @@ def _process_one_slice(task: dict) -> dict:
         flatfield_scale=task["flatfield_scale"],
         flatfield_nuc_scale=task["flatfield_nuc_scale"],
         flatfield_cyto_scale=task["flatfield_cyto_scale"],
+        color_settings=resolve_custom_colors(task),
     )
     rgb_unmasked = rgb.copy()
     rgb = apply_background_mask(
@@ -574,6 +633,7 @@ def _process_one_slice(task: dict) -> dict:
         "prefix": prefix,
         "output_path": str(output_path),
         "elapsed_s": time.time() - started,
+        "align_shift": align_shift,
     }
 
 
@@ -768,6 +828,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="horizontal",
     )
     parser.add_argument("--rolling_ball_radius", type=int, default=5)
+    parser.add_argument(
+        "--use_rolling_ball",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rolling-ball background subtraction on nuclei (--no-use_rolling_ball to skip).",
+    )
+    parser.add_argument(
+        "--align_channels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Per-slice global nuc<->cyto shift correction (phase cross-correlation, cyto shifted).",
+    )
+    parser.add_argument(
+        "--align_max_shift",
+        type=float,
+        default=32.0,
+        help="Guard: estimated shifts larger than +/- this many px are skipped.",
+    )
+    parser.add_argument(
+        "--nuclei_rgb",
+        default=None,
+        help="Custom nuclei stain color, RRGGBB hex (implies hue preset override).",
+    )
+    parser.add_argument("--nuclei_strength", type=float, default=None)
+    parser.add_argument(
+        "--cyto_rgb",
+        default=None,
+        help="Custom cyto stain color, RRGGBB hex.",
+    )
+    parser.add_argument("--cyto_strength", type=float, default=None)
+    parser.add_argument(
+        "--to_ims",
+        default=None,
+        help="After the batch finishes, pack the HE RGB tiff stack into this .ims path "
+        "(mirrors the source ims metadata when --from_source_ims is given).",
+    )
+    parser.add_argument(
+        "--from_source_ims",
+        default=None,
+        help="Source .ims to inherit voxel size / metadata / pyramid depth from for --to_ims.",
+    )
     parser.add_argument("--lcn_clip_limit", type=float, default=2.0)
     parser.add_argument("--lcn_grid_size", type=int, default=16)
     parser.add_argument(
@@ -1000,6 +1101,13 @@ def main(argv: list[str] | None = None) -> int:
                 "destripe_smooth_sigma": args.destripe_smooth_sigma,
                 "destripe_orientation": args.destripe_orientation,
                 "rolling_ball_radius": args.rolling_ball_radius,
+                "use_rolling_ball": args.use_rolling_ball,
+                "align_channels": args.align_channels,
+                "align_max_shift": args.align_max_shift,
+                "nuclei_rgb": args.nuclei_rgb,
+                "nuclei_strength": args.nuclei_strength,
+                "cyto_rgb": args.cyto_rgb,
+                "cyto_strength": args.cyto_strength,
                 "lcn_clip_limit": args.lcn_clip_limit,
                 "lcn_grid_size": args.lcn_grid_size,
                 "contrast": args.contrast,
@@ -1034,7 +1142,13 @@ def main(argv: list[str] | None = None) -> int:
         f"flatfield_cyto_scale={args.flatfield_cyto_scale}, "
         f"sharpen_alpha={args.sharpen_alpha}, clahe={args.clahe}, "
         f"he_preprocess={args.he_preprocess}, rolling_ball_radius={args.rolling_ball_radius}, "
-        f"fill_holes={args.fill_holes}"
+        f"align_channels={args.align_channels}"
+        + (
+            f" (rgb nuc={args.nuclei_rgb}x{args.nuclei_strength} cyto={args.cyto_rgb}x{args.cyto_strength})"
+            if args.nuclei_rgb or args.cyto_rgb
+            else ""
+        )
+        + f", fill_holes={args.fill_holes}"
     )
 
     if args.flatfield and args.backend != "gpu":
@@ -1099,6 +1213,21 @@ def main(argv: list[str] | None = None) -> int:
         f"Done. Processed {completed} slices, failed {failed} "
         f"in {elapsed / 60:.1f} min."
     )
+
+    if args.to_ims:
+        if failed:
+            print(
+                f"--to_ims skipped: {failed} slices failed; fix and rerun (resume skips done slices).",
+                file=sys.stderr,
+            )
+            return 1
+        from pipeline_modules.HE.stack_to_ims import write_stack_ims
+
+        write_stack_ims(
+            output_dir,
+            Path(args.to_ims),
+            source_ims=Path(args.from_source_ims) if args.from_source_ims else None,
+        )
     return 1 if failed and completed == 0 else 0
 
 

@@ -9,7 +9,8 @@
     "--flatfield (default on) REQUIRES --backend gpu (numba CUDA). On GPU-less hosts the backend silently falls back to cpu and the run then aborts on the flatfield check -- pass --no-flatfield (and tune nuc/cyto_normfactor) instead.",
     "Resume is default-on: non-empty existing outputs are skipped; a _falsecolor_progress.json is kept in the output dir.",
     "For production runs submit via PM wrap: `python -m pipeline_modules.harness wrap --sample-dir <dir> --title <ASCII title> -- <command>`. The program prints [done/total] lines but no PROGRESS protocol lines (no progress bar; heartbeat + log tail still tracked). Wrap runs the child with cwd=sample-dir, so set PYTHONPATH=<repo root> or run from the repo root.",
-    "Input discovery expects <prefix>_ch<N>.tif(f) pairs; output goes to <input_dir>_FalseColor (unless --output_dir) as <prefix>_HE.tif RGB uint8 slices."
+    "Input discovery expects <prefix>_ch<N>.tif(f) pairs; output goes to <input_dir>_FalseColor (unless --output_dir) as <prefix>_HE.tif RGB uint8 slices.",
+    "Stain colors = Beer-Lambert OD vectors per stain (nuclei/cyto, R-G-B; OD=-ln(channel/255), max-normalized, scaled by strength). HE presets live in falsecolor_batch.HE_COLOR_PRESETS (nuclei_hue: default|blue|purple). Custom colors: napari preview widget hue preset=custom + pickers, or programmatic render_falsecolor(color_settings=...) via display_rgb_to_od()."
   ],
   "entrypoints": [
     {
@@ -43,7 +44,7 @@
         "he_preprocess": {
           "type": "bool",
           "default": true,
-          "description": "Per-slice chain: RL deconvolution (deconv_backend rl, sigma 1.2, iterations 10) -> FFT destripe (strength 0.85, notch 2.0, orientation horizontal) -> rolling ball r5 on nuclei; see --deconv_*/--destripe_*/--rolling_ball_radius flags"
+          "description": "Per-slice chain: RL deconvolution (deconv_backend rl, sigma 1.2, iterations 10) -> FFT destripe (strength 0.85, notch 2.0, orientation horizontal) -> rolling ball r5 on nuclei; see --deconv_*/--destripe_*/--rolling_ball_radius flags; --no-use_rolling_ball skips the rolling-ball step (deconv/destripe turn off via identity backends)"
         },
         "flatfield": {
           "type": "bool",
@@ -68,6 +69,25 @@
         "contrast": {"type": "float", "default": 1.0, "description": "Post-color contrast around near-white background"},
         "sharpen": {"type": "float", "default": 0.0, "description": "Post-color unsharp-mask amount"},
         "suffix": {"type": "string", "default": "_HE.tif"},
+        "align_channels": {
+          "type": "bool",
+          "default": false,
+          "description": "Per-slice global nuc<->cyto shift correction (phase cross-correlation, cyto shifted; guard --align_max_shift, default +/-32 px)"
+        },
+        "nuclei_rgb": {
+          "type": "string|null",
+          "default": null,
+          "description": "Custom nuclei stain color RRGGBB hex (with --nuclei_strength OD scale); overrides hue preset; HE palette only"
+        },
+        "nuclei_strength": {"type": "float|null", "default": null, "description": "OD scale for custom nuclei color (default 1.0 when rgb given)"},
+        "cyto_rgb": {"type": "string|null", "default": null, "description": "Custom cyto stain color RRGGBB hex (with --cyto_strength)"},
+        "cyto_strength": {"type": "float|null", "default": null, "description": "OD scale for custom cyto color (default 1.0 when rgb given)"},
+        "to_ims": {
+          "type": "path|null",
+          "default": null,
+          "description": "After the batch completes with 0 failures, pack the HE stack into this .ims (uses HE.stack_to_ims); pair with --from_source_ims"
+        },
+        "from_source_ims": {"type": "path|null", "default": null, "description": "Source .ims for --to_ims to inherit voxel size/metadata from"},
         "test": {"type": "int", "default": 0, "description": "Process only the first N pairs (smoke test)"},
         "middle": {"type": "int", "default": 0, "description": "Process N pairs from the center of the stack"},
         "slice_start": {"type": "int", "default": 0},
@@ -91,7 +111,24 @@
       "id": "he_napari_preview",
       "function": "pipeline_modules.HE.napari_he_preview.main",
       "cli": "python -m pipeline_modules.HE.napari_he_preview --input_dir <dir> --middle 1 --crop 2048",
-      "description": "Interactive napari preview: nuclei/seg/cyto/HE layers with live parameter sliders."
+      "description": "Interactive napari preview: nuclei/seg/cyto/HE layers with live parameter sliders, stain color pickers (hue preset custom), rolling-ball toggle and global nuc<->cyto shift correction (phase cross-correlation, --align_channels; widget seeds via --use_lcn/--seg_method/--seg_threshold/--init_*_rgb/--init_*_strength)."
+    },
+    {
+      "id": "he_stack_to_ims",
+      "function": "pipeline_modules.HE.stack_to_ims.main",
+      "cli": "python -m pipeline_modules.HE.stack_to_ims --input_dir <HE tiff dir> --output <out.ims> [--from_source_ims src.ims]",
+      "description": "Pack <prefix>_HE.tif RGB uint8 slices into a NEW 3-channel (R/G/B uint8) Imaris 5.5 .ims, streamed slice by slice; max-pool pyramid until coarsest ~1MB; --from_source_ims inherits voxel spacing/metadata (extents scaled to the stack dims if the export is cropped vs the source).",
+      "inputs": {
+        "input_dir": {"type": "path", "required": true, "description": "Directory of <prefix>_HE.tif(f) RGB slices (falsecolor_batch output)"},
+        "output": {"type": "path", "required": true, "description": "Output .ims path (must differ from source)"},
+        "from_source_ims": {"type": "path|null", "default": null},
+        "pyramid_levels": {"type": "int", "default": 0, "description": "0 = auto until coarsest level ~1MB"},
+        "gzip": {"type": "int", "default": 4},
+        "overwrite": {"type": "bool", "default": false}
+      },
+      "outputs": {
+        "ims": {"type": "path", "description": "Imaris 5.5 file, 3 channels Red/Green/Blue uint8 + RGBA thumbnail"}
+      }
     },
     {
       "id": "he_param_tuner",

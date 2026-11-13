@@ -37,6 +37,10 @@
   `.sis` 逆向仅作只读解析，别再投入。
 
 ## 3. 对接场景与已知坑
+- 写 .objects（对象掩膜回写）：Geometries 行 Type_Id 必须=7（勿抄 Objects 的 30）；Data body
+  零初始化（空行 k=0）；坐标全局；run 终点闭区间；写后反填 Bounds、Arivis 关闭、先备份。
+  详见 docs/arivis_objects_guide.md「写入陷阱」；核心/边缘/远端区域先查 xinzang/roi_*.zarr。
+
 
 | 场景 | 要点 |
 |---|---|

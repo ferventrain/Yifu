@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+from scipy import ndimage
 
 from pipeline_modules.preprocessing.deconvolution import deconvolve_2d
 from pipeline_modules.preprocessing.destripe import destripe_2d
@@ -57,6 +58,7 @@ class HePreprocessParams:
     # When True, skip placeholder backends that would alter intensities.
     skip_deconv: bool = False
     skip_destripe: bool = False
+    skip_rolling_ball: bool = False
 
 
 def _run_deconv(image: np.ndarray, params: DeconvParams) -> np.ndarray:
@@ -117,10 +119,14 @@ def preprocess_nuclei(
     if not cfg.skip_destripe:
         after_destripe = _run_destripe(after_deconv, cfg.destripe)
 
-    corrected, background = rolling_ball_background(
-        after_destripe,
-        radius=int(cfg.rolling_ball.radius),
-    )
+    if cfg.skip_rolling_ball:
+        corrected = after_destripe
+        background = np.zeros_like(after_destripe)
+    else:
+        corrected, background = rolling_ball_background(
+            after_destripe,
+            radius=int(cfg.rolling_ball.radius),
+        )
     final = corrected
     if use_lcn:
         final = clahe_array(
@@ -138,3 +144,40 @@ def preprocess_nuclei(
         "background": background,
         "used_lcn": bool(use_lcn),
     }
+
+
+def estimate_channel_shift(
+    nuclei: np.ndarray,
+    cyto: np.ndarray,
+    *,
+    upsample_factor: int = 10,
+    max_shift: float = 32.0,
+) -> tuple[np.ndarray, bool]:
+    """Global rigid shift aligning cyto to nuclei via phase cross-correlation.
+
+    Returns (correction shift (dy, dx) to apply to cyto, ok flag); feed it to
+    apply_channel_shift. ok=False when the estimate exceeds +/-max_shift px
+    (wild peak -> refuse instead of wrecking the channel).
+    """
+    from skimage.registration import phase_cross_correlation
+
+    shift, _error, _phase = phase_cross_correlation(
+        nuclei, cyto, upsample_factor=upsample_factor
+    )
+    shift = np.asarray(shift, dtype=float)
+    return shift, bool(np.all(np.abs(shift) <= max_shift))
+
+
+def apply_channel_shift(cyto: np.ndarray, shift: np.ndarray) -> np.ndarray:
+    """Bilinear-subpixel shift of the cyto channel into the nuclei frame."""
+    return ndimage.shift(cyto, shift, order=1, mode="nearest")
+
+
+def parse_hex_rgb(value: str | None) -> tuple[int, int, int] | None:
+    """'RRGGBB' (optionally '#'-prefixed) -> (r, g, b); None/empty -> None."""
+    if not value:
+        return None
+    v = str(value).strip().lstrip("#")
+    if len(v) != 6:
+        raise ValueError(f"RGB hex expects RRGGBB, got {value!r}")
+    return tuple(int(v[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
