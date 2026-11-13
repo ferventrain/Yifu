@@ -1,11 +1,11 @@
 {
   "schema_version": "2",
   "module": "tubule_reconstruction",
-  "description": "Vessel / tubule skeleton reconstruction from binary mask Zarr using VesselExpress-style Lee thinning (default) or optional kimimaro/TEASAR, with per-brain-region morphology.",
+  "description": "Vessel / tubule skeleton reconstruction from binary mask Zarr using VesselExpress-style Lee thinning with native-resolution EDT radii, plus per-brain-region morphology.",
   "notes_for_agents": [
-    "Default skeletonizer is vessel_express (Lee + native EDT). Set method=kimimaro only if explicitly requested.",
+    "vessel_express (Lee + native EDT) is the only online skeletonizer; the kimimaro/TEASAR engine was removed 2026-11.",
     "save_skeleton=true is REQUIRED for multi-region morphology (branch points, tortuosity, path lengths). Outputs: skeleton_vertices.csv + skeleton_edges.csv.",
-    "save_swc is OPTIONAL visualization only (kimimaro view / PyVista). It is NOT required for region stats.",
+    "save_swc is OPTIONAL visualization only (PyVista view / Imaris import). It is NOT required for region stats.",
     "Default accelerated path: method=vessel_express + downsample_factor=4 (max-pool) + merge 15 um + prune 20 um + keep_downsampled_mask.",
     "VesselExpress CLI: python -m pipeline_modules.tubule_reconstruction.vessel_express_reconstruction. Use --estimate first.",
     "For main.py embedding: set tubule_reconstruction.enabled=true and region_analysis.all_regions=true to run segmentation once then export all Allen regions.",
@@ -35,94 +35,6 @@
     ]
   },
   "entrypoints": [
-    {
-      "id": "analyze_binary_mask_zarr",
-      "function": "pipeline_modules.tubule_reconstruction.kimimaro_reconstruction.analyze_binary_mask_zarr",
-      "cli": "python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --no_chunkwise",
-      "description": "Skeletonise a (optionally downsampled) binary mask Zarr in one shot and compute network metrics.",
-      "prerequisites": [
-        "Binary mask Zarr store must exist (e.g. SampleLayout.mask_zarr)"
-      ],
-      "inputs": {
-        "mask_zarr_path": {"type": "path", "required": true, "description": "Path to binary mask Zarr store"},
-        "output_dir":     {"type": "path", "required": true, "description": "Directory to write outputs; created if missing"},
-        "dataset_name":   {"type": "string", "default": "0"},
-        "resolution_xyz": {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
-        "foreground_label": {"type": "int", "default": 1},
-        "roi":            {"type": "object|null", "default": null, "description": "{\"z\":[lo,hi],\"y\":[lo,hi],\"x\":[lo,hi]}"},
-        "dust_threshold": {"type": "int", "default": 100},
-        "fix_borders":    {"type": "bool", "default": true},
-        "parallel":       {"type": "int", "default": 1},
-        "teasar_params":  {"type": "TeasarParams", "default": null, "description": "Dict matching TeasarParams fields; null uses defaults"},
-        "save_skeleton":  {"type": "bool", "default": true, "description": "REQUIRED for region morphology"},
-        "save_swc":       {"type": "bool", "default": false, "description": "Optional visualization only; NOT required for region stats"},
-        "downsample_factor": {"type": "int", "default": 4, "description": "Isotropic max-pool downsample before skeletonization; 1=off"},
-        "keep_downsampled_mask": {"type": "bool", "default": false},
-        "merge_branch_points_distance_um": {"type": "float", "default": 0.0, "description": "Merge branch points within this distance (um). 0=disabled"},
-        "prune_spurs_max_length_um": {"type": "float", "default": 0.0, "description": "Prune terminal branches shorter than this (um). 0=disabled"}
-      },
-      "outputs": {
-        "branch_csv_path":   {"type": "path", "description": "vessel_branch_metrics.csv"},
-        "summary_json_path": {"type": "path", "description": "vessel_network_summary.json"},
-        "vertex_csv_path":   {"type": "path", "optional": true, "description": "skeleton_vertices.csv (requires save_skeleton)"},
-        "edge_csv_path":     {"type": "path", "optional": true, "description": "skeleton_edges.csv (requires save_skeleton)"},
-        "swc_dir":           {"type": "path", "optional": true, "description": "SWC directory (requires save_swc)"},
-        "manifest_path":     {"type": "path", "description": "_run_manifest.json"}
-      },
-      "common_commands": [
-        {
-          "description": "Full-volume skeletonization with 4x downsample (default accel)",
-          "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --no_chunkwise --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --save_skeleton"
-        }
-      ]
-    },
-    {
-      "id": "analyze_binary_mask_zarr_chunkwise",
-      "function": "pipeline_modules.tubule_reconstruction.kimimaro_reconstruction.analyze_binary_mask_zarr_chunkwise",
-      "cli": "python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction",
-      "description": "Default path: chunk-by-chunk skeletonisation with optional cross-chunk stitching. Prefer this for large volumes.",
-      "prerequisites": [
-        "Binary mask Zarr store must exist"
-      ],
-      "inputs": {
-        "mask_zarr_path": {"type": "path", "required": true},
-        "output_dir":     {"type": "path", "required": true},
-        "dataset_name":   {"type": "string", "default": "0"},
-        "resolution_xyz": {"type": "triplet_float_um", "default": [1.0, 1.0, 1.0]},
-        "foreground_label": {"type": "int", "default": 1},
-        "dust_threshold": {"type": "int", "default": 100},
-        "fix_borders":    {"type": "bool", "default": true},
-        "parallel":       {"type": "int", "default": 1},
-        "teasar_params":  {"type": "TeasarParams", "default": null},
-        "save_skeleton":  {"type": "bool", "default": true, "description": "REQUIRED for region morphology"},
-        "save_swc":       {"type": "bool", "default": false, "description": "Optional visualization only"},
-        "process_existing_only": {"type": "bool", "default": true},
-        "halo_zyx":       {"type": "triplet_int_vox", "default": [2, 4, 4]},
-        "stitch":         {"type": "bool", "default": true},
-        "stitch_max_distance_um": {"type": "float", "default": 5.0},
-        "chunk_workers":  {"type": "int", "default": 8, "description": "Process pool size; auto-caps near CPU/2"},
-        "downsample_factor": {"type": "int", "default": 4},
-        "keep_downsampled_mask": {"type": "bool", "default": false},
-        "merge_branch_points_distance_um": {"type": "float", "default": 0.0},
-        "prune_spurs_max_length_um": {"type": "float", "default": 0.0}
-      },
-      "outputs": {
-        "branch_csv_path":   {"type": "path", "description": "vessel_branch_metrics.csv"},
-        "chunk_csv_path":    {"type": "path", "description": "vessel_chunk_metrics.csv"},
-        "summary_json_path": {"type": "path", "description": "vessel_network_summary.json"},
-        "vertex_csv_path":   {"type": "path", "optional": true},
-        "edge_csv_path":     {"type": "path", "optional": true},
-        "stitch_csv_path":   {"type": "path", "optional": true},
-        "swc_dir":           {"type": "path", "optional": true},
-        "manifest_path":     {"type": "path", "description": "_run_manifest.json"}
-      },
-      "common_commands": [
-        {
-          "description": "Recommended whole-brain skeletonization (defaults)",
-          "powershell": "micromamba run -n yifu python -m pipeline_modules.tubule_reconstruction.kimimaro_reconstruction --mask_zarr \"S:\\sample\\ch0_mask.zarr\" --output_dir \"S:\\sample\\tubule_reconstruction\" --resolution_xyz \"1.8,1.8,2.0\" --dust_threshold 100 --downsample_factor 4 --chunk_workers 8 --save_skeleton"
-        }
-      ]
-    },
     {
       "id": "analyze_regions_from_skeleton",
       "function": "pipeline_modules.tubule_reconstruction.region_vessel_analysis.analyze_regions_from_skeleton",
@@ -205,9 +117,9 @@
       "id": "analyze_vessel_diameter_global",
       "function": "pipeline_modules.tubule_reconstruction.vessel_diameter_analysis.main",
       "cli": "python -m pipeline_modules.tubule_reconstruction.vessel_diameter_analysis global",
-      "description": "Publication-ready whole-sample vessel diameter histogram (PNG) from kimimaro vessel_branch_metrics.csv (diameter_um = mean_radius_um * 2). Same script also offers the region mode for per-atlas-region diameter bin tables.",
+      "description": "Publication-ready whole-sample vessel diameter histogram (PNG) from vessel_branch_metrics.csv (diameter_um = mean_radius_um * 2). Same script also offers the region mode for per-atlas-region diameter bin tables.",
       "prerequisites": [
-        "Input CSV must contain mean_radius_um, typically from kimimaro_reconstruction.py or vessel_express_reconstruction.py branch metrics export"
+        "Input CSV must contain mean_radius_um, typically from vessel_express_reconstruction.py branch metrics export"
       ],
       "inputs": {
         "branch_csv": {"type": "path", "default": "vessel_branch_metrics.csv"},

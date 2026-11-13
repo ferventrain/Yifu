@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.ticker import MaxNLocator
 
-from ._recon_common import open_zarr_dataset, parse_resolution_xyz
+from .recon_common import open_zarr_dataset, parse_resolution_xyz
 from .region_vessel_analysis import (
     _attach_branch_midpoints,
     _collect_subtree_ids,

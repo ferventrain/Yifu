@@ -35,7 +35,7 @@ from pipeline_modules.tubule_reconstruction.edt_reconstruction import (
     parse_chunk_index,
     skeleton_to_graph,
 )
-from pipeline_modules.tubule_reconstruction._recon_common import (
+from pipeline_modules.tubule_reconstruction.recon_common import (
     chunk_index_to_slices,
     expand_slices,
     open_zarr_dataset,

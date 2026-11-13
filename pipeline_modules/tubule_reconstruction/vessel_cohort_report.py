@@ -2,6 +2,15 @@
 distribution figures (delegated to vessel_analysis_report builders), and an
 atlas-coronal hippocampal vessel-volume-density heatmap.
 
+SINGLE-SAMPLE: despite the name, one run produces a workbook for ONE sample.
+There is no cross-sample aggregator here — to combine cohorts, run per sample
+and merge the emitted ``cohort_summary.json`` yourself.
+
+The region id space is set by ``--region-csv`` (default: the Rev2 lineage,
+``Region_Csv_Rev2_updated.CSV``); the hippocampal-formation root id is derived
+from that CSV (1078 in Rev2, 1089 in Rev1), overridable with ``--hpf-root-id``.
+A pre-2026-10 Rev1 cohort is reproduced by passing the Rev1 CSV explicitly.
+
 Inputs are the six vessel-stat files of one sample (region_vessel_summary.*,
 skeleton_*, vessel_branch_metrics.csv, vessel_network_summary.json) plus the
 sample's upsampled atlas-label Zarr for tissue volumes / region mapping /
@@ -13,6 +22,7 @@ Usage:
         --tubule-dir "<sample tubule_reconstruction dir>" \
         --label-zarr "<sample>/upsampled_atlas_label.zarr" \
         --sample-id 16week_dbdb2 --output-dir <out> \
+        [--region-csv pipeline_modules/registration/Region_Csv_Rev2_updated.CSV] \
         [--metrics length,diameter,degree,tortuosity] [--stride 8]
 """
 from __future__ import annotations

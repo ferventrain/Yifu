@@ -275,6 +275,42 @@ def test_source_channel_name_from_byte_array(tmp_path: Path):
         assert _hdf_attr_text(handle["DataSetInfo/Channel 0"].attrs["Name"]) == "(name not specified)"
 
 
+def test_write_mask_ims_replaces_two_channels(tmp_path: Path):
+    shape = (4, 8, 8)
+    source_volumes = {
+        0: np.zeros(shape, dtype=np.uint16),
+        1: np.ones(shape, dtype=np.uint16),
+    }
+    dense0 = np.full(shape, 123, dtype=np.uint16)
+    dense1 = ((np.arange(int(np.prod(shape))).reshape(shape) * 5) % 3000).astype(np.uint16)
+    source_ims = tmp_path / "source.ims"
+    _write_synthetic_ims(source_ims, source_volumes)
+    zarr0 = _write_mask_zarr(tmp_path / "dense0.zarr", dense0)
+    zarr1 = _write_mask_zarr(tmp_path / "dense1.zarr", dense1)
+    output_ims = tmp_path / "out.ims"
+
+    result = write_masked_ims(
+        zarr0,
+        output_ims,
+        source_ims=source_ims,
+        mask_channel=0,
+        replacement_dense=True,
+        extra_replacements={1: zarr1},
+        pyramid_levels=1,
+        chunk_size=(4, 8, 8),
+        z_block=4,
+    )
+
+    assert result["extra_replacements"] == {"1": str(zarr1)}
+    assert [entry["source"] for entry in result["channels"]] == ["mask", "mask"]
+    assert np.array_equal(_read_ims_channel(output_ims, 0), dense0)
+    assert np.array_equal(_read_ims_channel(output_ims, 1), dense1)
+    with h5py.File(output_ims, "r") as handle:
+        level1 = np.asarray(handle["DataSet/ResolutionLevel 1/TimePoint 0/Channel 1/Data"][:])
+        np.testing.assert_array_equal(level1, downsample_block_mean(dense1))
+        assert _hdf_attr_text(handle["DataSetInfo/Channel 1"].attrs["Color"]) == "1.000 0.000 0.000"
+
+
 def test_write_mask_ims_keeps_source_channel_color_range(tmp_path: Path):
     shape = (4, 8, 8)
     volumes = {

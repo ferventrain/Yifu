@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from pipeline_modules.tubule_reconstruction._recon_common import (
+from pipeline_modules.tubule_reconstruction.recon_common import (
     branch_table_from_tables as _branch_table_from_tables,
     iter_all_chunk_indices,
     open_zarr_dataset,
@@ -108,10 +108,18 @@ def load_region_tree_with_lookups(region_csv_path):
     return nodes_by_id, acronym_to_ids, name_to_ids
 
 
+# v1 标注误挂区（ProSv-m, id 484682496）：v1 atlas_label 把它画在胼胝体背侧白质
+# （官方口径为 ccm/scwm），且混在 HPF(1089) 子树里。所有子树集合展开时剔除该 id，
+# 直接查询该 id 自身时仍返回自身（保住逐区行生成）。
+EXCLUDED_ATLAS_IDS = {484682496}
+
+
 def _collect_subtree_ids(node):
     ids = [int(node["id"])]
     for child in node["children"]:
         ids.extend(_collect_subtree_ids(child))
+    if int(node["id"]) not in EXCLUDED_ATLAS_IDS:
+        ids = [i for i in ids if i not in EXCLUDED_ATLAS_IDS]
     return ids
 
 

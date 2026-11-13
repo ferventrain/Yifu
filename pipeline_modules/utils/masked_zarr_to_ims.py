@@ -18,6 +18,8 @@ Two modes:
 - ``--replacement_dense``: the replacement Zarr is a dense image (e.g. a
   brightness-corrected signal) rather than a sparse mask. Pyramid levels use
   mean pooling, and the source channel's color/name metadata is inherited.
+- ``--replace CHANNEL:PATH`` (repeatable): also replace another source channel
+  with a Zarr on the same grid, so one pass can rebuild every processed channel.
 CLI::
 
     python -m pipeline_modules.utils.masked_zarr_to_ims \
@@ -266,8 +268,14 @@ def build_output_channels(
     resolution_level: int = DEFAULT_RESOLUTION_LEVEL,
     timepoint: int = DEFAULT_TIMEPOINT,
     replacement_dense: bool = False,
+    extra_replacements: dict[int, np.dtype] | None = None,
 ) -> list[OutputChannel]:
-    """Plan the channels of the new file. Validates shapes against the mask."""
+    """Plan the channels of the new file. Validates shapes against the mask.
+
+    ``extra_replacements`` maps further source-channel indices to replacement
+    dtypes, so a file can be rebuilt with several processed channels at once.
+    """
+    extra_replacements = dict(extra_replacements or {})
     if source_handle is None:
         return [OutputChannel(index=0, name="ch0", source="mask", dtype=mask_dtype)]
 
@@ -310,6 +318,20 @@ def build_output_channels(
                 {"mask_channel": mask_index, "source_channels": [entry.index for entry in channels]},
             )
 
+    if mask_index in extra_replacements:
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "extra replacement duplicates the primary replacement channel",
+            {"channel": mask_index},
+        )
+    unknown = sorted(set(extra_replacements) - {entry.index for entry in channels})
+    if unknown:
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "extra replacement channel not present in source IMS",
+            {"channels": unknown, "source_channels": [entry.index for entry in channels]},
+        )
+
     planned: list[OutputChannel] = []
     for entry in channels:
         if entry.index == mask_index:
@@ -319,6 +341,16 @@ def build_output_channels(
                     name=f"ch{entry.index}",
                     source="mask",
                     dtype=mask_dtype,
+                    dense=bool(replacement_dense),
+                )
+            )
+        elif entry.index in extra_replacements:
+            planned.append(
+                OutputChannel(
+                    index=entry.index,
+                    name=f"ch{entry.index}",
+                    source="mask",
+                    dtype=np.dtype(extra_replacements[entry.index]),
                     dense=bool(replacement_dense),
                 )
             )
@@ -529,7 +561,7 @@ def _write_thumbnail(handle: Any, channels: list[OutputChannel], data_by_channel
 def _copy_level_zero(
     channels: list[OutputChannel],
     data_by_channel: dict[int, Any],
-    mask_array: Any,
+    arrays: dict[int, Any],
     *,
     shape_zyx: tuple[int, int, int],
     chunk_size: tuple[int, int, int],
@@ -553,7 +585,7 @@ def _copy_level_zero(
                 for y0 in range(0, height, band_rows):
                     y1 = min(y0 + band_rows, height)
                     if entry.source == "mask":
-                        band = np.asarray(mask_array[z0:z1, y0:y1, :])
+                        band = np.asarray(arrays[entry.index][z0:z1, y0:y1, :])
                     else:
                         band = np.asarray(entry.source_dataset[z0:z1, y0:y1, :])
                     target[z0:z1, y0:y1, :] = band
@@ -708,6 +740,7 @@ def write_masked_ims(
     mask_channel: int = 0,
     append_as_new_channel: bool = False,
     replacement_dense: bool = False,
+    extra_replacements: dict[int, str | Path] | None = None,
     pyramid_levels: int = 0,
     chunk_size: tuple[int, int, int] | str = DEFAULT_MASK_CHUNK,
     z_block: int = DEFAULT_Z_BLOCK,
@@ -754,6 +787,26 @@ def write_masked_ims(
     mask_shape = tuple(int(v) for v in mask_array.shape)
     mask_dtype = np.dtype(mask_array.dtype)
 
+    extra_paths = {int(k): Path(v) for k, v in (extra_replacements or {}).items()}
+    extra_arrays: dict[int, Any] = {}
+    extra_dtypes: dict[int, np.dtype] = {}
+    for channel, path in extra_paths.items():
+        if not path.exists():
+            raise PipelineError(
+                ErrorCode.INPUT_NOT_FOUND,
+                "Extra replacement Zarr not found",
+                {"channel": channel, "zarr": str(path)},
+            )
+        array = open_zarr_array(path)
+        if array.ndim != 3 or tuple(int(v) for v in array.shape) != mask_shape:
+            raise PipelineError(
+                ErrorCode.INPUT_FORMAT_INVALID,
+                "Extra replacement Zarr must be 3D on the mask grid",
+                {"channel": channel, "shape": list(int(v) for v in array.shape), "mask_shape": list(mask_shape)},
+            )
+        extra_arrays[channel] = array
+        extra_dtypes[channel] = np.dtype(array.dtype)
+
     kwargs = dict(
         rdcc_nbytes=max(int(hdf_cache_mb), 64) * 1024 * 1024,
         rdcc_nslots=52000,
@@ -771,7 +824,13 @@ def write_masked_ims(
                 mask_channel=mask_channel,
                 append_as_new_channel=append_as_new_channel,
                 replacement_dense=bool(replacement_dense),
+                extra_replacements=extra_dtypes,
             )
+            arrays = dict(extra_arrays)
+            primary = [entry for entry in channels if entry.source == "mask" and entry.index not in extra_arrays]
+            if len(primary) != 1:  # pragma: no cover - build_output_channels guarantees it
+                raise PipelineError(ErrorCode.INTERNAL_ERROR, "Could not resolve the primary replacement channel")
+            arrays[primary[0].index] = mask_array
             data_by_channel = _init_ims_skeleton(
                 out_handle,
                 channels=channels,
@@ -785,7 +844,7 @@ def write_masked_ims(
             hist = _copy_level_zero(
                 channels,
                 data_by_channel,
-                mask_array,
+                arrays,
                 shape_zyx=mask_shape,
                 chunk_size=chunks_requested,
                 z_block=z_block,
@@ -837,6 +896,7 @@ def write_masked_ims(
         "shape": list(mask_shape),
         "mask_dtype": str(mask_dtype),
         "replacement_dense": bool(replacement_dense),
+        "extra_replacements": {str(k): str(v) for k, v in extra_paths.items()},
         "channels": [
             {"index": entry.index, "name": entry.name, "source": entry.source, "dtype": str(entry.dtype)}
             for entry in channels
@@ -863,6 +923,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="The replacement Zarr is a dense image: mean pyramid pooling, source channel color/range",
     )
+    parser.add_argument(
+        "--replace",
+        action="append",
+        default=[],
+        metavar="CHANNEL:PATH",
+        help="Also replace another source channel with a 3D Zarr on the same grid (repeatable)",
+    )
     parser.add_argument("--pyramid", type=int, default=0, choices=(0, 1, 2), help="Extra 2x majority-vote resolution levels to write (default: 0)")
     parser.add_argument(
         "--chunk_size",
@@ -881,6 +948,16 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     try:
+        extras: dict[int, str] = {}
+        for spec in args.replace:
+            channel_text, sep, path = str(spec).partition(":")
+            if not sep or not channel_text.strip().isdigit() or not path:
+                raise PipelineError(
+                    ErrorCode.ARGUMENT_INVALID,
+                    "--replace must be CHANNEL:PATH",
+                    {"replace": spec},
+                )
+            extras[int(channel_text)] = path
         result = write_masked_ims(
             args.input,
             args.output,
@@ -888,6 +965,7 @@ def main() -> int:
             mask_channel=int(args.channel),
             append_as_new_channel=bool(args.append_as_new_channel),
             replacement_dense=bool(args.replacement_dense),
+            extra_replacements=extras,
             pyramid_levels=int(args.pyramid),
             chunk_size=args.chunk_size,
             z_block=int(args.z_block),

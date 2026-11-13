@@ -6,12 +6,12 @@ import numpy as np
 import pandas as pd
 
 try:
-    from ._recon_common import open_zarr_dataset, parse_resolution_xyz
+    from .recon_common import open_zarr_dataset, parse_resolution_xyz
 except ImportError:
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
         sys.path.append(str(project_root))
-    from pipeline_modules.tubule_reconstruction._recon_common import (
+    from pipeline_modules.tubule_reconstruction.recon_common import (
         open_zarr_dataset,
         parse_resolution_xyz,
     )

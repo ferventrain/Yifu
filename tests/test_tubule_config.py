@@ -185,9 +185,9 @@ class TestLoadCapabilityManifest:
     def test_entrypoint_ids(self):
         manifest = load_capability_manifest()
         ids = {e["id"] for e in manifest["entrypoints"]}
-        assert "analyze_binary_mask_zarr" in ids
-        assert "analyze_binary_mask_zarr_chunkwise" in ids
         assert "analyze_regions_from_skeleton" in ids
+        assert "reconstruct_vessel_express" in ids
+        assert not any("kimimaro" in e.get("function", "") for e in manifest["entrypoints"])
         assert "notes_for_agents" in manifest
         assert "recommended_workflow" in manifest
 

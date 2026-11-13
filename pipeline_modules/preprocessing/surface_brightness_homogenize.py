@@ -3,7 +3,8 @@
 Selected with ``--method``:
 
 * ``log_field`` (default): log-domain regional brightness field over a signal
-  TIFF folder (the historical shell/shading behaviour of this module).
+  TIFF folder or a Zarr volume (``--image/--mask/--voxel_size_zyx``; the
+  historical shell/shading behaviour of this module).
   Non-specific stain often makes the exterior brighter than the interior. That
   is a slow illumination-like offset, not a reason to crush bright voxels: the
   highlights still carry structure. The correction is a log-domain shading
@@ -29,6 +30,7 @@ Selected with ``--method``:
 CLI::
 
     python -m pipeline_modules.preprocessing.surface_brightness_homogenize --input_dir ch0 --output_zarr ch0_surface_homogenized.zarr --qc_only
+    python -m pipeline_modules.preprocessing.surface_brightness_homogenize --method log_field --image ch0_downsampled.zarr --mask tissue_mask.tif --voxel_size_zyx 8,7.2,7.2 --field_sigma_um 80 --strength 1.0
     python -m pipeline_modules.preprocessing.surface_brightness_homogenize --method depth_profile --image ch0_downsampled.zarr --mask tissue_mask.tif --voxel_size_zyx 8,7.2,7.2
 """
 
@@ -1863,6 +1865,326 @@ def equalize_depth_brightness(
     return summary
 
 
+def _regional_uniformity(
+    volume: np.ndarray,
+    mask: np.ndarray,
+    spacing_zyx: tuple[float, float, float],
+    *,
+    target_um: float = 100.0,
+    min_voxels: int = 100,
+) -> dict[str, Any]:
+    """Spread of per-tile median intensity inside the mask (~100 µm tiles)."""
+    step = tuple(max(1, int(round(float(target_um) / max(float(s), 1e-6)))) for s in spacing_zyx)
+    medians: list[float] = []
+    for z0 in range(0, volume.shape[0], step[0]):
+        z1 = min(z0 + step[0], volume.shape[0])
+        for y0 in range(0, volume.shape[1], step[1]):
+            y1 = min(y0 + step[1], volume.shape[1])
+            for x0 in range(0, volume.shape[2], step[2]):
+                x1 = min(x0 + step[2], volume.shape[2])
+                block_mask = mask[z0:z1, y0:y1, x0:x1]
+                if int(block_mask.sum()) < int(min_voxels):
+                    continue
+                medians.append(float(np.median(volume[z0:z1, y0:y1, x0:x1][block_mask])))
+    if len(medians) < 2:
+        return {"tiles": len(medians), "p10": None, "p50": None, "p90": None, "ratio_p90_p10": None}
+    p10, p50, p90 = (float(v) for v in np.percentile(medians, [10, 50, 90]))
+    return {
+        "tiles": len(medians),
+        "p10": p10,
+        "p50": p50,
+        "p90": p90,
+        "ratio_p90_p10": p90 / max(p10, 1e-6),
+    }
+
+
+def normalize_log_field_zarr(
+    image: str | Path,
+    mask: str | Path,
+    output_zarr: str | Path | None = None,
+    *,
+    voxel_size_zyx: tuple[float, float, float] | str,
+    fit_image: str | Path | None = None,
+    fit_voxel_size_zyx: tuple[float, float, float] | str | None = None,
+    field_sigma_um: float = 80.0,
+    strength: float = 1.0,
+    min_gain: float = 0.2,
+    max_gain: float = 5.0,
+    alpha: float = 1.0,
+    apply_chunk_z: int = 0,
+    compressor: str = "default",
+    qc_dir: str | Path | None = None,
+    fit_only: bool = False,
+    overwrite: bool = False,
+    sample_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Normalize regional brightness inside a tissue mask over a Zarr volume.
+
+    The low-frequency field is a normalized-convolution Gaussian of log
+    intensity measured on the mask grid; the gain is
+    ``clip((i_ref / field) ** strength)`` and is blended in through a soft mask
+    edge, so voxels outside the mask stay unchanged. The field can be fitted on
+    a downsampled volume and sampled onto a finer target by physical spacing.
+    """
+    started_at = time.time()
+    image_path = Path(image)
+    mask_path = Path(mask)
+    if not image_path.exists():
+        raise PipelineError(ErrorCode.INPUT_NOT_FOUND, "Image Zarr not found", {"image": str(image_path)})
+    spacing = parse_triplet(voxel_size_zyx, name="voxel_size_zyx")
+    fit_path = Path(fit_image) if fit_image else image_path
+    fit_spacing = (
+        parse_triplet(fit_voxel_size_zyx, name="fit_voxel_size_zyx") if fit_voxel_size_zyx else spacing
+    )
+    field_sigma_um = float(field_sigma_um)
+    strength = float(strength)
+    min_gain = float(min_gain)
+    max_gain = float(max_gain)
+    alpha = float(alpha)
+    if not (0 < min_gain < 1 < max_gain):
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "Require 0 < min_gain < 1 < max_gain",
+            {"min_gain": min_gain, "max_gain": max_gain},
+        )
+    if field_sigma_um <= 0:
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "field_sigma_um must be positive",
+            {"field_sigma_um": field_sigma_um},
+        )
+
+    mask_volume = load_mask(mask_path)
+    fit_array = open_zarr_array(fit_path)
+    fit_shape = tuple(int(v) for v in fit_array.shape)
+    if fit_shape != mask_volume.shape:
+        raise PipelineError(
+            ErrorCode.INPUT_FORMAT_INVALID,
+            "Mask and fit image grids differ; resample the mask onto the fit grid first",
+            {"mask_shape": list(mask_volume.shape), "fit_shape": list(fit_shape), "fit_image": str(fit_path)},
+        )
+
+    logger.info(
+        "Estimating log brightness field on %s shape=%s spacing=%s sigma_um=%.1f mask_frac=%.3f",
+        fit_path,
+        list(fit_shape),
+        list(fit_spacing),
+        field_sigma_um,
+        float(mask_volume.mean()),
+    )
+    report(done=0, total=4, phase="estimate field", sample_dir=sample_dir)
+    fit_data = np.asarray(fit_array[:], dtype=np.float32)
+    mask_f = mask_volume.astype(np.float32)
+    sigma_vox = tuple(field_sigma_um / max(float(s), 1e-6) for s in fit_spacing)
+    numerator = ndi.gaussian_filter(np.log(np.maximum(fit_data, 1.0)) * mask_f, sigma=sigma_vox)
+    denominator = ndi.gaussian_filter(mask_f, sigma=sigma_vox)
+    field = np.exp(numerator / np.maximum(denominator, 1e-6))
+    field = np.where(denominator > 1e-3, field, 1.0).astype(np.float32, copy=False)
+    del numerator, denominator
+    i_ref = float(np.median(field[mask_volume]))
+    gain = np.clip((i_ref / np.maximum(field, 1e-3)) ** strength, min_gain, max_gain).astype(np.float32)
+    gain[~mask_volume] = 1.0
+    blend = np.clip(
+        alpha * np.clip(ndi.gaussian_filter(mask_f, sigma=1.0), 0.0, 1.0), 0.0, 1.0
+    ).astype(np.float32)
+    multiplier = (1.0 + blend * (gain - 1.0)).astype(np.float32, copy=False)
+    del blend
+    corrected_fit = fit_data * multiplier
+
+    gain_in = gain[mask_volume]
+    field_in = field[mask_volume]
+    before_region = _regional_uniformity(fit_data, mask_volume, fit_spacing)
+    after_region = _regional_uniformity(corrected_fit, mask_volume, fit_spacing)
+    summary: dict[str, Any] = {
+        "image": str(image_path),
+        "mask": str(mask_path),
+        "fit_image": str(fit_path),
+        "fit_shape": list(fit_shape),
+        "fit_voxel_size_zyx": list(fit_spacing),
+        "target_voxel_size_zyx": list(spacing),
+        "mask_fraction": float(mask_volume.mean()),
+        "field_sigma_um": field_sigma_um,
+        "strength": strength,
+        "alpha": alpha,
+        "i_ref": i_ref,
+        "field_p10": float(np.percentile(field_in, 10)),
+        "field_p50": float(np.percentile(field_in, 50)),
+        "field_p90": float(np.percentile(field_in, 90)),
+        "field_ratio_p90_p10": float(
+            np.percentile(field_in, 90) / max(float(np.percentile(field_in, 10)), 1e-6)
+        ),
+        "gain_inside_min": float(gain_in.min()),
+        "gain_inside_max": float(gain_in.max()),
+        "gain_p1": float(np.percentile(gain_in, 1)),
+        "gain_p50": float(np.percentile(gain_in, 50)),
+        "gain_p99": float(np.percentile(gain_in, 99)),
+        "gain_limits": [min_gain, max_gain],
+        "inside_median_before": float(np.median(fit_data[mask_volume])),
+        "inside_median_after": float(np.median(corrected_fit[mask_volume])),
+        "regional_before": before_region,
+        "regional_after": after_region,
+    }
+    logger.info(
+        "Log field i_ref=%.0f field_p90/p10=%.2f gain=[%.3f,%.3f] regional %.2fx -> %.2fx",
+        i_ref,
+        summary["field_ratio_p90_p10"],
+        summary["gain_inside_min"],
+        summary["gain_inside_max"],
+        before_region["ratio_p90_p10"] or 0.0,
+        after_region["ratio_p90_p10"] or 0.0,
+    )
+    report(done=1, total=4, phase="field fitted", sample_dir=sample_dir)
+
+    output_path = Path(output_zarr) if output_zarr else image_path.with_name(
+        f"{image_path.stem}_surface_homogenized.zarr"
+    )
+    if output_path.suffix.lower() != ".zarr":
+        output_path = output_path.with_suffix(".zarr")
+    if output_path.resolve() == image_path.resolve():
+        raise PipelineError(
+            ErrorCode.ARGUMENT_INVALID,
+            "Output must differ from the input image",
+            {"output": str(output_path)},
+        )
+    if output_path.exists() and not overwrite and not fit_only:
+        raise PipelineError(
+            ErrorCode.OUTPUT_INVALID,
+            "Output Zarr already exists; pass --overwrite to replace it",
+            {"output": str(output_path)},
+        )
+    if qc_dir:
+        summary["qc_images"] = _write_qc(
+            Path(qc_dir), fit_data, corrected_fit, multiplier, mask_volume, fit_spacing
+        )
+    del corrected_fit
+
+    if fit_only:
+        if output_zarr:
+            output_path = Path(output_zarr)
+            if output_path.suffix.lower() != ".json":
+                output_path = output_path.with_suffix(".json")
+        else:
+            output_path = image_path.with_name(f"{image_path.stem}_log_field_fit.json")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        summary["fit_only"] = True
+        summary["duration_seconds"] = time.time() - started_at
+        output_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        report_done(sample_dir=sample_dir)
+        return summary
+
+    target = open_zarr_array(image_path)
+    target_shape = tuple(int(v) for v in target.shape)
+    if len(target_shape) != 3:
+        raise PipelineError(
+            ErrorCode.INPUT_FORMAT_INVALID,
+            "Image must be a 3D volume",
+            {"image": str(image_path), "shape": list(target_shape)},
+        )
+    dtype = np.dtype(target.dtype)
+    chunks = tuple(int(v) for v in (target.chunks or (1, target_shape[1], target_shape[2])))
+    chunk_z = int(apply_chunk_z) if int(apply_chunk_z) > 0 else chunks[0]
+    chunk_z = max(1, min(chunk_z, target_shape[0]))
+    chunk_y = max(1, int(chunks[1]))
+    max_tile_voxels = 300_000_000
+    tile_y = max(chunk_y, int(max_tile_voxels // max(chunk_z * target_shape[2], 1)))
+    tile_y = min(target_shape[1], ((tile_y + chunk_y - 1) // chunk_y) * chunk_y)
+    z_starts = list(range(0, target_shape[0], chunk_z))
+    y_starts = list(range(0, target_shape[1], tile_y))
+    total_tiles = len(z_starts) * len(y_starts)
+
+    source_attrs = read_zarr_attrs(image_path)
+    out_compressor = array_compressor(target)
+    if out_compressor is None:
+        out_compressor = resolve_compressor(compressor)
+    root = open_output_group(output_path, overwrite=True)
+    dataset = create_array(
+        root,
+        "0",
+        shape=target_shape,
+        chunks=chunks,
+        dtype=dtype,
+        compressor=out_compressor,
+    )
+    for key, value in source_attrs.items():
+        try:
+            root.attrs[key] = value
+        except (TypeError, ValueError):
+            logger.warning("Could not copy attr %s to output", key)
+    root.attrs["log_field_normalize"] = {
+        "i_ref": summary["i_ref"],
+        "field_sigma_um": field_sigma_um,
+        "strength": strength,
+        "alpha": alpha,
+        "gain_inside": [summary["gain_inside_min"], summary["gain_inside_max"]],
+        "fit_image": str(fit_path),
+        "fit_voxel_size_zyx": list(fit_spacing),
+        "mask": str(mask_path),
+    }
+
+    clipped = 0
+    done = 0
+    for z0 in z_starts:
+        z1 = min(z0 + chunk_z, target_shape[0])
+        for y0 in y_starts:
+            y1 = min(y0 + tile_y, target_shape[1])
+            slab = np.asarray(target[z0:z1, y0:y1, :])
+            multiplier_block = gain_for_block(
+                multiplier,
+                fit_spacing,
+                spacing,
+                target_shape,
+                z0,
+                z1,
+                y0,
+                y1,
+                0,
+                target_shape[2],
+            )
+            out, clipped_block = _apply_chunk(slab, multiplier_block, dtype)
+            dataset[z0:z1, y0:y1, :] = out
+            clipped += clipped_block
+            done += 1
+            report(done=done, total=total_tiles, phase="apply field", sample_dir=sample_dir)
+            print(f"PROGRESS {done}/{total_tiles} apply_field", flush=True)
+
+    summary.update(
+        {
+            "output_zarr": str(output_path),
+            "target_shape": list(target_shape),
+            "dtype": str(dtype),
+            "chunk_z": chunk_z,
+            "tile_y": tile_y,
+            "total_tiles": total_tiles,
+            "processed_slices": target_shape[0],
+            "clipped_voxels": int(clipped),
+            "duration_seconds": time.time() - started_at,
+        }
+    )
+    write_run_manifest(
+        output_path,
+        module="preprocessing",
+        entrypoint="normalize_log_field_zarr",
+        inputs={
+            "image": str(image_path),
+            "mask": str(mask_path),
+            "fit_image": str(fit_path),
+            "voxel_size_zyx": list(spacing),
+            "fit_voxel_size_zyx": list(fit_spacing),
+            "field_sigma_um": field_sigma_um,
+            "strength": strength,
+            "min_gain": min_gain,
+            "max_gain": max_gain,
+            "alpha": alpha,
+        },
+        outputs=[output_path],
+        started_at=started_at,
+        extra=summary,
+    )
+    report_done(sample_dir=sample_dir)
+    logger.info("Wrote %s (%d slices, %.1f s)", output_path, target_shape[0], summary["duration_seconds"])
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1896,13 +2218,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d_out_px", type=float, default=48.0, help="Outward surface band width in full-res pixels, shell mode (default: 48)")
     parser.add_argument("--ref_band_px", type=float, default=40.0, help="Interior reference band just inside the surface, shell mode (default: 40)")
     parser.add_argument("--field_sigma_px", type=float, default=64.0, help="Gaussian sigma of the regional brightness field in full-res pixels (default: 64)")
-    parser.add_argument("--strength", type=float, default=2.0, help="Equalization strength; 1 is I*I_ref/field, >1 darkens the outer rim and lifts the interior more (default: 2.0)")
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=None,
+        help="Equalization strength; 1 is I*I_ref/field, >1 corrects more (default: 2.0 TIFF, 1.0 Zarr log_field)",
+    )
     parser.add_argument("--bright_keep", type=float, default=0.2, help="Unused legacy flag")
     parser.add_argument("--alpha", type=float, default=1.0, help="Blend strength 0-1 of the normalized result inside tissue (default: 1.0)")
     parser.add_argument("--interior_pct", type=float, default=50.0, help="Percentile of tissue used as I_ref in shading mode (default: 50)")
     parser.add_argument("--ref_mix", type=float, default=0.5, help="Shell I_ref mix in log space: 0=observed surface, 1=observed interior (default: 0.5, geometric mean)")
     parser.add_argument("--target_scale", type=float, default=1.0, help="Multiply deep shell gain ceiling; <1 overall darker, >1 overall brighter (default: 1.0)")
-    parser.add_argument("--max_gain", type=float, default=None, help="Depth gain ceiling: log_field default 6.0, depth_profile default 5.0")
+    parser.add_argument("--max_gain", type=float, default=None, help="Gain ceiling: log_field default 6.0 TIFF / 5.0 Zarr, depth_profile 5.0")
+    parser.add_argument(
+        "--field_sigma_um",
+        type=float,
+        default=80.0,
+        help="log_field Zarr: Gaussian sigma of the regional brightness field in µm (default 80)",
+    )
     parser.add_argument("--surface_gain", type=float, default=0.05, help="Shell mode gain at the tissue surface, <1 darkens (default: 0.05)")
     parser.add_argument("--depth_gamma", type=float, default=1.5, help="Shell depth exponent on (d/d_max); 1=linear with depth, >1 stays darker longer before the core (default: 1.5)")
     parser.add_argument("--exterior_gain", type=float, default=0.01, help="Gain applied to ALL voxels outside the tissue mask (default: 0.01)")
@@ -1939,24 +2272,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip_zarr", action="store_true", help="Do not write the full-res Zarr; requires --output_tiff_dir")
     parser.add_argument("--json_logs", action="store_true")
     # --- depth_profile method (former depth_brightness_equalize) ---
-    parser.add_argument("--image", default=None, help="depth_profile: input image Zarr (target grid)")
-    parser.add_argument("--mask", default=None, help="depth_profile: 3D tissue mask (TIFF, .npy or Zarr) on the fit grid")
+    parser.add_argument("--image", default=None, help="log_field Zarr / depth_profile: input image Zarr (target grid)")
+    parser.add_argument("--mask", default=None, help="log_field Zarr / depth_profile: 3D tissue mask (TIFF, .npy or Zarr) on the fit grid")
     parser.add_argument(
         "--voxel_size_zyx",
         default=None,
-        help="depth_profile: target image voxel size in µm as z,y,x (e.g. 2,1.8,1.8)",
+        help="log_field Zarr / depth_profile: target image voxel size in µm as z,y,x (e.g. 2,1.8,1.8)",
     )
     parser.add_argument(
         "--fit_image",
         default=None,
-        help="depth_profile: volume used to fit the curve; default is --image (must share the mask grid)",
+        help="log_field Zarr / depth_profile: volume used to fit the field; default is --image (must share the mask grid)",
     )
     parser.add_argument(
         "--fit_voxel_size_zyx",
         default=None,
-        help="depth_profile: voxel size of --fit_image in µm as z,y,x; default is --voxel_size_zyx",
+        help="log_field Zarr / depth_profile: voxel size of --fit_image in µm as z,y,x; default is --voxel_size_zyx",
     )
-    parser.add_argument("--min_gain", type=float, default=DEFAULT_MIN_GAIN, help="depth_profile: max darkening 1/min_gain (default 0.1 => 10x)")
+    parser.add_argument(
+        "--min_gain",
+        type=float,
+        default=None,
+        help="Max darkening 1/min_gain (default: 0.1 depth_profile, 0.2 log_field Zarr)",
+    )
     parser.add_argument("--bin_um", type=float, default=DEFAULT_BIN_UM, help="depth_profile: distance bin width in µm (default 10)")
     parser.add_argument("--smooth_bins", type=float, default=1.2, help="depth_profile: Gaussian smoothing of the profile in bins")
     parser.add_argument("--deep_fraction", type=float, default=0.1, help="depth_profile: fraction of deepest bins used as the plateau")
@@ -1978,7 +2316,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     _configure_logging(args.json_logs)
-    max_gain = args.max_gain if args.max_gain is not None else (5.0 if args.method == "depth_profile" else 6.0)
+    if args.method == "depth_profile":
+        max_gain = args.max_gain if args.max_gain is not None else 5.0
+        min_gain = args.min_gain if args.min_gain is not None else DEFAULT_MIN_GAIN
+    elif args.image:
+        max_gain = args.max_gain if args.max_gain is not None else 5.0
+        min_gain = args.min_gain if args.min_gain is not None else 0.2
+    else:
+        max_gain = args.max_gain if args.max_gain is not None else 6.0
+        min_gain = None
     output_zarr = args.output_zarr or args.output_dir
     try:
         if args.method == "depth_profile":
@@ -2005,7 +2351,7 @@ def main() -> int:
                 fit_image=args.fit_image,
                 fit_voxel_size_zyx=args.fit_voxel_size_zyx,
                 max_gain=max_gain,
-                min_gain=args.min_gain,
+                min_gain=min_gain,
                 bin_um=args.bin_um,
                 smooth_bins=args.smooth_bins,
                 deep_fraction=args.deep_fraction,
@@ -2019,11 +2365,46 @@ def main() -> int:
                 overwrite=bool(args.overwrite),
                 sample_dir=args.sample_dir,
             )
+        elif args.image:
+            missing = [
+                name
+                for name, value in (
+                    ("--image", args.image),
+                    ("--mask", args.mask),
+                    ("--voxel_size_zyx", args.voxel_size_zyx),
+                )
+                if not value
+            ]
+            if missing:
+                raise PipelineError(
+                    ErrorCode.ARGUMENT_INVALID,
+                    "log_field Zarr needs " + " ".join(missing),
+                    {"method": args.method},
+                )
+            result = normalize_log_field_zarr(
+                args.image,
+                args.mask,
+                output_zarr,
+                voxel_size_zyx=args.voxel_size_zyx,
+                fit_image=args.fit_image,
+                fit_voxel_size_zyx=args.fit_voxel_size_zyx,
+                field_sigma_um=args.field_sigma_um,
+                strength=args.strength if args.strength is not None else 1.0,
+                min_gain=float(min_gain),
+                max_gain=max_gain,
+                alpha=args.alpha,
+                apply_chunk_z=args.apply_chunk_z,
+                compressor=args.compressor,
+                qc_dir=args.qc_dir,
+                fit_only=bool(args.fit_only),
+                overwrite=bool(args.overwrite),
+                sample_dir=args.sample_dir,
+            )
         else:
             if not args.input_dir:
                 raise PipelineError(
                     ErrorCode.ARGUMENT_INVALID,
-                    "log_field needs --input_dir (signal TIFF folder)",
+                    "log_field needs --input_dir (signal TIFF folder) or --image/--mask/--voxel_size_zyx (Zarr)",
                     {"method": args.method},
                 )
             result = homogenize_surface_brightness(
@@ -2037,7 +2418,7 @@ def main() -> int:
                 field_sigma_px=args.field_sigma_px,
                 alpha=args.alpha,
                 interior_pct=args.interior_pct,
-                strength=args.strength,
+                strength=args.strength if args.strength is not None else 2.0,
                 bright_hi_pct=args.bright_hi_pct,
                 smooth_sigma=args.smooth_sigma,
                 close_iter=args.close_iter,

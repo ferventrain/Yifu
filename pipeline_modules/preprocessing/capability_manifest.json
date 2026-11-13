@@ -382,10 +382,10 @@
     {
       "id": "homogenize_surface_brightness",
       "function": "pipeline_modules.preprocessing.surface_brightness_homogenize.homogenize_surface_brightness",
-      "cli": "python -m pipeline_modules.preprocessing.surface_brightness_homogenize [--method log_field] --input_dir <sample>/chX --output_zarr <out>.zarr   |   python -m pipeline_modules.preprocessing.surface_brightness_homogenize --method depth_profile --image <in>.zarr --mask <mask.tif> --voxel_size_zyx 8,7.2,7.2",
-      "description": "ONE CLI, ONE selector --method, for tissue brightness equalization (merged from the former depth_brightness_equalize module; viewing-oriented, not wired into main.py). USE SCENARIOS — pick --method log_field (default) when the artifact is a slow illumination-like offset measured regionally (uneven staining across the XY field, brighter exterior shell) and the source is a signal TIFF folder; it builds a log-domain regional brightness field on a downsampled grid and scales by (I_ref/field)^strength inside a tissue envelope (sub-modes via --mode: shading = regional log-field normalize, shell = depth gain + local sub-surface suppression). Pick --method depth_profile when the brightness depends on the DISTANCE TO THE TISSUE SURFACE specifically (over-bright surface shell + dark core, scattering halo outside) and the source is a Zarr with a 3D tissue mask: it fits a 1D median-brightness-vs-distance curve on the mask grid and applies the inverse gain, clamped to [min_gain, max_gain], sampled onto the target grid by physical spacing (one downsample fit can be applied to the full-resolution volume).",
+      "cli": "python -m pipeline_modules.preprocessing.surface_brightness_homogenize [--method log_field] --input_dir <sample>/chX --output_zarr <out>.zarr   |   python -m pipeline_modules.preprocessing.surface_brightness_homogenize --method log_field --image <in>.zarr --mask <mask.tif> --voxel_size_zyx 8,7.2,7.2 --field_sigma_um 80 --strength 1.0   |   python -m pipeline_modules.preprocessing.surface_brightness_homogenize --method depth_profile --image <in>.zarr --mask <mask.tif> --voxel_size_zyx 8,7.2,7.2",
+      "description": "ONE CLI, ONE selector --method, for tissue brightness equalization (merged from the former depth_brightness_equalize module; viewing-oriented, not wired into main.py). USE SCENARIOS — pick --method log_field (default) when the artifact is a slow illumination-like offset measured regionally (uneven staining across the XY field, brighter exterior shell) and the source is a signal TIFF folder or a Zarr volume with a tissue mask (--image/--mask/--voxel_size_zyx, streamed in chunk-aligned blocks); it builds a log-domain regional brightness field on a downsampled or mask grid and scales by (I_ref/field)^strength inside a tissue envelope (sub-modes via --mode: shading = regional log-field normalize, shell = depth gain + local sub-surface suppression). Pick --method depth_profile when the brightness depends on the DISTANCE TO THE TISSUE SURFACE specifically (over-bright surface shell + dark core, scattering halo outside) and the source is a Zarr with a 3D tissue mask: it fits a 1D median-brightness-vs-distance curve on the mask grid and applies the inverse gain, clamped to [min_gain, max_gain], sampled onto the target grid by physical spacing (one downsample fit can be applied to the full-resolution volume).",
       "prerequisites": [
-        "log_field: signal TIFF directory exists and contains TIFF slices (input folder, not an OME-TIFF stack)",
+        "log_field: either a signal TIFF directory exists and contains TIFF slices (input folder, not an OME-TIFF stack), or --image/--mask share the fit grid (Zarr input)",
         "depth_profile: image and mask cover the same physical field of view; the mask must share the fit image grid; voxel sizes are physical um z,y,x read from the acquisition metadata"
       ],
       "inputs": {
@@ -397,8 +397,8 @@
         },
         "input_dir": {
           "type": "path",
-          "required": "log_field",
-          "description": "Signal TIFF folder, commonly sample_dir/chX/ (log_field)"
+          "required": "log_field (TIFF path)",
+          "description": "Signal TIFF folder, commonly sample_dir/chX/ (log_field TIFF path; omit when using --image)"
         },
         "output_zarr": {
           "type": "path",
@@ -424,9 +424,14 @@
           "type": "float",
           "default": 64.0
         },
+        "field_sigma_um": {
+          "type": "float",
+          "default": 80.0,
+          "description": "log_field Zarr: regional brightness field Gaussian sigma in um"
+        },
         "strength": {
           "type": "float",
-          "default": 2.0
+          "default": "2.0 (log_field TIFF) / 1.0 (log_field Zarr)"
         },
         "seed_pct": {
           "type": "float",
@@ -508,7 +513,7 @@
         },
         "max_gain": {
           "type": "float",
-          "default": "6.0 (log_field) / 5.0 (depth_profile)",
+          "default": "6.0 (log_field TIFF) / 5.0 (log_field Zarr, depth_profile)",
           "description": "CLI default is method-dependent; function defaults keep 6.0 / 5.0 respectively"
         },
         "alpha": {
@@ -576,33 +581,33 @@
         },
         "image": {
           "type": "path",
-          "required": "depth_profile",
+          "required": "log_field Zarr / depth_profile",
           "description": "Input image Zarr (the grid that is written)"
         },
         "mask": {
           "type": "path",
-          "required": "depth_profile",
+          "required": "log_field Zarr / depth_profile",
           "description": "3D tissue mask (TIFF, .npy or Zarr) on the fit grid"
         },
         "voxel_size_zyx": {
           "type": "triplet_float_um",
-          "required": "depth_profile",
+          "required": "log_field Zarr / depth_profile",
           "description": "Target image voxel size in um (z,y,x)"
         },
         "fit_image": {
           "type": "path",
           "required": false,
-          "description": "depth_profile: volume used to fit the curve; default is image"
+          "description": "log_field Zarr / depth_profile: volume used to fit the field; default is image"
         },
         "fit_voxel_size_zyx": {
           "type": "triplet_float",
           "required": false,
-          "description": "depth_profile: voxel size of fit_image; default is voxel_size_zyx"
+          "description": "log_field Zarr / depth_profile: voxel size of fit_image; default is voxel_size_zyx"
         },
         "min_gain": {
           "type": "float",
-          "default": 0.1,
-          "description": "depth_profile: maximum darkening is 1/min_gain (default 10x)"
+          "default": "0.1 (depth_profile) / 0.2 (log_field Zarr)",
+          "description": "Maximum darkening is 1/min_gain"
         },
         "bin_um": {
           "type": "float",
