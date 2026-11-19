@@ -144,8 +144,18 @@ def main() -> int:
     vertex_usecols = ["skeleton_id", "node_id", "z_um", "y_um", "x_um", "radius_um"]
     edge_usecols = ["skeleton_id", "source_node", "target_node"]
 
-    vertex_stream = grouped_reader(run_dir / "skeleton_vertices.csv", vertex_usecols, VERTEX_CHUNK)
-    edge_stream = grouped_reader(run_dir / "skeleton_edges.csv", edge_usecols, EDGE_CHUNK)
+    # skeleton rows interleave in the chunked CSV streams, so group strictly by
+    # skeleton_id (order-based grouping drops edges and fragments skeletons).
+    def group_rows_by_skeleton(csv_path, usecols, chunksize):
+        groups: dict[int, list] = {}
+        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunksize, low_memory=False):
+            chunk = chunk.dropna(subset=["skeleton_id"])
+            for row in chunk.itertuples(index=False):
+                groups.setdefault(int(row.skeleton_id), []).append(row)
+        return groups
+
+    vertex_groups = group_rows_by_skeleton(run_dir / "skeleton_vertices.csv", vertex_usecols, VERTEX_CHUNK)
+    edge_groups = group_rows_by_skeleton(run_dir / "skeleton_edges.csv", edge_usecols, EDGE_CHUNK)
 
     whole_path = output_dir / f"{args.output_prefix}.swc"
     filtered_path = output_dir / f"{args.output_prefix}_filtered.swc" if region_filter else None
@@ -156,8 +166,6 @@ def main() -> int:
     filtered_global_ids = set()
 
     header = f"# merged skeleton export, resolution_xyz={args.resolution_xyz}\n# id type x y z radius parent\n"
-    edge_iter = iter(edge_stream)
-    current_edges = None
 
     with open(whole_path, "w", encoding="utf-8") as whole_fh:
         whole_fh.write(header)
@@ -165,17 +173,9 @@ def main() -> int:
         if filtered_fh:
             filtered_fh.write(header)
 
-        for skeleton_id, vertex_rows in vertex_stream:
-            while current_edges is None or current_edges[0] < skeleton_id:
-                try:
-                    current_edges = next(edge_iter)
-                except StopIteration:
-                    current_edges = None
-                    break
-            edges = []
-            if current_edges is not None and current_edges[0] == skeleton_id:
-                edges = [(int(row.source_node), int(row.target_node)) for row in current_edges[1]]
-                current_edges = None
+        for skeleton_id in sorted(vertex_groups):
+            vertex_rows = vertex_groups[skeleton_id]
+            edges = [(int(row.source_node), int(row.target_node)) for row in edge_groups.get(skeleton_id, [])]
             edges.extend(stitch_rows.get(skeleton_id, []))
 
             vertex_map = {int(row.node_id): row for row in vertex_rows}

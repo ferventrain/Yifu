@@ -230,7 +230,7 @@ EUCLIDEAN_MIN_UM = 1e-6
 def is_express_branch_metrics(branch_csv):
     """True for vessel_express vessel_branch_metrics.csv (per-branch polylines)."""
     cols = set(csv_columns(branch_csv))
-    return "length_um" in cols and "mean_radius_um" in cols and "branch_length_um" not in cols
+    return "length_um" in cols and "mean_radius_um" in cols and "source_z_um" in cols
 
 
 def load_express_branch_table(branch_csv):
