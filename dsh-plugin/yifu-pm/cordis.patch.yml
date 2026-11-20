@@ -1,0 +1,11 @@
+# yifu-pm bundle: one Host row. Config is read at activation; edit values here
+# (or in the profile's own patch layer) and restart DSH.
+- insert:
+    - id: yifu-pm
+      name: '@local/yifu-pm'
+      config:
+        repoRoot: 'H:\yifu0428\Yifu'
+        pythonExe: 'C:\Users\admin\micromamba\envs\yifu\python.exe'
+        analysisRoot: 'H:\arivis-analysis'
+        jobsLimit: 20
+        logTailLines: 100

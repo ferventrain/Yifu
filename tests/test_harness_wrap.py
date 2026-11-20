@@ -189,7 +189,7 @@ def test_wrap_tracks_success_and_progress_lines(analysis_home: Path, capsys):
 
     store = ActiveStore()
     job = store.load_job(job_id)
-    assert job["status"] == "done"
+    assert job["status"] == "succeeded"
     assert job["title"] == "unit wrap success"
     # progress file harvested from stdout lines
     progress = json.loads(Path(job["module_progress_path"]).read_text(encoding="utf-8"))

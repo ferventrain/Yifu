@@ -81,9 +81,12 @@ async def pipeline_error_handler(_request, exc: PipelineError):
 
 
 def _jobs_payload() -> dict[str, Any]:
-    """Assemble the job view. Read-only: never spawns, never mutates."""
+    """Assemble the job view. Strictly read-only: never spawns, never writes."""
     return {
-        "jobs": [_attach_qc_images(view) for view in decorate_views(store.list_job_views(), store.active)],
+        "jobs": [
+            _attach_qc_images(view)
+            for view in decorate_views(store.list_job_views(persist=False), store.active)
+        ],
         "worker": worker_snapshot(store.active),
         "analysis_root": str(store.root),
         "active_dir": str(store.active),
@@ -156,7 +159,6 @@ def api_file(path: str = Query(..., min_length=1)):
 
 @app.get("/api/meta")
 def api_meta() -> dict[str, Any]:
-    store.ensure_layout()
     return {
         "analysis_root": str(store.root),
         "active_dir": str(store.active),
@@ -318,9 +320,23 @@ def api_analytics() -> dict[str, Any]:
 
 @app.post("/api/jobs")
 def api_add_job(body: AddJobBody) -> dict[str, Any]:
+    """Submit a sample. Same sample dedupe as the CLI ``run`` command."""
+    store.validate_sample_dir(body.sample_dir)
+    existing = store.find_active_for_sample(body.sample_dir)
+    if existing is not None:
+        worker = ensure_worker_running(store, python_exe=_resolve_pipeline_python())
+        return {
+            "job": store.job_view(existing, persist=False),
+            "worker": worker["worker"],
+            "already_active": True,
+        }
     record = store.add_job(body.sample_dir, body.config_path or None)
     worker = ensure_worker_running(store, python_exe=_resolve_pipeline_python())
-    return {"job": decorate_views([store.job_view(record)], store.active)[0], "worker": worker["worker"]}
+    return {
+        "job": store.job_view(record, persist=False),
+        "worker": worker["worker"],
+        "already_active": False,
+    }
 
 
 @app.delete("/api/jobs/{job_id}")

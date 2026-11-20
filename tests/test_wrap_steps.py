@@ -57,7 +57,7 @@ def test_wrap_steps_protocol(analysis_home: Path, capsys):
 
     store = ActiveStore()
     job = store.load_job(job_id)
-    assert job["status"] == "done"
+    assert job["status"] == "succeeded"
     progress = json.loads(Path(job["module_progress_path"]).read_text(encoding="utf-8"))
     assert progress["steps"] == ["download", "register", "write-ims"]
     assert progress["step_states"] == ["done", "done", "done"]

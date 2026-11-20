@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Yifu 流程监视",
+    "description": "把 Yifu LSFM 流程的提交与监视接进对话：预检、提交（按样本去重）、队列列表（进度/步骤/ETA）、单任务详情（结构化错误 + 日志尾）、协作式取消。除提交/取消外均为只读；队列、单串行 detached worker 与输出验证仍由 Python harness 负责。",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -13,14 +13,16 @@ description: 开发新程序、新工具、新模块、napari/Qt 小部件、管
 - **成像**：SmartSpim 光片显微镜，全脑 3D 成像（NAS 目录名沿用旧称 `MegaSpim`，是同一台）。
 - **体量常识**：单通道全脑 TB 级（典型 (4475, 32752, 18317) @ 0.71/0.71/2.0 µm）。
   任何新代码默认按"金字塔懒加载 / 分块 / zarr"设计，全量载入不是优化项而是设计错误。
-- **我们的栈**：`pipeline_modules/` 六模块——preprocessing（ims↔zarr、降采样 NIfTI）、
+- **我们的栈**：`pipeline_modules/` 九个目录——preprocessing（ims↔zarr、降采样 NIfTI）、
   registration（ANTs + Allen 图谱）、segmentation（cfos UNet / spotiflow）、
   tubule_reconstruction（血管骨架）、visualization（napari 小部件、报告出图）、
-  harness（PM 看板、wrap/进度协议）。可用程序与 CLI 契约：根 `capabilities.json`
-  → 各模块 `capability_manifest.json`，开工先读，不凭记忆猜。
+  qc（无参考图像质量）、HE（虚拟 H&E）、harness（队列/worker/进度协议）、utils（SampleLayout 等）。
+  可用程序与 CLI 契约：根 `capabilities.json` → 各模块 `capability_manifest.json`，开工先读，不凭记忆猜。
 - **环境**：运行时一律 micromamba **yifu env** 的 python；napari env 仅作查看器；
-  任务经 PM（http://127.0.0.1:8766）提交跟踪；Windows + GPU（torch cu128）。
-- **存储**：repo `S:/Yifu`；分析根 `S:/Arivis_Analysis/_active`（批=父目录）；
+  任务用 `python -m pipeline_modules.harness run` 提交，在 DSH 的 "Yifu 队列" 面板或
+  `yifu_jobs` / `yifu_job` 工具里跟踪（旧监视页 8766 迁移期保留）；Windows + GPU（torch cu128）。
+- **存储**：repo 路径与分析根由 `YIFU_ANALYSIS_ROOT` / `YIFU_ACTIVE_DIR` 决定
+  （本机 `H:\arivis-analysis`，生产机 `S:/Arivis_Analysis`；批=父目录）；
   原始 ims 在 NAS `//tnas-ad13/MegaSpim/`（UNC 路径两端引号、映射盘符等坑见各工具文档）。
 - **常用格式一句话**：zarr v2 / NGFF（multiscales + image-label 键=napari Labels 层）、
   NIfTI（配准空间）、TIFF 栈（中间产物）、SWC（神经元形态）、

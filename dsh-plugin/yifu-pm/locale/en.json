@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Yifu Pipeline Monitor",
+    "description": "Submits, monitors and cancels Yifu LSFM pipeline runs through the existing Python harness: preflight, submit (dedupe by sample), queue list with live progress, single-job detail with structured errors and log tail, cooperative cancel. Read-only except submit/cancel; the Python harness keeps ownership of the queue, the single detached worker and output verification.",
+    "detail": "docs/DETAIL.md"
+  }
+}

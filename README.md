@@ -27,31 +27,30 @@
 
 - 每个模块运行完写一份 `<output_dir>/_run_manifest.json`：输入参数、输出文件列表（绝对路径 + 字节数）、耗时、模块版本、警告
 - 统一的错误模型 `PipelineError(code, message, context)`，`code` 是枚举（如 `INPUT_NOT_FOUND / CONFIG_INVALID / CUDA_OOM`）
-- `print` 改用 `logging`；CLI 支持 `--json_logs` 输出 NDJSON 事件流，便于 agent 流式消费
+- `print` 改用 `logging`；CLI 失败时把结构化错误以 JSON 打到 stderr（便于 agent 解析）
 - 失败路径**不**用 `sys.exit(1)` 吞掉上下文，应抛结构化异常并在 CLI 层映射成非零退出码 + JSON 错误体
 
 ### 0.3 配置用 Pydantic / dataclass，并导出 JSON Schema
 
-- 每个模块的配置段由一个 Pydantic 模型定义，统一聚合在 `pipeline_modules/utils/config_schema.py`
-- 顶层 `PipelineConfig` 描述 `input / preprocessing / registration / segmentation / analysis / tubule_reconstruction` 全部字段
-- 提供一条命令导出 JSON Schema，agent / IDE / 外部工具都以此为写 config 的 ground truth
-- `main.py` 启动时必须用模型 **validate** 一次，坏配置直接拒绝，而不是到中途某步才崩
+- 每个模块的配置段由一个配置模型定义（各 `pipeline_modules/<module>/config.py`），统一契约见对应的 `capability_manifest.json`
+- 顶层 `input / preprocessing / registration / segmentation / analysis / tubule_reconstruction` 由 `main.py` 组合
+- 配置分层：补跑 config 缺省键自动继承 `config_N.json ← config.json ← config/config_cfos_template.json`
+- `main.py` 启动时校验一次坏配置，而不是到中途某步才崩
 
 ### 0.4 机器可读的 capability manifest
 
-- 根目录维护 `capabilities.yaml`（或 `tools.json`），列出每个模块的：
+- 根目录 `capabilities.json` 登记模块；每个模块目录下的 `capability_manifest.json` 是**唯一契约**：
   - `id`、自然语言描述
   - Python 入口路径、CLI 入口
-  - 输入 / 输出 schema（复用 0.3 的 Pydantic 模型）
-  - 前置条件（依赖哪些上游产物）
-- Agent 通过这个 manifest 做**能力发现**和**依赖推断**，不需要阅读源码就知道"当前能跑什么、结果会写到哪"
-- 这也是未来把仓库包成 MCP server 时的数据源
+  - 输入 / 输出、前置条件（依赖哪些上游产物）
+- Agent 通过 manifest 做**能力发现**和**依赖推断**，不需要阅读源码就知道"当前能跑什么、结果会写到哪"
+- 这也是把仓库包成 DSH 插件 / MCP server 时的数据源
 
 ### 0.5 样本目录布局由代码（而非注释）表达
 
-- 在 `pipeline_modules/utils/sample_layout.py` 用一个 `SampleLayout` 类集中表达 `sample_dir/` 下所有约定路径（`chX.zarr`、`chX_mask.zarr`、`upsampled_atlas_label.zarr`、`tubule_reconstruction/` 等）
+- 在 `pipeline_modules/utils/sample_layout.py` 用 `SampleLayout` 类集中表达 `sample_dir/` 下所有约定路径（`chX.zarr`、`chX_mask.zarr`、`upsampled_atlas_label.zarr`、`tubule_reconstruction/` 等）
 - 所有模块、`main.py`、agent 一律通过 `SampleLayout` 访问这些路径，不再在各处拼字符串
-- `SampleLayout` 提供 `status()` / `missing()` 方法，agent 拿到一个 `sample_dir` 就能判断"哪些步骤已做 / 下一步能做什么"
+- `SampleLayout.as_dict()` 可列出全部约定产物路径，配合 `require_exists=False` 用于判断"哪些步骤已做 / 下一步能做什么"
 - 路径命名保持与本文档第 7 节一致，避免破坏现有产物
 
 ### 改造优先级
@@ -118,7 +117,7 @@ sample_dir/
 先复制模板：
 
 ```bash
-copy config_template.json config.json
+copy config\config_template.json config.json
 ```
 
 然后至少检查下面这些字段。它们是 `main.py` 当前真正依赖的核心配置。
@@ -221,7 +220,7 @@ copy config_template.json config.json
 
 ## 4. 运行主流程
 
-**推荐入口（一条命令，跑完可以关终端）**：
+**唯一推荐入口（一条命令，跑完可以关终端）**：
 
 ```bash
 python -m pipeline_modules.harness run \
@@ -229,27 +228,42 @@ python -m pipeline_modules.harness run \
   --config "S:/Arivis_Analysis/<sample>/config.json"
 ```
 
-它会校验输入、创建任务、启动唯一 worker 并立即返回 `run_id`；之后在
-Pipeline Monitor（http://127.0.0.1:8766，只读）里看当前步骤、运行时间、心跳和结果。
+它会校验输入、建任务、启动唯一 worker 并立即返回 `run_id`；同一样本重复提交会去重返回原
+`run_id`（并确保 worker 在线）。之后在 DeepSeek Harness 里用 "Yifu 队列" 面板或
+`yifu_jobs` / `yifu_job` 工具看当前步骤、运行时间、心跳和结果；旧监视页
+（http://127.0.0.1:8766）迁移期保留，只读。
+
 任务结束时只有"进程正常结束 + 结果文件存在且可读 + artifact manifest 写入"才会标记
 `succeeded`，失败会给出结构化错误（哪一步 / 什么类别 / 能否重试 / 建议动作）。
 提交前可先 `python -m pipeline_modules.harness preflight --sample-dir ...` 做一次只读校验；
-取消用 `python -m pipeline_modules.harness cancel <run_id>`。
+取消用 `python -m pipeline_modules.harness cancel <run_id>`；查看任务
+`python -m pipeline_modules.harness list`。
 
-生产/全脑运行不要绕过队列裸跑：同一时间只跑一个任务，Monitor 显示有任务运行中时不要另启
-重型流程；main.py 表达不了的定制多步流程仍用 attach 挂到 PM（见 harness capability manifest）。
+生产/全脑运行不要绕过队列裸跑：同一时间只跑一个 `main.py` 任务，Monitor 显示有任务运行中时
+不要另启重型流程。
 
-直接启动（不经队列，前台阻塞，适合调试单个步骤）：
+`main.py` 表达不了的定制程序用 wrap 挂到同一个队列（零改动）：
+
+```bash
+python -m pipeline_modules.harness wrap --sample-dir "S:/Arivis_Analysis/<sample>" \
+  --title "<标题>" -- python my_script.py --args
+```
+
+旧的两行 status 文件 + `attach` 驱动契约属于兼容入口（wrap 内部仍在用），不要再用它新接流程，
+也不要手工编辑 queue 文件。
+
+直接启动（不经队列，前台阻塞，仅供调试单个步骤）：
 
 ```bash
 python main.py --config config.json --sample_dir "S:\path\to\sample_dir"
 ```
 
-这是原来的启动方式，仍然可用。`--sample_dir` 当前基本是必填项。
+这是原来的启动方式，仍然可用，但它不会被 PM 记录，也不会校验输出。`--sample_dir` 当前
+基本是必填项。
 
 ### 常见变体
 
-只检查 Cellpose 是否能正常调用：
+只检查 harness/模块能力清单能否加载（不跑流程）：
 
 ```bash
 python main.py --test
@@ -258,11 +272,11 @@ python main.py --test
 ## 5. 命令行参数
 
 - `--config`
-  配置文件路径，默认是根目录下的 `config.json`。
+  配置文件路径，默认是样本目录下的 `config.json`。
 - `--sample_dir`
   样本根目录，必须包含 `ch0`、`ch1` 这类通道文件夹。
 - `--test`
-  测试模式。当前只运行 `cellpose_distributed.py --test`，不会执行完整流程。
+  自检模式：加载模块能力清单后退出，不执行完整流程。
 
 ## 6. 主流程实际做了什么
 
@@ -281,8 +295,9 @@ python main.py --test
 - `median_filter`
 - `scattering_removal`
 - `clahe`
+- `channel_subtraction`（通道相减，抑制自发荧光串扰）
 
-### 6.2 TIFF 转 Zarr
+### 6.2 信号通道转 Zarr
 
 主流程会把信号通道转换成：
 
@@ -290,6 +305,8 @@ python main.py --test
 sample_dir/chX.zarr
 ```
 
+生产/全脑运行推荐 Imaris-direct：`python -m pipeline_modules.preprocessing.ims_to_zarr`
+直接从 `.ims` 流式写 Zarr，绕过 TIFF 中间产物（见 `preprocessing/capability_manifest.json`）。
 如果该 Zarr 已存在，会自动跳过这一阶段。
 
 ### 6.3 配准通道下采样
@@ -310,7 +327,8 @@ sample_dir/chY_downsample/
 
 ### 6.4 分割
 
-如果 `segmentation.method` 是 `cellpose`，会生成：
+`segmentation.method` 决定分割方式：`cellpose`（分布式 3D）、`threshold`、
+`cfos_unet`（本地 checkpoint 3D U-Net）或 `spotiflow`（斑点检测）。分割结果写：
 
 ```text
 sample_dir/chX_mask.zarr
@@ -344,10 +362,10 @@ sample_dir/chX_mask/
 - `chX_mask.zarr`
 - `upsampled_atlas_label.zarr`
 
-最终输出：
+最终输出（`SampleLayout.brain_distribution_stats_xlsx`）：
 
 ```text
-sample_dir/density_results_chX.xlsx
+sample_dir/results/<sample>_ch<X>_brain_distribution_stats.xlsx
 ```
 
 ## 7. 运行后常见输出
@@ -366,7 +384,7 @@ sample_dir/density_results_chX.xlsx
 - `ch0_downsample/`：配准通道下采样结果
 - `upsampled_atlas_label/`：映射回样本空间的 atlas 标签 TIFF
 - `upsampled_atlas_label.zarr/`：atlas 标签 Zarr
-- `density_results_ch1.xlsx`：最终统计结果
+- `results/<sample>_ch1_brain_distribution_stats.xlsx`：最终统计结果
 - `transforms/`：ANTs 变换文件
 
 ## 8. 常见问题
@@ -381,20 +399,20 @@ sample_dir/density_results_chX.xlsx
 
 ### 8.3 `config_template.json` 里有些字段为什么没效果
 
-因为模板比主流程更“宽”。按当前代码，下面这些字段不是 `main.py` 主流程的核心输入，或者不会被完整使用：
+模板比主流程更“宽”。按当前代码，下面这些字段不是 `main.py` 主流程的核心输入，或者不会被完整使用：
 
-- `registration.mode`
-- `tubule_reconstruction`
+- `registration.mode`（固定 `atlas2image`）
 - `segmentation.cellpose.use_gpu`
 - `segmentation.cellpose.block_size`
-- `segmentation.threshold.min_object_size`
 - `preprocessing.homomorphic_filter`
 
-如果需要这些能力，建议直接查看对应模块脚本，确认是否已经接入主流程。
+`tubule_reconstruction`（第 6 步）与 `segmentation.threshold.min_object_size` 已经接入主流程，
+配置后会生效。具体字段以各模块 `capability_manifest.json` 为准。
 
 ### 8.4 预处理会不会作用到配准通道
 
-不会。当前 `main.py` 的增强预处理只作用于信号通道；配准通道直接从原始 TIFF 做下采样。
+不会。增强预处理只作用于信号通道；配准通道用原始数据（生产推荐直接从 `.ims` 下采样成
+`volume.nii.gz`，见 `pipeline_modules/preprocessing/capability_manifest.json`）。
 
 ## 9. 相关模块
 
@@ -404,8 +422,8 @@ sample_dir/density_results_chX.xlsx
 - `pipeline_modules/registration/`
 - `pipeline_modules/segmentation/`
 
-但对于日常跑样本，优先使用：
+完整契约以每个模块的 `capability_manifest.json` 为准。日常跑样本用标准入口：
 
 ```bash
-python main.py --config config.json --sample_dir "你的样本目录"
+python -m pipeline_modules.harness run --sample-dir "<样本目录>" --config "<样本目录>/config.json"
 ```

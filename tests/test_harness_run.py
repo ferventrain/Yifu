@@ -280,6 +280,89 @@ def test_legacy_done_status_maps_to_succeeded(analysis_home: Path):
     store.save_job(job)
     views = decorate_views(store.list_job_views(), store.active)
     assert views[0]["display_status"] == "succeeded"
+    # the canonical vocabulary is normalized on read, not just in the display
+    assert views[0]["status"] == "succeeded"
+    assert store.load_job(job["id"])["status"] == "succeeded"
+
+
+def test_job_list_read_path_writes_nothing(analysis_home: Path, monkeypatch):
+    """GET /api/jobs must be side-effect free (it used to save external jobs)."""
+    pytest.importorskip("fastapi")
+    import os
+
+    sample = analysis_home / "_active" / "batch" / "mouse04"
+    sample.mkdir(parents=True)
+    (sample / "config.json").write_text(json.dumps(MINIMAL_CONFIG), encoding="utf-8")
+    status = sample.parent / "_mouse04_status.txt"
+    status.write_text(f"RUNNING step 2\n{datetime.now(timezone.utc).replace(microsecond=0).isoformat()}\n", encoding="utf-8")
+
+    store = ActiveStore()
+    record = store.attach_external(
+        sample,
+        title="readonly probe",
+        pid=os.getpid(),
+        log_path=sample.parent / "_mouse04.log",
+        status_path=status,
+        config_path=sample / "config.json",
+    )
+    job_file = Path(store.active) / "jobs" / f"{record['id']}.json"
+    before = job_file.read_bytes()
+    before_stat = job_file.stat()
+
+    import importlib
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    monkeypatch.setattr(monitor, "store", store)
+    payload = monitor.api_jobs()
+    assert len(payload["jobs"]) == 1
+
+    after_stat = job_file.stat()
+    assert job_file.read_bytes() == before
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+
+
+def test_run_dedupe_still_starts_worker(analysis_home: Path, capsys, monkeypatch):
+    """A deduped `run` must still bring a dead worker back online."""
+    from pipeline_modules.harness import worker as worker_mod
+
+    sample = _write_sample(analysis_home)
+    _run_cli(capsys, ["run", "--sample-dir", str(sample), "--no-start-worker"])
+
+    calls: list[int] = []
+
+    def fake_ensure(store, python_exe=None):
+        calls.append(1)
+        return {"started": True, "worker": {"alive": True}}
+
+    monkeypatch.setattr(worker_mod, "ensure_worker_running", fake_ensure)
+    code, payload = _run_cli(capsys, ["run", "--sample-dir", str(sample)])
+    assert code == 0
+    assert payload["already_active"] is True
+    assert payload["worker"]["started"] is True
+    assert calls == [1]
+
+
+def test_monitor_post_dedupes_sample(analysis_home: Path, monkeypatch):
+    pytest.importorskip("fastapi")
+    sample = _write_sample(analysis_home, "mouse05")
+
+    import importlib
+
+    monitor = importlib.import_module("apps.pipeline_harness.main")
+    store = ActiveStore()
+    monkeypatch.setattr(monitor, "store", store)
+    monkeypatch.setattr(
+        monitor,
+        "ensure_worker_running",
+        lambda *a, **k: {"started": True, "worker": {"alive": True}},
+    )
+
+    first = monitor.api_add_job(monitor.AddJobBody(sample_dir=str(sample)))
+    second = monitor.api_add_job(monitor.AddJobBody(sample_dir=str(sample)))
+    assert first["already_active"] is False
+    assert second["already_active"] is True
+    assert second["job"]["id"] == first["job"]["id"]
+    assert len(store.list_jobs()) == 1
 
 
 # 8. the same sample is not submitted twice

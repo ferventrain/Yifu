@@ -32,10 +32,22 @@ from pipeline_modules.utils.run_manifest import collect_code_version
 JOB_STATUSES = ("queued", "running", "verifying", "succeeded", "failed", "cancelled", "stalled")
 #: Statuses that mean "this sample already has an active run" for dedupe.
 ACTIVE_STATUSES = ("queued", "running", "verifying")
+#: Historical records (external jobs finished before the vocabulary was
+#: unified) still carry ``done``; read paths normalize it to ``succeeded``
+#: without rewriting the files.
+LEGACY_STATUS_ALIASES = {"done": "succeeded"}
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _STEP_RE = re.compile(r"Step\s+(\d+)", re.IGNORECASE)
 RESERVED_ACTIVE_NAMES = {"jobs", "runs"}
-VESSEL_STEP_TOTAL = 7
+#: Default step denominator for external jobs when none is given; the only
+#: step list lives in ``progress.planned_step_names``.
+DEFAULT_STEP_TOTAL = len(planned_step_names())
+
+
+def normalize_status(value: Any) -> str:
+    """Map a stored status onto the current vocabulary (read-only)."""
+    status = str(value or "")
+    return LEGACY_STATUS_ALIASES.get(status, status)
 
 
 def _norm(path: Path) -> Path:
@@ -188,7 +200,7 @@ class ActiveStore:
         config_path: str | Path | None = None,
         module_progress_path: str | Path | None = None,
         command: str = "",
-        step_total: int = VESSEL_STEP_TOTAL,
+        step_total: int = DEFAULT_STEP_TOTAL,
     ) -> dict[str, Any]:
         """Track an already-running pipeline that was started outside the harness."""
         self.ensure_layout()
@@ -273,17 +285,29 @@ class ActiveStore:
         return any(str(job.get("status")) == "running" for job in self.list_jobs())
 
     def sync_external_jobs(self) -> None:
+        """Persist the external jobs' derived state. Write path only."""
         for job in self.list_jobs():
             if str(job.get("kind") or "") == "external":
                 self.sync_external_job(job)
 
     def sync_external_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Derive an external job's state and persist it (write path)."""
+        self.derive_external_job(job)
+        self.save_job(job)
+        return job
+
+    def derive_external_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Derive an external job's state from its pid/status file, in memory.
+
+        Read-only by design: view/list paths call this and never write. The
+        worker and ``harness wrap`` call :meth:`sync_external_job` to persist.
+        """
         parsed = _parse_status_file(job.get("status_path"))
         alive = pid_matches(job.get("pid"), job.get("pid_created_at"))
         first = parsed.get("first_line") or ""
-        previous = str(job.get("status") or "running")
+        previous = normalize_status(job.get("status")) or "running"
         if first.startswith("ALL DONE"):
-            job["status"] = "done"
+            job["status"] = "succeeded"
             job["error"] = None
             job["ended_at"] = job.get("ended_at") or utc_now_iso()
             job["step_name"] = "全部完成"
@@ -319,7 +343,7 @@ class ActiveStore:
             job["error"] = "process exited while still marked RUNNING"
             job["ended_at"] = utc_now_iso()
             job["step_name"] = first
-        elif previous in {"done", "cancelled"}:
+        elif previous in {"succeeded", "cancelled"}:
             return job
         elif previous == "queued":
             job["status"] = "queued"
@@ -339,7 +363,6 @@ class ActiveStore:
             total = int(module_prog.get("unit_total") or 0)
             if phase and total > 0 and job.get("status") == "running":
                 job["step_name"] = f"{phase} {done}/{total}"
-        self.save_job(job)
         return job
 
     def load_job(self, job_id: str) -> dict[str, Any]:
@@ -350,6 +373,7 @@ class ActiveStore:
                 "job not found",
                 context={"job_id": job_id},
             )
+        payload["status"] = normalize_status(payload.get("status"))
         return payload
 
     def save_job(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -358,11 +382,12 @@ class ActiveStore:
         return record
 
     def list_jobs(self) -> list[dict[str, Any]]:
-        self.ensure_layout()
+        """Every job record, ordered for display. Read-only: creates nothing."""
         jobs: list[dict[str, Any]] = []
         for path in sorted(jobs_dir(self.active).glob("*.json")):
             payload = read_json(path, default=None)
             if isinstance(payload, dict) and payload.get("id"):
+                payload["status"] = normalize_status(payload.get("status"))
                 jobs.append(payload)
         order = {job_id: index for index, job_id in enumerate(self._queue_ids())}
 
@@ -375,7 +400,6 @@ class ActiveStore:
                 "stalled": 3,
                 "failed": 4,
                 "cancelled": 5,
-                "done": 6,
                 "succeeded": 6,
             }.get(status, 7)
             queued_index = order.get(str(job.get("id")), 10_000)
@@ -415,9 +439,10 @@ class ActiveStore:
         ids = [item for item in self._queue_ids() if item != job_id]
         self._write_queue(ids)
 
-    def job_view(self, job: dict[str, Any]) -> dict[str, Any]:
+    def job_view(self, job: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
+        """Display view of one job. ``persist=False`` is strictly read-only."""
         if str(job.get("kind") or "") == "external":
-            job = self.sync_external_job(job)
+            job = self.sync_external_job(job) if persist else self.derive_external_job(dict(job))
         job_id = str(job["id"])
         log_file = job.get("log_path") or str(stdout_log_path(job_id, self.active))
         if str(job.get("kind") or "") == "external":
@@ -428,7 +453,7 @@ class ActiveStore:
             progress = {
                 "status": job.get("status") or "running",
                 "step_index": int(job.get("step_index") or 0),
-                "step_total": int(job.get("step_total") or VESSEL_STEP_TOTAL),
+                "step_total": int(job.get("step_total") or DEFAULT_STEP_TOTAL),
                 "step_name": job.get("step_name") or job.get("status_line") or "",
                 "message": job.get("status_line") or "",
                 "error": job.get("error"),
@@ -499,9 +524,13 @@ class ActiveStore:
             view["results"] = progress["results"]
         return view
 
-    def list_job_views(self) -> list[dict[str, Any]]:
-        self.sync_external_jobs()
-        return [self.job_view(job) for job in self.list_jobs()]
+    def list_job_views(self, *, persist: bool = True) -> list[dict[str, Any]]:
+        """All job views. ``persist=False`` is strictly read-only (monitor GET)."""
+        if persist:
+            # External state (heartbeat/status) is advanced by the worker's tick
+            # and by wrap's own finalize; the read path only reflects it.
+            self.sync_external_jobs()
+        return [self.job_view(job, persist=False) for job in self.list_jobs()]
 
 
 def _read_module_progress(path_value: str | None) -> dict[str, Any] | None:

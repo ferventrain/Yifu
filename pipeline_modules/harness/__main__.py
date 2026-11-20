@@ -108,11 +108,11 @@ def cmd_run(args: argparse.Namespace, store: ActiveStore) -> int:
     existing = store.find_active_for_sample(spec.sample_dir)
     if existing is not None:
         payload = _run_payload(store, existing, already_active=True)
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
-        return 0
-
-    record = store.add_job(spec.sample_dir, spec.config_path, extra_args=list(spec.extra_args))
-    payload = _run_payload(store, record, already_active=False)
+    else:
+        record = store.add_job(spec.sample_dir, spec.config_path, extra_args=list(spec.extra_args))
+        payload = _run_payload(store, record, already_active=False)
+    # `run` promises a live worker even when it only deduped onto an existing
+    # queued job whose worker had died meanwhile.
     if not args.no_start_worker:
         from pipeline_modules.harness.worker import ensure_worker_running
 
@@ -182,12 +182,24 @@ def cmd_cancel(args: argparse.Namespace, store: ActiveStore) -> int:
 def cmd_list(_args: argparse.Namespace, store: ActiveStore) -> int:
     from pipeline_modules.harness.worker import decorate_views
 
-    views = decorate_views(store.list_job_views(), store.active)
+    # `list` is documented as read-only: derive external state in memory only.
+    views = decorate_views(store.list_job_views(persist=False), store.active)
     print(json.dumps(views, indent=2, ensure_ascii=False))
     return 0
 
 
+def _ensure_utf8_stdio() -> None:
+    """Machine-readable JSON goes to stdout; never let a cp936/ANSI console
+    codec break ``list``/``run`` when the output is redirected or piped."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _ensure_utf8_stdio()
     args = build_parser().parse_args(argv)
     store = ActiveStore()
     try:

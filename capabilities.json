@@ -6,10 +6,11 @@
   {
    "id": "preprocessing",
    "path": "pipeline_modules/preprocessing",
-   "description": "TIFF-to-Zarr conversion, downsampling, and optional contrast enhancement.",
+   "description": "Imaris-direct (.ims → Zarr) and TIFF-based signal conversion, downsampling, and optional contrast enhancement.",
    "agent_native": true,
    "capability_manifest": "pipeline_modules/preprocessing/capability_manifest.json",
    "primary_scripts": [
+    "pipeline_modules/preprocessing/ims_to_zarr.py",
     "pipeline_modules/preprocessing/preprocessor.py",
     "pipeline_modules/preprocessing/tiff_to_zarr.py",
     "pipeline_modules/preprocessing/downsample.py",
@@ -170,12 +171,27 @@
    ]
   },
   {
+   "id": "HE",
+   "path": "pipeline_modules/HE",
+   "description": "Virtual H&E false coloring of paired two-channel TIFF slice stacks: per-slice restoration (RL deconvolution, FFT destripe, rolling-ball background, optional CLAHE) + Beer-Lambert falsecolor rendering with optional background masking, RGB post-sharpening and .ims packing.",
+   "agent_native": true,
+   "capability_manifest": "pipeline_modules/HE/capability_manifest.json",
+   "primary_scripts": [
+    "pipeline_modules/HE/falsecolor_batch.py",
+    "pipeline_modules/HE/pipeline.py",
+    "pipeline_modules/HE/stack_to_ims.py",
+    "pipeline_modules/HE/falsecolor_param_tuner.py",
+    "pipeline_modules/HE/napari_he_preview.py"
+   ],
+   "python_package": "pipeline_modules.HE"
+  },
+  {
    "id": "harness",
    "path": "pipeline_modules/harness",
-   "description": "Pipeline Monitor (PM): local serial job queue + operator UI (http://127.0.0.1:8766), progress.json, historical step ETAs, SampleLayout result listing. MANDATORY for production runs: enqueue main.py flows via `python -m pipeline_modules.harness enqueue` and attach custom multi-step drivers via ActiveStore.attach_external; never launch heavy pipelines outside PM while any job is running (poll ActiveStore.has_running()). Read the capability manifest first: it carries the two-line status-file verdict, launch_stability_policy and driver_contract.",
+   "description": "Pipeline Monitor (PM): local serial job queue + operator UI (http://127.0.0.1:8766), progress.json, historical step ETAs, SampleLayout result listing. MANDATORY for production runs: submit with `python -m pipeline_modules.harness run` (one standard command: validate, enqueue, start the single detached worker, print run_id). Programs main.py cannot express go through `harness wrap`; the legacy `enqueue`/`attach` subcommands remain only for compatibility. Never launch heavy pipelines outside the worker while a job is running (poll ActiveStore.has_running()). Read the capability manifest first: it carries launch_stability_policy and the progress contract. The same queue is exposed inside DeepSeek Harness by the in-repo plugin `dsh-plugin/yifu-pm` (tools yifu_preflight/yifu_submit/yifu_jobs/yifu_job/yifu_cancel + a read-only queue panel).",
    "agent_native": true,
    "capability_manifest": "pipeline_modules/harness/capability_manifest.json",
-   "usage_doc": "README.md section 4.0",
+   "usage_doc": "README.md section 4",
    "primary_scripts": [
     "pipeline_modules/harness/queue.py",
     "pipeline_modules/harness/runspec.py",

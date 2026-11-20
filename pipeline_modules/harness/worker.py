@@ -6,7 +6,7 @@ monitor) validates a RunSpec, appends a job record, then calls
 (if none is alive) which owns the queue from then on:
 
 * claims queued ``kind=main`` jobs serially (never two at once),
-* launches the standard pipeline command (Runner -> main.py -> modules),
+* launches the standard pipeline command (RunSpec -> main.py -> modules),
 * stamps ``heartbeat_at`` into progress.json while the pipeline runs,
 * honours cooperative cancel flags,
 * verifies required outputs and writes the artifact manifest,
@@ -19,6 +19,7 @@ worker can never start and races on job files are impossible.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -45,6 +46,7 @@ from pipeline_modules.harness.progress import (
 )
 from pipeline_modules.harness.queue import ActiveStore
 from pipeline_modules.harness.results import load_config
+from pipeline_modules.harness.runspec import RunSpec
 from pipeline_modules.harness.timing import record_step_timings
 from pipeline_modules.harness.verify import (
     classify_failure,
@@ -55,6 +57,8 @@ from pipeline_modules.harness.verify import (
 )
 from pipeline_modules.utils.errors import ErrorCode, PipelineError
 from pipeline_modules.utils.run_manifest import collect_code_version
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -236,19 +240,11 @@ class HarnessWorker:
         self.store.save_job(job)
         touch_heartbeat(progress_path(job_id, self.store.active))
 
-        command = [
-            self.python_exe,
-            str(self.repo_root / "main.py"),
-            "--config",
-            str(job["config_path"]),
-            "--sample_dir",
-            str(job["sample_dir"]),
-            "--progress_file",
-            str(progress_file),
-        ]
-        extras = job.get("extra_args") or []
-        if isinstance(extras, list):
-            command.extend(str(item) for item in extras)
+        command = RunSpec(
+            sample_dir=Path(job["sample_dir"]),
+            config_path=Path(job["config_path"]),
+            extra_args=tuple(str(item) for item in (job.get("extra_args") or [])),
+        ).command(self.python_exe, self.repo_root / "main.py", progress_file)
         env = os.environ.copy()
         env["YIFU_PROGRESS_FILE"] = str(progress_file)
         popen_kwargs: dict[str, Any] = {
@@ -474,9 +470,9 @@ def decorate_views(views: list[dict[str, Any]], active: Path | None = None) -> l
     alive = worker_is_alive(active)
     now = utc_now_iso()
     for view in views:
+        # Statuses are already canonical here (ActiveStore normalizes legacy
+        # ``done`` on read), so display only adds the liveness verdict.
         status = str(view.get("status"))
-        if status == "done":
-            status = "succeeded"
         display = status
         progress = view.get("progress") or {}
         heartbeat_age = _elapsed_seconds(progress.get("heartbeat_at"), now)

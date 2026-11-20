@@ -54,17 +54,20 @@
 
 ## PM（Pipeline Monitor）
 
-地址 http://127.0.0.1:8766。提交后在 PM 看板跟踪；拿不准时把结构化错误和日志尾部报告给用户。
+旧监视页 http://127.0.0.1:8766 迁移期保留（只读、不启任务）；日常用 DSH 里的
+"Yifu 队列" 面板或 `yifu_jobs` / `yifu_job` / `yifu_submit` / `yifu_cancel` 工具
+（仓库内插件 `dsh-plugin/yifu-pm`，与 CLI 读写同一份队列）。拿不准时把结构化错误和日志尾部报告给用户。
 
-**新写的程序必须让 PM 可读（三选一，从简到繁）**：
+**新写的程序必须让队列可读（从简到繁）**：
 1. 用 **wrap** 包装（零改动，默认姿势）：`python -m pipeline_modules.harness wrap --sample-dir <样本> --title <标题> -- <任意命令>`。
    自动挂任务/日志/心跳/取消；程序 stdout 打 `PROGRESS <done>/<total> [phase]` 行就有进度条。
 2. Python 程序内三行接入：`from pipeline_modules.harness.progress import report, report_done, report_failed`；
    `report(done=42, total=100, phase="写 ims", sample_dir=...)`。
-3. 已在跑的外部进程用 attach（status 文件首行 `RUNNING/ALL DONE/FAILED/CANCELLED` + 第二行 started_at）。
+3. 兼容入口：已在跑的外部进程用 attach（status 文件首行 `RUNNING/ALL DONE/FAILED/CANCELLED` + 第二行 started_at）挂到队列。
+   新流程不要再用它，用 wrap。
    进度文件字段等完整契约见 `pipeline_modules/harness/capability_manifest.json` 的 progress_protocol。
 
-**看板用法**：
+**看板用法（旧 PM 8766；DSH 面板只做队列监视，没有优先级/归档/分析页）**：
 1. 两级结构：项目（批=父目录）→ 样本卡；`_active` 下的批排前面，其余批展开排在后面（样式略暗）。
 2. 批头部最右侧 P0-P3 设项目紧急度（存 `_active/pm_board.json`，P 高置顶，再点取消）；样本卡：config 下拉 +
    "开始/继续"（一键断点续跑）；预计时长 chip；
@@ -78,11 +81,12 @@
 **不报错的要点**：
 1. 提交/启动 worker 一律用 **micromamba yifu env 的 python**——worker 解释器跟随提交者，系统 python 会拉起无依赖
    worker，任务秒退 ModuleNotFoundError。
-2. fresh shell 没设 `YIFU_ANALYSIS_ROOT` 时 harness 默认指向不存在的 `H:\`——命令前带
+2. `YIFU_ANALYSIS_ROOT` 缺省是 `H:\arivis-analysis`（本机存在）；换机器或数据在 `S:` 根时必须显式带
    `YIFU_ANALYSIS_ROOT=S:/Arivis_Analysis YIFU_ACTIVE_DIR=S:/Arivis_Analysis/_active`。
 3. PM 启动（重启不杀任务；改后端需重启，改前端刷新 + Ctrl+F5）：
    `YIFU_ANALYSIS_ROOT=... micromamba run -n yifu python -m apps.pipeline_harness.main --port 8766`。
-4. 刷新/GET 永不启动任务；开始、归档、取消才是显式操作。运行中 external 任务显"失联"= 进程死了或心跳断了。
+4. 刷新/GET 不启动任务、不写任务记录；提交、开始、取消、归档、设优先级才是显式写操作。
+   运行中 external 任务显"失联"= 进程死了或心跳断了。
 5. 失败 run 的 manifest 会写 `status: incomplete`（含出错步骤），环节耗时统计自动排除。
 
 

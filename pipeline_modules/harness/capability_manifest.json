@@ -2,7 +2,7 @@
   "schema_version": "3",
   "module": "harness",
   "product_name": "Pipeline Monitor (PM)",
-  "description": "Yifu 本地任务运行器 + 只读监视 UI。一条标准命令 (python -m pipeline_modules.harness run) 完成校验、建任务、启动唯一 worker 并返回 run_id；worker 串行执行 main.py、写 progress.json 心跳、结束后做输出验证并生成 artifact manifest。Pipeline Monitor (FastAPI, http://127.0.0.1:8766) 完全只读：刷新页面不会启动任何任务。",
+  "description": "Yifu 本地任务运行器 + 监视 UI。一条标准命令 (python -m pipeline_modules.harness run) 完成校验、建任务、启动唯一 worker 并返回 run_id；worker 串行执行 main.py、写 progress.json 心跳、结束后做输出验证并生成 artifact manifest。Pipeline Monitor (FastAPI, http://127.0.0.1:8766) 的 GET/查询接口只读：不写任务记录、不启动任务；提交、取消、设置优先级、归档是显式写操作（归档会删样本中间产物）。",
   "recommended_entrypoint": {
     "id": "run_sample",
     "cli": "python -m pipeline_modules.harness run --sample-dir \"S:/Arivis_Analysis/<sample>\" --config \"S:/Arivis_Analysis/<sample>/config.json\"",
@@ -118,12 +118,12 @@
           "default": null
         },
         "log_path": {
-          "type": "path",
-          "required": true
+          "type": "path|null",
+          "default": null
         },
         "status_path": {
-          "type": "path",
-          "required": true
+          "type": "path|null",
+          "default": null
         },
         "config_path": {
           "type": "path|null",
@@ -135,7 +135,8 @@
         },
         "step_total": {
           "type": "int",
-          "default": 7
+          "description": "步数分母；缺省取主流程步数（脑 6 / 脊髓 3），不是旧的 7",
+          "default": 6
         }
       },
       "outputs": {
@@ -159,7 +160,7 @@
       "id": "serve_pipeline_monitor",
       "function": "apps.pipeline_harness.main.main",
       "cli": "python -m apps.pipeline_harness --host 127.0.0.1 --port 8766",
-      "description": "启动 Pipeline Monitor（只读 UI）。REST：GET /api/meta, GET /api/jobs（只读）, GET /api/jobs/{id}/log, GET /api/jobs/{id}/artifacts, POST /api/jobs（提交+启动 worker）, POST /api/queue/start（显式启动 worker）, POST /api/jobs/{id}/cancel, POST /api/queue/cancel, DELETE /api/jobs/{id}, POST /api/open。GET 请求永远不会启动任务。",
+      "description": "启动 Pipeline Monitor（监视 UI）。REST：GET /api/meta, /api/jobs, /api/jobs/{id}/log, /api/jobs/{id}/artifacts, /api/projects, /api/stage-times, /api/analytics, /api/file（全部只读）；POST /api/jobs（提交，按样本去重后启动 worker）, /api/queue/start, /api/jobs/{id}/cancel, /api/queue/cancel, /api/open, /api/projects/priority, /api/projects/archive（会删数据，默认 dry_run 预览）；DELETE /api/jobs/{id}。GET 请求不会启动任务，也不写任务记录。",
       "inputs": {
         "host": {
           "type": "string",
@@ -189,7 +190,7 @@
     ]
   },
   "queue_semantics": {
-    "storage": "YIFU_ANALYSIS_ROOT/_active: queue.json (ordered ids), jobs/*.json (records), runs/<job_id>/ (progress.json + stdout.log + artifacts.json + cancel.flag), worker.json (worker liveness), worker.lock (exclusive), logs/worker.log",
+    "storage": "YIFU_ACTIVE_DIR（缺省 <YIFU_ANALYSIS_ROOT>/_active）: queue.json (ordered ids), jobs/*.json (records), runs/<job_id>/ (progress.json + stdout.log + artifacts.json + cancel.flag), worker.json (worker liveness), worker.lock (exclusive), timing_history.json (步骤耗时/内存历史), pm_board.json (P0-P3 优先级，可不存在), logs/worker.log, logs/wrap-* (wrap 的临时日志/状态/进度)",
     "statuses": [
       "queued",
       "running",
@@ -208,11 +209,13 @@
       "cancelled": "用户主动取消",
       "stalled": "worker/心跳消失，无法确认是否仍在执行（retryable）"
     },
-    "serial": "Single detached worker holds an exclusive lock; one running job at a time across kinds",
-    "dedupe": "run 命令对同一样本的 queued/running/verifying 任务去重，返回原 run_id",
-    "readonly_monitor": "GET /api/jobs 与页面刷新不做任何状态变更；只有 提交/显式启动 worker/取消/worker 推进队列 会改变状态"
+    "legacy_status": "历史记录里的 done 在读取时归一为 succeeded（不改写历史文件），写入端只产生上面 7 个状态",
+    "serial": "Single detached worker holds an exclusive lock; 串行只针对 kind=main；external/wrap 任务不参与该锁",
+    "dedupe": "run 命令与 POST /api/jobs 对同一样本的 queued/running/verifying 任务去重，返回原 run_id（仍会确保 worker 在线）",
+    "readonly_monitor": "GET 接口与页面刷新只读：不写任务记录、不建目录、不启动任务；external 状态在内存派生，落盘由 worker tick 与 wrap 收尾负责"
   },
   "progress_protocol": {
+    "contract": "schema 1 progress.json 是唯一契约（runs/<job_id>/progress.json）。schema 2 pm_progress.json、wrap 的 module_progress.json、两行 status 文件都只是兼容输入，新程序不要再引入新的进度文件。",
     "default_for_new_programs": "harness wrap: python -m pipeline_modules.harness wrap --sample-dir <dir> --title <标题> -- <任意命令>。自动挂任务、记录日志、心跳，把子进程 stdout 里的 PROGRESS <done>/<total> [phase] 行转成进度；子进程若调 progress.report() 也直接生效（wrap 会设 YIFU_PROGRESS_FILE）。什么都不打印的程序也有活性/耗时/日志尾。",
     "file": "runs/<job_id>/progress.json (atomic writes, schema 1, 由 main.py/worker 写)",
     "fields": [
@@ -232,8 +235,8 @@
     ],
     "field_note": "时间戳字段为 run_started_at（不是 started_at）；peak_mem_mb 为 worker 采样的进程树私有提交内存峰值（MB，规划并发用），steps[] 每步另有 peak_mem_mb/module 字段",
     "unknown_units": "unit_total 为 null 表示进度未知；UI 显示『进度未知』，禁止伪造百分比或 ETA",
-    "module_api": "细粒度进度：pipeline_modules.harness.progress.report(done, total, phase, sample_dir) / report_done / report_failed——环境变量 YIFU_PROGRESS_FILE 存在时并入 run 进度，否则写 <sample_dir>/pm_progress.json（schema 2：done/total/phase/status）。PM 对 external 任务自动回退读 pm_progress.json，读取端宽容（unit_done/done、percent 别名都认）。",
+    "module_api": "细粒度进度：pipeline_modules.harness.progress.report(done, total, phase, sample_dir) / report_done / report_failed——环境变量 YIFU_PROGRESS_FILE 存在时并入 run 进度，否则写 <sample_dir>/pm_progress.json（schema 2，兼容输入：done/total/phase/status）。PM 对 external 任务自动回退读 pm_progress.json，读取端宽容（unit_done/done、percent 别名都认）。",
     "env_chain": "main.py 收到 --progress_file 时会导出 YIFU_PROGRESS_FILE，手动跑 main.py 子模块单位进度不丢",
-    "external_jobs": "attach_external 的 inputs 含 module_progress_path（可选）；缺省时按 sample_dir 找 pm_progress.json；external 任务存活时由 sync_external_job 打 heartbeat_at（不再恒显『失联』）"
+    "external_jobs": "attach_external 的 inputs 含 module_progress_path（可选）；缺省时按 sample_dir 找 pm_progress.json；external 任务存活时由 worker tick 或 wrap 收尾刷新 heartbeat_at（GET 不再写盘）"
   }
 }

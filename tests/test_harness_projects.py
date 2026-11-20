@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -101,11 +102,17 @@ def test_analytics_endpoint_aggregates_read_only(analysis_home: Path, monkeypatc
 
     batch = analysis_home / "YF20991001"
     sample = _write_sample(batch, "ot")
+    # Analytics only counts runs inside a rolling 30-day window, so the fixture
+    # must stay relative to "now" instead of a fixed date that ages out.
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ended = now - timedelta(minutes=5)
+    started = ended - timedelta(hours=1)
+    created = started - timedelta(hours=1)
     manifest = {
         "module": "segmentation.cfos_unet_inference",
         "status": "completed",
         "duration_seconds": 900.0,
-        "ended_at": "2026-10-09T12:00:00+00:00",
+        "ended_at": ended.isoformat(),
     }
     (sample / "qc").mkdir(exist_ok=True)
     (sample / "qc" / "_run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -113,9 +120,9 @@ def test_analytics_endpoint_aggregates_read_only(analysis_home: Path, monkeypatc
     store = ActiveStore()
     job = store.add_job(sample)
     job["status"] = "succeeded"
-    job["created_at"] = "2026-10-09T10:00:00+00:00"
-    job["started_at"] = "2026-10-09T11:00:00+00:00"
-    job["ended_at"] = "2026-10-09T12:00:00+00:00"
+    job["created_at"] = created.isoformat()
+    job["started_at"] = started.isoformat()
+    job["ended_at"] = ended.isoformat()
     job["duration_s"] = 3600.0
     store.save_job(job)
 
@@ -129,7 +136,8 @@ def test_analytics_endpoint_aggregates_read_only(analysis_home: Path, monkeypatc
     assert payload["kpi"]["total_runs"] == 1
     assert payload["kpi"]["success_rate"] == 1.0
     assert payload["kpi"]["queue_wait_median_s"] == 3600.0
-    assert payload["daily"][0]["date"] == "2026-10-09"
+    run_dates = {created.date().isoformat(), started.date().isoformat(), ended.date().isoformat()}
+    assert payload["daily"][0]["date"] in run_dates
     assert any(row["module"] == "segmentation.cfos_unet_inference" for row in payload["stages"])
     heatmap = {row["sample"]: row for row in payload["heatmap"]}
     assert heatmap["ot"]["batch"] == "YF20991001"
@@ -264,7 +272,7 @@ def test_archive_endpoint_dry_run_and_full_roundtrip(analysis_home: Path, monkey
     sample = _make_archivable_sample(analysis_home)
     store = ActiveStore()
     job = store.add_job(sample)
-    job["status"] = "done"
+    job["status"] = "succeeded"
     store.save_job(job)
 
     import importlib

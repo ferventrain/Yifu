@@ -14,12 +14,13 @@ description: 用户要求跑分析、处理样本、出报告、查结果、操�
 1. **读契约**：根 `capabilities.json` → 涉及模块的 `capability_manifest.json`。
    可用程序、CLI 参数、输入输出、图谱体系（registration manifest 的 `atlas_reference`）都在那里。
 2. **跑流程**：标准入口三件套——`preflight`（只读校验）→ `harness run`（提交，返回 run_id）
-   → PM 看板（http://127.0.0.1:8766）跟踪。状态与成败只认结构化错误
-   （`error.code / step_id / retryable / suggestion`），不认日志文字。
+   → DSH 的 "Yifu 队列" 面板或 `yifu_jobs` / `yifu_job` 工具跟踪（旧监视页 8766 迁移期保留）。
+   状态与成败只认结构化错误（`error.code / step_id / retryable / suggestion`），不认日志文字。
 3. **config 规则**：template 已定的参数不重复写；run config 只写覆盖项；
    继承链 `config_1 ← config.json ← cfos_template`。首建必查三项：
    `project_name`、`input.resolution_xyz`、`input.channels`。
-4. **环境**：一切命令用 micromamba **yifu env** 的 python；fresh shell 带
+4. **环境**：一切命令用 micromamba **yifu env** 的 python；`YIFU_ANALYSIS_ROOT` 缺省
+   `H:\arivis-analysis`（本机），换机器或数据在 `S:` 根时显式带
    `YIFU_ANALYSIS_ROOT=S:/Arivis_Analysis YIFU_ACTIVE_DIR=S:/Arivis_Analysis/_active`。
 
 ## 边界（什么时候切换到别的 skill）

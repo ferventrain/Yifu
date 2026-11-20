@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from pipeline_modules.harness.jsonio import read_json, utc_now_iso, write_json_atomic
-from pipeline_modules.harness.progress import planned_step_names
+from pipeline_modules.harness.progress import (
+    BRAIN_STEPS,
+    SPINAL_CORD_STEPS,
+    SPOTIFLOW_STEP_5,
+    planned_step_names,
+)
 
 # ------------------------------------------------------------- archive (归档)
 #
@@ -105,20 +110,14 @@ _AGGREGATE_RANK = {
     "failed": 3,
     "cancelled": 4,
     "succeeded": 5,
-    "done": 5,
 }
 
 #: canonical pipeline step names (progress.py BRAIN_STEPS + SPINAL steps) used
 #: to bound the timing-history based estimate to real pipeline stages only.
 _CANONICAL_STEP_NAMES = {
-    "Registration channel downsample",
-    "Atlas registration and label outputs",
-    "Signal preprocessing and Zarr conversion",
-    "Segmentation",
-    "Region density analysis",
-    "Vessel network reconstruction and region morphology",
-    "Spinal cord per-vertebra signal analysis",
-    "Spotiflow signal count summary",
+    *BRAIN_STEPS,
+    *SPINAL_CORD_STEPS,
+    SPOTIFLOW_STEP_5,
 }
 
 _MANIFEST_CANDIDATE_LIMIT = 60
@@ -361,7 +360,7 @@ def _succeeded_durations(runs: list[dict[str, Any]]) -> list[float]:
         float(run["duration_s"])
         for run in runs
         if run.get("duration_s")
-        and str(run.get("display_status") or run.get("status")) in {"succeeded", "done"}
+        and str(run.get("display_status") or run.get("status")) == "succeeded"
     ]
 
 
@@ -856,7 +855,7 @@ def collect_analytics(root: Path, active_dir: Path) -> dict[str, Any]:
                  "duration_s": 0.0, "wait_s": [], "samples": {}},
             )
             bucket["runs"] += 1
-            if status in {"succeeded", "done"}:
+            if status == "succeeded":
                 bucket["success"] += 1
             elif status in {"failed", "stalled"}:
                 bucket["failed"] += 1
@@ -887,7 +886,7 @@ def collect_analytics(root: Path, active_dir: Path) -> dict[str, Any]:
         days_ago = now - cutoff * 86400.0
         window_runs = [r for r in records if (_iso_epoch(r.get("ended_at")) or 0.0) >= days_ago and r.get("ended_at")]
         total = len(window_runs)
-        success = sum(1 for r in window_runs if str(r.get("status")) in {"succeeded", "done"})
+        success = sum(1 for r in window_runs if str(r.get("status")) == "succeeded")
         window_totals[str(int(cutoff))] = {
             "runs": total,
             "success_rate": round(success / total, 3) if total else None,
@@ -896,7 +895,7 @@ def collect_analytics(root: Path, active_dir: Path) -> dict[str, Any]:
                     float(r.get("duration_s") or 0.0)
                     or max((_iso_epoch(r.get("ended_at")) or 0.0) - (_iso_epoch(r.get("started_at")) or 0.0), 0.0)
                     for r in window_runs
-                    if str(r.get("status")) in {"succeeded", "done"}
+                    if str(r.get("status")) == "succeeded"
                 ), 1,
             ),
         }
@@ -988,7 +987,7 @@ def collect_analytics(root: Path, active_dir: Path) -> dict[str, Any]:
     for sample in by_sample.values():
         counts = sample["statuses"]
         total = sum(counts.values())
-        success = counts.get("succeeded", 0) + counts.get("done", 0)
+        success = counts.get("succeeded", 0)
         failed = counts.get("failed", 0) + counts.get("stalled", 0)
         sample_rows.append(
             {"sample": sample["sample"], "batch": sample["batch"], "runs": total,
@@ -1190,7 +1189,7 @@ def group_into_batches(
         if project.get("active_run_id"):
             return "running"
         status = str(project.get("status") or "idle")
-        if status in {"succeeded", "done"}:
+        if status == "succeeded":
             return "done"
         if status in {"failed", "stalled"}:
             return "failed"
