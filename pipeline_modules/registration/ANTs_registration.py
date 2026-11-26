@@ -333,7 +333,11 @@ class BidirectionalRegistration:
         # override (e.g. "CC" — RA stages stay Mattes MI) and histogram
         # matching toggle; defaults keep the production behavior.
         self.syn_metric = str(registration_config.get("syn_metric", "mattes"))
-        self.histogram_matching = bool(registration_config.get("histogram_matching", True))
+        # Histogram matching defaults OFF (2026-11-26): without a brain mask it
+        # amplifies the scattering halo in the registration input (mid-low
+        # sample intensities get stretched to atlas-bright values). Opt in via
+        # registration.histogram_matching=true.
+        self.histogram_matching = bool(registration_config.get("histogram_matching", False))
         # Restrict the affine/SyN metric to the halo brain_mask.nii.gz so the
         # scattering halo cannot pull the deformation (opt-in via config).
         self.mask_registration = bool(registration_config.get("mask_registration", False))

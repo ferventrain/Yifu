@@ -74,6 +74,32 @@ def _write_zarr(path, volume, chunks=(2, 8, 8)):
     create_output_zarr(path, shape=volume.shape, chunks=chunks, dtype=volume.dtype, data=volume)
 
 
+def test_convert_without_brain_mask_unmasked(tmp_path):
+    """No --brain_mask: nothing is zeroed, no brain_mask.nii.gz written,
+    and a stale one from an earlier masked run is removed."""
+    volume = np.zeros((12, 48, 40), np.uint16)
+    volume[:] = 2000  # non-brain corners survive: nothing may be zeroed
+    _write_zarr(tmp_path / "ch0_L2.zarr", volume)
+    stale_mask = tmp_path / "ch0_downsample" / "brain_mask.nii.gz"
+    stale_mask.parent.mkdir(parents=True)
+    stale_mask.write_bytes(b"stale")
+
+    result = convert_zarr_to_registration_nii(
+        tmp_path / "ch0_L2.zarr",
+        tmp_path / "ch0_downsample" / "volume.nii.gz",
+        input_resolution_xyz=(12.0, 12.0, 16.0),
+        target_resolution_xyz=(24.0, 24.0, 32.0),
+        brain_mask_erode=0,
+    )
+
+    assert result["brain_mask"]["applied"] is False
+    import nibabel as nib
+
+    reg = np.asarray(nib.load(str(tmp_path / "ch0_downsample" / "volume.nii.gz")).dataobj)
+    assert (reg == 2000).all(), "unmasked run must not zero anything"
+    assert not stale_mask.exists(), "stale brain_mask.nii.gz must be removed"
+
+
 def test_convert_uses_external_brain_mask(tmp_path):
     volume = np.full((12, 48, 40), 2000, np.uint16)
     _write_zarr(tmp_path / "ch0_L2.zarr", volume)
@@ -96,8 +122,8 @@ def test_convert_uses_external_brain_mask(tmp_path):
 
     assert result["brain_mask"]["applied"] is True
 
-    # Expected mask on the registration grid: nearest zoom + largest component,
-    # mirroring what load_external_brain_mask does (erode=0 here).
+    # Expected mask on the registration grid: nearest zoom, no largest-component
+    # cleanup (removed: 0.7-era workaround) — both blocks survive (erode=0 here).
     out_shape = tuple(result["output_shape_zyx"])
     mapped = ndimage.zoom(
         (mask > 0).astype(np.uint8),
@@ -105,18 +131,14 @@ def test_convert_uses_external_brain_mask(tmp_path):
         order=0,
         mode="nearest",
     ) > 0
-    labels, count = ndimage.label(mapped)
-    sizes = np.bincount(labels.ravel())
-    sizes[0] = 0
-    expected = labels == int(np.argmax(sizes))
-    expected_xyz = np.transpose(expected, (2, 1, 0))
+    expected_xyz = np.transpose(mapped, (2, 1, 0))
 
     import nibabel as nib
 
     reg = np.asarray(nib.load(str(output_nii)).dataobj)  # xyz, unit affine
     assert reg.shape == expected_xyz.shape
     assert (reg[expected_xyz] == 2000).all(), "voxels inside the DL mask survive"
-    assert (reg[~expected_xyz] == 0).all(), "fragment and background are zeroed"
+    assert (reg[~expected_xyz] == 0).all(), "background is zeroed"
 
     mask_nii = np.asarray(nib.load(str(output_nii.parent / "brain_mask.nii.gz")).dataobj)
     assert set(np.unique(mask_nii)) <= {0, 1}
@@ -124,8 +146,6 @@ def test_convert_uses_external_brain_mask(tmp_path):
 
     shape_meta = json.loads((output_nii.parent / "original_shape.json").read_text())
     assert shape_meta["brain_mask"]["applied"] is True
-    # the stray fragment is mapped too, so the pre-cleanup count is 2
-    assert shape_meta["brain_mask"]["components"] == 2
 
 
 def test_run_brain_mask_end_to_end_tiny(tmp_path, monkeypatch):

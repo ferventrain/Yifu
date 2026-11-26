@@ -365,8 +365,17 @@ def ensure_brain_mask_dl(sample_dir, reg_ch, reg_cfg):
     if complete:
         print_skip(f"DL brain mask up to date ({reason}): {mask_zarr}")
         return mask_zarr
+    force = bool(reg_cfg.get("brain_mask_force_recompute", False))
+    if mask_zarr.exists() and not force:
+        # an existing mask is trusted: the DL mask depends on the coarse image,
+        # not on metadata refreshes, so staleness alone never justifies a
+        # ~1 h re-inference. Set registration.brain_mask_force_recompute=true
+        # (or delete the mask zarr) to recompute deliberately.
+        print_skip(f"DL brain mask exists ({reason}); skipping. Set registration."
+                   f"brain_mask_force_recompute=true to recompute: {mask_zarr}")
+        return mask_zarr
     if mask_zarr.exists():
-        print_note(f"DL brain mask exists but {reason}; rebuilding.")
+        print_note(f"DL brain mask exists but {reason}; force_recompute=true, rebuilding.")
     run_command(cmd, desc)
     _mark_done([mask_zarr], [reg_downsampled_zarr], payload)
     return mask_zarr

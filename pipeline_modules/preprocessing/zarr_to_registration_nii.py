@@ -8,9 +8,11 @@ convention (xyz transpose + unit affine — see the comment in
 place of the TIFF-folder downsample.
 
 The DL brain mask (``pipeline_modules.segmentation.brain_mask_aind``) is the
-ONLY mask source: ``--brain_mask`` is required, the mask zeroes everything
-outside the brain and is mirrored into ``brain_mask.nii.gz`` (N4 + orientation
-preflight consumers). The old Otsu halo mask was removed.
+only mask source when used: ``--brain_mask`` zeroes everything outside the
+brain and is mirrored into ``brain_mask.nii.gz`` (N4 + orientation preflight
+consumers). Omitting ``--brain_mask`` runs unmasked (no zeroing, no
+brain_mask.nii.gz; ANTs falls back to unmasked behaviour). The old Otsu halo
+mask was removed.
 """
 from __future__ import annotations
 
@@ -65,6 +67,15 @@ def resolve_input_resolution_xyz(
             )
     except Exception:  # noqa: BLE001 - metadata lookup is best-effort
         pass
+    logger.warning(
+        "Coarse zarr %s has no ims_resolution_level/ims_stride_xyz attrs; "
+        "assuming NATIVE resolution %s um. If this zarr is an ims pyramid "
+        "level, the output nii physical size will be wrong (atlas appears "
+        "magnified). Make coarse reg inputs with --reg_channel or write the "
+        "attrs yourself.",
+        input_zarr,
+        native,
+    )
     return native, "native (no ims attrs)"
 
 
@@ -90,9 +101,12 @@ def _zoom_mask_to_shape(mask: np.ndarray, target_shape: tuple[int, int, int]) ->
 
 def load_external_brain_mask(mask_zarr: str | Path, target_shape: tuple[int, int, int], erode: int = 1):
     """Map an external (aind fusion3 DL) coarse-grid brain mask onto the
-    registration grid and clean it up: keep the largest 3D component (stray
-    tissue fragments have no atlas counterpart and only drag the metric) and
-    erode ``erode`` voxels off the boundary rim.
+    registration grid and erode ``erode`` voxels off the boundary rim.
+
+    The former keep-largest-3D-component cleanup was removed: it was a
+    workaround for the 0.7-threshold era when the fused mask fragmented;
+    at the 0.5 threshold the mask is solid and strays are already dropped
+    per-slice by fuse_slab's relative-size filter.
 
     Returns (mask bool array, stats dict).
     """
@@ -109,19 +123,8 @@ def load_external_brain_mask(mask_zarr: str | Path, target_shape: tuple[int, int
         slabs.append(_zoom_mask_to_shape(slab, (1, target_shape[1], target_shape[2]))[0].astype(np.uint8))
         if (z + 1) % 256 == 0 or z + 1 == depth:
             logger.info("Brain mask xy mapping %d/%d slabs", z + 1, depth)
-    stacked = _zoom_mask_to_shape(np.stack(slabs, axis=0), target_shape)
+    mask = _zoom_mask_to_shape(np.stack(slabs, axis=0), target_shape)
     del slabs
-
-    labels, count = ndimage.label(stacked)
-    if count > 1:
-        sizes = np.bincount(labels.ravel())
-        sizes[0] = 0
-        mask = labels == int(np.argmax(sizes))
-        components = count
-    else:
-        mask = stacked
-        components = count
-    del labels, stacked
     if erode > 0:
         structure = ndimage.generate_binary_structure(3, 1)
         mask = ndimage.binary_erosion(mask, structure=structure, iterations=erode)
@@ -130,13 +133,11 @@ def load_external_brain_mask(mask_zarr: str | Path, target_shape: tuple[int, int
         "applied": True,
         "source": str(mask_path),
         "erode": int(erode),
-        "components": int(components),
         "voxels": int(mask.sum()),
     }
     logger.info(
-        "DL brain mask: %s, %d component(s), kept %d/%d voxels after erode=%d",
+        "DL brain mask: %s, kept %d/%d voxels after erode=%d",
         mask_path.name,
-        components,
         int(mask.sum()),
         int(mask.size),
         erode,
@@ -187,19 +188,22 @@ def convert_zarr_to_registration_nii(
     input_resolution_xyz: tuple[float, float, float],
     target_resolution_xyz: tuple[float, float, float],
     dataset_name: str = "0",
-    brain_mask: str | Path,
+    brain_mask: str | Path | None = None,
     brain_mask_erode: int = 1,
     flip_atlas: tuple[bool, bool, bool] = NO_FLIP,
 ) -> dict:
     """Rescale a Zarr volume to the target isotropic spacing and write a NIfTI.
 
-    ``brain_mask`` (required) is the coarse-grid DL brain mask (e.g.
+    ``brain_mask`` (optional) is the coarse-grid DL brain mask (e.g.
     ``ch0_brain_mask_dl.zarr`` from pipeline_modules.segmentation.brain_mask_aind):
-    it is mapped onto the registration grid, reduced to its largest 3D
-    component, eroded ``brain_mask_erode`` voxels, used to zero everything
+    when given it is mapped onto the registration grid, eroded ``brain_mask_erode``
+    voxels, used to zero everything
     outside the brain before writing, and mirrored into ``brain_mask.nii.gz``
-    next to the NIfTI (N4 + orientation preflight consumers). An existing
-    ``volume.nii.gz`` (and its side outputs) is overwritten, never refused.
+    next to the NIfTI (N4 + orientation preflight consumers). When ``brain_mask``
+    is ``None`` nothing is zeroed and no brain_mask.nii.gz is written (a stale
+    one is removed) — unmasked registration, ANTs falls back to its unmasked
+    behaviour. An existing ``volume.nii.gz`` (and its side outputs) is
+    overwritten, never refused.
 
     ``flip_atlas`` mirrors the volume along the axes selected by the sample
     config's ``registration.flip_atlas`` ``[ML, AP, DV]`` booleans (see
@@ -258,11 +262,16 @@ def convert_zarr_to_registration_nii(
     volume_u16 = np.clip(np.rint(volume), 0, 65535).astype(np.uint16)
     del volume
 
-    mask, brain_mask_stats = load_external_brain_mask(
-        brain_mask, (out_nz, out_ny, out_nx), erode=brain_mask_erode
-    )
-    volume_u16 = np.where(mask, volume_u16, 0).astype(np.uint16)
-    del mask
+    if brain_mask:
+        mask, brain_mask_stats = load_external_brain_mask(
+            brain_mask, (out_nz, out_ny, out_nx), erode=brain_mask_erode
+        )
+        volume_u16 = np.where(mask, volume_u16, 0).astype(np.uint16)
+        del mask
+    else:
+        # Unmasked registration: raw volume straight into ANTs (which itself
+        # falls back to its unmasked behaviour when brain_mask.nii.gz is absent).
+        brain_mask_stats = {"applied": False, "source": None, "erode": 0, "voxels": int(np.count_nonzero(volume_u16))}
 
     axes = flip_axes_from_flip_atlas(tuple(bool(v) for v in flip_atlas))
     if axes:
@@ -282,9 +291,14 @@ def convert_zarr_to_registration_nii(
     nib.save(nib.Nifti1Image(volume_xyz, affine), str(output_path))
 
     # Same geometry as volume.nii.gz (xyz transpose + unit affine) so the
-    # mask can be overlaid on the registration volume directly.
+    # mask can be overlaid on the registration volume directly. In the
+    # unmasked variant no brain_mask.nii.gz is written — and a stale one from
+    # an earlier masked run is removed so ANTs cannot pick it up silently.
     mask_nii_path = output_path.parent / "brain_mask.nii.gz"
-    nib.save(nib.Nifti1Image(np.where(volume_xyz > 0, 1, 0).astype(np.uint8), affine), str(mask_nii_path))
+    if brain_mask:
+        nib.save(nib.Nifti1Image(np.where(volume_xyz > 0, 1, 0).astype(np.uint8), affine), str(mask_nii_path))
+    elif mask_nii_path.exists():
+        mask_nii_path.unlink()
 
     with (output_path.parent / "original_shape.json").open("w", encoding="utf-8") as handle:
         json.dump(
@@ -320,10 +334,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_name", default="0", help="Dataset name inside the Zarr group")
     parser.add_argument(
         "--brain_mask",
-        required=True,
+        default=None,
         help="Coarse-grid DL brain-mask Zarr (e.g. ch0_brain_mask_dl.zarr from "
-        "pipeline_modules.segmentation.brain_mask_aind); the only mask source: "
-        "zeroes the registration NIfTI outside the brain and becomes brain_mask.nii.gz",
+        "pipeline_modules.segmentation.brain_mask_aind); zeroes the registration "
+        "NIfTI outside the brain and becomes brain_mask.nii.gz. Omit for unmasked "
+        "registration (no zeroing, no brain_mask.nii.gz; stale one removed)",
     )
     parser.add_argument(
         "--brain_mask_erode",
