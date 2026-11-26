@@ -29,6 +29,9 @@ def main():
     ap.add_argument("--window", type=int, default=1500, help="square canvas px")
     ap.add_argument("--tube_width", type=float, default=9.0)
     ap.add_argument("--branch_sphere_um", type=float, default=7.0, help="radius; 7um ~ 12px at default zoom")
+    ap.add_argument("--mask_min_voxels", type=int, default=640,
+                    help="drop mask components smaller than this (native voxels); 640 = skeleton dust rule "
+                         "(10 voxels of the 4x-downsampled mask). 0 keeps everything")
     args = ap.parse_args()
 
     RES = np.array([float(v) for v in args.resolution.split(",")])  # z,y,x um
@@ -124,6 +127,28 @@ def main():
 
     # ---- panel 2: mask isosurface, bright red ----
     mask = zarr.open(args.mask_zarr + "/0", mode="r")[sl] > 0
+    # drop small fragments with the same rule the skeleton uses: vessel_express removes
+    # 6-connected components < dust_threshold(10) voxels of the 4x-downsampled mask,
+    # i.e. < 10 * 64 native voxels. Components are sized in a padded crop so that pieces
+    # near the cube face are not cut and misjudged; anything reaching the padded border is kept.
+    if args.mask_min_voxels > 0:
+        from scipy import ndimage
+        pad = 60
+        psl = tuple(slice(max(s.start - pad, 0), min(s.stop + pad, n)) for s, n in zip(sl, shape))
+        padded = zarr.open(args.mask_zarr + "/0", mode="r")[psl] > 0
+        lab, n = ndimage.label(padded)
+        sizes = np.bincount(lab.ravel())
+        border = np.zeros(n + 1, dtype=bool)
+        for axis in range(3):
+            for idx in (0, -1):
+                b = np.take(lab, idx, axis=axis)
+                border[np.unique(b)] = True
+        small = (sizes < args.mask_min_voxels) & ~border
+        small[0] = False
+        padded[small[lab]] = False
+        inner = tuple(slice(s.start - p.start, s.stop - p.start) for s, p in zip(sl, psl))
+        mask = padded[inner]
+        print(f"mask fragments removed in/around cube: {int(small.sum())} components")
     verts, faces, _, _ = marching_cubes(mask.astype(np.uint8), level=0.5, spacing=tuple(RES))
     verts = verts[:, ::-1] + off_um[::-1]  # marching_cubes emits (z,y,x); pyvista wants (x,y,z)
     mesh = pv.PolyData(verts)

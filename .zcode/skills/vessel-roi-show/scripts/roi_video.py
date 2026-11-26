@@ -30,6 +30,8 @@ def main():
     ap.add_argument("--window", type=int, default=2000)
     ap.add_argument("--tube_width", type=float, default=9.0)
     ap.add_argument("--branch_sphere_um", type=float, default=7.0)
+    ap.add_argument("--mask_min_voxels", type=int, default=640,
+                    help="drop mask components smaller than this (native voxels); 0 keeps everything")
     args = ap.parse_args()
 
     RES = np.array([float(v) for v in args.resolution.split(",")])
@@ -80,6 +82,26 @@ def main():
 
     # ---- panel B: mask surface ----
     mask = zarr.open(args.mask_zarr + "/0", mode="r")[sl] > 0
+    # drop small fragments (same padded-crop rule as roi_trio: components reaching the
+    # padded border are kept, purely-local ones below the threshold are removed)
+    from scipy import ndimage
+    pad = 60
+    full_shape = zarr.open(args.mask_zarr + "/0", mode="r").shape
+    psl = tuple(slice(max(s.start - pad, 0), min(s.stop + pad, n)) for s, n in zip(sl, full_shape))
+    padded = zarr.open(args.mask_zarr + "/0", mode="r")[psl] > 0
+    lab, n = ndimage.label(padded)
+    sizes = np.bincount(lab.ravel())
+    border = np.zeros(n + 1, dtype=bool)
+    for axis in range(3):
+        for idx in (0, -1):
+            b = np.take(lab, idx, axis=axis)
+            border[np.unique(b)] = True
+    small = (sizes < args.mask_min_voxels) & ~border
+    small[0] = False
+    padded[small[lab]] = False
+    inner = tuple(slice(s.start - p.start, s.stop - p.start) for s, p in zip(sl, psl))
+    mask = padded[inner]
+    print("mask fragments removed in/around cube:", int(small.sum()))
     verts, faces, _, _ = marching_cubes(mask.astype(np.uint8), level=0.5, spacing=tuple(RES))
     verts = verts[:, ::-1] + off_um[::-1]  # (z,y,x) -> (x,y,z)
     mesh = pv.PolyData(verts)
